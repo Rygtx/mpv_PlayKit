@@ -1,0 +1,11 @@
+# native/ 下只跟踪源码、CMake 工程与 fetch-deps/build 脚本
+native/build/
+native/bin/
+# 第三方依赖: fetch-deps.ps1 可重建 (NGX SDK / VapourSynth 头), 不入库
+native/dependencies/
+# 本地诊断测试与产物 (python 脚本/exe/截图/日志)
+native/tests/
+
+# AI 模型文件体积巨大 (nvngx_dlssnr.dll ~165MB), 随 Release 分发不入库
+*.dll
+!portable_config/**/*.dll

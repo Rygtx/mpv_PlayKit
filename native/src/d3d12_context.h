@@ -1,0 +1,81 @@
+#pragma once
+// Owns the D3D12 environment for vs_dlssnr. Unlike Magpie (D3D11 renderer with
+// D3D12 interop via NT handles) the VapourSynth plugin feeds CPU frames, so a
+// single self-contained D3D12 device + DIRECT queue is enough: CPU pack/unpack,
+// staging upload, readback heap, zero-guidance textures, no shared fences.
+
+#include <d3d12.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+#include <cstdint>
+
+namespace vsdlssnr {
+
+using Microsoft::WRL::ComPtr;
+
+class D3D12Context {
+public:
+    D3D12Context() = default;
+    ~D3D12Context();
+    D3D12Context(const D3D12Context &) = delete;
+    D3D12Context &operator=(const D3D12Context &) = delete;
+
+    bool Initialize(char *err, size_t errLen) noexcept;
+    void Finalize() noexcept;
+
+    ID3D12Device *Device() const noexcept { return _device.Get(); }
+    ID3D12CommandQueue *Queue() const noexcept { return _queue.Get(); }
+    ID3D12GraphicsCommandList *CommandList() const noexcept { return _commandList.Get(); }
+    // 用于 CreateFeature / EvaluateFeature 的命令提交(Magpie 在 open 的
+    // command list 上调用,随后 Close + Execute,见 DLSSNRFilter.cpp:1727-1758)
+    bool BeginRecording() noexcept;
+    bool ExecuteAndWait() noexcept;
+
+    bool CreateFrameResources(int width, int height, char *err, size_t errLen) noexcept;
+
+    ID3D12Resource *InputColor() const noexcept { return _inputColor.Get(); }
+    ID3D12Resource *OutputColor() const noexcept { return _outputColor.Get(); }
+    // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
+    // motion R16G16_FLOAT、depth R32_FLOAT,内容全 0
+    ID3D12Resource *Motion() const noexcept { return _motion.Get(); }
+    ID3D12Resource *Depth() const noexcept { return _depth.Get(); }
+
+    // RGBS float32 三平面 → RGBA8_UNORM 纹理(CPU pack + staging 上传,同步)
+    bool UploadInput(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
+                     int width, int height, char *err, size_t errLen) noexcept;
+    // RGBA8_UNORM 纹理 → RGBS float32 三平面(readback + CPU unpack,同步)
+    bool ReadbackOutput(uint8_t **dstPlanes, int64_t *dstStrides,
+                        int width, int height, char *err, size_t errLen) noexcept;
+
+private:
+    bool CreateColorTexture(ID3D12Resource **out, int width, int height,
+                            DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
+                            D3D12_RESOURCE_FLAGS flags,
+                            char *err, size_t errLen) noexcept;
+    void SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept;
+
+    ComPtr<ID3D12Device> _device;
+    ComPtr<ID3D12InfoQueue> _infoQueue;
+    bool _debug = false;
+    ComPtr<ID3D12CommandQueue> _queue;
+    ComPtr<ID3D12CommandAllocator> _allocator;
+    ComPtr<ID3D12GraphicsCommandList> _commandList;
+    ComPtr<ID3D12Fence> _fence;
+    HANDLE _fenceEvent = nullptr;
+    uint64_t _fenceValue = 0;
+
+    ComPtr<ID3D12Resource> _inputColor;
+    ComPtr<ID3D12Resource> _outputColor;
+    ComPtr<ID3D12Resource> _readback;
+    ComPtr<ID3D12Resource> _upload;
+    ComPtr<ID3D12Resource> _motion;
+    ComPtr<ID3D12Resource> _depth;
+    ComPtr<ID3D12DescriptorHeap> _rtvHeap;
+
+    int _width = 0;
+    int _height = 0;
+    size_t _uploadPitch = 0;
+    size_t _readbackPitch = 0;
+};
+
+} // namespace vsdlssnr
