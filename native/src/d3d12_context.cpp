@@ -331,11 +331,11 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
     return true;
 }
 
-bool D3D12Context::UploadInput(
+bool D3D12Context::PackInput(
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
     int width, int height, char *err, size_t errLen) noexcept {
     if (width != _width || height != _height) {
-        SetErr(err, errLen, E_INVALIDARG, "UploadInput: size mismatch");
+        SetErr(err, errLen, E_INVALIDARG, "PackInput: size mismatch");
         return false;
     }
     void *mapped = nullptr;
@@ -358,11 +358,10 @@ bool D3D12Context::UploadInput(
         }
     }
     _upload->Unmap(0, nullptr);
+    return true;
+}
 
-    if (!BeginRecording()) {
-        SetErr(err, errLen, E_FAIL, "BeginRecording(upload) failed");
-        return false;
-    }
+bool D3D12Context::RecordUploadCopy(char *err, size_t errLen) noexcept {
     D3D12_RESOURCE_BARRIER toCopyDest[1]{
         Transition(_inputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
     };
@@ -372,8 +371,8 @@ bool D3D12Context::UploadInput(
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Offset = 0;
     src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = static_cast<UINT>(width);
-    src.PlacedFootprint.Footprint.Height = static_cast<UINT>(height);
+    src.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
+    src.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
     src.PlacedFootprint.Footprint.Depth = 1;
     src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(_uploadPitch);
     D3D12_TEXTURE_COPY_LOCATION dst{};
@@ -385,24 +384,10 @@ bool D3D12Context::UploadInput(
         Transition(_inputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
     };
     _commandList->ResourceBarrier(1, toCommon1);
-    if (!ExecuteAndWait()) {
-        SetErr(err, errLen, E_FAIL, "Execute(upload) failed");
-        return false;
-    }
     return true;
 }
 
-bool D3D12Context::ReadbackOutput(
-    uint8_t **dstPlanes, int64_t *dstStrides,
-    int width, int height, char *err, size_t errLen) noexcept {
-    if (width != _width || height != _height) {
-        SetErr(err, errLen, E_INVALIDARG, "ReadbackOutput: size mismatch");
-        return false;
-    }
-    if (!BeginRecording()) {
-        SetErr(err, errLen, E_FAIL, "BeginRecording(readback) failed");
-        return false;
-    }
+bool D3D12Context::RecordReadbackCopy(char *err, size_t errLen) noexcept {
     D3D12_RESOURCE_BARRIER toCopySrc[1]{
         Transition(_outputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
     };
@@ -416,8 +401,8 @@ bool D3D12Context::ReadbackOutput(
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Offset = 0;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(width);
-    dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(height);
+    dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
+    dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(_readbackPitch);
     _commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
@@ -425,8 +410,14 @@ bool D3D12Context::ReadbackOutput(
         Transition(_outputColor.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
     _commandList->ResourceBarrier(1, backToCommon);
-    if (!ExecuteAndWait()) {
-        SetErr(err, errLen, E_FAIL, "Execute(readback) failed");
+    return true;
+}
+
+bool D3D12Context::UnpackOutput(
+    uint8_t **dstPlanes, int64_t *dstStrides,
+    int width, int height, char *err, size_t errLen) noexcept {
+    if (width != _width || height != _height) {
+        SetErr(err, errLen, E_INVALIDARG, "UnpackOutput: size mismatch");
         return false;
     }
 

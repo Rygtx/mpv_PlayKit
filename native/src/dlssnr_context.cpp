@@ -436,105 +436,82 @@ bool DlssnrContext::ProcessFrame(
     }
     // Diagnostic: VSDLSSNR_SKIP_EVAL=1 measures the pipe without NGX evaluate
     static const bool skipEval = GetEnvironmentVariableA("VSDLSSNR_SKIP_EVAL", nullptr, 0) != 0;
-    if (!_d3d12->UploadInput(srcPlanes, srcStrides, width, height, err, errLen)) return false;
+    if (!_d3d12->PackInput(srcPlanes, srcStrides, width, height, err, errLen)) return false;
+    if (timing) QueryPerformanceCounter(&t1);
+
+    if (!_d3d12->BeginRecording()) {
+        if (err && errLen) std::snprintf(err, errLen, "BeginRecording(frame) failed");
+        return false;
+    }
 
     if (skipEval) {
-        // Route input straight to the output planes for pipe-cost measurement
-        if (!_d3d12->BeginRecording()) {
-            if (err && errLen) std::snprintf(err, errLen, "BeginRecording(skip) failed");
-            return false;
-        }
-        D3D12_RESOURCE_BARRIER inBar[1]{
+        // Diagnostic path: route input straight to output for pipe-cost measurement
+        auto *cl = _d3d12->CommandList();
+        D3D12_RESOURCE_BARRIER bar[2]{
             TransitionTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_COPY_SOURCE),
-        };
-        D3D12_RESOURCE_BARRIER outBar[1]{
             TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_COPY_DEST),
         };
-        _d3d12->CommandList()->ResourceBarrier(1, inBar);
-        _d3d12->CommandList()->ResourceBarrier(1, outBar);
-        D3D12_TEXTURE_COPY_LOCATION src{ _d3d12->InputColor(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-        D3D12_TEXTURE_COPY_LOCATION dst{ _d3d12->OutputColor(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-        _d3d12->CommandList()->CopyResource(_d3d12->OutputColor(), _d3d12->InputColor());
-        D3D12_RESOURCE_BARRIER back[2]{
-            inBar[0], outBar[0],
+        cl->ResourceBarrier(2, bar);
+        cl->CopyResource(_d3d12->OutputColor(), _d3d12->InputColor());
+        for (auto &b : bar) {
+            D3D12_RESOURCE_STATES tmp = b.Transition.StateBefore;
+            b.Transition.StateBefore = b.Transition.StateAfter;
+            b.Transition.StateAfter = tmp;
+        }
+        cl->ResourceBarrier(2, bar);
+    } else {
+        if (!_d3d12->RecordUploadCopy(err, errLen)) return false;
+
+        auto *cl = _d3d12->CommandList();
+        // Barrier set mirrors Magpie Draw() (cpp:1932-1945 / 2006-2012):
+        // inputs COMMON -> NON_PIXEL_SHADER_RESOURCE, output COMMON -> UNORDERED_ACCESS.
+        D3D12_RESOURCE_BARRIER barriers[4]{
+            TransitionTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         };
-        back[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        back[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        back[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        back[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        _d3d12->CommandList()->ResourceBarrier(2, back);
-        if (timing) QueryPerformanceCounter(&t2);
-        if (!_d3d12->ExecuteAndWait()) {
-            if (err && errLen) std::snprintf(err, errLen, "Execute(skip) failed");
+        cl->ResourceBarrier(4, barriers);
+
+        DWORD sehCode = 0;
+        if (!SetEvaluateParametersSafely(resetHistory, &sehCode)) {
+            if (err && errLen) std::snprintf(err, errLen, "Evaluate parameter setup raised SEH");
             return false;
         }
-        if (timing) QueryPerformanceCounter(&t3);
-        const bool rb = _d3d12->ReadbackOutput(dstPlanes, dstStrides, width, height, err, errLen);
-        if (timing) {
-            LARGE_INTEGER t4{};
-            QueryPerformanceCounter(&t4);
-            const auto ms = [](LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f) {
-                return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
-            };
-            std::snprintf(timingOut, timingLen, "upload+copy=%.1f,exec=%.1f,readback=%.1f",
-                          ms(t0, t2, qpcFreq), ms(t2, t3, qpcFreq), ms(t3, t4, qpcFreq));
+        const NVSDK_NGX_Result r = SnippetEvaluateSafely(cl, _parameters, &sehCode);
+        if (sehCode) {
+            if (err && errLen) std::snprintf(err, errLen, "EvaluateFeature raised SEH");
+            return false;
         }
-        return rb;
+        if (!NVSDK_NGX_SUCCEED(r)) {
+            if (err && errLen) std::snprintf(err, errLen, "EvaluateFeature failed (0x%x)", static_cast<unsigned>(r));
+            return false;
+        }
+
+        for (auto &b : barriers) {
+            D3D12_RESOURCE_BARRIER back = b;
+            D3D12_RESOURCE_STATES tmp = back.Transition.StateBefore;
+            back.Transition.StateBefore = back.Transition.StateAfter;
+            back.Transition.StateAfter = tmp;
+            cl->ResourceBarrier(1, &back);
+        }
     }
 
-    if (timing) QueryPerformanceCounter(&t1);
-    if (!_d3d12->BeginRecording()) {
-        if (err && errLen) std::snprintf(err, errLen, "BeginRecording(evaluate) failed");
-        return false;
-    }
-    auto *cl = _d3d12->CommandList();
-    // Barrier set mirrors Magpie Draw() (cpp:1932-1945 / 2006-2012):
-    // inputs COMMON -> NON_PIXEL_SHADER_RESOURCE, output COMMON -> UNORDERED_ACCESS.
-    D3D12_RESOURCE_BARRIER barriers[4]{
-        TransitionTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-    };
-    cl->ResourceBarrier(4, barriers);
-
-    DWORD sehCode = 0;
-    if (!SetEvaluateParametersSafely(resetHistory, &sehCode)) {
-        if (err && errLen) std::snprintf(err, errLen, "Evaluate parameter setup raised SEH");
-        return false;
-    }
-    const NVSDK_NGX_Result r = SnippetEvaluateSafely(cl, _parameters, &sehCode);
-    if (timing) QueryPerformanceCounter(&t2);
-    if (sehCode) {
-        if (err && errLen) std::snprintf(err, errLen, "EvaluateFeature raised SEH");
-        return false;
-    }
-    if (!NVSDK_NGX_SUCCEED(r)) {
-        if (err && errLen) std::snprintf(err, errLen, "EvaluateFeature failed (0x%x)", static_cast<unsigned>(r));
-        return false;
-    }
-
-    for (auto &b : barriers) {
-        D3D12_RESOURCE_BARRIER back = b;
-        D3D12_RESOURCE_STATES tmp = back.Transition.StateBefore;
-        back.Transition.StateBefore = back.Transition.StateAfter;
-        back.Transition.StateAfter = tmp;
-        cl->ResourceBarrier(1, &back);
-    }
+    if (!_d3d12->RecordReadbackCopy(err, errLen)) return false;
     if (!_d3d12->ExecuteAndWait()) {
-        if (err && errLen) std::snprintf(err, errLen, "Execute(evaluate) failed");
+        if (err && errLen) std::snprintf(err, errLen, "Execute(frame) failed");
         return false;
     }
-    if (timing) QueryPerformanceCounter(&t3);
-    const bool rb = _d3d12->ReadbackOutput(dstPlanes, dstStrides, width, height, err, errLen);
+    if (timing) QueryPerformanceCounter(&t2);
+    const bool rb = _d3d12->UnpackOutput(dstPlanes, dstStrides, width, height, err, errLen);
     if (timing) {
-        LARGE_INTEGER t4{};
-        QueryPerformanceCounter(&t4);
+        LARGE_INTEGER t3{};
+        QueryPerformanceCounter(&t3);
         const auto ms = [](LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f) {
             return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
         };
-        std::snprintf(timingOut, timingLen, "upload=%.1f,eval=%.1f,readback=%.1f",
-                      ms(t0, t1, qpcFreq), ms(t2, t3, qpcFreq), ms(t3, t4, qpcFreq));
+        std::snprintf(timingOut, timingLen, "pack=%.1f,submit+gpu=%.1f,unpack=%.1f",
+                      ms(t0, t1, qpcFreq), ms(t1, t2, qpcFreq), ms(t2, t3, qpcFreq));
     }
     return rb;
 }

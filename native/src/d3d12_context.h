@@ -40,12 +40,18 @@ public:
     ID3D12Resource *Motion() const noexcept { return _motion.Get(); }
     ID3D12Resource *Depth() const noexcept { return _depth.Get(); }
 
-    // RGBS float32 三平面 → RGBA8_UNORM 纹理(CPU pack + staging 上传,同步)
-    bool UploadInput(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
-                     int width, int height, char *err, size_t errLen) noexcept;
-    // RGBA8_UNORM 纹理 → RGBS float32 三平面(readback + CPU unpack,同步)
-    bool ReadbackOutput(uint8_t **dstPlanes, int64_t *dstStrides,
-                        int width, int height, char *err, size_t errLen) noexcept;
+    // 单次提交管线(三段同步已合并):CPU pack → [一次提交: 上传拷贝 → evaluate → 回读拷贝] → CPU unpack。
+    // 每个记录函数自包含 barrier COMMON→…→COMMON,便于 skip-eval 诊断路径复用。
+    // RGBS float32 三平面 → RGBA8 行写入 upload buffer(纯 CPU,不提交)
+    bool PackInput(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
+                   int width, int height, char *err, size_t errLen) noexcept;
+    // 在已 BeginRecording 的命令列表上记录:input COMMON→COPY_DEST→拷贝→COMMON
+    bool RecordUploadCopy(char *err, size_t errLen) noexcept;
+    // 在已 BeginRecording 的命令列表上记录:output COMMON→COPY_SOURCE→拷贝→COMMON
+    bool RecordReadbackCopy(char *err, size_t errLen) noexcept;
+    // GPU 完成后调用:readback buffer → RGBS 三平面(纯 CPU)
+    bool UnpackOutput(uint8_t **dstPlanes, int64_t *dstStrides,
+                      int width, int height, char *err, size_t errLen) noexcept;
 
 private:
     bool CreateColorTexture(ID3D12Resource **out, int width, int height,
