@@ -623,9 +623,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     HANDLE watch = CreateThread(nullptr, 0, ExitWatchProc, nullptr, 0, nullptr);
 
-    LARGE_INTEGER freq{}, prev{};
+    LARGE_INTEGER freq{};
     QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&prev);
     MSG msg;
     while (!g_quit) {
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -643,14 +642,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
-        const double seconds = (now.QuadPart - prev.QuadPart) / double(freq.QuadPart);
-        prev = now;
+        // Absolute QPC time (a per-frame delta would always be < the 100ms
+        // write throttle, which permanently blocked live writes)
+        const double nowSec = now.QuadPart / double(freq.QuadPart);
 
         // Throttled live-file writes while dragging sliders
-        if (g_app.liveDirty && seconds - g_app.lastLiveWrite > 0.1) {
+        if (g_app.liveDirty && nowSec - g_app.lastLiveWrite > 0.1) {
             WriteLiveJson();
             g_app.liveDirty = false;
-            g_app.lastLiveWrite = seconds;
+            g_app.lastLiveWrite = nowSec;
         }
 
         ImGui_ImplDX11_NewFrame();
