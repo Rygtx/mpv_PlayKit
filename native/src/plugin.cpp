@@ -3,9 +3,11 @@
 // Model file: nvngx_dlssnr.dll (310.9.0), zero-guidance mode (Magpie
 // guidanceMode=1 Force Zero), same-resolution processing.
 
+#include "bridge.h"
 #include "d3d12_context.h"
 #include "dlssnr_context.h"
 #include "dlssnr_params.h"
+#include "shared_params.h"
 
 #include "VapourSynth4.h"
 #include "VSHelper4.h"
@@ -13,6 +15,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <windows.h>
 
@@ -37,7 +40,9 @@ double GetFloatDef(const VSMap *in, const VSAPI *vsapi, const char *key, double 
 
 struct FilterData {
     VSNode *node = nullptr;
-    DlssnrParams params{};
+    // Runtime-mutable parameters shared with the tray panel (initial values
+    // come from the .vpy call).
+    std::unique_ptr<vsdlssnr::SharedParams> params;
 
     // Lazily initialized on the first ready frame; serialized by fmUnordered.
     vsdlssnr::D3D12Context d3d12;
@@ -70,8 +75,10 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         char err[256]{};
         if (d->d3d12.Initialize(err, sizeof(err)) &&
             d->ngx.Initialize(d->d3d12, d->ngxDllPath.c_str(),
-                              d->width, d->height, d->params, err, sizeof(err))) {
+                              d->width, d->height, d->params.get(), err, sizeof(err))) {
             d->initOk = true;
+            // Filter is live: start the mpv-side parameter bridge
+            vsdlssnr::BridgeStart(d->params.get());
             char msg[128];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
             vsapi->logMessage(mtInformation, msg, core);
@@ -144,6 +151,8 @@ static const VSFrame *VS_CC DlssnrGetFrame(
 static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI *vsapi) {
     auto *d = static_cast<FilterData *>(instanceData);
     if (d->node) vsapi->freeNode(d->node);
+    // Stop the bridge before tearing down the contexts it observes.
+    vsdlssnr::BridgeStop(d->params.get());
     delete d;
 }
 
@@ -169,15 +178,19 @@ static void VS_CC DlssnrCreate(
     d->width = vi->width;
     d->height = vi->height;
 
-    d->params.preset = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "preset", 0), 0LL, 3LL));
-    d->params.style = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "style", 0), 0LL, 2LL));
-    d->params.intensity = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "intensity", 1.0), 0.0, 2.0));
-    d->params.localToneStrength = vsh::doubleToFloatS(GetFloatDef(in, vsapi, "local_tone", 1.0));
-    d->params.localStructureStrength = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "local_structure", 1.0), 0.0, 2.0));
-    d->params.skinStructureStrength = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "skin_structure", -1.0), -1.0, 2.0));
-    d->params.useAutoMask = GetIntDef(in, vsapi, "use_auto_mask", 1) != 0;
-    d->params.uiCorrection = GetIntDef(in, vsapi, "ui_correction", 1) != 0;
-    d->params.residualMultiplier = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), 1.0, 2.0));
+    DlssnrParams initial{};
+    initial.preset = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "preset", 0), 0LL, 3LL));
+    initial.style = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "style", 0), 0LL, 2LL));
+    initial.intensity = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "intensity", 1.0), 0.0, 2.0));
+    initial.localToneStrength = vsh::doubleToFloatS(GetFloatDef(in, vsapi, "local_tone", 1.0));
+    initial.localStructureStrength = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "local_structure", 1.0), 0.0, 2.0));
+    initial.skinStructureStrength = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "skin_structure", -1.0), -1.0, 2.0));
+    initial.useAutoMask = GetIntDef(in, vsapi, "use_auto_mask", 1) != 0;
+    initial.uiCorrection = GetIntDef(in, vsapi, "ui_correction", 1) != 0;
+    initial.residualMultiplier = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), 1.0, 2.0));
+    // Panel-saved profile (dlssnr_ui.ini) overrides .vpy defaults when present.
+    vsdlssnr::BridgeLoadIni(initial);
+    d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
 
     int dllErr = 0;
     const char *dllArg = vsapi->mapGetData(in, "ngx_dll", 0, &dllErr);

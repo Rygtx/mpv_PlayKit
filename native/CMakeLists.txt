@@ -21,6 +21,7 @@ add_library(vs_dlssnr SHARED
     src/dlssnr_context.cpp
     src/iat_hook.cpp
     src/d3d12_context.cpp
+    src/bridge.cpp
 )
 
 target_include_directories(vs_dlssnr PRIVATE
@@ -34,6 +35,25 @@ target_link_libraries(vs_dlssnr PRIVATE
     "${DEP_DIR}/ngx/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib"
     d3d12.lib dxgi.lib d3d11.lib dxguid.lib d3dcompiler.lib
 )
+
+# --- Independent control panel: ImGui + D3D11, talks to vs_dlssnr.dll via
+#     dlssnr_live.json (live) and dlssnr_ui.ini (saved defaults) ---
+set(IMGUI_DIR "${DEP_DIR}/imgui")
+add_executable(dlssnr_panel WIN32
+    src/panel_app.cpp
+    "${IMGUI_DIR}/imgui.cpp"
+    "${IMGUI_DIR}/imgui_draw.cpp"
+    "${IMGUI_DIR}/imgui_tables.cpp"
+    "${IMGUI_DIR}/imgui_widgets.cpp"
+    "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
+    "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp"
+)
+target_include_directories(dlssnr_panel PRIVATE src "${IMGUI_DIR}" "${IMGUI_DIR}/backends")
+target_link_libraries(dlssnr_panel PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib dwmapi.lib)
+set_property(TARGET dlssnr_panel PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+target_compile_definitions(dlssnr_panel PRIVATE UNICODE _UNICODE)
+target_compile_options(dlssnr_panel PRIVATE /utf-8)
+set_target_properties(dlssnr_panel PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 
 # mpv-lazy ships an old vcruntime140.dll that preempts System32 -> static CRT required
 set_property(TARGET vs_dlssnr PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

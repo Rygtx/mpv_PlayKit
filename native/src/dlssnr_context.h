@@ -8,6 +8,7 @@
 #include "d3d12_context.h"
 #include "dlssnr_params.h"
 #include "iat_hook.h"
+#include "shared_params.h"
 #include <nvsdk_ngx.h>
 
 namespace vsdlssnr {
@@ -20,13 +21,18 @@ public:
     DlssnrContext &operator=(const DlssnrContext &) = delete;
 
     bool Initialize(D3D12Context &d3d12, const wchar_t *ngxDllPath,
-                    int width, int height, const DlssnrParams &params,
+                    int width, int height, SharedParams *shared,
                     char *err, size_t errLen) noexcept;
     void Shutdown() noexcept;
     bool IsReady() const noexcept { return _ready; }
 
+    // Preset is a create-time NGX key: on panel change the frame thread
+    // rebuilds the feature (device/textures/parameter block reused logic kept
+    // close to a fresh Initialize).
+    bool RecreateFeature(int preset, char *err, size_t errLen) noexcept;
+
     // RGBS float32 三平面进 → 处理 → RGBS float32 三平面出(同分辨率)
-    // timingOut 非 NULL 时写入分段耗时(毫秒,逗号分隔:upload,evaluate,readback)
+    // timingOut 非 NULL 时写入分段耗时(毫秒,逗号分隔:pack,submit+gpu,unpack)
     bool ProcessFrame(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                       uint8_t **dstPlanes, int64_t *dstStrides,
                       int width, int height, bool resetHistory,
@@ -55,6 +61,7 @@ private:
     NVSDK_NGX_Handle *_feature = nullptr;
     HMODULE _snippetModule = nullptr;
     SnippetCallerHook _hook{};
+    SharedParams *_shared = nullptr;
 
     using SnippetInitExtFn = NVSDK_NGX_Result(NVSDK_CONV *)(
         unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version, const NVSDK_NGX_Parameter *);
@@ -71,7 +78,6 @@ private:
     ReleaseFeatureFn _snippetReleaseFeature = nullptr;
     ShutdownFn _snippetShutdown = nullptr;
 
-    DlssnrParams _params{};
     wchar_t _appDataPath[MAX_PATH]{};
     int _width = 0;
     int _height = 0;

@@ -35,4 +35,17 @@ foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
     Fetch "https://raw.githubusercontent.com/VapourSynth/VapourSynth/R73/include/$h" (Join-Path $vsInc $h)
 }
 
+# --- Dear ImGui (independent panel UI), unpacked to dependencies\imgui ---
+$imguiDir = Join-Path $root "dependencies\imgui"
+if (-not (Test-Path (Join-Path $imguiDir "imgui.h"))) {
+    $zip = Join-Path $env:TEMP "imgui.zip"
+    Fetch "https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b.zip" $zip
+    $extract = Join-Path $root "dependencies"
+    Expand-Archive $zip $extract -Force
+    if (Test-Path $imguiDir) { Remove-Item $imguiDir -Recurse -Force -Confirm:$false }
+    Rename-Item (Join-Path $extract "imgui-1.91.9b") "imgui"
+    Remove-Item $zip -Force -Confirm:$false -ErrorAction SilentlyContinue
+    Write-Host "imgui: unpacked to $imguiDir"
+}
+
 Write-Host "done."

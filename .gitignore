@@ -5,6 +5,8 @@ native/bin/
 native/dependencies/
 # 本地诊断测试与产物 (python 脚本/exe/截图/日志)
 native/tests/
+# 本地路线图/进展文档, 不随仓库分发
+native/PORTING.md
 
 # AI 模型文件体积巨大 (nvngx_dlssnr.dll ~165MB), 随 Release 分发不入库
 *.dll

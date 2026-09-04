@@ -223,6 +223,7 @@ NVSDK_NGX_Result DlssnrContext::SnippetShutdownSafely(DWORD *sehCode) noexcept {
 
 void DlssnrContext::SetCreateParametersUnsafe() noexcept {
     NVSDK_NGX_Parameter *p = _parameters;
+    const DlssnrParams createParams = _shared->Snapshot();
     p->Set(PARAM_WIDTH, _width);
     p->Set(PARAM_HEIGHT, _height);
     p->Set(PARAM_INPUT_WIDTH, _width);
@@ -235,7 +236,7 @@ void DlssnrContext::SetCreateParametersUnsafe() noexcept {
     p->Set(PARAM_SCALE, 1.0f);
     p->Set(PARAM_SCALING_RATIO, 1.0f);
     p->Set(PARAM_SCALING_RATIO_CALLBACK, FunctionAddress(&SetScalingRatioCallback));
-    p->Set(PARAM_PRESET, _params.preset);
+    p->Set(PARAM_PRESET, createParams.preset);
     p->Set(NVSDK_NGX_Parameter_Width, _width);
     p->Set(NVSDK_NGX_Parameter_Height, _height);
     p->Set(NVSDK_NGX_Parameter_PerfQualityValue,
@@ -258,6 +259,7 @@ bool DlssnrContext::SetCreateParametersSafely(DWORD *sehCode) noexcept {
 
 void DlssnrContext::SetEvaluateParametersUnsafe(bool resetHistory) noexcept {
     NVSDK_NGX_Parameter *p = _parameters;
+    const DlssnrParams params = _shared->Snapshot();
     p->Set(PARAM_COLOR, _d3d12->InputColor());
     p->Set(PARAM_OUTPUT, _d3d12->OutputColor());
     p->Set(PARAM_MVEC, _d3d12->Motion());
@@ -271,13 +273,13 @@ void DlssnrContext::SetEvaluateParametersUnsafe(bool resetHistory) noexcept {
     p->Set(PARAM_DEPTH_INVERTED, 1);
     p->Set(PARAM_ENABLED, 1);
     p->Set(PARAM_RESET, resetHistory ? 1 : 0);
-    p->Set(PARAM_STYLE, _params.style);
-    p->Set(PARAM_INTENSITY, _params.intensity);
-    p->Set(PARAM_LOCAL_TONE, _params.localToneStrength);
-    p->Set(PARAM_LOCAL_STRUCTURE, _params.localStructureStrength);
-    p->Set(PARAM_SKIN_STRUCTURE, _params.skinStructureStrength);
-    p->Set(PARAM_AUTO_MASK, _params.useAutoMask ? 1 : 0);
-    p->Set(PARAM_UI_CORRECTION, _params.uiCorrection ? 1 : 0);
+    p->Set(PARAM_STYLE, params.style);
+    p->Set(PARAM_INTENSITY, params.intensity);
+    p->Set(PARAM_LOCAL_TONE, params.localToneStrength);
+    p->Set(PARAM_LOCAL_STRUCTURE, params.localStructureStrength);
+    p->Set(PARAM_SKIN_STRUCTURE, params.skinStructureStrength);
+    p->Set(PARAM_AUTO_MASK, params.useAutoMask ? 1 : 0);
+    p->Set(PARAM_UI_CORRECTION, params.uiCorrection ? 1 : 0);
 }
 
 bool DlssnrContext::SetEvaluateParametersSafely(bool resetHistory, DWORD *sehCode) noexcept {
@@ -294,7 +296,7 @@ bool DlssnrContext::SetEvaluateParametersSafely(bool resetHistory, DWORD *sehCod
 
 bool DlssnrContext::Initialize(
     D3D12Context &d3d12, const wchar_t *ngxDllPath,
-    int width, int height, const DlssnrParams &params,
+    int width, int height, SharedParams *shared,
     char *err, size_t errLen) noexcept {
     auto fail = [&](const char *what) {
         if (err && errLen) std::snprintf(err, errLen, "%s", what);
@@ -306,7 +308,7 @@ bool DlssnrContext::Initialize(
     _d3d12 = &d3d12;
     _width = width;
     _height = height;
-    _params = params;
+    _shared = shared;
 
     // Application data path = snippet directory (mirrors Magpie using its exe dir;
     // the directory must be writable for NGX caches).
@@ -418,6 +420,55 @@ bool DlssnrContext::Initialize(
     return true;
 }
 
+bool DlssnrContext::RecreateFeature(int preset, char *err, size_t errLen) noexcept {
+    if (!_ready || !_snippetReleaseFeature) {
+        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
+        return false;
+    }
+    // Preset is a create-time key: release + re-allocate the parameter block,
+    // then CreateFeature again (device/queues/textures untouched).
+    {
+        DWORD sehCode = 0;
+        SnippetReleaseSafely(&sehCode);
+        _feature = nullptr;
+        sehCode = 0;
+        CoreDestroyParametersSafely(_parameters, &sehCode);
+        _parameters = nullptr;
+        sehCode = 0;
+        const NVSDK_NGX_Result r = CoreAllocateParametersSafely(&_parameters, &sehCode);
+        if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_parameters) {
+            if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: AllocateParameters failed");
+            _ready = false;
+            return false;
+        }
+    }
+    if (!_d3d12->BeginRecording()) {
+        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: BeginRecording failed");
+        return false;
+    }
+    {
+        DWORD sehCode = 0;
+        if (!SetCreateParametersSafely(&sehCode)) {
+            if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: parameter setup raised SEH");
+            return false;
+        }
+        const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CommandList(), _parameters, &sehCode);
+        if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_feature) {
+            if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: CreateFeature failed (0x%x)",
+                static_cast<unsigned>(sehCode ? 0xFFFFFFFFu : r));
+            return false;
+        }
+    }
+    if (!_d3d12->ExecuteAndWait()) {
+        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: Execute failed");
+        return false;
+    }
+    char msg[96];
+    std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: preset=%d feature recreated", preset);
+    DbgLine(msg);
+    return true;
+}
+
 bool DlssnrContext::ProcessFrame(
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
     uint8_t **dstPlanes, int64_t *dstStrides,
@@ -427,6 +478,10 @@ bool DlssnrContext::ProcessFrame(
     if (!_ready) {
         if (err && errLen) std::snprintf(err, errLen, "context not ready");
         return false;
+    }
+    // Panel preset changes require a feature rebuild; consume before packing.
+    if (int newPreset = -1; _shared->ConsumePresetChange(newPreset)) {
+        if (!RecreateFeature(newPreset, err, errLen)) return false;
     }
     const bool timing = timingOut && timingLen > 0;
     LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3{};
