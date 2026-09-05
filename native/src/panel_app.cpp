@@ -72,6 +72,7 @@ struct AppState {
     char status[160]{};
     char statsBig[64]{};
     char statsDetail[160]{};
+    char statsRes[96]{};
     char gpuName[128]{};
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f;
@@ -237,6 +238,7 @@ void LoadStats() noexcept {
     if (!m) {
         g_app.statsBig[0] = 0;
         g_app.statsDetail[0] = 0;
+        g_app.statsRes[0] = 0;
         return;
     }
     const char *body = static_cast<const char *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
@@ -250,16 +252,16 @@ void LoadStats() noexcept {
         const int h = JsonGetInt(body, "height", 0);
         if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
+            snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
+                     "EMA %.1f  ·  P99 %.1f", gpuEma, gpuP99);
             // 分辨率展示:未开启缩放 -> 原生分辨率;开启 -> 处理分辨率 → 回源分辨率
             const int scaling = JsonGetInt(body, "scaling", 0);
             if (scaling && iw > 0 && ih > 0) {
-                snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
-                         "EMA %.1f  ·  P99 %.1f  ·  分辨率 %dx%d → %dx%d",
-                         gpuEma, gpuP99, iw, ih, w, h);
+                snprintf(g_app.statsRes, sizeof(g_app.statsRes),
+                         "分辨率 %dx%d → %dx%d", iw, ih, w, h);
             } else {
-                snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
-                         "EMA %.1f  ·  P99 %.1f  ·  分辨率 %dx%d(原生)",
-                         gpuEma, gpuP99, w, h);
+                snprintf(g_app.statsRes, sizeof(g_app.statsRes),
+                         "分辨率 %dx%d(原生)", w, h);
             }
             g_app.segPack = static_cast<float>(JsonGetFloat(body, "pack_ema", 0));
             g_app.segEval = static_cast<float>(JsonGetFloat(body, "eval_cpu_ema", 0));
@@ -365,6 +367,10 @@ void DrawUi() noexcept {
     ImGui::SetWindowFontScale(1.4f);
     ImGui::TextColored(ImVec4(120 / 255.0f, 190 / 255.0f, 1.0f, 1.0f), "%s", g_app.statsBig);
     ImGui::SetWindowFontScale(1.0f);
+    if (g_app.statsDetail[0]) {
+        ImGui::TextDisabled("%s", g_app.statsDetail);
+        ImGui::TextDisabled("%s", g_app.statsRes);
+    }
     ImGui::Spacing();
 
     // 效果渲染用时(堆叠时间线,列宽 = 耗时占比)
@@ -617,8 +623,8 @@ void DrawUi() noexcept {
         snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
     }
     if (ImGui::IsItemHovered()) {
-        char u8tip[192];
-        WideCharToMultiByte(CP_UTF8, 0, L"将当前设置保存为默认值(dlssnr_ui.ini),下次加载滤镜时自动生效。", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
+        char u8tip[256];
+        WideCharToMultiByte(CP_UTF8, 0, L"将当前设置保存为默认值(dlssnr_ui.ini)。\n仅对 .vpy 未显式设置的参数在下次加载时生效; vpy 参数始终优先。", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
         ShowTip(u8tip);
     }
     ImGui::SameLine(0, 14 * s);

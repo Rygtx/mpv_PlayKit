@@ -32,6 +32,15 @@ long long GetIntDef(const VSMap *in, const VSAPI *vsapi, const char *key, long l
     return err ? def : v;
 }
 
+// true when the caller (vpy) explicitly passed this argument
+bool HasArg(const VSMap *in, const VSAPI *vsapi, const char *key) {
+    const int n = vsapi->mapNumKeys(in);
+    for (int i = 0; i < n; ++i) {
+        if (std::strcmp(vsapi->mapGetKey(in, i), key) == 0) return true;
+    }
+    return false;
+}
+
 double GetFloatDef(const VSMap *in, const VSAPI *vsapi, const char *key, double def) {
     int err = 0;
     const double v = vsapi->mapGetFloat(in, key, 0, &err);
@@ -191,8 +200,23 @@ static void VS_CC DlssnrCreate(
     initial.inputResolutionPercent = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "input_resolution", 100), 25LL, 100LL));
     // scaling_enabled=0 drops the residual pipeline entirely (input_resolution ignored)
     initial.scalingEnabled = GetIntDef(in, vsapi, "scaling_enabled", 1) != 0;
-    // Panel-saved profile (dlssnr_ui.ini) overrides .vpy defaults when present.
-    vsdlssnr::BridgeLoadIni(initial);
+    // Priority: explicit .vpy argument > panel-saved ini (dlssnr_ui.ini) >
+    // built-in default. The ini only fills keys the vpy did not pass, so a
+    // tuned .vpy is never silently overridden by stale panel state.
+    DlssnrParams iniP = initial;
+    if (vsdlssnr::BridgeLoadIni(iniP)) {
+        if (!HasArg(in, vsapi, "preset")) initial.preset = iniP.preset;
+        if (!HasArg(in, vsapi, "style")) initial.style = iniP.style;
+        if (!HasArg(in, vsapi, "intensity")) initial.intensity = iniP.intensity;
+        if (!HasArg(in, vsapi, "local_tone")) initial.localToneStrength = iniP.localToneStrength;
+        if (!HasArg(in, vsapi, "local_structure")) initial.localStructureStrength = iniP.localStructureStrength;
+        if (!HasArg(in, vsapi, "skin_structure")) initial.skinStructureStrength = iniP.skinStructureStrength;
+        if (!HasArg(in, vsapi, "use_auto_mask")) initial.useAutoMask = iniP.useAutoMask;
+        if (!HasArg(in, vsapi, "ui_correction")) initial.uiCorrection = iniP.uiCorrection;
+        if (!HasArg(in, vsapi, "residual_multiplier")) initial.residualMultiplier = iniP.residualMultiplier;
+        if (!HasArg(in, vsapi, "input_resolution")) initial.inputResolutionPercent = iniP.inputResolutionPercent;
+        if (!HasArg(in, vsapi, "scaling_enabled")) initial.scalingEnabled = iniP.scalingEnabled;
+    }
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
 
     int dllErr = 0;

@@ -4,7 +4,8 @@
 ###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
 ### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18), 零 guidance 单帧模式
 ###       处理为同分辨率 (非超分), SDR 色彩空间 (非 HDR)
-### 调参_ 播放时托盘点击 DLSSNR 图标打开控制面板, 实时调节; 保存后下次自动生效
+### 调参_ 播放时托盘点击 DLSSNR 图标打开控制面板, 实时调节 (不写回本文件)
+###       本文件显式设置的参数优先于面板保存的 dlssnr_ui.ini
 
 import vapoursynth as vs
 from vapoursynth import core
