@@ -67,7 +67,7 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   按 ' 键或右键菜单中的 DLSSNR增强 开关 (RTX 显卡专用)
   首帧初始化约 1 秒 (模型加载), 属正常现象
   双击 vs-plugins\dlssnr_panel.exe 可在播放时实时调参, "保存为默认值"写入 dlssnr_ui.ini
-  删除 vs-plugins\dlssnr_ui.ini 与 dlssnr_live.json 可恢复脚本默认参数
+  删除 vs-plugins\dlssnr_ui.ini 可恢复脚本默认参数
 
 要求: RTX 显卡
 本包不含 mpv.exe 与 VapourSynth 运行时, 请使用官方 mpv-lazy 发行包

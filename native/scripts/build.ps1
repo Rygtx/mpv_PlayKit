@@ -15,10 +15,14 @@ if ($Clean -and (Test-Path $buildDir)) {
 }
 New-Item -ItemType Directory -Force $buildDir | Out-Null
 
-# Run through cmd so vcvars environment sticks for cmake+nmake
+# Run through cmd so vcvars environment sticks for cmake+nmake.
+# Paths travel via environment variables: baking them into the batch text
+# would hit Out-File -Encoding ascii, which mangles non-ASCII paths.
+$env:VSDLSSNR_VCVARS = $vcvars
+$env:VSDLSSNR_BUILD_DIR = $buildDir
 $cmd = @"
-call "$vcvars" x64 >nul
-cd /d "$buildDir"
+call "%VSDLSSNR_VCVARS%" x64 >nul
+cd /d "%VSDLSSNR_BUILD_DIR%"
 cmake .. -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release || exit /b 1
 nmake || exit /b 1
 "@

@@ -1,4 +1,4 @@
-# 从公开源落地 native/ 依赖:NGX SDK(官方 NVIDIA/DLSS 仓库)+ VapourSynth R73 头
+﻿# 从公开源落地 native/ 依赖:NGX SDK(官方 NVIDIA/DLSS 仓库)+ VapourSynth R73 头
 # 用法: powershell -File scripts\fetch-deps.ps1
 $ErrorActionPreference = "Stop"
 
@@ -10,7 +10,10 @@ New-Item -ItemType Directory -Force $ngxInc, $ngxLib, $vsInc | Out-Null
 
 function Fetch([string]$url, [string]$dst) {
     if (Test-Path $dst) { return }
-    & curl.exe -sSL --retry 8 --retry-all-errors --retry-delay 2 -o $dst $url
+    # --fail: never persist an HTTP error body (a 404 page would pass the
+    # non-empty check below and poison the dependency cache permanently)
+    & curl.exe -sSL --fail --retry 8 --retry-all-errors --retry-delay 2 -o $dst $url
+    if ($LASTEXITCODE -ne 0) { throw "download failed: $url (curl exit $LASTEXITCODE)" }
     if (-not (Test-Path $dst) -or (Get-Item $dst).Length -eq 0) { throw "download failed: $url" }
     Write-Host "fetched: $dst ($((Get-Item $dst).Length) bytes)"
 }
