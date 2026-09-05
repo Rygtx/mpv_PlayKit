@@ -553,7 +553,7 @@ void DrawUi() noexcept {
     {
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
         bool logOn = g_app.timingLog;
-        if (ImGui::Checkbox("写入性能日志 (dlssnr_timing.log)", &logOn)) {
+        if (ImGui::Checkbox("写入性能日志", &logOn)) {
             g_app.timingLog = logOn;
             wchar_t iniPath[MAX_PATH];
             if (BasePath(iniPath, MAX_PATH)) {
@@ -564,7 +564,7 @@ void DrawUi() noexcept {
             WritePayload(); // logEnabled included
             g_app.liveDirty = false;
         }
-        if (ImGui::IsItemHovered()) ShowTip("开关 dlssnr_timing.log 的周期统计写入。\n改动立即生效(经共享内存通道通知插件)。");
+        if (ImGui::IsItemHovered()) ShowTip("每 60 帧一行性能统计,追加到 mpv 同目录 dlssnr_timing.log。\n排查性能问题时把该文件一并附上。");
         y += 28 * s;
     }
 
