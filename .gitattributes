@@ -7,3 +7,9 @@
 *.md linguist-language=Markdown
 *.vpy linguist-language=Python
 *.spec linguist-language=Python
+
+# 发行分支: 配置类文件强制 LF (打包产物与上游一致, 防止 autocrlf 工作树漂移)
+*.conf text eol=lf
+*.vpy text eol=lf
+*.lua text eol=lf
+*.js text eol=lf
