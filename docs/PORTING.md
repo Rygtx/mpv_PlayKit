@@ -28,8 +28,8 @@
 ```
 D:\Portable\mpv-lazy\
 ├── vs-plugins\{vs_dlssnr.dll, dlssnr_panel.exe, ngx\nvngx_dlssnr.dll, dlssnr_ui.ini(保存后生成)}
-└── portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 ',45 行)}
-本仓库:portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 ',45 行)}
+└── portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 *,45 行)}
+本仓库:portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 *,45 行)}
 构建:native\scripts\{fetch-deps.ps1, build.ps1} → native\bin\
 ```
 
