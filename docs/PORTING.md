@@ -20,7 +20,7 @@
 
 - 形态:ImGui + D3D11 自绘 UI 独立程序(中文、Per-Monitor DPI、悬停参数说明、滑块数值、保存/重置);托盘常驻,点击呼出/隐藏窗口,右键菜单退出。
 - 生命周期:插件加载滤镜时自动静默拉起(仅托盘不弹窗);滤镜关闭/mpv 退出后自动退出(命名事件 `vs_dlssnr_bridge_alive` watchdog)。单实例 mutex。
-- 通信:面板写 `dlssnr_live.json` → 插件 `bridge.cpp` 轮询(150ms)应用(下一帧生效);「保存设置」→ `dlssnr_ui.ini` → 下次加载滤镜作为默认值(优先于 .vpy;删除 ini 恢复 vpy 控制)。test_bridge 9/9 字段、test_lifecycle 生命周期验证通过。
+- 通信:面板与插件经两块 512 字节命名共享内存双向通信(`native/src/panel_ipc.h`:参数通道面板写 → 插件 `bridge.cpp` 40ms 轮询应用(seq 门控,下一帧生效);stats 通道插件写 → 面板 0.5s 读,即 Profiler 数据源);「保存设置」→ `dlssnr_ui.ini` → 下次加载滤镜作为默认值(优先于 .vpy;删除 ini 恢复 vpy 控制)。test_bridge 9/9 字段、test_lifecycle 生命周期验证通过。
 - 参数改动实时生效路径与保存路径完全分离,保存不影响当前画面。
 
 ### 部署布局
@@ -28,8 +28,8 @@
 ```
 D:\Portable\mpv-lazy\
 ├── vs-plugins\{vs_dlssnr.dll, dlssnr_panel.exe, ngx\nvngx_dlssnr.dll, dlssnr_ui.ini(保存后生成)}
-└── portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 *)}
-本仓库:portable_config\{vs\DLSSNR_NV.vpy, input_list.conf(键位 '), menu.conf}
+└── portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 ',45 行)}
+本仓库:portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 ',45 行)}
 构建:native\scripts\{fetch-deps.ps1, build.ps1} → native\bin\
 ```
 
