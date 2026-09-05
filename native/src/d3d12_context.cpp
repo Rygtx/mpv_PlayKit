@@ -827,6 +827,10 @@ void D3D12Context::ClearScalingResources() noexcept {
     _horizontalRes.Reset();
     _reducedDenoised.Reset();
     _reducedColor.Reset();
+    // zero the reported internal size too: stats consumers treat 0 as
+    // "scaling disabled" instead of a stale percentage of a previous state
+    _internalWidth = 0;
+    _internalHeight = 0;
     _scalingReady = false;
 }
 

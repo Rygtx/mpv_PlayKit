@@ -833,7 +833,7 @@ bool DlssnrContext::ProcessFrame(
                      "{\"gpu_last\":%.1f,\"gpu_ema\":%.1f,\"gpu_p99\":%.1f,"
                      "\"pack_ema\":%.1f,\"eval_cpu_ema\":%.1f,\"unpack_ema\":%.1f,"
                      "\"internal_w\":%d,\"internal_h\":%d,\"width\":%d,\"height\":%d,"
-                     "\"fps\":%.1f,\"gpu_name\":\"%s\"}",
+                     "\"scaling\":%d,\"fps\":%.1f,\"gpu_name\":\"%s\"}",
                      g_timing.gpu[lastIdx],
                      TimingWindow::Ema(g_timing.gpu, g_timing.count),
                      TimingWindow::P99(g_timing.gpu, g_timing.count),
@@ -841,6 +841,7 @@ bool DlssnrContext::ProcessFrame(
                      TimingWindow::Ema(g_timing.evalCpu, g_timing.count),
                      TimingWindow::Ema(g_timing.unpack, g_timing.count),
                      _d3d12->InternalWidth(), _d3d12->InternalHeight(), _width, _height,
+                     _d3d12->HasScaling() ? 1 : 0,
                      _d3d12->FrameRateEma(), gpuNameUtf8);
             PublishStatsJson(body);
         }

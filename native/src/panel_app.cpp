@@ -250,9 +250,17 @@ void LoadStats() noexcept {
         const int h = JsonGetInt(body, "height", 0);
         if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
-            snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
-                     "EMA %.1f  ·  P99 %.1f  ·  内部 %dx%d  ·  源 %dx%d",
-                     gpuEma, gpuP99, iw, ih, w, h);
+            // 分辨率展示:未开启缩放 -> 原生分辨率;开启 -> 处理分辨率 → 回源分辨率
+            const int scaling = JsonGetInt(body, "scaling", 0);
+            if (scaling && iw > 0 && ih > 0) {
+                snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
+                         "EMA %.1f  ·  P99 %.1f  ·  分辨率 %dx%d → %dx%d",
+                         gpuEma, gpuP99, iw, ih, w, h);
+            } else {
+                snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
+                         "EMA %.1f  ·  P99 %.1f  ·  分辨率 %dx%d(原生)",
+                         gpuEma, gpuP99, w, h);
+            }
             g_app.segPack = static_cast<float>(JsonGetFloat(body, "pack_ema", 0));
             g_app.segEval = static_cast<float>(JsonGetFloat(body, "eval_cpu_ema", 0));
             g_app.segGpu = static_cast<float>(JsonGetFloat(body, "gpu_ema", 0));
