@@ -558,7 +558,6 @@ void DrawUi() noexcept {
             // textures every frame; push once on slider release instead.
             g_app.liveDirty = true;
         }
-        if (ImGui::IsItemHovered()) ShowTip(u8tip);
         y += 38 * s;
     }
 
