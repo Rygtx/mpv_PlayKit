@@ -151,8 +151,14 @@ void ApplyLiveFile(BridgeState *state) noexcept {
     if (!n) return;
 
     // Merge: only keys present in the file are applied (defaults = current).
+    // Create-time params (preset/input_resolution/scaling_enabled) must NOT
+    // land in the Update() merge below: _cur for them is synced exclusively by
+    // SharedParams::ConsumeRebuild, otherwise the pending-vs-current comparison
+    // dies and the rebuild never fires. residualMultiplier is per-frame.
     DlssnrParams p = state->params->Snapshot();
     const int preset = JsonGetInt(body, "preset", p.preset);
+    const int reqRes = std::clamp(JsonGetInt(body, "input_resolution", p.inputResolutionPercent), 25, 100);
+    const int reqScaling = JsonGetInt(body, "scaling_enabled", p.scalingEnabled);
     p.style = JsonGetInt(body, "style", p.style);
     p.intensity = std::clamp(JsonGetFloat(body, "intensity", p.intensity), 0.0f, 2.0f);
     p.localToneStrength = std::clamp(JsonGetFloat(body, "local_tone", p.localToneStrength), 0.0f, 2.0f);
@@ -160,12 +166,10 @@ void ApplyLiveFile(BridgeState *state) noexcept {
     p.skinStructureStrength = std::clamp(JsonGetFloat(body, "skin_structure", p.skinStructureStrength), -1.0f, 2.0f);
     p.useAutoMask = JsonGetInt(body, "use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
     p.uiCorrection = JsonGetInt(body, "ui_correction", p.uiCorrection ? 1 : 0) != 0;
-    p.inputResolutionPercent = std::clamp(JsonGetInt(body, "input_resolution", p.inputResolutionPercent), 25, 100);
-    p.scalingEnabled = JsonGetInt(body, "scaling_enabled", p.scalingEnabled);
     p.residualMultiplier = std::clamp(JsonGetFloat(body, "residual_multiplier", p.residualMultiplier), 1.0f, 2.0f);
     state->params->RequestPreset(std::clamp(preset, 0, 3));
-    state->params->RequestResolution(p.inputResolutionPercent);
-    state->params->RequestScalingEnabled(p.scalingEnabled);
+    state->params->RequestResolution(reqRes);
+    state->params->RequestScalingEnabled(reqScaling);
     state->params->Update(p);
 
     // Command keys run after the merge so __save persists the just-applied values.

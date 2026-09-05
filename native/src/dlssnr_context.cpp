@@ -643,6 +643,9 @@ bool DlssnrContext::ProcessFrame(
         auto *cl = _d3d12->CommandList();
         const bool scaling = _d3d12->HasScaling();
 
+        // Pre-evaluate barriers (executed on the GPU before the NGX dispatch).
+        D3D12_RESOURCE_BARRIER pre[4];
+        UINT preCount = 0;
         if (scaling) {
             // downsample source -> reducedColor (area average, Magpie HLSL)
             D3D12_RESOURCE_BARRIER b1[2]{
@@ -656,15 +659,21 @@ bool DlssnrContext::ProcessFrame(
                 TransitionFromTo(_d3d12->ReducedColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
             cl->ResourceBarrier(1, b2);
+            // NGX evaluate: color=ReducedColor (NSR), output=ReducedDenoised (UAV)
+            pre[0] = TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            pre[1] = TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            pre[2] = TransitionTo(_d3d12->ReducedDenoised(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            preCount = 3;
+        } else {
+            // NGX evaluate at full source size: color=InputColor, output=OutputColor
+            // (barrier set mirrors the pre-residual pipeline / Magpie Draw())
+            pre[0] = TransitionTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            pre[1] = TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            pre[2] = TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            pre[3] = TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            preCount = 4;
         }
-
-        // NGX evaluate: inputs NSR (reduced color / motion / depth), output UAV
-        D3D12_RESOURCE_BARRIER barriers[3]{
-            TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            TransitionTo(_d3d12->ReducedDenoised(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        };
-        cl->ResourceBarrier(3, barriers);
+        cl->ResourceBarrier(preCount, pre);
 
         DWORD sehCode = 0;
         if (!SetEvaluateParametersSafely(resetHistory, &sehCode)) {
@@ -712,37 +721,23 @@ bool DlssnrContext::ProcessFrame(
             cl->ResourceBarrier(1, b7);
             // move input back to COMMON only after vertical dispatch consumed it
             _d3d12->RecordResidualVertical(residualMultiplier);
-            D3D12_RESOURCE_BARRIER b8[3]{
+            D3D12_RESOURCE_BARRIER b8[5]{
                 TransitionFromTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
                 TransitionFromTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                 TransitionFromTo(_d3d12->HorizontalRes(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             };
-            cl->ResourceBarrier(3, b8);
+            cl->ResourceBarrier(5, b8);
         } else {
-            // no scaling: NGX writes OutputColor directly
-            D3D12_RESOURCE_BARRIER barriers[3]{
-                TransitionTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            };
-            cl->ResourceBarrier(3, barriers);
-            D3D12_RESOURCE_BARRIER bOut[1]{
-                TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-            };
-            cl->ResourceBarrier(1, bOut);
-
-            for (auto &b : barriers) {
-                D3D12_RESOURCE_BARRIER back = b;
+            // no scaling: NGX wrote OutputColor directly; undo the pre-evaluate set
+            for (UINT i = 0; i < preCount; ++i) {
+                D3D12_RESOURCE_BARRIER back = pre[i];
                 D3D12_RESOURCE_STATES tmp = back.Transition.StateBefore;
                 back.Transition.StateBefore = back.Transition.StateAfter;
                 back.Transition.StateAfter = tmp;
                 cl->ResourceBarrier(1, &back);
             }
-            D3D12_RESOURCE_BARRIER bBack[1]{
-                TransitionFromTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                 D3D12_RESOURCE_STATE_COMMON),
-            };
-            cl->ResourceBarrier(1, bBack);
         }
     }
 

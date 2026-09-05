@@ -44,29 +44,26 @@ public:
         _pendingScalingEnabled = enabled;
     }
 
-    // Frame thread: returns true and fills all values when a rebuild is due.
+    // Frame thread: returns true and fills the current effective trio when a
+    // rebuild is due. _cur for preset/resolution/scaling is synced ONLY here:
+    // the bridge's Update() must not pre-sync create-time params, or the
+    // pending-vs-current comparison dies (rebuild never fires) — mirrors the
+    // pre-F1 preset invariant.
     bool ConsumeRebuild(int &newPreset, int &newResolution, int &newScalingEnabled) {
         SRWLOCK_HELPER(this);
         const bool presetChanged = _pendingPreset >= 0 && _pendingPreset != _cur.preset;
-        const bool resChanged = _pendingResolution > 0 && _pendingResolution != _cur.inputResolutionPercent;
         const bool scalingChanged = _pendingScalingEnabled >= 0 && _pendingScalingEnabled != _cur.scalingEnabled;
-        if (presetChanged) {
-            newPreset = _pendingPreset;
-            _cur.preset = newPreset;
-        }
-        if (resChanged) {
-            newResolution = _pendingResolution;
-            _cur.inputResolutionPercent = newResolution;
-        }
-        if (scalingChanged) {
-            newScalingEnabled = _pendingScalingEnabled;
-            _cur.scalingEnabled = newScalingEnabled;
-        }
-        if (!presetChanged) newPreset = _cur.preset;
-        if (!resChanged) newResolution = _cur.inputResolutionPercent;
-        if (!scalingChanged) newScalingEnabled = _cur.scalingEnabled;
-        // scaling off forces 100%
-        if (!newScalingEnabled) newResolution = 100;
+        const bool scalingOff = (scalingChanged ? _pendingScalingEnabled : _cur.scalingEnabled) == 0;
+        // Effective pending resolution: 100 when scaling ends up disabled.
+        const int pendingRes = _pendingResolution > 0 ? _pendingResolution : _cur.inputResolutionPercent;
+        const int effRes = scalingOff ? 100 : pendingRes;
+        const bool resChanged = effRes != _cur.inputResolutionPercent;
+        if (presetChanged) _cur.preset = _pendingPreset;
+        if (scalingChanged) _cur.scalingEnabled = _pendingScalingEnabled;
+        if (resChanged) _cur.inputResolutionPercent = effRes;
+        newPreset = _cur.preset;
+        newResolution = _cur.inputResolutionPercent;
+        newScalingEnabled = _cur.scalingEnabled;
         return presetChanged || resChanged || scalingChanged;
     }
 
