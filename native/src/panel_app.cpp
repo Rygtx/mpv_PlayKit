@@ -1,9 +1,12 @@
 // dlssnr_panel - independent control panel for the vs_dlssnr VapourSynth
-// plugin. ImGui + D3D11 rendered UI (no native controls). Writes
-// dlssnr_live.json next to vs_dlssnr.dll for live tuning (the plugin's
-// bridge polls it) and dlssnr_ui.ini for saved defaults.
+// plugin. ImGui + D3D11 rendered UI (no native controls). Pushes the full
+// parameter set into a named shared-memory mapping (panel_ipc.h; the plugin's
+// bridge polls it) for live tuning, and dlssnr_ui.ini for saved defaults.
 
 #include "dlssnr_params.h"
+#include "panel_ipc.h"
+
+using namespace vsdlssnr;
 
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
@@ -33,7 +36,6 @@ constexpr wchar_t WINDOW_CLASS[] = L"vs_dlssnr_panel_app";
 constexpr wchar_t WINDOW_TITLE[] = L"DLSSNR 控制面板";
 constexpr wchar_t TRAY_TIP[] = L"DLSSNR 控制面板";
 constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";
-constexpr wchar_t LIVE_FILE[] = L"dlssnr_live.json";
 constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive";
 constexpr UINT WM_APP_TRAYICON = WM_APP + 1;
 
@@ -62,6 +64,7 @@ struct AppState {
     float uiScale = 1.0f;
     int dpi = 96;
     bool liveDirty = false;
+    bool timingLog = true;
     double lastLiveWrite = 0.0;
     char status[160]{};
 };
@@ -83,25 +86,65 @@ bool BasePath(wchar_t *path, size_t len) noexcept {
     return true;
 }
 
-void WriteLiveJson() noexcept {
-    wchar_t base[MAX_PATH];
-    if (!BasePath(base, MAX_PATH)) return;
-    wchar_t path[MAX_PATH];
-    swprintf_s(path, L"%s\\%s", base, LIVE_FILE);
+// Shared-memory parameter channel: the panel creates the mapping and pushes
+// the full parameter set on every edit (seq-gated); the plugin polls it.
+HANDLE g_paramsMapping = nullptr;
+PanelPayload *g_payload = nullptr;
+uint32_t g_generation = 0;
+
+bool CreateParamsMapping() noexcept {
+    g_generation = GetTickCount();
+    g_paramsMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                         0, PAYLOAD_SIZE, PARAMS_MAPPING);
+    if (!g_paramsMapping) return false;
+    g_payload = static_cast<PanelPayload *>(
+        MapViewOfFile(g_paramsMapping, FILE_MAP_WRITE | FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
+    if (!g_payload) {
+        CloseHandle(g_paramsMapping);
+        g_paramsMapping = nullptr;
+        return false;
+    }
+    // Adopt parameters from a previous panel session (last live state wins
+    // over the ini), then publish our generation + current values.
+    if (g_payload->magic == PAYLOAD_MAGIC && g_payload->seq > 0) {
+        g_app.params.preset = std::clamp(g_payload->preset, 0, 3);
+        g_app.params.style = std::clamp(g_payload->style, 0, 2);
+        g_app.params.intensity = std::clamp(g_payload->intensity, 0.0f, 2.0f);
+        g_app.params.localToneStrength = std::clamp(g_payload->localTone, 0.0f, 2.0f);
+        g_app.params.localStructureStrength = std::clamp(g_payload->localStructure, 0.0f, 2.0f);
+        g_app.params.skinStructureStrength = std::clamp(g_payload->skinStructure, -1.0f, 2.0f);
+        g_app.params.useAutoMask = g_payload->useAutoMask != 0;
+        g_app.params.uiCorrection = g_payload->uiCorrection != 0;
+        g_app.params.inputResolutionPercent = std::clamp(g_payload->inputResolution, 25, 100);
+        g_app.params.scalingEnabled = g_payload->scalingEnabled != 0;
+        g_app.params.residualMultiplier = std::clamp(g_payload->residualMultiplier, 1.0f, 2.0f);
+    }
+    return true;
+}
+
+void WritePayload(int saveRequest = 0, int resetRequest = 0) noexcept {
+    if (!g_payload) return;
+    static uint32_t seq = 0;
     const DlssnrParams &p = g_app.params;
-    char body[512];
-    static int seq = 0;
-    const int bl = std::snprintf(body, sizeof(body),
-        "{\"preset\":%d,\"style\":%d,\"intensity\":%.2f,\"local_tone\":%.2f,"
-        "\"local_structure\":%.2f,\"skin_structure\":%.2f,\"use_auto_mask\":%d,"
-        "\"ui_correction\":%d,\"__seq\":%d}",
-        p.preset, p.style, p.intensity, p.localToneStrength, p.localStructureStrength,
-        p.skinStructureStrength, p.useAutoMask ? 1 : 0, p.uiCorrection ? 1 : 0, ++seq);
-    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return;
-    DWORD written = 0;
-    WriteFile(f, body, bl, &written, nullptr);
-    CloseHandle(f);
+    PanelPayload pl{};
+    pl.magic = PAYLOAD_MAGIC;
+    pl.seq = ++seq;
+    pl.generation = g_generation;
+    pl.preset = p.preset;
+    pl.style = p.style;
+    pl.intensity = p.intensity;
+    pl.localTone = p.localToneStrength;
+    pl.localStructure = p.localStructureStrength;
+    pl.skinStructure = p.skinStructureStrength;
+    pl.useAutoMask = p.useAutoMask ? 1 : 0;
+    pl.uiCorrection = p.uiCorrection ? 1 : 0;
+    pl.inputResolution = p.inputResolutionPercent;
+    pl.scalingEnabled = p.scalingEnabled ? 1 : 0;
+    pl.residualMultiplier = p.residualMultiplier;
+    pl.saveRequest = saveRequest;
+    pl.resetRequest = resetRequest;
+    pl.logEnabled = g_app.timingLog ? 1 : 0;
+    memcpy(g_payload, &pl, sizeof(pl));
 }
 
 void WriteIni() noexcept {
@@ -127,6 +170,9 @@ void WriteIni() noexcept {
     writeX100(L"skin_structure_x100", p.skinStructureStrength);
     writeInt(L"use_auto_mask", p.useAutoMask ? 1 : 0);
     writeInt(L"ui_correction", p.uiCorrection ? 1 : 0);
+    writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, 25, 100));
+    writeInt(L"scaling_enabled", p.scalingEnabled ? 1 : 0);
+    writeInt(L"residual_multiplier_x100", static_cast<int>(std::lround(p.residualMultiplier * 100.0f)));
     writeInt(L"saved", 1);
 }
 
@@ -135,6 +181,8 @@ void LoadIni() noexcept {
     if (!BasePath(base, MAX_PATH)) return;
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\%s", base, INI_FILE);
+    // panel-local setting: perf log toggle (independent of the saved profile)
+    g_app.timingLog = GetPrivateProfileIntW(L"panel", L"log", 1, path) != 0;
     const auto readInt = [&](const wchar_t *key, int def) -> int {
         return static_cast<int>(GetPrivateProfileIntW(L"dlssnr", key, def, path));
     };
@@ -150,45 +198,9 @@ void LoadIni() noexcept {
     p.skinStructureStrength = static_cast<float>(readInt(L"skin_structure_x100", static_cast<int>(p.skinStructureStrength * 100))) / 100.0f;
     p.useAutoMask = readInt(L"use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
     p.uiCorrection = readInt(L"ui_correction", p.uiCorrection ? 1 : 0) != 0;
-}
-
-// Flat-object JSON extraction (mirrors the plugin bridge's parser)
-float JsonGetFloat(const char *body, const char *key, float def) noexcept {
-    char pat[48];
-    std::snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *k = strstr(body, pat);
-    if (!k) return def;
-    const char *c = strchr(k + strlen(pat), ':');
-    if (!c) return def;
-    return strtof(c + 1, nullptr);
-}
-
-int JsonGetInt(const char *body, const char *key, int def) noexcept {
-    return static_cast<int>(JsonGetFloat(body, key, static_cast<float>(def)));
-}
-
-// Take over the filter's current state: the live file is the last value the
-// panel pushed (or what a running filter is using). Priority: live > ini > defaults.
-void LoadLive() noexcept {
-    wchar_t base[MAX_PATH];
-    if (!BasePath(base, MAX_PATH)) return;
-    wchar_t path[MAX_PATH];
-    swprintf_s(path, L"%s\\%s", base, LIVE_FILE);
-    FILE *f = nullptr;
-    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
-    char body[1024]{};
-    const size_t n = fread(body, 1, sizeof(body) - 1, f);
-    fclose(f);
-    if (!n) return;
-    DlssnrParams &p = g_app.params;
-    p.preset = std::clamp(JsonGetInt(body, "preset", p.preset), 0, 3);
-    p.style = std::clamp(JsonGetInt(body, "style", p.style), 0, 2);
-    p.intensity = std::clamp(JsonGetFloat(body, "intensity", p.intensity), 0.0f, 2.0f);
-    p.localToneStrength = std::clamp(JsonGetFloat(body, "local_tone", p.localToneStrength), 0.0f, 2.0f);
-    p.localStructureStrength = std::clamp(JsonGetFloat(body, "local_structure", p.localStructureStrength), 0.0f, 2.0f);
-    p.skinStructureStrength = std::clamp(JsonGetFloat(body, "skin_structure", p.skinStructureStrength), -1.0f, 2.0f);
-    p.useAutoMask = JsonGetInt(body, "use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
-    p.uiCorrection = JsonGetInt(body, "ui_correction", p.uiCorrection ? 1 : 0) != 0;
+    p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), 25, 100);
+    p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled);
+    p.residualMultiplier = static_cast<float>(readInt(L"residual_multiplier_x100", static_cast<int>(p.residualMultiplier * 100))) / 100.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -343,6 +355,7 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     if (ImGui::Button("保存设置", ImVec2(120 * s, 30 * s))) {
         WriteIni();
+        WritePayload(1, 0); // persist-through-bridge flag included
         snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
     }
     if (ImGui::IsItemHovered()) {
@@ -353,7 +366,7 @@ void DrawUi() noexcept {
     ImGui::SameLine(0, 14 * s);
     if (ImGui::Button("重置默认", ImVec2(120 * s, 30 * s))) {
         g_app.params = DlssnrParams{};
-        g_app.liveDirty = true;
+        WritePayload(0, 1);
         snprintf(g_app.status, sizeof(g_app.status), "已重置");
     }
     ImGui::SameLine(0, 16 * s);
@@ -618,8 +631,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     LoadIni();
-    LoadLive();      // take over the filter's current state if a live file exists
-    WriteLiveJson(); // re-announce (same values; refreshes an already-running filter)
+    CreateParamsMapping(); // adopts previous session's live params if present
+    WritePayload();        // announce current values to the plugin
 
     HANDLE watch = CreateThread(nullptr, 0, ExitWatchProc, nullptr, 0, nullptr);
 
@@ -646,9 +659,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         // write throttle, which permanently blocked live writes)
         const double nowSec = now.QuadPart / double(freq.QuadPart);
 
-        // Throttled live-file writes while dragging sliders
+        // Throttled shared-memory pushes while dragging sliders
         if (g_app.liveDirty && nowSec - g_app.lastLiveWrite > 0.1) {
-            WriteLiveJson();
+            WritePayload();
             g_app.liveDirty = false;
             g_app.lastLiveWrite = nowSec;
         }

@@ -1,8 +1,8 @@
 #pragma once
-// mpv-integrated parameter bridge: a lua script (uosc menu) writes
-// dlssnr_live.json next to this plugin; the bridge polls that file and applies
-// changes onto SharedParams. "save" requests persist SharedParams to
-// dlssnr_ui.ini which later loads use as defaults.
+// Panel parameter channel: the tray panel (dlssnr_panel.exe) pushes the full
+// parameter set into a named shared-memory mapping (panel_ipc.h); the bridge
+// polls it and applies changes onto SharedParams. "save" requests persist
+// SharedParams to dlssnr_ui.ini which later loads use as defaults.
 
 #include "shared_params.h"
 

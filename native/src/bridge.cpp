@@ -1,4 +1,6 @@
 #include "bridge.h"
+#include "dlssnr_context.h"
+#include "panel_ipc.h"
 
 #include <shellapi.h>
 #include <algorithm>
@@ -14,17 +16,17 @@ namespace vsdlssnr {
 namespace {
 
 constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";
-constexpr wchar_t LIVE_FILE[] = L"dlssnr_live.json";
 constexpr wchar_t PANEL_EXE[] = L"dlssnr_panel.exe";
 constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive";
-constexpr int POLL_INTERVAL_MS = 150;
+// Shared-memory polling: no disk IO, so poll fast enough for slider edits to
+// land within a frame or two.
+constexpr int POLL_INTERVAL_MS = 40;
 
 struct BridgeState {
     SharedParams *params = nullptr;
     HANDLE thread = nullptr;
     HANDLE aliveEvent = nullptr; // existence marks a live filter (panel watches it)
     volatile bool running = false;
-    FILETIME liveBaseline{}; // ignore pre-existing live file from an old session
 };
 
 BridgeState *g_bridge = nullptr; // one live bridge at a time (last filter wins)
@@ -99,81 +101,30 @@ bool BridgeLoadIni(DlssnrParams &p) noexcept {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// live-file polling
-// ---------------------------------------------------------------------------
-
-bool GetSelfLivePath(wchar_t *path, size_t pathLen) noexcept {
-    HMODULE self = nullptr;
-    if (!GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&GetSelfLivePath), &self)) {
-        return false;
-    }
-    wchar_t dllPath[MAX_PATH]{};
-    if (!GetModuleFileNameW(self, dllPath, MAX_PATH)) return false;
-    std::wstring dir = std::filesystem::path(dllPath).parent_path().wstring();
-    if (dir.size() + 1 + wcslen(LIVE_FILE) >= pathLen) return false;
-    swprintf_s(path, pathLen, L"%s\\%s", dir.c_str(), LIVE_FILE);
-    return true;
-}
-
-bool GetFileMTime(const wchar_t *path, FILETIME &ft) noexcept {
-    WIN32_FILE_ATTRIBUTE_DATA attr{};
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attr)) return false;
-    ft = attr.ftLastWriteTime;
-    return true;
-}
-
-// Flat-object JSON extraction (our own writer's format only)
-float JsonGetFloat(const char *body, const char *key, float def) noexcept {
-    char pat[48];
-    std::snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *k = strstr(body, pat);
-    if (!k) return def;
-    const char *c = strchr(k + strlen(pat), ':');
-    if (!c) return def;
-    return strtof(c + 1, nullptr);
-}
-
-int JsonGetInt(const char *body, const char *key, int def) noexcept {
-    return static_cast<int>(JsonGetFloat(body, key, static_cast<float>(def)));
-}
-
-void ApplyLiveFile(BridgeState *state) noexcept {
-    wchar_t livePath[MAX_PATH];
-    if (!GetSelfLivePath(livePath, MAX_PATH)) return;
-    FILE *f = nullptr;
-    if (_wfopen_s(&f, livePath, L"rb") != 0 || !f) return;
-    char body[2048]{};
-    const size_t n = fread(body, 1, sizeof(body) - 1, f);
-    fclose(f);
-    if (!n) return;
-
-    // Merge: only keys present in the file are applied (defaults = current).
-    // Create-time params (preset/input_resolution/scaling_enabled) must NOT
-    // land in the Update() merge below: _cur for them is synced exclusively by
-    // SharedParams::ConsumeRebuild, otherwise the pending-vs-current comparison
-    // dies and the rebuild never fires. residualMultiplier is per-frame.
+// Apply one panel payload onto SharedParams. Create-time params
+// (preset/input_resolution/scaling_enabled) go through Request* only: their
+// _cur side is synced exclusively by SharedParams::ConsumeRebuild, otherwise
+// the pending-vs-current comparison dies and the rebuild never fires.
+// residualMultiplier is per-frame (compute cbuffer) and merges directly.
+void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
     DlssnrParams p = state->params->Snapshot();
-    const int preset = JsonGetInt(body, "preset", p.preset);
-    const int reqRes = std::clamp(JsonGetInt(body, "input_resolution", p.inputResolutionPercent), 25, 100);
-    const int reqScaling = JsonGetInt(body, "scaling_enabled", p.scalingEnabled);
-    p.style = JsonGetInt(body, "style", p.style);
-    p.intensity = std::clamp(JsonGetFloat(body, "intensity", p.intensity), 0.0f, 2.0f);
-    p.localToneStrength = std::clamp(JsonGetFloat(body, "local_tone", p.localToneStrength), 0.0f, 2.0f);
-    p.localStructureStrength = std::clamp(JsonGetFloat(body, "local_structure", p.localStructureStrength), 0.0f, 2.0f);
-    p.skinStructureStrength = std::clamp(JsonGetFloat(body, "skin_structure", p.skinStructureStrength), -1.0f, 2.0f);
-    p.useAutoMask = JsonGetInt(body, "use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
-    p.uiCorrection = JsonGetInt(body, "ui_correction", p.uiCorrection ? 1 : 0) != 0;
-    p.residualMultiplier = std::clamp(JsonGetFloat(body, "residual_multiplier", p.residualMultiplier), 1.0f, 2.0f);
-    state->params->RequestPreset(std::clamp(preset, 0, 3));
+    const int preset = std::clamp(pl.preset, 0, 3);
+    const int reqRes = std::clamp(pl.inputResolution, 25, 100);
+    const int reqScaling = pl.scalingEnabled != 0;
+    p.style = std::clamp(pl.style, 0, 2);
+    p.intensity = std::clamp(pl.intensity, 0.0f, 2.0f);
+    p.localToneStrength = std::clamp(pl.localTone, 0.0f, 2.0f);
+    p.localStructureStrength = std::clamp(pl.localStructure, 0.0f, 2.0f);
+    p.skinStructureStrength = std::clamp(pl.skinStructure, -1.0f, 2.0f);
+    p.useAutoMask = pl.useAutoMask != 0;
+    p.uiCorrection = pl.uiCorrection != 0;
+    p.residualMultiplier = std::clamp(pl.residualMultiplier, 1.0f, 2.0f);
+    state->params->RequestPreset(preset);
     state->params->RequestResolution(reqRes);
     state->params->RequestScalingEnabled(reqScaling);
     state->params->Update(p);
 
-    // Command keys run after the merge so __save persists the just-applied values.
-    if (JsonGetInt(body, "__save", 0) != 0) {
+    if (pl.saveRequest) {
         wchar_t iniPath[MAX_PATH];
         if (GetSelfIniPath(iniPath, MAX_PATH)) {
             DlssnrParams s = state->params->Snapshot();
@@ -182,28 +133,61 @@ void ApplyLiveFile(BridgeState *state) noexcept {
             SaveIni(s, iniPath);
         }
     }
-    if (JsonGetInt(body, "__reset", 0) != 0) {
+    if (pl.resetRequest) {
         state->params->Update(state->params->Initial());
     }
+    SetTimingLogEnabled(pl.logEnabled != 0);
 }
 
 DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
     auto *state = static_cast<BridgeState *>(param);
 
-    wchar_t livePath[MAX_PATH];
-    if (!GetSelfLivePath(livePath, MAX_PATH)) return 1;
-    GetFileMTime(livePath, state->liveBaseline); // ignore stale file from old session
+    // Panel parameters come over shared memory (panel creates the mapping;
+    // we wait for it - without a panel there is simply nothing to apply).
+    HANDLE mapping = nullptr;
+    const PanelPayload *view = nullptr;
+    uint32_t lastSeq = 0;
+    uint32_t lastGeneration = 0;
 
     while (state->running) {
         Sleep(POLL_INTERVAL_MS);
         if (!state->running) break;
-        FILETIME ft{};
-        if (!GetFileMTime(livePath, ft)) continue;
-        if (CompareFileTime(&ft, &state->liveBaseline) != 0) {
-            state->liveBaseline = ft;
-            ApplyLiveFile(state);
+
+        if (!view) {
+            mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, PARAMS_MAPPING);
+            if (!mapping) continue;
+            view = static_cast<const PanelPayload *>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
+            if (!view) {
+                CloseHandle(mapping);
+                mapping = nullptr;
+                continue;
+            }
+            lastGeneration = view->generation;
+            lastSeq = view->seq; // skip history: apply only future edits
+            continue;
         }
+
+        // The mapping object survives panel restarts (we hold a reference); a
+        // zero seq means the (re)started panel has not written yet. A changed
+        // generation resets the seq baseline so restarts never collide with
+        // the previous instance's seq history.
+        if (view->generation != lastGeneration) {
+            lastGeneration = view->generation;
+            lastSeq = 0;
+        }
+        if (view->magic != PAYLOAD_MAGIC) continue;
+        if (view->seq == 0 || view->seq == lastSeq) continue;
+        // Snapshot under the writer: copy the payload, then confirm the seq
+        // did not move mid-copy (the panel rewrites the whole 512B struct).
+        PanelPayload snap;
+        memcpy(&snap, view, sizeof(snap));
+        if (view->seq != snap.seq || snap.seq == lastSeq) continue;
+        lastSeq = snap.seq;
+        ApplyPanelPayload(state, snap);
     }
+
+    if (view) UnmapViewOfFile(view);
+    if (mapping) CloseHandle(mapping);
     return 0;
 }
 
