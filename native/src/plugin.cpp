@@ -189,6 +189,8 @@ static void VS_CC DlssnrCreate(
     initial.uiCorrection = GetIntDef(in, vsapi, "ui_correction", 1) != 0;
     initial.residualMultiplier = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), 1.0, 2.0));
     initial.inputResolutionPercent = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "input_resolution", 100), 25LL, 100LL));
+    // scaling_enabled=0 drops the residual pipeline entirely (input_resolution ignored)
+    initial.scalingEnabled = GetIntDef(in, vsapi, "scaling_enabled", 1) != 0;
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy defaults when present.
     vsdlssnr::BridgeLoadIni(initial);
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
@@ -238,6 +240,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "use_auto_mask:int:opt;"
         "ui_correction:int:opt;"
         "residual_multiplier:float:opt;"
+        "scaling_enabled:int:opt;"
         "input_resolution:int:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);

@@ -21,6 +21,7 @@ Local_Structure = 1.0
 Skin_Structure = -1
 Use_Auto_Mask = True
 UI_Correction = True
+Scaling_Enabled = True
 Input_Resolution = 100
 Residual_Multiplier = 1.0
 H_Max = 0
@@ -32,8 +33,13 @@ H_Max = 0
 ## <-1-2> 浮点, 皮肤结构强度 (-1 = 自动, 默认)
 ## <True|False> 使用自动蒙版
 ## <True|False> UI 文字修正
+## <True|False> 内部分辨率缩放总开关 (默认 True)
+##          False = 彻底关闭残差管线: 不建中间纹理/compute, 按源尺寸直接处理,
+##          且 Input_Resolution 被忽略; 需要零缩放开销时用
 ## <25-100> 整数, NGX 内部推理分辨率占源尺寸的百分比 (默认 100);
-##          调低可大幅提速, 由 Lanczos3 残差重建恢复到源分辨率
+##          由 Lanczos3 残差重建恢复到源分辨率; 降低档位减少推理量与细节,
+##          但 NGX 固定成本主导, 实测帧耗差异有限
+##          注意 100% 仍走残差通道 (Magpie 行为), residual_multiplier > 1 时增强细节
 ## <1-2> 浮点, 残差乘数 (默认 1.0), 配合内部分辨率缩放使用
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
@@ -58,6 +64,7 @@ else :
 		skin_structure = Skin_Structure,
 		use_auto_mask = int(Use_Auto_Mask),
 		ui_correction = int(UI_Correction),
+		scaling_enabled = int(Scaling_Enabled),
 		input_resolution = Input_Resolution,
 		residual_multiplier = Residual_Multiplier,
 	)
