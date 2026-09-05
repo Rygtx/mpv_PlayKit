@@ -1,4 +1,5 @@
 #include "d3d12_context.h"
+#include "panel_ipc.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,20 @@ float Saturate(float v) noexcept {
 } // namespace
 
 D3D12Context::~D3D12Context() { Finalize(); }
+
+void D3D12Context::NotifyFrameTick(double qpcSeconds) noexcept {
+    // Frame-rate EMA over the last frames (the cadence is decided by the host)
+    if (_lastFrameTickSec < 0) {
+        _lastFrameTickSec = qpcSeconds;
+        return;
+    }
+    const double delta = qpcSeconds - _lastFrameTickSec;
+    _lastFrameTickSec = qpcSeconds;
+    if (delta > 1e-4 && delta < 1.0) {
+        const double fps = 1.0 / delta;
+        _frameRateEma = _frameRateEma > 0 ? _frameRateEma * 0.9 + fps * 0.1 : fps;
+    }
+}
 
 void D3D12Context::SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept {
     if (!err || !errLen) return;
@@ -208,6 +223,12 @@ bool D3D12Context::ExecuteAndWait() noexcept {
             snprintf(buf, sizeof(buf),
                      "GPU hang/removed: reason=0x%08lX fence=%llu",
                      static_cast<unsigned long>(rr), static_cast<unsigned long long>(_fenceValue));
+            // surface through the stats mapping so the panel shows it
+            char json[224];
+            snprintf(json, sizeof(json),
+                     "{\"gpu_hang\":true,\"removed_reason\":\"0x%08lX\"}",
+                     static_cast<unsigned long>(rr));
+            PublishStatsJson(json);
             OutputDebugStringA("vs_dlssnr: ");
             OutputDebugStringA(buf);
             OutputDebugStringA("\n");

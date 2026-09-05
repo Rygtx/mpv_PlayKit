@@ -57,6 +57,8 @@ public:
     ID3D12Resource *HorizontalRes() const noexcept { return _horizontalRes.Get(); }
     int InternalWidth() const noexcept { return _internalWidth; }
     int InternalHeight() const noexcept { return _internalHeight; }
+    double FrameRateEma() const noexcept { return _frameRateEma; }
+    void NotifyFrameTick(double qpcSeconds) noexcept; // frame-rate EMA (播放节奏由宿主决定)
     // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
     // motion R16G16_FLOAT、depth R32_FLOAT,内容全 0
     ID3D12Resource *Motion() const noexcept { return _motion.Get(); }
@@ -119,6 +121,8 @@ private:
     int _internalWidth = 0;
     int _internalHeight = 0;
     bool _scalingReady = false;
+    double _lastFrameTickSec = -1.0;
+    double _frameRateEma = 0.0;
 };
 
 } // namespace vsdlssnr

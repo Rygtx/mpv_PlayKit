@@ -1,5 +1,6 @@
 // Ported from Magpie experimental DLSSNRFilter.cpp / NgxD3D12Core.cpp (see header).
 #include "dlssnr_context.h"
+#include "panel_ipc.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -498,6 +499,21 @@ bool DlssnrContext::Initialize(
         if (!_d3d12->CreateScalingResources(iw, ih, err, errLen)) return false;
     }
 
+    // Publish the render GPU's name so the panel shows it before the first
+    // frame lands (queried live from the adapter the device was created on).
+    {
+        char gpuNameUtf8[160] = "UNAVAILABLE";
+        DXGI_ADAPTER_DESC desc{};
+        if (_d3d12->Adapter() && SUCCEEDED(_d3d12->Adapter()->GetDesc(&desc))) {
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+                                gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
+        }
+        char body[224];
+        std::snprintf(body, sizeof(body), "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d}",
+                      gpuNameUtf8, _width, _height);
+        PublishStatsJson(body);
+    }
+
     // 5) CreateFeature on an open command list, then close+execute (Magpie cpp:1720-1758)
     if (!_d3d12->BeginRecording()) return fail("BeginRecording(create) failed");
     {
@@ -611,6 +627,7 @@ bool DlssnrContext::ProcessFrame(
     LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3{}, t4{};
     QueryPerformanceFrequency(&qpcFreq);
     QueryPerformanceCounter(&t0);
+    _d3d12->NotifyFrameTick(static_cast<double>(t0.QuadPart) / static_cast<double>(qpcFreq.QuadPart));
     // Diagnostic: VSDLSSNR_SKIP_EVAL=1 measures the pipe without NGX evaluate
     static const bool skipEval = GetEnvironmentVariableA("VSDLSSNR_SKIP_EVAL", nullptr, 0) != 0;
     if (!_d3d12->PackInput(srcPlanes, srcStrides, width, height, err, errLen)) return false;
@@ -801,6 +818,31 @@ bool DlssnrContext::ProcessFrame(
                      std::clamp(_shared->Snapshot().inputResolutionPercent, 25, 100),
                      _width, _height);
             TimingLog(line);
+
+            // stats via named shared memory (no disk IO; panel reads directly).
+            // GPU name queried live from the render device (Magpie
+            // OverlayDrawer.cpp:71-74 style) - always matches the device.
+            char gpuNameUtf8[160] = "UNAVAILABLE";
+            DXGI_ADAPTER_DESC desc{};
+            if (_d3d12->Adapter() && SUCCEEDED(_d3d12->Adapter()->GetDesc(&desc))) {
+                WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+                                    gpuNameUtf8, sizeof(gpuNameUtf8), nullptr, nullptr);
+            }
+            char body[512];
+            snprintf(body, sizeof(body),
+                     "{\"gpu_last\":%.1f,\"gpu_ema\":%.1f,\"gpu_p99\":%.1f,"
+                     "\"pack_ema\":%.1f,\"eval_cpu_ema\":%.1f,\"unpack_ema\":%.1f,"
+                     "\"internal_w\":%d,\"internal_h\":%d,\"width\":%d,\"height\":%d,"
+                     "\"fps\":%.1f,\"gpu_name\":\"%s\"}",
+                     g_timing.gpu[lastIdx],
+                     TimingWindow::Ema(g_timing.gpu, g_timing.count),
+                     TimingWindow::P99(g_timing.gpu, g_timing.count),
+                     TimingWindow::Ema(g_timing.pack, g_timing.count),
+                     TimingWindow::Ema(g_timing.evalCpu, g_timing.count),
+                     TimingWindow::Ema(g_timing.unpack, g_timing.count),
+                     _d3d12->InternalWidth(), _d3d12->InternalHeight(), _width, _height,
+                     _d3d12->FrameRateEma(), gpuNameUtf8);
+            PublishStatsJson(body);
         }
 
         if (vsTiming) {

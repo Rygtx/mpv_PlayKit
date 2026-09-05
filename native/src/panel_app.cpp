@@ -5,6 +5,7 @@
 
 #include "dlssnr_params.h"
 #include "panel_ipc.h"
+#include "fonts.h"
 
 using namespace vsdlssnr;
 
@@ -46,6 +47,7 @@ constexpr struct { const char *key; const wchar_t *label; const wchar_t *tip;
     { "local_tone",        L"局部色调", L"局部色调强度(0-2,默认 1)。影响明暗过渡区域的处理力度。", 1, 0, 2 },
     { "local_structure",   L"局部结构", L"局部结构强度(0-2,默认 1)。越高保留越多细节纹理。", 1, 0, 2 },
     { "skin_structure",    L"皮肤结构", L"皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", -1, -1, 2 },
+    { "residual_multiplier", L"残差乘数", L"残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", 1, 1, 2 },
 };
 constexpr struct { const char *key; const wchar_t *label; const wchar_t *tip;
                    int def; int lo; int hi; } kEnums[] = {
@@ -66,12 +68,21 @@ struct AppState {
     bool liveDirty = false;
     bool timingLog = true;
     double lastLiveWrite = 0.0;
+    double lastStatsRead = 0.0;
     char status[160]{};
+    char statsBig[64]{};
+    char statsDetail[160]{};
+    char gpuName[128]{};
+    double fps = 0.0;
+    float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f;
+    bool hasSegments = false;
 };
 
 AppState g_app;
 DWORD g_mainThreadId = 0;
 HWND g_hwnd = nullptr;
+ImFont *g_fontUI = nullptr;
+ImFont *g_fontMono = nullptr;
 
 // ---------------------------------------------------------------------------
 // paths + persistence
@@ -203,6 +214,67 @@ void LoadIni() noexcept {
     p.residualMultiplier = static_cast<float>(readInt(L"residual_multiplier_x100", static_cast<int>(p.residualMultiplier * 100))) / 100.0f;
 }
 
+// Flat-object JSON extraction for the stats blob (our own writer's format)
+float JsonGetFloat(const char *body, const char *key, float def) noexcept {
+    char pat[48];
+    std::snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *k = strstr(body, pat);
+    if (!k) return def;
+    const char *c = strchr(k + strlen(pat), ':');
+    if (!c) return def;
+    return strtof(c + 1, nullptr);
+}
+
+int JsonGetInt(const char *body, const char *key, int def) noexcept {
+    return static_cast<int>(JsonGetFloat(body, key, static_cast<float>(def)));
+}
+
+// Read the plugin's periodic stats from named shared memory (zero disk IO).
+// Mapping absent = no live filter: clear the stats line. The mapping object
+// dies with the plugin process, so re-open each refresh (no stale handles).
+void LoadStats() noexcept {
+    const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
+    if (!m) {
+        g_app.statsBig[0] = 0;
+        g_app.statsDetail[0] = 0;
+        return;
+    }
+    const char *body = static_cast<const char *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
+    if (body) {
+        const double gpuLast = JsonGetFloat(body, "gpu_last", -1);
+        const double gpuEma = JsonGetFloat(body, "gpu_ema", -1);
+        const double gpuP99 = JsonGetFloat(body, "gpu_p99", -1);
+        const int iw = JsonGetInt(body, "internal_w", 0);
+        const int ih = JsonGetInt(body, "internal_h", 0);
+        const int w = JsonGetInt(body, "width", 0);
+        const int h = JsonGetInt(body, "height", 0);
+        if (gpuLast >= 0) {
+            snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
+            snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
+                     "EMA %.1f  ·  P99 %.1f  ·  内部 %dx%d  ·  源 %dx%d",
+                     gpuEma, gpuP99, iw, ih, w, h);
+            g_app.segPack = static_cast<float>(JsonGetFloat(body, "pack_ema", 0));
+            g_app.segEval = static_cast<float>(JsonGetFloat(body, "eval_cpu_ema", 0));
+            g_app.segGpu = static_cast<float>(JsonGetFloat(body, "gpu_ema", 0));
+            g_app.segUnpack = static_cast<float>(JsonGetFloat(body, "unpack_ema", 0));
+            g_app.hasSegments = g_app.segGpu > 0;
+            g_app.fps = JsonGetFloat(body, "fps", 0);
+            const char *gn = strstr(body, "\"gpu_name\":\"");
+            if (gn) {
+                gn += 12;
+                const char *end = strchr(gn, '"');
+                const size_t len = end ? std::min<size_t>(end - gn, 127) : 0;
+                if (len) {
+                    memcpy(g_app.gpuName, gn, len);
+                    g_app.gpuName[len] = 0;
+                }
+            }
+        }
+        UnmapViewOfFile(const_cast<char *>(body));
+    }
+    CloseHandle(m);
+}
+
 // ---------------------------------------------------------------------------
 // UI
 // ---------------------------------------------------------------------------
@@ -266,10 +338,134 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + 16 * s, wpos.y + (th - ImGui::GetTextLineHeight()) * 0.5f));
     ImGui::TextUnformatted("DLSSNR 控制面板");
 
-    // --- 内容 ---
-    float y = th + 12 * s;
+    // --- 性能分析器(照抄 Magpie Overlay Profiler 样式,数据来自插件共享内存) ---
+    // 遥测带背景高度流式自适应:用上一帧的带底位置画背景(滞后一帧无感),
+    // Collapse 收起/展开时窗口高度随之自动收缩。
     char u8[64], u8tip[256];
+    static float s_bandBottom = th + 120 * s;
+    dl->AddRectFilled(ImVec2(wpos.x, wpos.y + th), ImVec2(wpos.x + wsize.x, wpos.y + s_bandBottom),
+                      IM_COL32(24, 28, 40, 255));
+    dl->AddLine(ImVec2(wpos.x, wpos.y + s_bandBottom), ImVec2(wpos.x + wsize.x, wpos.y + s_bandBottom),
+                IM_COL32(58, 62, 78, 255));
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + 16 * s, wpos.y + th + 12 * s));
 
+    // Magpie Profiler 头部:GPU 名称 + 帧率(全程显示,无滤镜时占位)
+    ImGui::Text("GPU: %s", g_app.gpuName[0] ? g_app.gpuName : "(等待滤镜加载)");
+    ImGui::Text("帧率: %.1f FPS", g_app.fps);
+
+    // 大号:NGX 纯延迟(窗口级字体缩放, imgui 1.91 的 PushFont 是单参)
+    ImGui::SetWindowFontScale(1.4f);
+    ImGui::TextColored(ImVec4(120 / 255.0f, 190 / 255.0f, 1.0f, 1.0f), "%s", g_app.statsBig);
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::Spacing();
+
+    // 效果渲染用时(堆叠时间线,列宽 = 耗时占比)
+    const bool timingsOpen = ImGui::CollapsingHeader("处理用时", ImGuiTreeNodeFlags_DefaultOpen);
+    if (timingsOpen && g_app.hasSegments) {
+        const float total = g_app.segPack + g_app.segEval + g_app.segGpu + g_app.segUnpack;
+        if (total > 0.5f) {
+            struct Seg { float v; ImU32 c; const char *name; };
+            const Seg segs[4]{
+                { g_app.segPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
+                { g_app.segEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
+                { g_app.segGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NGX+残差)" },
+                { g_app.segUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
+            };
+
+            ImGui::Spacing();
+            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.5f, 0.5f));
+            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5, 5));
+            ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+
+            if (ImGui::BeginTable("timeline", 4)) {
+                for (int i = 0; i < 4; ++i) {
+                    if (segs[i].v < 1e-3f) continue;
+                    char colId[8];
+                    snprintf(colId, sizeof(colId), "%d", i);
+                    ImGui::TableSetupColumn(colId,
+                        ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoResize | ImGuiTableColumnFlags_NoReorder,
+                        segs[i].v / total);
+                }
+                ImGui::TableNextRow();
+                for (int i = 0; i < 4; ++i) {
+                    if (segs[i].v < 1e-3f) continue;
+                    ImGui::TableNextColumn();
+                    ImGui::PushID(i);
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, segs[i].c);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderActive, segs[i].c);
+                    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, segs[i].c);
+                    ImGui::PushStyleColor(ImGuiCol_Header, segs[i].c);
+                    ImGui::Selectable("", false);
+                    ImGui::PopStyleColor(3);
+                    if (ImGui::IsItemHovered() || ImGui::IsItemClicked()) {
+                        char tipContent[128];
+                        snprintf(tipContent, sizeof(tipContent), "%s\n%.3f ms\n%d%%", segs[i].name,
+                                 segs[i].v, static_cast<int>(segs[i].v / total * 100 + 0.5f));
+                        ImGui::SetTooltip("%s", tipContent);
+                    }
+                    // 空间足够时居中显示百分比
+                    char pctText[16];
+                    snprintf(pctText, sizeof(pctText), "%d%%", static_cast<int>(segs[i].v / total * 100 + 0.5f));
+                    const float textWidth = ImGui::CalcTextSize(pctText).x;
+                    const float itemWidth = ImGui::GetItemRectSize().x;
+                    if (itemWidth > textWidth + 4 * s) {
+                        ImGui::SameLine(0, 0);
+                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (itemWidth - textWidth) / 2);
+                        ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 0.5f * s);
+                        ImGui::TextUnformatted(pctText);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::PopStyleVar(4);
+            ImGui::Spacing();
+
+            // timings 列表:色点 ■ + 名称 + 右对齐时间
+            if (ImGui::BeginTable("timings", 1, ImGuiTableFlags_PadOuterX)) {
+                ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoResize);
+                for (int si = 0; si < 4; ++si) {
+                    const Seg &seg = segs[si];
+                    ImGui::PushID(si);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    char timeStr[32];
+                    snprintf(timeStr, sizeof(timeStr), "%.3f ms", seg.v);
+                    const float timeWidth = ImGui::CalcTextSize(timeStr).x;
+                    const float wrapPos = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - timeWidth - 8 * s;
+                    ImGui::Selectable("", false, 0, ImVec2(0, ImGui::GetTextLineHeight()));
+                    ImGui::SameLine(0, 3 * s);
+                    const ImVec4 segCol = ImGui::ColorConvertU32ToFloat4(seg.c);
+                    // ■ 字形已在 fontUI 的 glyph range 里(Magpie COLOR_INDICATOR 同款)
+                    ImGui::TextColored(segCol, "%s", vsdlssnr::fonts::COLOR_INDICATOR);
+                    ImGui::SameLine(0, 3 * s);
+                    ImGui::PushTextWrapPos(wrapPos);
+                    ImGui::TextUnformatted(seg.name);
+                    ImGui::PopTextWrapPos();
+                    ImGui::SameLine(0, 0);
+                    ImGui::SetCursorPosX(wrapPos + 8 * s);
+                    // 时间数值用等宽数字字体(Magpie _fontMonoNumbers 用途)
+                    if (g_fontMono) {
+                        ImGui::PushFont(g_fontMono);
+                        ImGui::TextUnformatted(timeStr);
+                        ImGui::PopFont();
+                    } else {
+                        ImGui::TextUnformatted(timeStr);
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::Spacing();
+        }
+    }
+
+    // 遥测带底(供下一帧背景;随 Collapse 自动收缩)
+    s_bandBottom = ImGui::GetCursorPosY() + 10 * s;
+    float y = s_bandBottom + 12 * s;
+
+    // --- 内容 ---
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     ImGui::TextDisabled("参数改动在下一帧生效");
     y += 24 * s;
@@ -290,7 +486,8 @@ void DrawUi() noexcept {
         int count = 0;
         if (e.key == std::string("preset")) {
             for (int i = 0; i <= 3; ++i) {
-                snprintf(itemBuf[i], sizeof(itemBuf[i]), "%d(%s)", i, i == 0 ? "默认" : "预设");
+                snprintf(itemBuf[i], sizeof(itemBuf[i]), "%d(%s)", i,
+                         i == 0 ? "默认" : (i == 1 ? "预设 #1" : i == 2 ? "预设 #2" : "预设 #3"));
                 items[i] = itemBuf[i];
                 ++count;
             }
@@ -318,19 +515,50 @@ void DrawUi() noexcept {
         if (ImGui::IsItemHovered()) ShowTip(u8tip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
-        float v = sl.key == std::string("intensity")         ? g_app.params.intensity
-                  : sl.key == std::string("local_tone")      ? g_app.params.localToneStrength
-                  : sl.key == std::string("local_structure") ? g_app.params.localStructureStrength
-                                                             : g_app.params.skinStructureStrength;
+        float v = sl.key == std::string("intensity")            ? g_app.params.intensity
+                  : sl.key == std::string("local_tone")         ? g_app.params.localToneStrength
+                  : sl.key == std::string("local_structure")    ? g_app.params.localStructureStrength
+                  : sl.key == std::string("residual_multiplier") ? g_app.params.residualMultiplier
+                                                                 : g_app.params.skinStructureStrength;
         if (ImGui::SliderFloat(("##" + std::string(sl.key)).c_str(), &v, sl.lo, sl.hi, "%.2f")) {
             // NGX accepts continuous float steps (verified: 0.01 steps produce
             // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
             if (sl.key == std::string("intensity")) g_app.params.intensity = v;
             else if (sl.key == std::string("local_tone")) g_app.params.localToneStrength = v;
             else if (sl.key == std::string("local_structure")) g_app.params.localStructureStrength = v;
+            else if (sl.key == std::string("residual_multiplier")) g_app.params.residualMultiplier = v;
             else g_app.params.skinStructureStrength = v;
             g_app.liveDirty = true;
         }
+        y += 38 * s;
+    }
+
+    // 内部分辨率(25-100%,int;改动触发热重建)+ 缩放启用开关
+    {
+        WideCharToMultiByte(CP_UTF8, 0, L"分辨率缩放", -1, u8, sizeof(u8), nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, L"启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Lanczos3 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 8 * s));
+        ImGui::Text("%s", u8);
+        if (ImGui::IsItemHovered()) ShowTip(u8tip);
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+        ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
+        bool scalingOn = g_app.params.scalingEnabled != 0;
+        if (ImGui::Checkbox("##scaling_enabled", &scalingOn)) {
+            g_app.params.scalingEnabled = scalingOn ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+        ImGui::SameLine(0, 12 * s);
+        ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX - 40 * s);
+        int ir = g_app.params.inputResolutionPercent;
+        if (ImGui::SliderInt("##input_resolution", &ir, 25, 100, "%d%%")) {
+            g_app.params.inputResolutionPercent = std::clamp(ir, 25, 100);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // Debounce: rebuilding per drag tick would recreate the feature +
+            // textures every frame; push once on slider release instead.
+            g_app.liveDirty = true;
+        }
+        if (ImGui::IsItemHovered()) ShowTip(u8tip);
         y += 38 * s;
     }
 
@@ -349,6 +577,29 @@ void DrawUi() noexcept {
         }
         if (ImGui::IsItemHovered()) ShowTip(u8tip);
         y += 26 * s;
+    }
+
+    // 性能日志开关(经共享内存参数通道通知插件;状态持久化在 ini [panel] 节)
+    {
+        char logLabel[96];
+        WideCharToMultiByte(CP_UTF8, 0, L"写入性能日志 (dlssnr_timing.log)", -1, logLabel, sizeof(logLabel), nullptr, nullptr);
+        char logTip[192];
+        WideCharToMultiByte(CP_UTF8, 0, L"开关 dlssnr_timing.log 的周期统计写入。\n改动立即生效(经共享内存通道通知插件)。", -1, logTip, sizeof(logTip), nullptr, nullptr);
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+        bool logOn = g_app.timingLog;
+        if (ImGui::Checkbox(logLabel, &logOn)) {
+            g_app.timingLog = logOn;
+            wchar_t iniPath[MAX_PATH];
+            if (BasePath(iniPath, MAX_PATH)) {
+                wchar_t iniFile[MAX_PATH];
+                swprintf_s(iniFile, L"%s\\%s", iniPath, INI_FILE);
+                WritePrivateProfileStringW(L"panel", L"log", logOn ? L"1" : L"0", iniFile);
+            }
+            WritePayload(); // logEnabled included
+            g_app.liveDirty = false;
+        }
+        if (ImGui::IsItemHovered()) ShowTip(logTip);
+        y += 28 * s;
     }
 
     y += 8 * s;
@@ -397,15 +648,12 @@ namespace {
 void RebuildFontDpi(int dpi) noexcept {
     ImGuiIO &io = ImGui::GetIO();
     io.Fonts->Clear();
-    char fontPath[MAX_PATH];
-    GetWindowsDirectoryA(fontPath, MAX_PATH);
-    strcat_s(fontPath, "\\Fonts\\msyh.ttc");
-    static const ImWchar ranges[] = {
-        0x0020, 0x00FF, 0x2000, 0x206F, 0x3000, 0x30FF, 0xFF00, 0xFFEF,
-        0x4E00, 0x9FAF, 0,
-    };
-    io.Fonts->AddFontFromFileTTF(fontPath, 15.0f * dpi / 96.0f, nullptr, ranges);
-    io.Fonts->Build();
+    g_fontUI = g_fontMono = nullptr;
+    // Magpie 三字体架构:Segoe UI 主字 + msyh(YaHei UI)中文 merge + 数字等宽
+    if (!vsdlssnr::fonts::BuildFonts(dpi / 96.0f, &g_fontUI, &g_fontMono)) {
+        g_fontUI = g_fontMono = nullptr;
+        OutputDebugStringA("vs_dlssnr panel: BuildFonts failed\n");
+    }
     ImGui_ImplDX11_InvalidateDeviceObjects();
 }
 
@@ -664,6 +912,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             WritePayload();
             g_app.liveDirty = false;
             g_app.lastLiveWrite = nowSec;
+        }
+
+        // Throttled stats read (plugin publishes into the stats mapping every
+        // 60 frames); shared memory, zero disk IO
+        if (nowSec - g_app.lastStatsRead > 0.5) {
+            g_app.lastStatsRead = nowSec;
+            LoadStats();
         }
 
         ImGui_ImplDX11_NewFrame();
