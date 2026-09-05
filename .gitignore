@@ -7,7 +7,10 @@ native/dependencies/
 native/tests/
 # 本地路线图/进展文档, 不随仓库分发
 native/PORTING.md
+# 打包: 仓库内暂存的模型等大文件 (package.ps1 输入) 与 zip 输出
+native/vendor/
+native/dist/
 
-# AI 模型文件体积巨大 (nvngx_dlssnr.dll ~165MB), 随 Release 分发不入库
+# AI 模型文件体积巨大 (nvngx_dlssnr.dll ~165MB), 随 Release 附件分发不入库
 *.dll
 !portable_config/**/*.dll
