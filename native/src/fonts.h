@@ -149,8 +149,8 @@ inline bool BuildFonts(float dpiScale, ImFont **outUI, ImFont **outMono) noexcep
     ImFontConfig config;
     config.FontDataOwnedByAtlas = false;
 
-    // fontUI: Basic Latin + COLOR_INDICATOR
-    ImWchar uiRanges[5]{ 0x20, 0x7E, COLOR_INDICATOR_W, COLOR_INDICATOR_W, 0 };
+    // fontUI: Basic Latin + → (U+2192, 分辨率行用) + COLOR_INDICATOR
+    ImWchar uiRanges[7]{ 0x20, 0x7E, 0x2192, 0x2192, COLOR_INDICATOR_W, COLOR_INDICATOR_W, 0 };
     *outUI = fontAtlas.AddFontFromMemoryTTF(
         reinterpret_cast<void *>(uiData.data()), static_cast<int>(uiData.size()),
         fontSize, &config, uiRanges);

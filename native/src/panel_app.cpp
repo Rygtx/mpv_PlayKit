@@ -71,7 +71,6 @@ struct AppState {
     double lastStatsRead = 0.0;
     char status[160]{};
     char statsBig[64]{};
-    char statsDetail[160]{};
     char statsRes[96]{};
     char gpuName[128]{};
     double fps = 0.0;
@@ -237,23 +236,18 @@ void LoadStats() noexcept {
     const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
     if (!m) {
         g_app.statsBig[0] = 0;
-        g_app.statsDetail[0] = 0;
         g_app.statsRes[0] = 0;
         return;
     }
     const char *body = static_cast<const char *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
     if (body) {
         const double gpuLast = JsonGetFloat(body, "gpu_last", -1);
-        const double gpuEma = JsonGetFloat(body, "gpu_ema", -1);
-        const double gpuP99 = JsonGetFloat(body, "gpu_p99", -1);
         const int iw = JsonGetInt(body, "internal_w", 0);
         const int ih = JsonGetInt(body, "internal_h", 0);
         const int w = JsonGetInt(body, "width", 0);
         const int h = JsonGetInt(body, "height", 0);
         if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
-            snprintf(g_app.statsDetail, sizeof(g_app.statsDetail),
-                     "EMA %.1f  ·  P99 %.1f", gpuEma, gpuP99);
             // 分辨率展示:未开启缩放 -> 原生分辨率;开启 -> 处理分辨率 → 回源分辨率
             const int scaling = JsonGetInt(body, "scaling", 0);
             if (scaling && iw > 0 && ih > 0) {
@@ -367,8 +361,7 @@ void DrawUi() noexcept {
     ImGui::SetWindowFontScale(1.4f);
     ImGui::TextColored(ImVec4(120 / 255.0f, 190 / 255.0f, 1.0f, 1.0f), "%s", g_app.statsBig);
     ImGui::SetWindowFontScale(1.0f);
-    if (g_app.statsDetail[0]) {
-        ImGui::TextDisabled("%s", g_app.statsDetail);
+    if (g_app.statsRes[0]) {
         ImGui::TextDisabled("%s", g_app.statsRes);
     }
     ImGui::Spacing();
@@ -623,8 +616,8 @@ void DrawUi() noexcept {
         snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
     }
     if (ImGui::IsItemHovered()) {
-        char u8tip[256];
-        WideCharToMultiByte(CP_UTF8, 0, L"将当前设置保存为默认值(dlssnr_ui.ini)。\n仅对 .vpy 未显式设置的参数在下次加载时生效; vpy 参数始终优先。", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
+        char u8tip[192];
+        WideCharToMultiByte(CP_UTF8, 0, L"将当前设置保存为默认值(dlssnr_ui.ini),下次加载滤镜时自动生效。", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
         ShowTip(u8tip);
     }
     ImGui::SameLine(0, 14 * s);
