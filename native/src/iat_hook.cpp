@@ -136,8 +136,19 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook) no
     FlushInstructionCache(GetCurrentProcess(), hook.iatSlot, sizeof(void *));
 
     if (!originalFunction) {
-        // Null import: the snippet cannot resolve its caller either way, treat as failure
-        // so the caller restores immediately.
+        // Null import: the hook cannot work — restore the slot and release
+        // the owner right here. The Initialize caller fails without calling
+        // RestoreSnippetCallerHook, so leaving the hook armed would serve
+        // ERROR_INVALID_FUNCTION from this IAT slot for the whole session
+        // and block every future context from installing.
+        InterlockedExchangePointer(
+            reinterpret_cast<void *volatile *>(hook.iatSlot), original);
+        g_originalGetModuleFileNameW.store(nullptr, std::memory_order_release);
+        g_snippetCallerModule.store(nullptr, std::memory_order_release);
+        hook.installed = false;
+        hook.iatSlot = nullptr;
+        void *owner = &hook;
+        g_hookOwner.compare_exchange_strong(owner, nullptr, std::memory_order_acq_rel);
         return false;
     }
     return true;

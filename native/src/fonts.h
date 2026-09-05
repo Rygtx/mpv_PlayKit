@@ -15,7 +15,6 @@
 namespace vsdlssnr {
 namespace fonts {
 
-constexpr ImWchar BASIC_LATIN_RANGES[] = { 0x20, 0x7E };
 constexpr ImWchar NUMBER_RANGES[] = { '0', '9', 0 };
 constexpr ImWchar NOT_NUMBER_RANGES[] = { 0x20, '0' - 1, '9' + 1, 0x7E, 0 };
 constexpr ImWchar COLOR_INDICATOR_W = 0x25A0;

@@ -1,5 +1,6 @@
 #include "bridge.h"
 #include "dlssnr_context.h"
+#include "dlssnr_ini.h"
 #include "panel_ipc.h"
 
 #include <shellapi.h>
@@ -15,9 +16,8 @@ namespace vsdlssnr {
 
 namespace {
 
-constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";
 constexpr wchar_t PANEL_EXE[] = L"dlssnr_panel.exe";
-constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive";
+// INI_FILE / ALIVE_EVENT come from panel_ipc.h (cross-process contract names)
 // Shared-memory polling: no disk IO, so poll fast enough for slider edits to
 // land within a frame or two.
 constexpr int POLL_INTERVAL_MS = 40;
@@ -50,53 +50,12 @@ bool GetSelfIniPath(wchar_t *path, size_t pathLen) noexcept {
     return true;
 }
 
-void SaveIni(const DlssnrParams &p, const wchar_t *iniPath) noexcept {
-    wchar_t buf[32];
-    auto writeInt = [&](const wchar_t *key, int v) {
-        swprintf_s(buf, L"%d", v);
-        WritePrivateProfileStringW(L"dlssnr", key, buf, iniPath);
-    };
-    // std::lround rounds half away from zero; (int)(v*100+0.5) would eat negatives
-    auto writeX100 = [&](const wchar_t *key, float v) {
-        writeInt(key, static_cast<int>(std::lround(v * 100.0f)));
-    };
-    writeInt(L"preset", p.preset);
-    writeInt(L"style", p.style);
-    writeX100(L"intensity_x100", p.intensity);
-    writeX100(L"local_tone_x100", p.localToneStrength);
-    writeX100(L"local_structure_x100", p.localStructureStrength);
-    writeX100(L"skin_structure_x100", p.skinStructureStrength);
-    writeInt(L"use_auto_mask", p.useAutoMask ? 1 : 0);
-    writeInt(L"ui_correction", p.uiCorrection ? 1 : 0);
-    writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, 25, 100));
-    writeX100(L"residual_multiplier_x100", p.residualMultiplier);
-    writeInt(L"saved", 1);
-}
-
 } // namespace
 
 bool BridgeLoadIni(DlssnrParams &p) noexcept {
     wchar_t iniPath[MAX_PATH];
     if (!GetSelfIniPath(iniPath, MAX_PATH)) return false;
-    wchar_t buf[64]{};
-    if (!GetPrivateProfileStringW(L"dlssnr", L"saved", L"", buf, 64, iniPath) || !buf[0]) {
-        return false; // no saved profile
-    }
-    const auto readInt = [&](const wchar_t *key, int def) -> int {
-        return static_cast<int>(GetPrivateProfileIntW(L"dlssnr", key, def, iniPath));
-    };
-    p.preset = std::clamp(readInt(L"preset", p.preset), 0, 3);
-    p.style = std::clamp(readInt(L"style", p.style), 0, 2);
-    p.intensity = static_cast<float>(readInt(L"intensity_x100", static_cast<int>(p.intensity * 100))) / 100.0f;
-    p.localToneStrength = static_cast<float>(readInt(L"local_tone_x100", static_cast<int>(p.localToneStrength * 100))) / 100.0f;
-    p.localStructureStrength = static_cast<float>(readInt(L"local_structure_x100", static_cast<int>(p.localStructureStrength * 100))) / 100.0f;
-    p.skinStructureStrength = static_cast<float>(readInt(L"skin_structure_x100", static_cast<int>(p.skinStructureStrength * 100))) / 100.0f;
-    p.useAutoMask = readInt(L"use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
-    p.uiCorrection = readInt(L"ui_correction", p.uiCorrection ? 1 : 0) != 0;
-    p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), 25, 100);
-    p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled);
-    p.residualMultiplier = static_cast<float>(readInt(L"residual_multiplier_x100", static_cast<int>(p.residualMultiplier * 100))) / 100.0f;
-    return true;
+    return LoadDlssnrIni(p, iniPath); // shared key list + clamps (dlssnr_ini.h)
 }
 
 namespace {
@@ -106,22 +65,19 @@ namespace {
 // _cur side is synced exclusively by SharedParams::ConsumeRebuild, otherwise
 // the pending-vs-current comparison dies and the rebuild never fires.
 // residualMultiplier is per-frame (compute cbuffer) and merges directly.
+// A reset payload needs no special handling: the panel ships the default
+// values inside the same payload, so the Request*/Update path below restores
+// them (writing Initial() into _cur directly would stomp the create-time
+// fields past the rebuild machinery and leave NGX on the old preset).
 void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
     DlssnrParams p = state->params->Snapshot();
-    const int preset = std::clamp(pl.preset, 0, 3);
-    const int reqRes = std::clamp(pl.inputResolution, 25, 100);
-    const int reqScaling = pl.scalingEnabled != 0;
-    p.style = std::clamp(pl.style, 0, 2);
-    p.intensity = std::clamp(pl.intensity, 0.0f, 2.0f);
-    p.localToneStrength = std::clamp(pl.localTone, 0.0f, 2.0f);
-    p.localStructureStrength = std::clamp(pl.localStructure, 0.0f, 2.0f);
-    p.skinStructureStrength = std::clamp(pl.skinStructure, -1.0f, 2.0f);
-    p.useAutoMask = pl.useAutoMask != 0;
-    p.uiCorrection = pl.uiCorrection != 0;
-    p.residualMultiplier = std::clamp(pl.residualMultiplier, 1.0f, 2.0f);
-    state->params->RequestPreset(preset);
-    state->params->RequestResolution(reqRes);
-    state->params->RequestScalingEnabled(reqScaling);
+    LoadLiveParams(p, pl); // shared field mapping (panel_ipc.h), clamps included
+    // Create-time params: request only — their _cur side is synced
+    // exclusively by SharedParams::ConsumeRebuild, otherwise
+    // the pending-vs-current comparison dies and the rebuild never fires.
+    state->params->RequestPreset(std::clamp(pl.preset, kPresetMin, kPresetMax));
+    state->params->RequestResolution(std::clamp(pl.inputResolution, kResPctMin, kResPctMax));
+    state->params->RequestScalingEnabled(pl.scalingEnabled != 0);
     state->params->Update(p);
 
     if (pl.saveRequest) {
@@ -130,11 +86,8 @@ void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
             DlssnrParams s = state->params->Snapshot();
             s.preset = state->params->SaveTimePreset();
             s.inputResolutionPercent = state->params->SaveTimeResolution();
-            SaveIni(s, iniPath);
+            WriteDlssnrIni(s, iniPath);
         }
-    }
-    if (pl.resetRequest) {
-        state->params->Update(state->params->Initial());
     }
     SetTimingLogEnabled(pl.logEnabled != 0);
 }
@@ -178,10 +131,15 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
         if (view->magic != PAYLOAD_MAGIC) continue;
         if (view->seq == 0 || view->seq == lastSeq) continue;
         // Snapshot under the writer: copy the payload, then confirm the seq
-        // did not move mid-copy (the panel rewrites the whole 512B struct).
+        // did not move mid-copy (the panel publishes the counter only after
+        // the body is stable — a volatile re-read keeps the compiler from
+        // forwarding the pre-copy load).
         PanelPayload snap;
         memcpy(&snap, view, sizeof(snap));
-        if (view->seq != snap.seq || snap.seq == lastSeq) continue;
+        if (static_cast<const volatile PanelPayload *>(view)->seq != snap.seq ||
+            snap.seq == lastSeq) {
+            continue;
+        }
         lastSeq = snap.seq;
         ApplyPanelPayload(state, snap);
     }

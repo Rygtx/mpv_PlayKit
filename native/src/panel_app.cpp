@@ -5,6 +5,7 @@
 
 #include "dlssnr_params.h"
 #include "panel_ipc.h"
+#include "dlssnr_ini.h"
 #include "fonts.h"
 
 using namespace vsdlssnr;
@@ -36,28 +37,27 @@ namespace {
 constexpr wchar_t WINDOW_CLASS[] = L"vs_dlssnr_panel_app";
 constexpr wchar_t WINDOW_TITLE[] = L"DLSSNR 控制面板";
 constexpr wchar_t TRAY_TIP[] = L"DLSSNR 控制面板";
-constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";
-constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive";
+// INI_FILE / ALIVE_EVENT come from panel_ipc.h (cross-process contract names)
 constexpr UINT WM_APP_TRAYICON = WM_APP + 1;
 
 // clang-format off
-constexpr struct { const char *key; const wchar_t *label; const wchar_t *tip;
-                   float def, lo, hi; } kSliders[] = {
-    { "intensity",         L"强度",     L"整体处理强度(0-2,默认 1)。数值越高降噪/增强越明显。", 1, 0, 2 },
-    { "local_tone",        L"局部色调", L"局部色调强度(0-2,默认 1)。影响明暗过渡区域的处理力度。", 1, 0, 2 },
-    { "local_structure",   L"局部结构", L"局部结构强度(0-2,默认 1)。越高保留越多细节纹理。", 1, 0, 2 },
-    { "skin_structure",    L"皮肤结构", L"皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", -1, -1, 2 },
-    { "residual_multiplier", L"残差乘数", L"残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", 1, 1, 2 },
+// Labels/tips are UTF-8 (the project compiles with /utf-8); the old
+// wchar_t tables + per-frame WideCharToMultiByte are gone.
+constexpr struct { const char *key; const char *label; const char *tip;
+                   float lo, hi; } kSliders[] = {
+    { "intensity",         "强度",     "整体处理强度(0-2,默认 1)。数值越高降噪/增强越明显。", 0, 2 },
+    { "local_tone",        "局部色调", "局部色调强度(0-2,默认 1)。影响明暗过渡区域的处理力度。", 0, 2 },
+    { "local_structure",   "局部结构", "局部结构强度(0-2,默认 1)。越高保留越多细节纹理。", 0, 2 },
+    { "skin_structure",    "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", -1, 2 },
+    { "residual_multiplier", "残差乘数", "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", 1, 2 },
 };
-constexpr struct { const char *key; const wchar_t *label; const wchar_t *tip;
-                   int def; int lo; int hi; } kEnums[] = {
-    { "preset", L"预设", L"NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。", 0, 0, 3 },
-    { "style",  L"风格", L"处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。", 0, 0, 2 },
+constexpr struct { const char *key; const char *label; const char *tip; } kEnums[] = {
+    { "preset", "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。" },
+    { "style",  "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。" },
 };
-constexpr struct { const char *key; const wchar_t *label; const wchar_t *tip;
-                   bool def; } kFlags[] = {
-    { "use_auto_mask", L"自动蒙版", L"自动蒙版。模型自动识别区域并区别处理。", true },
-    { "ui_correction", L"UI 文字修正", L"UI 修正。降低对画面内文字/UI 元素的涂抹。", true },
+constexpr struct { const char *key; const char *label; const char *tip; } kFlags[] = {
+    { "use_auto_mask", "自动蒙版", "自动蒙版。模型自动识别区域并区别处理。" },
+    { "ui_correction", "UI 文字修正", "UI 修正。降低对画面内文字/UI 元素的涂抹。" },
 };
 // clang-format on
 
@@ -76,6 +76,7 @@ struct AppState {
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f;
     bool hasSegments = false;
+    bool statsDirty = false; // LoadStats changed something on screen (redraw gate)
 };
 
 AppState g_app;
@@ -116,19 +117,10 @@ bool CreateParamsMapping() noexcept {
         return false;
     }
     // Adopt parameters from a previous panel session (last live state wins
-    // over the ini), then publish our generation + current values.
+    // over the ini) via the shared field mapping (panel_ipc.h).
     if (g_payload->magic == PAYLOAD_MAGIC && g_payload->seq > 0) {
-        g_app.params.preset = std::clamp(g_payload->preset, 0, 3);
-        g_app.params.style = std::clamp(g_payload->style, 0, 2);
-        g_app.params.intensity = std::clamp(g_payload->intensity, 0.0f, 2.0f);
-        g_app.params.localToneStrength = std::clamp(g_payload->localTone, 0.0f, 2.0f);
-        g_app.params.localStructureStrength = std::clamp(g_payload->localStructure, 0.0f, 2.0f);
-        g_app.params.skinStructureStrength = std::clamp(g_payload->skinStructure, -1.0f, 2.0f);
-        g_app.params.useAutoMask = g_payload->useAutoMask != 0;
-        g_app.params.uiCorrection = g_payload->uiCorrection != 0;
-        g_app.params.inputResolutionPercent = std::clamp(g_payload->inputResolution, 25, 100);
-        g_app.params.scalingEnabled = g_payload->scalingEnabled != 0;
-        g_app.params.residualMultiplier = std::clamp(g_payload->residualMultiplier, 1.0f, 2.0f);
+        LoadLiveParams(g_app.params, *g_payload);
+        LoadCreateParams(g_app.params, *g_payload);
     }
     return true;
 }
@@ -136,55 +128,27 @@ bool CreateParamsMapping() noexcept {
 void WritePayload(int saveRequest = 0, int resetRequest = 0) noexcept {
     if (!g_payload) return;
     static uint32_t seq = 0;
-    const DlssnrParams &p = g_app.params;
-    PanelPayload pl{};
-    pl.magic = PAYLOAD_MAGIC;
-    pl.seq = ++seq;
+    const uint32_t newSeq = ++seq;
+    PanelPayload pl = PayloadFromParams(g_app.params); // shared field mapping; seq stays 0
     pl.generation = g_generation;
-    pl.preset = p.preset;
-    pl.style = p.style;
-    pl.intensity = p.intensity;
-    pl.localTone = p.localToneStrength;
-    pl.localStructure = p.localStructureStrength;
-    pl.skinStructure = p.skinStructureStrength;
-    pl.useAutoMask = p.useAutoMask ? 1 : 0;
-    pl.uiCorrection = p.uiCorrection ? 1 : 0;
-    pl.inputResolution = p.inputResolutionPercent;
-    pl.scalingEnabled = p.scalingEnabled ? 1 : 0;
-    pl.residualMultiplier = p.residualMultiplier;
     pl.saveRequest = saveRequest;
     pl.resetRequest = resetRequest;
     pl.logEnabled = g_app.timingLog ? 1 : 0;
     memcpy(g_payload, &pl, sizeof(pl));
+    // Readers skip seq==0 and re-check the counter after copying, so moving
+    // it only after the body is stable (interlocked store = compiler barrier
+    // on top of the memcpy) closes the old "seq written inside the same
+    // memcpy as the fields" tear window.
+    _InterlockedExchange(reinterpret_cast<volatile long *>(&g_payload->seq),
+                         static_cast<long>(newSeq));
 }
 
-void WriteIni() noexcept {
+void WriteIniNow() noexcept {
     wchar_t base[MAX_PATH];
     if (!BasePath(base, MAX_PATH)) return;
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\%s", base, INI_FILE);
-    const DlssnrParams &p = g_app.params;
-    wchar_t buf[32];
-    auto writeInt = [&](const wchar_t *key, int v) {
-        swprintf_s(buf, L"%d", v);
-        WritePrivateProfileStringW(L"dlssnr", key, buf, path);
-    };
-    // std::lround rounds half away from zero; (int)(v*100+0.5) would eat negatives
-    auto writeX100 = [&](const wchar_t *key, float v) {
-        writeInt(key, static_cast<int>(std::lround(v * 100.0f)));
-    };
-    writeInt(L"preset", p.preset);
-    writeInt(L"style", p.style);
-    writeX100(L"intensity_x100", p.intensity);
-    writeX100(L"local_tone_x100", p.localToneStrength);
-    writeX100(L"local_structure_x100", p.localStructureStrength);
-    writeX100(L"skin_structure_x100", p.skinStructureStrength);
-    writeInt(L"use_auto_mask", p.useAutoMask ? 1 : 0);
-    writeInt(L"ui_correction", p.uiCorrection ? 1 : 0);
-    writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, 25, 100));
-    writeInt(L"scaling_enabled", p.scalingEnabled ? 1 : 0);
-    writeInt(L"residual_multiplier_x100", static_cast<int>(std::lround(p.residualMultiplier * 100.0f)));
-    writeInt(L"saved", 1);
+    WriteDlssnrIni(g_app.params, path); // shared key list (dlssnr_ini.h)
 }
 
 void LoadIni() noexcept {
@@ -194,24 +158,7 @@ void LoadIni() noexcept {
     swprintf_s(path, L"%s\\%s", base, INI_FILE);
     // panel-local setting: perf log toggle (independent of the saved profile)
     g_app.timingLog = GetPrivateProfileIntW(L"panel", L"log", 1, path) != 0;
-    const auto readInt = [&](const wchar_t *key, int def) -> int {
-        return static_cast<int>(GetPrivateProfileIntW(L"dlssnr", key, def, path));
-    };
-    wchar_t marker[16]{};
-    GetPrivateProfileStringW(L"dlssnr", L"saved", L"", marker, 16, path);
-    if (!marker[0]) return; // no saved profile
-    DlssnrParams &p = g_app.params;
-    p.preset = std::clamp(readInt(L"preset", p.preset), 0, 3);
-    p.style = std::clamp(readInt(L"style", p.style), 0, 2);
-    p.intensity = static_cast<float>(readInt(L"intensity_x100", static_cast<int>(p.intensity * 100))) / 100.0f;
-    p.localToneStrength = static_cast<float>(readInt(L"local_tone_x100", static_cast<int>(p.localToneStrength * 100))) / 100.0f;
-    p.localStructureStrength = static_cast<float>(readInt(L"local_structure_x100", static_cast<int>(p.localStructureStrength * 100))) / 100.0f;
-    p.skinStructureStrength = static_cast<float>(readInt(L"skin_structure_x100", static_cast<int>(p.skinStructureStrength * 100))) / 100.0f;
-    p.useAutoMask = readInt(L"use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
-    p.uiCorrection = readInt(L"ui_correction", p.uiCorrection ? 1 : 0) != 0;
-    p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), 25, 100);
-    p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled);
-    p.residualMultiplier = static_cast<float>(readInt(L"residual_multiplier_x100", static_cast<int>(p.residualMultiplier * 100))) / 100.0f;
+    LoadDlssnrIni(g_app.params, path);
 }
 
 // Flat-object JSON extraction for the stats blob (our own writer's format)
@@ -235,21 +182,42 @@ int JsonGetInt(const char *body, const char *key, int def) noexcept {
 void LoadStats() noexcept {
     const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
     if (!m) {
+        g_app.statsDirty = g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0;
         g_app.statsBig[0] = 0;
         g_app.statsRes[0] = 0;
         return;
     }
-    const char *body = static_cast<const char *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
-    if (body) {
-        const double gpuLast = JsonGetFloat(body, "gpu_last", -1);
-        const int iw = JsonGetInt(body, "internal_w", 0);
-        const int ih = JsonGetInt(body, "internal_h", 0);
-        const int w = JsonGetInt(body, "width", 0);
-        const int h = JsonGetInt(body, "height", 0);
-        if (gpuLast >= 0) {
+    // Seq-gated snapshot (protocol mirrors PublishStatsJson): a copy whose
+    // counter moved mid-read, or a write still in progress (seq 0), is
+    // discarded — the next 0.5s refresh repaints it.
+    const StatsPayload *view =
+        static_cast<const StatsPayload *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
+    StatsPayload st{};
+    bool valid = false;
+    if (view) {
+        memcpy(&st, view, sizeof(st));
+        valid = st.magic == STATS_MAGIC && st.seq != 0 &&
+                st.seq == static_cast<const volatile StatsPayload *>(view)->seq;
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(m);
+    if (!valid) return;
+    const AppState before = g_app; // display snapshot for the redraw gate below
+    const char *body = st.json;
+    {
+        const double gpuLast = JsonGetFloat(body, SK_GPU_LAST, -1);
+        const int iw = JsonGetInt(body, SK_INTERNAL_W, 0);
+        const int ih = JsonGetInt(body, SK_INTERNAL_H, 0);
+        const int w = JsonGetInt(body, SK_WIDTH, 0);
+        const int h = JsonGetInt(body, SK_HEIGHT, 0);
+        if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
+            // The hang payload has no gpu_last, so the gate below would keep
+            // showing frozen pre-hang stats forever; surface it instead.
+            snprintf(g_app.statsBig, sizeof(g_app.statsBig), "GPU 挂起/设备移除(滤镜已回退)");
+        } else if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
             // 分辨率展示:未开启缩放 -> 原生分辨率;开启 -> 处理分辨率 → 回源分辨率
-            const int scaling = JsonGetInt(body, "scaling", 0);
+            const int scaling = JsonGetInt(body, SK_SCALING, 0);
             if (scaling && iw > 0 && ih > 0) {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d → %dx%d", iw, ih, w, h);
@@ -257,15 +225,17 @@ void LoadStats() noexcept {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d(原生)", w, h);
             }
-            g_app.segPack = static_cast<float>(JsonGetFloat(body, "pack_ema", 0));
-            g_app.segEval = static_cast<float>(JsonGetFloat(body, "eval_cpu_ema", 0));
-            g_app.segGpu = static_cast<float>(JsonGetFloat(body, "gpu_ema", 0));
-            g_app.segUnpack = static_cast<float>(JsonGetFloat(body, "unpack_ema", 0));
+            g_app.segPack = static_cast<float>(JsonGetFloat(body, SK_PACK_EMA, 0));
+            g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_EMA, 0));
+            g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_EMA, 0));
+            g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_EMA, 0));
             g_app.hasSegments = g_app.segGpu > 0;
-            g_app.fps = JsonGetFloat(body, "fps", 0);
-            const char *gn = strstr(body, "\"gpu_name\":\"");
+            g_app.fps = JsonGetFloat(body, SK_FPS, 0);
+            char gnPat[32];
+            snprintf(gnPat, sizeof(gnPat), "\"%s\":\"", SK_GPU_NAME);
+            const char *gn = strstr(body, gnPat);
             if (gn) {
-                gn += 12;
+                gn += strlen(gnPat);
                 const char *end = strchr(gn, '"');
                 const size_t len = end ? std::min<size_t>(end - gn, 127) : 0;
                 if (len) {
@@ -274,9 +244,13 @@ void LoadStats() noexcept {
                 }
             }
         }
-        UnmapViewOfFile(const_cast<char *>(body));
     }
-    CloseHandle(m);
+    g_app.statsDirty = memcmp(before.statsBig, g_app.statsBig, sizeof(g_app.statsBig)) != 0 ||
+                       memcmp(before.statsRes, g_app.statsRes, sizeof(g_app.statsRes)) != 0 ||
+                       memcmp(before.gpuName, g_app.gpuName, sizeof(g_app.gpuName)) != 0 ||
+                       before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
+                       before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
+                       before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack;
 }
 
 // ---------------------------------------------------------------------------
@@ -333,9 +307,7 @@ void DrawUi() noexcept {
         dl->AddLine(ImVec2(cx - 5 * s, cy - 5 * s), ImVec2(cx + 5 * s, cy + 5 * s), col, 2.0f * s);
         dl->AddLine(ImVec2(cx - 5 * s, cy + 5 * s), ImVec2(cx + 5 * s, cy - 5 * s), col, 2.0f * s);
         if (hov) {
-            char u8tip[128];
-            WideCharToMultiByte(CP_UTF8, 0, L"隐藏到托盘(退出在托盘右键菜单)", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
-            ShowTip(u8tip);
+            ShowTip("隐藏到托盘(退出在托盘右键菜单)");
         }
     }
 
@@ -345,7 +317,6 @@ void DrawUi() noexcept {
     // --- 性能分析器(照抄 Magpie Overlay Profiler 样式,数据来自插件共享内存) ---
     // 遥测带背景高度流式自适应:用上一帧的带底位置画背景(滞后一帧无感),
     // Collapse 收起/展开时窗口高度随之自动收缩。
-    char u8[64], u8tip[256];
     static float s_bandBottom = th + 120 * s;
     dl->AddRectFilled(ImVec2(wpos.x, wpos.y + th), ImVec2(wpos.x + wsize.x, wpos.y + s_bandBottom),
                       IM_COL32(24, 28, 40, 255));
@@ -480,11 +451,9 @@ void DrawUi() noexcept {
     y += 14 * s;
 
     for (const auto &e : kEnums) {
-        WideCharToMultiByte(CP_UTF8, 0, e.label, -1, u8, sizeof(u8), nullptr, nullptr);
-        WideCharToMultiByte(CP_UTF8, 0, e.tip, -1, u8tip, sizeof(u8tip), nullptr, nullptr);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 7 * s));
-        ImGui::Text("%s", u8);
-        if (ImGui::IsItemHovered()) ShowTip(u8tip);
+        ImGui::Text("%s", e.label);
+        if (ImGui::IsItemHovered()) ShowTip(e.tip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
         int v = (e.key == std::string("preset")) ? g_app.params.preset : g_app.params.style;
@@ -515,11 +484,9 @@ void DrawUi() noexcept {
     }
 
     for (const auto &sl : kSliders) {
-        WideCharToMultiByte(CP_UTF8, 0, sl.label, -1, u8, sizeof(u8), nullptr, nullptr);
-        WideCharToMultiByte(CP_UTF8, 0, sl.tip, -1, u8tip, sizeof(u8tip), nullptr, nullptr);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 8 * s));
-        ImGui::Text("%s", u8);
-        if (ImGui::IsItemHovered()) ShowTip(u8tip);
+        ImGui::Text("%s", sl.label);
+        if (ImGui::IsItemHovered()) ShowTip(sl.tip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
         float v = sl.key == std::string("intensity")            ? g_app.params.intensity
@@ -542,11 +509,10 @@ void DrawUi() noexcept {
 
     // 内部分辨率(25-100%,int;改动触发热重建)+ 缩放启用开关
     {
-        WideCharToMultiByte(CP_UTF8, 0, L"分辨率缩放", -1, u8, sizeof(u8), nullptr, nullptr);
-        WideCharToMultiByte(CP_UTF8, 0, L"启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Lanczos3 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 8 * s));
-        ImGui::Text("%s", u8);
-        if (ImGui::IsItemHovered()) ShowTip(u8tip);
+        ImGui::Text("%s", "分辨率缩放");
+        if (ImGui::IsItemHovered())
+            ShowTip("启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Lanczos3 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
         bool scalingOn = g_app.params.scalingEnabled != 0;
@@ -558,7 +524,7 @@ void DrawUi() noexcept {
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX - 40 * s);
         int ir = g_app.params.inputResolutionPercent;
         if (ImGui::SliderInt("##input_resolution", &ir, 25, 100, "%d%%")) {
-            g_app.params.inputResolutionPercent = std::clamp(ir, 25, 100);
+            g_app.params.inputResolutionPercent = std::clamp(ir, kResPctMin, kResPctMax);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             // Debounce: rebuilding per drag tick would recreate the feature +
@@ -572,28 +538,22 @@ void DrawUi() noexcept {
     y += 14 * s;
 
     for (const auto &f : kFlags) {
-        WideCharToMultiByte(CP_UTF8, 0, f.label, -1, u8, sizeof(u8), nullptr, nullptr);
-        WideCharToMultiByte(CP_UTF8, 0, f.tip, -1, u8tip, sizeof(u8tip), nullptr, nullptr);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
         bool v = f.key == std::string("use_auto_mask") ? g_app.params.useAutoMask : g_app.params.uiCorrection;
-        if (ImGui::Checkbox(u8, &v)) {
+        if (ImGui::Checkbox(f.label, &v)) {
             if (f.key == std::string("use_auto_mask")) g_app.params.useAutoMask = v;
             else g_app.params.uiCorrection = v;
             g_app.liveDirty = true;
         }
-        if (ImGui::IsItemHovered()) ShowTip(u8tip);
+        if (ImGui::IsItemHovered()) ShowTip(f.tip);
         y += 26 * s;
     }
 
     // 性能日志开关(经共享内存参数通道通知插件;状态持久化在 ini [panel] 节)
     {
-        char logLabel[96];
-        WideCharToMultiByte(CP_UTF8, 0, L"写入性能日志 (dlssnr_timing.log)", -1, logLabel, sizeof(logLabel), nullptr, nullptr);
-        char logTip[192];
-        WideCharToMultiByte(CP_UTF8, 0, L"开关 dlssnr_timing.log 的周期统计写入。\n改动立即生效(经共享内存通道通知插件)。", -1, logTip, sizeof(logTip), nullptr, nullptr);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
         bool logOn = g_app.timingLog;
-        if (ImGui::Checkbox(logLabel, &logOn)) {
+        if (ImGui::Checkbox("写入性能日志 (dlssnr_timing.log)", &logOn)) {
             g_app.timingLog = logOn;
             wchar_t iniPath[MAX_PATH];
             if (BasePath(iniPath, MAX_PATH)) {
@@ -604,21 +564,19 @@ void DrawUi() noexcept {
             WritePayload(); // logEnabled included
             g_app.liveDirty = false;
         }
-        if (ImGui::IsItemHovered()) ShowTip(logTip);
+        if (ImGui::IsItemHovered()) ShowTip("开关 dlssnr_timing.log 的周期统计写入。\n改动立即生效(经共享内存通道通知插件)。");
         y += 28 * s;
     }
 
     y += 8 * s;
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     if (ImGui::Button("保存设置", ImVec2(120 * s, 30 * s))) {
-        WriteIni();
+        WriteIniNow();
         WritePayload(1, 0); // persist-through-bridge flag included
         snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
     }
     if (ImGui::IsItemHovered()) {
-        char u8tip[192];
-        WideCharToMultiByte(CP_UTF8, 0, L"将当前设置保存为默认值(dlssnr_ui.ini),下次加载滤镜时自动生效。", -1, u8tip, sizeof(u8tip), nullptr, nullptr);
-        ShowTip(u8tip);
+        ShowTip("将当前设置保存为默认值(dlssnr_ui.ini),下次加载滤镜时自动生效。");
     }
     ImGui::SameLine(0, 14 * s);
     if (ImGui::Button("重置默认", ImVec2(120 * s, 30 * s))) {
@@ -652,6 +610,7 @@ void DrawUi() noexcept {
 namespace {
 
 void RebuildFontDpi(int dpi) noexcept {
+    if (!ImGui::GetCurrentContext()) return; // WM_DPICHANGED can precede CreateContext
     ImGuiIO &io = ImGui::GetIO();
     io.Fonts->Clear();
     g_fontUI = g_fontMono = nullptr;
@@ -689,8 +648,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noex
     case WM_SIZE:
         if (g_device && wParam != SIZE_MINIMIZED) {
             DropRenderTarget();
-            g_swap->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
-            CreateRenderTarget();
+            // On failure (e.g. device removal) there is no back buffer to
+            // bind; skip re-creating the RTV instead of leaving a null one
+            // for the render loop to dereference.
+            if (SUCCEEDED(g_swap->ResizeBuffers(0, LOWORD(lParam), HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0))) {
+                CreateRenderTarget();
+            }
         }
         return 0;
     case WM_DPICHANGED: {
@@ -894,10 +857,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     QueryPerformanceFrequency(&freq);
     MSG msg;
     while (!g_quit) {
+        bool activity = false;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) { g_quit = true; break; }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            activity = true;
         }
         if (g_quit) break;
 
@@ -927,17 +892,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             LoadStats();
         }
 
-        ImGui_ImplDX11_NewFrame();
-        ImGui_ImplWin32_NewFrame();
-        ImGui::NewFrame();
-        DrawUi();
-        ImGui::Render();
+        // Repaint only on input, pending edits, or changed stats: an idle
+        // visible panel used to burn a full ImGui frame + vsynced Present 60
+        // times a second for content that moves at most twice a second.
+        if (activity || g_app.liveDirty || g_app.statsDirty) {
+            g_app.statsDirty = false;
+            if (g_rtv) { // WM_SIZE failure (device removal) leaves no RTV to bind
+                ImGui_ImplDX11_NewFrame();
+                ImGui_ImplWin32_NewFrame();
+                ImGui::NewFrame();
+                DrawUi();
+                ImGui::Render();
 
-        const float clear[4] = { 0.09f, 0.10f, 0.13f, 1.0f };
-        g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
-        g_context->ClearRenderTargetView(g_rtv, clear);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-        g_swap->Present(1, 0);
+                const float clear[4] = { 0.09f, 0.10f, 0.13f, 1.0f };
+                g_context->OMSetRenderTargets(1, &g_rtv, nullptr);
+                g_context->ClearRenderTargetView(g_rtv, clear);
+                ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+                g_swap->Present(1, 0);
+            }
+        } else {
+            // sleep until input arrives or the next 0.5s stats tick comes due
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 500, QS_ALLINPUT);
+        }
     }
 
     if (watch) CloseHandle(watch);

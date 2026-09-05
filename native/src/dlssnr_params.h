@@ -2,6 +2,16 @@
 // User-facing parameters, mapped 1:1 onto Magpie's DLSSNR_AI_Filter.hlsl surface
 // (see F:\Project\Magpie\src\Effects\DLSSNR\DLSSNR_AI_Filter.hlsl).
 
+// Documented parameter ranges — the single authority. Every std::clamp on
+// these params (vpy args, dlssnr_ui.ini values, panel payload, internal
+// size) must reference these constants; a bare literal is a drift bug.
+inline constexpr int kPresetMin = 0, kPresetMax = 3;
+inline constexpr int kStyleMin = 0, kStyleMax = 2;
+inline constexpr float kStrengthMin = 0.0f, kStrengthMax = 2.0f; // intensity / local tone / local structure
+inline constexpr float kSkinMin = -1.0f, kSkinMax = 2.0f;        // skin structure (-1 = auto)
+inline constexpr int kResPctMin = 25, kResPctMax = 100;          // internal resolution percent
+inline constexpr float kResidualMultMin = 1.0f, kResidualMultMax = 2.0f;
+
 struct DlssnrParams {
     // NGX "DLSSNR.Hint.Render.Preset" 0-3
     int preset = 0;

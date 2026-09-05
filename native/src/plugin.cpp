@@ -179,16 +179,16 @@ static void VS_CC DlssnrCreate(
     d->height = vi->height;
 
     DlssnrParams initial{};
-    initial.preset = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "preset", 0), 0LL, 3LL));
-    initial.style = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "style", 0), 0LL, 2LL));
-    initial.intensity = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "intensity", 1.0), 0.0, 2.0));
-    initial.localToneStrength = vsh::doubleToFloatS(GetFloatDef(in, vsapi, "local_tone", 1.0));
-    initial.localStructureStrength = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "local_structure", 1.0), 0.0, 2.0));
-    initial.skinStructureStrength = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "skin_structure", -1.0), -1.0, 2.0));
+    initial.preset = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "preset", 0), kPresetMin, kPresetMax));
+    initial.style = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "style", 0), kStyleMin, kStyleMax));
+    initial.intensity = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "intensity", 1.0), kStrengthMin, kStrengthMax));
+    initial.localToneStrength = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "local_tone", 1.0), kStrengthMin, kStrengthMax));
+    initial.localStructureStrength = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "local_structure", 1.0), kStrengthMin, kStrengthMax));
+    initial.skinStructureStrength = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "skin_structure", -1.0), kSkinMin, kSkinMax));
     initial.useAutoMask = GetIntDef(in, vsapi, "use_auto_mask", 1) != 0;
     initial.uiCorrection = GetIntDef(in, vsapi, "ui_correction", 1) != 0;
-    initial.residualMultiplier = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), 1.0, 2.0));
-    initial.inputResolutionPercent = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "input_resolution", 100), 25LL, 100LL));
+    initial.residualMultiplier = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), kResidualMultMin, kResidualMultMax));
+    initial.inputResolutionPercent = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "input_resolution", 100), kResPctMin, kResPctMax));
     // scaling_enabled=0 drops the residual pipeline entirely (input_resolution ignored)
     initial.scalingEnabled = GetIntDef(in, vsapi, "scaling_enabled", 1) != 0;
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present.
@@ -199,7 +199,9 @@ static void VS_CC DlssnrCreate(
     const char *dllArg = vsapi->mapGetData(in, "ngx_dll", 0, &dllErr);
     if (!dllErr && dllArg && dllArg[0]) {
         try {
-            d->ngxDllPath = std::filesystem::path(dllArg).wstring();
+            // VS map strings are UTF-8; the path(const char*) ctor would
+            // decode them as ANSI and mojibake non-ASCII paths.
+            d->ngxDllPath = std::filesystem::path(reinterpret_cast<const char8_t *>(dllArg)).wstring();
         } catch (...) {
             d->ngxDllPath.clear();
         }
@@ -210,8 +212,9 @@ static void VS_CC DlssnrCreate(
         const char *selfPath = self ? vsapi->getPluginPath(self) : nullptr;
         if (selfPath) {
             try {
+                // getPluginPath is UTF-8 as well (see above)
                 const std::filesystem::path dir =
-                    std::filesystem::path(selfPath).parent_path() / "ngx";
+                    std::filesystem::path(reinterpret_cast<const char8_t *>(selfPath)).parent_path() / "ngx";
                 d->ngxDllPath = (dir / SNIPPET_DLL_NAME).wstring();
             } catch (...) {
                 d->ngxDllPath.clear();

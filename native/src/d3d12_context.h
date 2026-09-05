@@ -31,6 +31,9 @@ public:
     // command list 上调用,随后 Close + Execute,见 DLSSNRFilter.cpp:1727-1758)
     bool BeginRecording() noexcept;
     bool ExecuteAndWait() noexcept;
+    // True once a fence wait timed out (GPU hang / device removal): callers
+    // should stop evaluating instead of stalling the full wait every frame.
+    bool IsDeviceLost() const noexcept { return _deviceLost; }
 
     bool CreateFrameResources(int width, int height, char *err, size_t errLen) noexcept;
 
@@ -65,19 +68,26 @@ public:
     ID3D12Resource *Depth() const noexcept { return _depth.Get(); }
 
     // 单次提交管线(三段同步已合并):CPU pack → [一次提交: 上传拷贝 → evaluate → 回读拷贝] → CPU unpack。
-    // 每个记录函数自包含 barrier COMMON→…→COMMON,便于 skip-eval 诊断路径复用。
-    // RGBS float32 三平面 → RGBA8 行写入 upload buffer(纯 CPU,不提交)
+    // 上传/回读拷贝的 barrier 直达下一消费者状态(帧末仍统一归位 COMMON);
+    // skip-eval 诊断路径传 COMMON。RGBS float32 三平面 → RGBA8 行写入 upload buffer(纯 CPU,不提交)
     bool PackInput(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                    int width, int height, char *err, size_t errLen) noexcept;
-    // 在已 BeginRecording 的命令列表上记录:input COMMON→COPY_DEST→拷贝→COMMON
-    bool RecordUploadCopy(char *err, size_t errLen) noexcept;
-    // 在已 BeginRecording 的命令列表上记录:output COMMON→COPY_SOURCE→拷贝→COMMON
-    bool RecordReadbackCopy(char *err, size_t errLen) noexcept;
+    // 在已 BeginRecording 的命令列表上记录:input COMMON→COPY_DEST→拷贝→stateAfter
+    bool RecordUploadCopy(D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept;
+    // 在已 BeginRecording 的命令列表上记录:output stateBefore→COPY_SOURCE→拷贝→COMMON
+    bool RecordReadbackCopy(D3D12_RESOURCE_STATES stateBefore, char *err, size_t errLen) noexcept;
     // GPU 完成后调用:readback buffer → RGBS 三平面(纯 CPU)
     bool UnpackOutput(uint8_t **dstPlanes, int64_t *dstStrides,
                       int width, int height, char *err, size_t errLen) noexcept;
 
 private:
+    // Shared prologue of the three residual passes; only the PSO, descriptor
+    // slots and dispatch dims differ. cbuffer layout (root constants):
+    // SourceExtent@0, TargetExtent@2, Padding0@4, MotionScale@5,
+    // ResidualMultiplier@7 — mirrors the three HLSL cbuffer blocks.
+    void RecordPass(ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
+                    UINT dispatchX, UINT dispatchY, float residualMultiplier) noexcept;
+
     bool CreateColorTexture(ID3D12Resource **out, int width, int height,
                             DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
                             D3D12_RESOURCE_FLAGS flags,
@@ -95,11 +105,13 @@ private:
     ComPtr<ID3D12Fence> _fence;
     HANDLE _fenceEvent = nullptr;
     uint64_t _fenceValue = 0;
+    bool _deviceLost = false;
 
     ComPtr<ID3D12Resource> _inputColor;
     ComPtr<ID3D12Resource> _outputColor;
     ComPtr<ID3D12Resource> _readback;
     ComPtr<ID3D12Resource> _upload;
+    void *_uploadMapped = nullptr; // persist-mapped upload heap (map once, unmap with the resource)
     ComPtr<ID3D12Resource> _motion;
     ComPtr<ID3D12Resource> _depth;
     ComPtr<ID3D12DescriptorHeap> _rtvHeap;

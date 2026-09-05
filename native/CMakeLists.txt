@@ -37,7 +37,8 @@ target_link_libraries(vs_dlssnr PRIVATE
 )
 
 # --- Independent control panel: ImGui + D3D11, talks to vs_dlssnr.dll via
-#     dlssnr_live.json (live) and dlssnr_ui.ini (saved defaults) ---
+#     two named shared-memory mappings (panel_ipc.h: params + stats) and
+#     dlssnr_ui.ini (saved defaults) ---
 set(IMGUI_DIR "${DEP_DIR}/imgui")
 add_executable(dlssnr_panel WIN32
     src/panel_app.cpp

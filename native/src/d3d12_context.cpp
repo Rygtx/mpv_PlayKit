@@ -203,7 +203,15 @@ void D3D12Context::Finalize() noexcept {
 
 bool D3D12Context::BeginRecording() noexcept {
     HRESULT hr = _allocator->Reset();
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        // A previous frame's mid-recording error return leaves the command
+        // list open, which makes allocator/list Reset fail with E_FAIL from
+        // then on; force-close once and retry so a single SEH doesn't brick
+        // the filter for the rest of the session.
+        _commandList->Close();
+        hr = _allocator->Reset();
+        if (FAILED(hr)) return false;
+    }
     hr = _commandList->Reset(_allocator.Get(), nullptr);
     return SUCCEEDED(hr);
 }
@@ -224,11 +232,13 @@ bool D3D12Context::ExecuteAndWait() noexcept {
                      "GPU hang/removed: reason=0x%08lX fence=%llu",
                      static_cast<unsigned long>(rr), static_cast<unsigned long long>(_fenceValue));
             // surface through the stats mapping so the panel shows it
+            // (gpu_hang numeric — the panel parses it via JsonGetInt/SK_GPU_HANG)
             char json[224];
             snprintf(json, sizeof(json),
-                     "{\"gpu_hang\":true,\"removed_reason\":\"0x%08lX\"}",
+                     "{\"gpu_hang\":1,\"removed_reason\":\"0x%08lX\"}",
                      static_cast<unsigned long>(rr));
             PublishStatsJson(json);
+            _deviceLost = true;
             OutputDebugStringA("vs_dlssnr: ");
             OutputDebugStringA(buf);
             OutputDebugStringA("\n");
@@ -391,13 +401,17 @@ bool D3D12Context::PackInput(
         SetErr(err, errLen, E_INVALIDARG, "PackInput: size mismatch");
         return false;
     }
-    void *mapped = nullptr;
-    HRESULT hr = _upload->Map(0, nullptr, &mapped);
-    if (FAILED(hr)) {
-        SetErr(err, errLen, hr, "Map(upload) failed");
-        return false;
+    // Persist-mapped upload heap: map once, never unmap (releasing the
+    // resource at Finalize implicitly unmaps); a per-frame Map/Unmap pair is
+    // pure driver-call overhead.
+    if (!_uploadMapped) {
+        HRESULT hr = _upload->Map(0, nullptr, &_uploadMapped);
+        if (FAILED(hr)) {
+            SetErr(err, errLen, hr, "Map(upload) failed");
+            return false;
+        }
     }
-    auto *dstRow = static_cast<uint8_t *>(mapped);
+    auto *dstRow = static_cast<uint8_t *>(_uploadMapped);
     for (int y = 0; y < height; ++y, dstRow += _uploadPitch) {
         const float *rowR = reinterpret_cast<const float *>(srcPlanes[0] + srcStrides[0] * y);
         const float *rowG = reinterpret_cast<const float *>(srcPlanes[1] + srcStrides[1] * y);
@@ -410,11 +424,10 @@ bool D3D12Context::PackInput(
             dstPx[x] = 0xFF000000u | (b << 16) | (g << 8) | r;
         }
     }
-    _upload->Unmap(0, nullptr);
     return true;
 }
 
-bool D3D12Context::RecordUploadCopy(char *err, size_t errLen) noexcept {
+bool D3D12Context::RecordUploadCopy(D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept {
     D3D12_RESOURCE_BARRIER toCopyDest[1]{
         Transition(_inputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
     };
@@ -433,16 +446,16 @@ bool D3D12Context::RecordUploadCopy(char *err, size_t errLen) noexcept {
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dst.SubresourceIndex = 0;
     _commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    D3D12_RESOURCE_BARRIER toCommon1[1]{
-        Transition(_inputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+    D3D12_RESOURCE_BARRIER toAfter[1]{
+        Transition(_inputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, stateAfter),
     };
-    _commandList->ResourceBarrier(1, toCommon1);
+    _commandList->ResourceBarrier(1, toAfter);
     return true;
 }
 
-bool D3D12Context::RecordReadbackCopy(char *err, size_t errLen) noexcept {
+bool D3D12Context::RecordReadbackCopy(D3D12_RESOURCE_STATES stateBefore, char *err, size_t errLen) noexcept {
     D3D12_RESOURCE_BARRIER toCopySrc[1]{
-        Transition(_outputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(_outputColor.Get(), stateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE),
     };
     _commandList->ResourceBarrier(1, toCopySrc);
     D3D12_TEXTURE_COPY_LOCATION src{};
@@ -834,9 +847,12 @@ void D3D12Context::ClearScalingResources() noexcept {
     _scalingReady = false;
 }
 
-void D3D12Context::RecordDownsample(float residualMultiplier) noexcept {
+void D3D12Context::RecordPass(ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
+                              UINT dispatchX, UINT dispatchY, float residualMultiplier) noexcept {
+    // NGX's evaluate may rebind its own descriptor heap / root signature on
+    // this command list; rebind ours before touching our descriptors.
     _commandList->SetComputeRootSignature(_rsCompute.Get());
-    _commandList->SetPipelineState(_psoDownsample.Get());
+    _commandList->SetPipelineState(pso);
     ID3D12DescriptorHeap *heaps[]{ _srvUavHeap.Get() };
     _commandList->SetDescriptorHeaps(1, heaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = _srvUavHeap->GetGPUDescriptorHandleForHeapStart();
@@ -853,60 +869,28 @@ void D3D12Context::RecordDownsample(float residualMultiplier) noexcept {
     _commandList->SetComputeRoot32BitConstants(0, 2, motion, 5);
     _commandList->SetComputeRoot32BitConstants(0, 1, &residualMultiplier, 7);
 
-    _commandList->SetComputeRootDescriptorTable(1, gpu(0)); // t0 input (t1 unused)
-    _commandList->SetComputeRootDescriptorTable(2, gpu(0)); // t1 dummy
-    _commandList->SetComputeRootDescriptorTable(3, gpu(4)); // u0 reducedColor
-    _commandList->Dispatch((dstWH[0] + 7) / 8, (dstWH[1] + 7) / 8, 1);
+    _commandList->SetComputeRootDescriptorTable(1, gpu(srv0));
+    _commandList->SetComputeRootDescriptorTable(2, gpu(srv1));
+    _commandList->SetComputeRootDescriptorTable(3, gpu(uav));
+    _commandList->Dispatch(dispatchX, dispatchY, 1);
+}
+
+void D3D12Context::RecordDownsample(float residualMultiplier) noexcept {
+    RecordPass(_psoDownsample.Get(), 0, 0, 4, // t0 input, t1 dummy, u0 reducedColor
+               (static_cast<UINT>(_internalWidth) + 7) / 8,
+               (static_cast<UINT>(_internalHeight) + 7) / 8, residualMultiplier);
 }
 
 void D3D12Context::RecordResidualHorizontal(float residualMultiplier) noexcept {
-    // NGX's evaluate may rebind its own descriptor heap / root signature on
-    // this command list; rebind ours before touching our descriptors.
-    _commandList->SetComputeRootSignature(_rsCompute.Get());
-    _commandList->SetPipelineState(_psoHorizontal.Get());
-    ID3D12DescriptorHeap *heaps[]{ _srvUavHeap.Get() };
-    _commandList->SetDescriptorHeaps(1, heaps);
-    const UINT srcWH[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
-    const UINT dstWH[2]{ static_cast<UINT>(_internalWidth), static_cast<UINT>(_internalHeight) };
-    _commandList->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
-    _commandList->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
-    const float zero = 0.0f;
-    _commandList->SetComputeRoot32BitConstants(0, 1, &zero, 4);
-    const float motion[2]{ 1.0f, 1.0f };
-    _commandList->SetComputeRoot32BitConstants(0, 2, motion, 5);
-    _commandList->SetComputeRoot32BitConstants(0, 1, &residualMultiplier, 7);
-
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = _srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
-    _commandList->SetComputeRootDescriptorTable(1, gpu(1)); // t0 reducedColor
-    _commandList->SetComputeRootDescriptorTable(2, gpu(2)); // t1 reducedDenoised
-    _commandList->SetComputeRootDescriptorTable(3, gpu(6)); // u0 horizontalRes
-    _commandList->Dispatch((srcWH[0] + 7) / 8, (dstWH[1] + 7) / 8, 1);
+    RecordPass(_psoHorizontal.Get(), 1, 2, 6, // t0 reducedColor, t1 reducedDenoised, u0 horizontalRes
+               (static_cast<UINT>(_width) + 7) / 8,
+               (static_cast<UINT>(_internalHeight) + 7) / 8, residualMultiplier);
 }
 
 void D3D12Context::RecordResidualVertical(float residualMultiplier) noexcept {
-    _commandList->SetComputeRootSignature(_rsCompute.Get());
-    _commandList->SetPipelineState(_psoVertical.Get());
-    ID3D12DescriptorHeap *heaps[]{ _srvUavHeap.Get() };
-    _commandList->SetDescriptorHeaps(1, heaps);
-    const UINT srcWH[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
-    const UINT dstWH[2]{ static_cast<UINT>(_internalWidth), static_cast<UINT>(_internalHeight) };
-    _commandList->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
-    _commandList->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
-    const float zero = 0.0f;
-    _commandList->SetComputeRoot32BitConstants(0, 1, &zero, 4);
-    const float motion[2]{ 1.0f, 1.0f };
-    _commandList->SetComputeRoot32BitConstants(0, 2, motion, 5);
-    _commandList->SetComputeRoot32BitConstants(0, 1, &residualMultiplier, 7);
-
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = _srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
-    _commandList->SetComputeRootDescriptorTable(1, gpu(0)); // t0 original(input)
-    _commandList->SetComputeRootDescriptorTable(2, gpu(3)); // t1 horizontalRes
-    _commandList->SetComputeRootDescriptorTable(3, gpu(7)); // u0 outputColor
-    _commandList->Dispatch((srcWH[0] + 7) / 8, (srcWH[1] + 7) / 8, 1);
+    RecordPass(_psoVertical.Get(), 0, 3, 7, // t0 original(input), t1 horizontalRes, u0 outputColor
+               (static_cast<UINT>(_width) + 7) / 8,
+               (static_cast<UINT>(_height) + 7) / 8, residualMultiplier);
 }
 
 } // namespace vsdlssnr

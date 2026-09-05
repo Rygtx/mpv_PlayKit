@@ -1,0 +1,73 @@
+#pragma once
+// Single implementation of the dlssnr_ui.ini persistence, shared by the
+// plugin (bridge) and the panel — one key list, one authority. Two
+// hand-maintained copies had already drifted (the plugin's SaveIni omitted
+// scaling_enabled). Callers resolve the ini path themselves (panel and
+// plugin derive it from different modules).
+
+#include "dlssnr_params.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <windows.h>
+
+namespace vsdlssnr {
+
+// Persist the parameter profile (the [panel] log toggle is panel-local and
+// stays with the panel).
+inline void WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexcept {
+    wchar_t buf[32];
+    auto writeInt = [&](const wchar_t *key, int v) {
+        swprintf_s(buf, L"%d", v);
+        WritePrivateProfileStringW(L"dlssnr", key, buf, iniPath);
+    };
+    // std::lround rounds half away from zero; (int)(v*100+0.5) would eat negatives
+    auto writeX100 = [&](const wchar_t *key, float v) {
+        writeInt(key, static_cast<int>(std::lround(v * 100.0f)));
+    };
+    writeInt(L"preset", p.preset);
+    writeInt(L"style", p.style);
+    writeX100(L"intensity_x100", p.intensity);
+    writeX100(L"local_tone_x100", p.localToneStrength);
+    writeX100(L"local_structure_x100", p.localStructureStrength);
+    writeX100(L"skin_structure_x100", p.skinStructureStrength);
+    writeInt(L"use_auto_mask", p.useAutoMask ? 1 : 0);
+    writeInt(L"ui_correction", p.uiCorrection ? 1 : 0);
+    writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax));
+    writeInt(L"scaling_enabled", p.scalingEnabled ? 1 : 0);
+    writeX100(L"residual_multiplier_x100", p.residualMultiplier);
+    writeInt(L"saved", 1);
+}
+
+// Load the saved profile into p (fields absent from the file keep their
+// current value). Returns false when no profile has been saved yet.
+inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
+    wchar_t buf[64]{};
+    if (!GetPrivateProfileStringW(L"dlssnr", L"saved", L"", buf, 64, iniPath) || !buf[0]) {
+        return false; // no saved profile
+    }
+    const auto readInt = [&](const wchar_t *key, int def) -> int {
+        return static_cast<int>(GetPrivateProfileIntW(L"dlssnr", key, def, iniPath));
+    };
+    // *_x100 values are hand-editable on disk: clamp to the documented ranges
+    // (the panel and vpy paths clamp; without this an edited ini would push
+    // out-of-range floats into the NGX evaluate keys every frame).
+    const auto readX100 = [&](const wchar_t *key, float def, float lo, float hi) -> float {
+        return std::clamp(
+            static_cast<float>(readInt(key, static_cast<int>(def * 100))) / 100.0f, lo, hi);
+    };
+    p.preset = std::clamp(readInt(L"preset", p.preset), kPresetMin, kPresetMax);
+    p.style = std::clamp(readInt(L"style", p.style), kStyleMin, kStyleMax);
+    p.intensity = readX100(L"intensity_x100", p.intensity, kStrengthMin, kStrengthMax);
+    p.localToneStrength = readX100(L"local_tone_x100", p.localToneStrength, kStrengthMin, kStrengthMax);
+    p.localStructureStrength = readX100(L"local_structure_x100", p.localStructureStrength, kStrengthMin, kStrengthMax);
+    p.skinStructureStrength = readX100(L"skin_structure_x100", p.skinStructureStrength, kSkinMin, kSkinMax);
+    p.useAutoMask = readInt(L"use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
+    p.uiCorrection = readInt(L"ui_correction", p.uiCorrection ? 1 : 0) != 0;
+    p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), kResPctMin, kResPctMax);
+    p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled);
+    p.residualMultiplier = readX100(L"residual_multiplier_x100", p.residualMultiplier, kResidualMultMin, kResidualMultMax);
+    return true;
+}
+
+} // namespace vsdlssnr

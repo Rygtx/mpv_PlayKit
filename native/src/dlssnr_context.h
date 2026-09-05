@@ -27,7 +27,6 @@ public:
                     int width, int height, SharedParams *shared,
                     char *err, size_t errLen) noexcept;
     void Shutdown() noexcept;
-    bool IsReady() const noexcept { return _ready; }
 
     // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
     // on panel change the frame thread rebuilds the feature (and scaling
@@ -84,6 +83,9 @@ private:
     wchar_t _appDataPath[MAX_PATH]{};
     int _width = 0;
     int _height = 0;
+    // Adapter description in UTF-8, filled once in Initialize and reused by
+    // the periodic stats publish (GetDesc per stats tick is wasted work).
+    char _gpuNameUtf8[160] = "UNAVAILABLE";
     bool _coreInitialized = false;
     bool _snippetInitialized = false;
     bool _ready = false;
