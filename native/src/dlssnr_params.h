@@ -19,8 +19,13 @@ struct DlssnrParams {
     int useAutoMask = 1;
     // NGX "DLSSNR.UICorrection" 0/1
     int uiCorrection = 1;
-    // Magpie-side residual composite weight, clamped [1,2]; v1 keeps the value
-    // for future internal-resolution-scaling support (no effect at 100%).
+    // Internal processing resolution in percent of source (25-100, create-time;
+    // changing it rebuilds the feature + scaling resources). Ignored when
+    // scalingEnabled == 0.
+    int inputResolutionPercent = 100;
+    // Master switch for internal-resolution scaling (0 = always process at 100%)
+    int scalingEnabled = 1;
+    // Magpie-side residual composite weight (1-2, per-frame via compute cbuffer)
     float residualMultiplier = 1.0f;
     // Absolute path to nvngx_dlssnr.dll; empty = derive from plugin location
     const char *ngxDllPath = nullptr;

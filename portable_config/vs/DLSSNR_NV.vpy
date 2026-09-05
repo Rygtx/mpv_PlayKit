@@ -1,9 +1,10 @@
 ### NVIDIA DLSSNR 同分辨率 AI 画质增强 <RTX N卡专用>
 ### 依赖_ vs-plugins\vs_dlssnr.dll (VapourSynth 插件, 自动加载)
 ###       vs-plugins\ngx\nvngx_dlssnr.dll (模型文件, 310.9.0)
+###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
 ### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18), 零 guidance 单帧模式
 ###       处理为同分辨率 (非超分), SDR 色彩空间 (非 HDR)
-### 参数_ preset 0-3 / style 0-2 / intensity 0-2 / 详细见 DLSSNR_AI_Filter 说明
+### 调参_ 播放时托盘点击 DLSSNR 图标打开控制面板, 实时调节; 保存后下次自动生效
 
 import vapoursynth as vs
 from vapoursynth import core
@@ -20,16 +21,22 @@ Local_Structure = 1.0
 Skin_Structure = -1
 Use_Auto_Mask = True
 UI_Correction = True
-H_Max = 1440
+Input_Resolution = 100
+Residual_Multiplier = 1.0
+H_Max = 0
 ## <0-3> 整数, NR 预设档位
-## <0-2> 整数, 风格档位
+## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
 ## <0-2> 浮点, 强度 (默认 1.0)
 ## <0-2> 浮点, 局部色调强度 (默认 1.0)
 ## <0-2> 浮点, 局部结构强度 (默认 1.0)
 ## <-1-2> 浮点, 皮肤结构强度 (-1 = 自动, 默认)
 ## <True|False> 使用自动蒙版
 ## <True|False> UI 文字修正
-## 整数, 输出高度限制 (填你的显示器高度), 源高度超过该值时跳过处理 (0 = 不限制)
+## <25-100> 整数, NGX 内部推理分辨率占源尺寸的百分比 (默认 100);
+##          调低可大幅提速, 由 Lanczos3 残差重建恢复到源分辨率
+## <1-2> 浮点, 残差乘数 (默认 1.0), 配合内部分辨率缩放使用
+## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
+## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
 
 ############
 
@@ -51,6 +58,8 @@ else :
 		skin_structure = Skin_Structure,
 		use_auto_mask = int(Use_Auto_Mask),
 		ui_correction = int(UI_Correction),
+		input_resolution = Input_Resolution,
+		residual_multiplier = Residual_Multiplier,
 	)
 	ret = core.resize.Bilinear(clip=rgb, format=clip.format.id, matrix_s="709")
 

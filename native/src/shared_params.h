@@ -27,27 +27,59 @@ public:
         _cur = next;
     }
 
-    // UI thread: request a preset change (feature rebuild on frame thread).
+    // UI thread: request a preset / internal-resolution / scaling-toggle change
+    // (all create-time; the frame thread rebuilds the feature).
     void RequestPreset(int preset) {
         SRWLOCK_HELPER(this);
         _pendingPreset = preset;
     }
 
-    // Frame thread: returns true and fills newPreset once per request.
-    bool ConsumePresetChange(int &newPreset) {
+    void RequestResolution(int percent) {
         SRWLOCK_HELPER(this);
-        const bool has = _pendingPreset >= 0 && _pendingPreset != _cur.preset;
-        if (has) {
+        _pendingResolution = percent;
+    }
+
+    void RequestScalingEnabled(int enabled) {
+        SRWLOCK_HELPER(this);
+        _pendingScalingEnabled = enabled;
+    }
+
+    // Frame thread: returns true and fills all values when a rebuild is due.
+    bool ConsumeRebuild(int &newPreset, int &newResolution, int &newScalingEnabled) {
+        SRWLOCK_HELPER(this);
+        const bool presetChanged = _pendingPreset >= 0 && _pendingPreset != _cur.preset;
+        const bool resChanged = _pendingResolution > 0 && _pendingResolution != _cur.inputResolutionPercent;
+        const bool scalingChanged = _pendingScalingEnabled >= 0 && _pendingScalingEnabled != _cur.scalingEnabled;
+        if (presetChanged) {
             newPreset = _pendingPreset;
             _cur.preset = newPreset;
         }
-        return has;
+        if (resChanged) {
+            newResolution = _pendingResolution;
+            _cur.inputResolutionPercent = newResolution;
+        }
+        if (scalingChanged) {
+            newScalingEnabled = _pendingScalingEnabled;
+            _cur.scalingEnabled = newScalingEnabled;
+        }
+        if (!presetChanged) newPreset = _cur.preset;
+        if (!resChanged) newResolution = _cur.inputResolutionPercent;
+        if (!scalingChanged) newScalingEnabled = _cur.scalingEnabled;
+        // scaling off forces 100%
+        if (!newScalingEnabled) newResolution = 100;
+        return presetChanged || resChanged || scalingChanged;
     }
 
     // Preset value a save should persist (pending request wins over current).
     int SaveTimePreset() {
         SRWLOCK_HELPER(this);
         return _pendingPreset >= 0 ? _pendingPreset : _cur.preset;
+    }
+
+    // Resolution value a save should persist (pending request wins).
+    int SaveTimeResolution() {
+        SRWLOCK_HELPER(this);
+        return _pendingResolution > 0 ? _pendingResolution : _cur.inputResolutionPercent;
     }
 
     DlssnrParams Initial() const { return _initial; }
@@ -67,6 +99,8 @@ private:
     DlssnrParams _cur;
     DlssnrParams _initial;
     int _pendingPreset = -1;
+    int _pendingResolution = -1;
+    int _pendingScalingEnabled = -1;
 };
 
 } // namespace vsdlssnr

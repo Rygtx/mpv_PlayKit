@@ -53,13 +53,16 @@ target_link_libraries(dlssnr_panel PRIVATE d3d11.lib dxgi.lib d3dcompiler.lib dw
 set_property(TARGET dlssnr_panel PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 target_compile_definitions(dlssnr_panel PRIVATE UNICODE _UNICODE)
 target_compile_options(dlssnr_panel PRIVATE /utf-8)
-set_target_properties(dlssnr_panel PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
+target_link_options(dlssnr_panel PRIVATE /DEBUG:FULL)
+set_target_properties(dlssnr_panel PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin" PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin")
 
 # mpv-lazy ships an old vcruntime140.dll that preempts System32 -> static CRT required
 set_property(TARGET vs_dlssnr PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 target_compile_definitions(vs_dlssnr PRIVATE UNICODE _UNICODE)
 target_compile_options(vs_dlssnr PRIVATE /utf-8)
+target_link_options(vs_dlssnr PRIVATE /DEBUG:FULL)
 set_target_properties(vs_dlssnr PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
+    PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/bin"
     PREFIX ""
 )

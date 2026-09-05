@@ -13,6 +13,9 @@
 
 namespace vsdlssnr {
 
+// Panel toggle for the periodic perf log (dlssnr_timing.log)
+void SetTimingLogEnabled(bool enabled) noexcept;
+
 class DlssnrContext {
 public:
     DlssnrContext() = default;
@@ -26,10 +29,10 @@ public:
     void Shutdown() noexcept;
     bool IsReady() const noexcept { return _ready; }
 
-    // Preset is a create-time NGX key: on panel change the frame thread
-    // rebuilds the feature (device/textures/parameter block reused logic kept
-    // close to a fresh Initialize).
-    bool RecreateFeature(int preset, char *err, size_t errLen) noexcept;
+    // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
+    // on panel change the frame thread rebuilds the feature (and scaling
+    // textures for resolution changes; disabled = residual pipeline dropped).
+    bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen) noexcept;
 
     // RGBS float32 三平面进 → 处理 → RGBS float32 三平面出(同分辨率)
     // timingOut 非 NULL 时写入分段耗时(毫秒,逗号分隔:pack,submit+gpu,unpack)

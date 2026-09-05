@@ -132,10 +132,6 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                     static_cast<size_t>(d->width) * 4, d->height);
     }
 
-    // getFrameFilter handed us a reference to src; release it or every source
-    // frame leaks (~24MB per 1080p frame).
-    vsapi->freeFrame(src);
-    return out;
     if (timingEnabled && timing[0]) {
         // Throttle: log every 30th frame to avoid flooding the log channel
         static int timingFrameCount = 0;
@@ -145,6 +141,10 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             vsapi->logMessage(mtInformation, msg, core);
         }
     }
+
+    // getFrameFilter handed us a reference to src; release it or every source
+    // frame leaks (~24MB per 1080p frame).
+    vsapi->freeFrame(src);
     return out;
 }
 
@@ -188,6 +188,7 @@ static void VS_CC DlssnrCreate(
     initial.useAutoMask = GetIntDef(in, vsapi, "use_auto_mask", 1) != 0;
     initial.uiCorrection = GetIntDef(in, vsapi, "ui_correction", 1) != 0;
     initial.residualMultiplier = vsh::doubleToFloatS(std::clamp(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), 1.0, 2.0));
+    initial.inputResolutionPercent = static_cast<int>(std::clamp(GetIntDef(in, vsapi, "input_resolution", 100), 25LL, 100LL));
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy defaults when present.
     vsdlssnr::BridgeLoadIni(initial);
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
@@ -236,7 +237,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "skin_structure:float:opt;"
         "use_auto_mask:int:opt;"
         "ui_correction:int:opt;"
-        "residual_multiplier:float:opt;",
+        "residual_multiplier:float:opt;"
+        "input_resolution:int:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);
 }

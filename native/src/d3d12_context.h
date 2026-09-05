@@ -24,6 +24,7 @@ public:
     void Finalize() noexcept;
 
     ID3D12Device *Device() const noexcept { return _device.Get(); }
+    IDXGIAdapter1 *Adapter() const noexcept { return _adapter.Get(); }
     ID3D12CommandQueue *Queue() const noexcept { return _queue.Get(); }
     ID3D12GraphicsCommandList *CommandList() const noexcept { return _commandList.Get(); }
     // 用于 CreateFeature / EvaluateFeature 的命令提交(Magpie 在 open 的
@@ -33,8 +34,29 @@ public:
 
     bool CreateFrameResources(int width, int height, char *err, size_t errLen) noexcept;
 
+    // diagnostics: dump a RGBA8 texture's raw rows to a file (VSDLSSNR_DUMP)
+    bool DumpTextureToFile(ID3D12Resource *tex, int width, int height,
+                           const wchar_t *path) noexcept;
+
+    // Residual pipeline resources for internal-resolution scaling
+    // (Magpie DLSSNRFilter.cpp:100-308). internalW/H = source * percent/100.
+    bool CreateScalingResources(int internalW, int internalH, char *err, size_t errLen) noexcept;
+    // Drop the residual pipeline entirely (scaling disabled)
+    void ClearScalingResources() noexcept;
+    bool HasScaling() const noexcept { return _scalingReady; }
+
+    // 三条残差 compute 路径的命令记录(在已 BeginRecording 的列表上)
+    void RecordDownsample(float residualMultiplier) noexcept;
+    void RecordResidualHorizontal(float residualMultiplier) noexcept;
+    void RecordResidualVertical(float residualMultiplier) noexcept;
+
     ID3D12Resource *InputColor() const noexcept { return _inputColor.Get(); }
     ID3D12Resource *OutputColor() const noexcept { return _outputColor.Get(); }
+    ID3D12Resource *ReducedColor() const noexcept { return _reducedColor.Get(); }
+    ID3D12Resource *ReducedDenoised() const noexcept { return _reducedDenoised.Get(); }
+    ID3D12Resource *HorizontalRes() const noexcept { return _horizontalRes.Get(); }
+    int InternalWidth() const noexcept { return _internalWidth; }
+    int InternalHeight() const noexcept { return _internalHeight; }
     // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
     // motion R16G16_FLOAT、depth R32_FLOAT,内容全 0
     ID3D12Resource *Motion() const noexcept { return _motion.Get(); }
@@ -58,9 +80,11 @@ private:
                             DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
                             D3D12_RESOURCE_FLAGS flags,
                             char *err, size_t errLen) noexcept;
+    bool CreateComputeObjects(char *err, size_t errLen) noexcept;
     void SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept;
 
     ComPtr<ID3D12Device> _device;
+    ComPtr<IDXGIAdapter1> _adapter; // the adapter the device was created on
     ComPtr<ID3D12InfoQueue> _infoQueue;
     bool _debug = false;
     ComPtr<ID3D12CommandQueue> _queue;
@@ -82,6 +106,19 @@ private:
     int _height = 0;
     size_t _uploadPitch = 0;
     size_t _readbackPitch = 0;
+
+    // residual scaling pipeline
+    ComPtr<ID3D12RootSignature> _rsCompute;
+    ComPtr<ID3D12PipelineState> _psoDownsample;
+    ComPtr<ID3D12PipelineState> _psoHorizontal;
+    ComPtr<ID3D12PipelineState> _psoVertical;
+    ComPtr<ID3D12DescriptorHeap> _srvUavHeap;
+    ComPtr<ID3D12Resource> _reducedColor;
+    ComPtr<ID3D12Resource> _reducedDenoised;
+    ComPtr<ID3D12Resource> _horizontalRes;
+    int _internalWidth = 0;
+    int _internalHeight = 0;
+    bool _scalingReady = false;
 };
 
 } // namespace vsdlssnr

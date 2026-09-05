@@ -66,6 +66,8 @@ void SaveIni(const DlssnrParams &p, const wchar_t *iniPath) noexcept {
     writeX100(L"skin_structure_x100", p.skinStructureStrength);
     writeInt(L"use_auto_mask", p.useAutoMask ? 1 : 0);
     writeInt(L"ui_correction", p.uiCorrection ? 1 : 0);
+    writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, 25, 100));
+    writeX100(L"residual_multiplier_x100", p.residualMultiplier);
     writeInt(L"saved", 1);
 }
 
@@ -89,6 +91,9 @@ bool BridgeLoadIni(DlssnrParams &p) noexcept {
     p.skinStructureStrength = static_cast<float>(readInt(L"skin_structure_x100", static_cast<int>(p.skinStructureStrength * 100))) / 100.0f;
     p.useAutoMask = readInt(L"use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
     p.uiCorrection = readInt(L"ui_correction", p.uiCorrection ? 1 : 0) != 0;
+    p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), 25, 100);
+    p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled);
+    p.residualMultiplier = static_cast<float>(readInt(L"residual_multiplier_x100", static_cast<int>(p.residualMultiplier * 100))) / 100.0f;
     return true;
 }
 
@@ -155,7 +160,12 @@ void ApplyLiveFile(BridgeState *state) noexcept {
     p.skinStructureStrength = std::clamp(JsonGetFloat(body, "skin_structure", p.skinStructureStrength), -1.0f, 2.0f);
     p.useAutoMask = JsonGetInt(body, "use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
     p.uiCorrection = JsonGetInt(body, "ui_correction", p.uiCorrection ? 1 : 0) != 0;
+    p.inputResolutionPercent = std::clamp(JsonGetInt(body, "input_resolution", p.inputResolutionPercent), 25, 100);
+    p.scalingEnabled = JsonGetInt(body, "scaling_enabled", p.scalingEnabled);
+    p.residualMultiplier = std::clamp(JsonGetFloat(body, "residual_multiplier", p.residualMultiplier), 1.0f, 2.0f);
     state->params->RequestPreset(std::clamp(preset, 0, 3));
+    state->params->RequestResolution(p.inputResolutionPercent);
+    state->params->RequestScalingEnabled(p.scalingEnabled);
     state->params->Update(p);
 
     // Command keys run after the merge so __save persists the just-applied values.
@@ -164,6 +174,7 @@ void ApplyLiveFile(BridgeState *state) noexcept {
         if (GetSelfIniPath(iniPath, MAX_PATH)) {
             DlssnrParams s = state->params->Snapshot();
             s.preset = state->params->SaveTimePreset();
+            s.inputResolutionPercent = state->params->SaveTimeResolution();
             SaveIni(s, iniPath);
         }
     }
