@@ -574,10 +574,14 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // CreateFeature again (device/queues untouched). Scaling disabled means
     // the residual pipeline is dropped from the frame flow entirely.
     //
-    // ConsumeRebuild is consumed before any slot is acquired on this thread,
-    // and RebuildScaling/ClearScalingResources drain the slot pool — so no
-    // other frame thread can still be recording against the resources we
-    // replace here.
+    // Seal the slot pool BEFORE any NGX call: release racing a concurrent
+    // evaluate on another frame thread corrupts the snippet and wedges the
+    // pipeline (observed as a hard hang on preset/resolution changes), and
+    // the per-slot scaling textures are replaced wholesale. With the pool
+    // sealed there is by definition no concurrent evaluate — no NGX-side
+    // lock is needed. ConsumeRebuild is consumed before any slot is acquired
+    // on this thread, so this thread holds no slot and the drain completes.
+    D3D12Context::PoolHold pool(*_d3d12);
     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
     {
         DWORD sehCode = 0;

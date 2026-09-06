@@ -293,9 +293,23 @@ void D3D12Context::ReleaseSlot(FrameSlot *slot) noexcept {
     _poolCv.notify_all();
 }
 
-void D3D12Context::DrainSlots() noexcept {
-    std::unique_lock<std::mutex> lock(_poolMutex);
-    _poolCv.wait(lock, [this] { return _freeCount == kSlotCount; });
+// --- PoolHold: drain + seal ------------------------------------------------
+
+D3D12Context::PoolHold::PoolHold(D3D12Context &ctx) noexcept : _ctx(&ctx) {
+    // Take the pool mutex and only release it when the hold ends: while held,
+    // AcquireSlot blocks on this very mutex, so no new frame can start against
+    // the resources the holder is about to replace. Waiting for the drain
+    // inside the same lock is safe — the frames still in flight never take
+    // _poolMutex again (they already own their slot), they just release.
+    _lock = std::unique_lock<std::mutex>(_ctx->_poolMutex);
+    _ctx->_poolCv.wait(_lock, [&ctx] { return ctx._freeCount == kSlotCount; });
+}
+
+D3D12Context::PoolHold::~PoolHold() noexcept {
+    if (_lock.owns_lock()) {
+        _lock.unlock();
+        _ctx->_poolCv.notify_all();
+    }
 }
 
 bool D3D12Context::CreateColorTexture(
@@ -937,10 +951,8 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
 }
 
 bool D3D12Context::RebuildScaling(int internalW, int internalH, char *err, size_t errLen) noexcept {
-    // Rebuilds touch every slot's resources: drain the pool first so no
-    // frame's command list still references the old textures (a rebuild only
-    // happens on a panel-driven recreate, so the stall is irrelevant).
-    DrainSlots();
+    // Replaces every slot's scaling textures; the caller must hold a PoolHold
+    // (all slots idle, pool sealed) so no frame can still reference them.
     for (int i = 0; i < kSlotCount; ++i) {
         ClearScalingForSlot(_slots[i]);
         if (!CreateScalingForSlot(_slots[i], internalW, internalH, err, errLen)) {
@@ -957,7 +969,7 @@ bool D3D12Context::RebuildScaling(int internalW, int internalH, char *err, size_
 }
 
 void D3D12Context::ClearScalingResources() noexcept {
-    DrainSlots();
+    // Caller must hold a PoolHold (see RebuildScaling).
     for (int i = 0; i < kSlotCount; ++i) {
         ClearScalingForSlot(_slots[i]);
     }

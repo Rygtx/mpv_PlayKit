@@ -86,11 +86,11 @@ public:
                            const wchar_t *path,
                            DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) noexcept;
 
-    // Residual scaling rebuilds drain the slot pool first (all frames idle),
-    // then rebuild every slot's scaling textures; safe to call from any
-    // getFrame thread that has NOT acquired a slot yet.
+    // Residual scaling rebuilds. The caller must hold a PoolHold (all slots
+    // idle, pool sealed) — the rebuild replaces every slot's scaling
+    // textures; Initialize may call these directly (single-threaded).
     bool RebuildScaling(int internalW, int internalH, char *err, size_t errLen) noexcept;
-    // Drop the residual pipeline entirely (scaling disabled); drains too.
+    // Drop the residual pipeline entirely (scaling disabled).
     void ClearScalingResources() noexcept;
     bool HasScaling() const noexcept { return _scalingReady; }
     int InternalWidth() const noexcept { return _internalWidth; }
@@ -100,6 +100,22 @@ public:
     // the caller must ReleaseSlot exactly once on every path.
     FrameSlot *AcquireSlot() noexcept;
     void ReleaseSlot(FrameSlot *slot) noexcept;
+
+    // RAII: drain the pool (wait until every slot is released) and hold the
+    // pool mutex, so AcquireSlot cannot hand out a slot while the holder
+    // replaces shared NGX state / per-slot textures. Never call this while
+    // holding a slot yourself.
+    class PoolHold {
+    public:
+        explicit PoolHold(D3D12Context &ctx) noexcept;
+        ~PoolHold() noexcept;
+        PoolHold(const PoolHold &) = delete;
+        PoolHold &operator=(const PoolHold &) = delete;
+    private:
+        D3D12Context *_ctx;
+        std::unique_lock<std::mutex> _lock;
+        friend class D3D12Context;
+    };
 
     // Per-slot frame path.
     bool PackInput(FrameSlot &slot, const uint8_t *const *srcPlanes, const int64_t *srcStrides,
@@ -136,9 +152,6 @@ private:
     bool CreateSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool CreateScalingForSlot(FrameSlot &slot, int iw, int ih, char *err, size_t errLen) noexcept;
     void ClearScalingForSlot(FrameSlot &slot) noexcept;
-    // Drains the pool (blocks until every slot is released). Caller may then
-    // rebuild shared/per-slot resources; AcquireSlot blocks meanwhile.
-    void DrainSlots() noexcept;
     bool WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept;
 
     // Shared prologue of the three residual passes; only the PSO, descriptor
