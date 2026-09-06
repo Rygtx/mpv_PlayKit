@@ -9,6 +9,7 @@
 #include "dlssnr_params.h"
 #include "iat_hook.h"
 #include "shared_params.h"
+#include <mutex>
 #include <nvsdk_ngx.h>
 
 namespace vsdlssnr {
@@ -55,8 +56,8 @@ private:
     NVSDK_NGX_Result SnippetShutdownSafely(DWORD *sehCode) noexcept;
     void SetCreateParametersUnsafe() noexcept;
     bool SetCreateParametersSafely(DWORD *sehCode) noexcept;
-    void SetEvaluateParametersUnsafe(bool resetHistory) noexcept;
-    bool SetEvaluateParametersSafely(bool resetHistory, DWORD *sehCode) noexcept;
+    void SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory) noexcept;
+    bool SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, DWORD *sehCode) noexcept;
 
     D3D12Context *_d3d12 = nullptr;
     NVSDK_NGX_Parameter *_parameters = nullptr;
@@ -89,6 +90,11 @@ private:
     bool _coreInitialized = false;
     bool _snippetInitialized = false;
     bool _ready = false;
+    // fmParallel: several frame threads call EvaluateFeature concurrently.
+    // The feature and the parameter block are singletons, so evaluate
+    // (parameter setup + snippet call) is serialized; GPU-side dispatches
+    // still overlap via each slot's own command list.
+    std::mutex _evaluateMutex;
 };
 
 } // namespace vsdlssnr

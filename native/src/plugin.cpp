@@ -44,15 +44,16 @@ struct FilterData {
     // come from the .vpy call).
     std::unique_ptr<vsdlssnr::SharedParams> params;
 
-    // Lazily initialized on the first ready frame; serialized by fmUnordered.
+    // Eagerly initialized in DlssnrCreate (before playback starts); VS may
+    // call getFrame on several threads under fmParallel, but each frame runs
+    // on its own D3D12 slot, so no further locking is needed here.
     vsdlssnr::D3D12Context d3d12;
     vsdlssnr::DlssnrContext ngx;
     std::wstring ngxDllPath;
-    bool initAttempted = false;
     bool initOk = false;
     int width = 0;
     int height = 0;
-    int lastN = -1 << 30;
+    std::atomic<int> lastN{ -1 << 30 };
 };
 
 } // namespace
@@ -70,34 +71,19 @@ static const VSFrame *VS_CC DlssnrGetFrame(
 
     const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
 
-    if (!d->initAttempted) {
-        d->initAttempted = true;
-        char err[256]{};
-        if (d->d3d12.Initialize(err, sizeof(err)) &&
-            d->ngx.Initialize(d->d3d12, d->ngxDllPath.c_str(),
-                              d->width, d->height, d->params.get(), err, sizeof(err))) {
-            d->initOk = true;
-            // Filter is live: start the mpv-side parameter bridge
-            vsdlssnr::BridgeStart(d->params.get());
-            char msg[128];
-            std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
-            vsapi->logMessage(mtInformation, msg, core);
-        } else {
-            char msg[512];
-            std::snprintf(msg, sizeof(msg),
-                          "vs_dlssnr init failed, falling back to passthrough: %s", err);
-            vsapi->logMessage(mtWarning, msg, core);
-            OutputDebugStringA("vs_dlssnr: init failed: ");
-            OutputDebugStringA(err);
-            OutputDebugStringA("\n");
-        }
-    }
-
     if (!d->initOk) return src; // passthrough on any setup failure; the frame
                                 // reference is handed off to the caller
 
-    const bool resetHistory = n != d->lastN + 1;
-    d->lastN = n;
+    // fmParallel lets VS activate frames out of order and on several threads
+    // (mpv's startup prefetch especially does), so a strict n != lastN + 1
+    // would fire NGX's reset path on every reordering and stall the first
+    // seconds of playback. Only treat real discontinuities as a reset:
+    // backwards jump (seek back) or a large forward gap (seek past the
+    // prefetch window). Relaxed ordering: a stale read at worst triggers one
+    // extra harmless reset on a zero-guidance (stateless) model.
+    const int lastN = d->lastN.load(std::memory_order_relaxed);
+    const bool resetHistory = lastN < 0 || n < lastN || n - lastN > 32;
+    d->lastN.store(n, std::memory_order_relaxed);
 
     const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
     VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
@@ -222,9 +208,39 @@ static void VS_CC DlssnrCreate(
         }
     }
 
+    // Eager init: the D3D12/NGX bring-up costs ~1s (165MB snippet DLL load +
+    // CreateFeature + first-evaluate warm-up). Doing it here — script
+    // execution, before mpv starts the playback clock — keeps that whole
+    // warm-up period out of playback; lazily initializing on the first
+    // getFrame made the first seconds of playback stutter. Failure keeps the
+    // passthrough fallback semantics below.
+    char err[256]{};
+    if (d->d3d12.Initialize(err, sizeof(err)) &&
+        d->ngx.Initialize(d->d3d12, d->ngxDllPath.c_str(),
+                          d->width, d->height, d->params.get(), err, sizeof(err))) {
+        d->initOk = true;
+        // Filter is live: start the mpv-side parameter bridge
+        vsdlssnr::BridgeStart(d->params.get());
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
+        vsapi->logMessage(mtInformation, msg, core);
+    } else {
+        char msg[512];
+        std::snprintf(msg, sizeof(msg),
+                      "vs_dlssnr init failed, falling back to passthrough: %s", err);
+        vsapi->logMessage(mtWarning, msg, core);
+        OutputDebugStringA("vs_dlssnr: init failed: ");
+        OutputDebugStringA(err);
+        OutputDebugStringA("\n");
+    }
+
     VSFilterDependency deps[]{ { node, rpStrictSpatial } };
+    // fmParallel: mpv keeps multiple frame requests in flight; each getFrame
+    // runs on its own D3D12 slot (slot pool caps the concurrency at
+    // kSlotCount), which overlaps CPU pack/unpack with the GPU work of other
+    // slots — the old fmUnordered path idled the GPU between frames.
     vsapi->createVideoFilter(out, "Enhance", vi, DlssnrGetFrame, DlssnrFree,
-                             fmUnordered, deps, 1, d, core);
+                             fmParallel, deps, 1, d, core);
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {

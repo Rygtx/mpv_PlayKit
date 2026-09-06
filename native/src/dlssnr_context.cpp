@@ -146,6 +146,8 @@ D3D12_RESOURCE_BARRIER TransitionFromTo(
 // diagnostics: append timing lines next to the host exe.
 // Controlled by the panel ("性能日志" toggle; wired up by the panel-IPC step).
 std::atomic<bool> g_timingLogEnabled{ true };
+// fmParallel: several frame threads push timing samples / flush the log
+std::mutex g_timingMutex;
 
 void SetTimingLogEnabled(bool enabled) noexcept {
     g_timingLogEnabled.store(enabled, std::memory_order_relaxed);
@@ -164,6 +166,8 @@ void TimingLog(const char *line) noexcept {
         swprintf_s(logPath, MAX_PATH, L"%s\\dlssnr_timing.log",
                    std::filesystem::path(dir).parent_path().c_str());
     }
+    // concurrent frame threads: serialize appends so lines never interleave
+    std::lock_guard<std::mutex> lock(g_timingMutex);
     FILE *f = nullptr;
     if (_wfopen_s(&f, logPath, L"a") != 0 || !f) return;
     // Timestamp every line: the log is append-only across sessions and hosts,
@@ -364,7 +368,7 @@ bool DlssnrContext::SetCreateParametersSafely(DWORD *sehCode) noexcept {
     }
 }
 
-void DlssnrContext::SetEvaluateParametersUnsafe(bool resetHistory) noexcept {
+void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory) noexcept {
     NVSDK_NGX_Parameter *p = _parameters;
     const DlssnrParams params = _shared->Snapshot();
     // With internal-resolution scaling, NGX consumes/produces the reduced
@@ -372,8 +376,8 @@ void DlssnrContext::SetEvaluateParametersUnsafe(bool resetHistory) noexcept {
     const bool scaling = _d3d12->HasScaling();
     const int ew = scaling ? _d3d12->InternalWidth() : _width;
     const int eh = scaling ? _d3d12->InternalHeight() : _height;
-    p->Set(PARAM_COLOR, scaling ? _d3d12->ReducedColor() : _d3d12->InputColor());
-    p->Set(PARAM_OUTPUT, scaling ? _d3d12->ReducedDenoised() : _d3d12->OutputColor());
+    p->Set(PARAM_COLOR, scaling ? _d3d12->ReducedColor(slot) : _d3d12->InputColor(slot));
+    p->Set(PARAM_OUTPUT, scaling ? _d3d12->ReducedDenoised(slot) : _d3d12->OutputColor(slot));
     p->Set(PARAM_MVEC, _d3d12->Motion());
     p->Set(PARAM_DEPTH, _d3d12->Depth());
     SetSubrect(p, RESOURCE_PARAMETERS[0], ew, eh);
@@ -394,10 +398,10 @@ void DlssnrContext::SetEvaluateParametersUnsafe(bool resetHistory) noexcept {
     p->Set(PARAM_UI_CORRECTION, params.uiCorrection ? 1 : 0);
 }
 
-bool DlssnrContext::SetEvaluateParametersSafely(bool resetHistory, DWORD *sehCode) noexcept {
+bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, DWORD *sehCode) noexcept {
     *sehCode = 0;
     __try {
-        SetEvaluateParametersUnsafe(resetHistory);
+        SetEvaluateParametersUnsafe(slot, resetHistory);
         return true;
     } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
         return false;
@@ -510,7 +514,7 @@ bool DlssnrContext::Initialize(
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
         int iw = _width, ih = _height;
         InternalSize(_width, _height, pct, iw, ih);
-        if (!_d3d12->CreateScalingResources(iw, ih, err, errLen)) return false;
+        if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) return false;
     }
 
     // Publish the render GPU's name so the panel shows it before the first
@@ -528,23 +532,28 @@ bool DlssnrContext::Initialize(
         PublishStatsJson(body);
     }
 
-    // 5) CreateFeature on an open command list, then close+execute (Magpie cpp:1720-1758)
-    if (!_d3d12->BeginRecording()) return fail("BeginRecording(create) failed");
+    // 5) CreateFeature on the control-path command list, then close+execute
+    // (Magpie cpp:1720-1758). Initialization is single-threaded (no frame
+    // threads yet), the ctl mutex is taken for symmetry with RecreateFeature.
     {
-        DWORD sehCode = 0;
-        if (!SetCreateParametersSafely(&sehCode)) return fail("Create parameter setup raised SEH");
-    }
-    {
-        DWORD sehCode = 0;
-        const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CommandList(), _parameters, &sehCode);
-        if (sehCode) return fail("Snippet CreateFeature raised SEH");
-        if (!NVSDK_NGX_SUCCEED(r) || !_feature) {
-            char msg[96];
-            std::snprintf(msg, sizeof(msg), "Feature 18 creation failed (0x%x)", static_cast<unsigned>(r));
-            return fail(msg);
+        std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
+        if (!_d3d12->BeginCtlRecording()) return fail("BeginCtlRecording(create) failed");
+        {
+            DWORD sehCode = 0;
+            if (!SetCreateParametersSafely(&sehCode)) return fail("Create parameter setup raised SEH");
         }
+        {
+            DWORD sehCode = 0;
+            const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CtlCommandList(), _parameters, &sehCode);
+            if (sehCode) return fail("Snippet CreateFeature raised SEH");
+            if (!NVSDK_NGX_SUCCEED(r) || !_feature) {
+                char msg[96];
+                std::snprintf(msg, sizeof(msg), "Feature 18 creation failed (0x%x)", static_cast<unsigned>(r));
+                return fail(msg);
+            }
+        }
+        if (!_d3d12->ExecuteCtlAndWait()) return fail("Execute(create) failed");
     }
-    if (!_d3d12->ExecuteAndWait()) return fail("Execute(create) failed");
 
     _ready = true;
     {
@@ -564,6 +573,12 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // release the feature, rebuild scaling textures when needed, then
     // CreateFeature again (device/queues untouched). Scaling disabled means
     // the residual pipeline is dropped from the frame flow entirely.
+    //
+    // ConsumeRebuild is consumed before any slot is acquired on this thread,
+    // and RebuildScaling/ClearScalingResources drain the slot pool — so no
+    // other frame thread can still be recording against the resources we
+    // replace here.
+    std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
     {
         DWORD sehCode = 0;
         SnippetReleaseSafely(&sehCode);
@@ -584,7 +599,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         if (scalingEnabled) {
             int iw = _width, ih = _height;
             InternalSize(_width, _height, resPercent, iw, ih);
-            if (!_d3d12->CreateScalingResources(iw, ih, err, errLen)) {
+            if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) {
                 _ready = false;
                 return false;
             }
@@ -592,8 +607,8 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             _d3d12->ClearScalingResources();
         }
     }
-    if (!_d3d12->BeginRecording()) {
-        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: BeginRecording failed");
+    if (!_d3d12->BeginCtlRecording()) {
+        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: BeginCtlRecording failed");
         _ready = false;
         return false;
     }
@@ -604,7 +619,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             _ready = false;
             return false;
         }
-        const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CommandList(), _parameters, &sehCode);
+        const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CtlCommandList(), _parameters, &sehCode);
         if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_feature) {
             if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: CreateFeature failed (0x%x)",
                 static_cast<unsigned>(sehCode ? 0xFFFFFFFFu : r));
@@ -612,7 +627,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             return false;
         }
     }
-    if (!_d3d12->ExecuteAndWait()) {
+    if (!_d3d12->ExecuteCtlAndWait()) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: Execute failed");
         _ready = false;
         return false;
@@ -652,11 +667,21 @@ bool DlssnrContext::ProcessFrame(
     // Diagnostic: VSDLSSNR_SKIP_EVAL=1 measures the pipe without NGX evaluate
     static const bool skipEval = GetEnvironmentVariableA("VSDLSSNR_SKIP_EVAL", nullptr, 0) != 0;
     static const bool dumpEnabled = GetEnvironmentVariableA("VSDLSSNR_DUMP", nullptr, 0) != 0;
-    if (!_d3d12->PackInput(srcPlanes, srcStrides, width, height, err, errLen)) return false;
+    // fmParallel: VS feeds several frames concurrently, each on its own slot
+    // (command list, staging, textures). The queue serializes the GPU work in
+    // submit order, so slots overlap CPU pack/unpack with other slots' GPU
+    // time instead of idling it away between frames.
+    FrameSlot *slot = _d3d12->AcquireSlot();
+    struct SlotGuard {
+        D3D12Context *ctx;
+        FrameSlot *s;
+        ~SlotGuard() { if (s) ctx->ReleaseSlot(s); }
+    } guard{ _d3d12, slot };
+    if (!_d3d12->PackInput(*slot, srcPlanes, srcStrides, width, height, err, errLen)) return false;
     QueryPerformanceCounter(&t1);
 
-    if (!_d3d12->BeginRecording()) {
-        if (err && errLen) std::snprintf(err, errLen, "BeginRecording(frame) failed");
+    if (!_d3d12->BeginFrameRecording(*slot)) {
+        if (err && errLen) std::snprintf(err, errLen, "BeginFrameRecording(frame) failed");
         return false;
     }
     // NOTE: D3D12 timestamp queries crash NGX snippet evaluate (SEH) when on the same command list - do not re-enable (verified 2026-09-05)
@@ -669,17 +694,17 @@ bool DlssnrContext::ProcessFrame(
     const D3D12_RESOURCE_STATES uploadPost = skipEval
                                                  ? D3D12_RESOURCE_STATE_COMMON
                                                  : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (!_d3d12->RecordUploadCopy(uploadPost, err, errLen)) return false;
+    if (!_d3d12->RecordUploadCopy(*slot, uploadPost, err, errLen)) return false;
 
     if (skipEval) {
         // Diagnostic path: route input straight to output for pipe-cost measurement
-        auto *cl = _d3d12->CommandList();
+        auto *cl = slot->commandList.Get();
         D3D12_RESOURCE_BARRIER bar[2]{
-            TransitionTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_COPY_SOURCE),
-            TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_COPY_DEST),
+            TransitionTo(_d3d12->InputColor(*slot), D3D12_RESOURCE_STATE_COPY_SOURCE),
+            TransitionTo(_d3d12->OutputColor(*slot), D3D12_RESOURCE_STATE_COPY_DEST),
         };
         cl->ResourceBarrier(2, bar);
-        cl->CopyResource(_d3d12->OutputColor(), _d3d12->InputColor());
+        cl->CopyResource(_d3d12->OutputColor(*slot), _d3d12->InputColor(*slot));
         for (auto &b : bar) {
             D3D12_RESOURCE_STATES tmp = b.Transition.StateBefore;
             b.Transition.StateBefore = b.Transition.StateAfter;
@@ -687,48 +712,48 @@ bool DlssnrContext::ProcessFrame(
         }
         cl->ResourceBarrier(2, bar);
     } else {
-        auto *cl = _d3d12->CommandList();
+        auto *cl = slot->commandList.Get();
         const bool scaling = _d3d12->HasScaling();
 
         // Pre-evaluate barriers (executed on the GPU before the NGX dispatch).
-        D3D12_RESOURCE_BARRIER pre[3];
+        // Motion/depth are resident NON_PIXEL_SHADER_RESOURCE (read-only), no
+        // transitions needed for them on the concurrent frame path.
+        D3D12_RESOURCE_BARRIER pre[1];
         UINT preCount = 0;
         if (scaling) {
             // downsample source -> reducedColor (area average, Magpie HLSL);
             // InputColor is already NSR (the upload copy landed it there)
             D3D12_RESOURCE_BARRIER b1[1]{
-                TransitionTo(_d3d12->ReducedColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                TransitionTo(_d3d12->ReducedColor(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
             cl->ResourceBarrier(1, b1);
-            _d3d12->RecordDownsample(residualMultiplier);
+            _d3d12->RecordDownsample(*slot, residualMultiplier);
             // reducedColor: UAV (write) -> NSR (NGX input)
             D3D12_RESOURCE_BARRIER b2[1]{
-                TransitionFromTo(_d3d12->ReducedColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                TransitionFromTo(_d3d12->ReducedColor(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
             cl->ResourceBarrier(1, b2);
             // NGX evaluate: color=ReducedColor (NSR), output=ReducedDenoised (UAV)
-            pre[0] = TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            pre[1] = TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            pre[2] = TransitionTo(_d3d12->ReducedDenoised(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            preCount = 3;
+            pre[0] = TransitionTo(_d3d12->ReducedDenoised(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            preCount = 1;
         } else {
             // NGX evaluate at full source size: color=InputColor (already NSR
             // from the upload copy), output=OutputColor
-            pre[0] = TransitionTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            pre[1] = TransitionTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            pre[2] = TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            preCount = 3;
+            pre[0] = TransitionTo(_d3d12->OutputColor(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            preCount = 1;
         }
         cl->ResourceBarrier(preCount, pre);
 
+        // The feature + parameter block are singletons: serialize the CPU-side
+        // evaluate across concurrent frame threads. GPU dispatches recorded on
+        // this slot's list still run overlapped with other slots' work.
+        std::lock_guard<std::mutex> evalLock(_evaluateMutex);
         DWORD sehCode = 0;
-        if (!SetEvaluateParametersSafely(resetHistory, &sehCode)) {
+        if (!SetEvaluateParametersSafely(*slot, resetHistory, &sehCode)) {
             if (err && errLen) std::snprintf(err, errLen, "Evaluate parameter setup raised SEH");
             return false;
         }
         const NVSDK_NGX_Result r = SnippetEvaluateSafely(cl, _parameters, &sehCode);
-        // split timing: NGX's own CPU cost inside EvaluateFeature vs GPU wait
-        // NOTE: timestamp disabled, see note above
         QueryPerformanceCounter(&t2);
         if (sehCode) {
             char buf[96];
@@ -745,67 +770,69 @@ bool DlssnrContext::ProcessFrame(
         if (scaling) {
             // reducedDenoised: UAV (NGX write) -> NSR (residual read)
             D3D12_RESOURCE_BARRIER b4[1]{
-                TransitionFromTo(_d3d12->ReducedDenoised(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                TransitionFromTo(_d3d12->ReducedDenoised(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
             cl->ResourceBarrier(1, b4);
             // Lanczos3 horizontal residual upsample (reducedColor still NSR)
             D3D12_RESOURCE_BARRIER b5[1]{
-                TransitionTo(_d3d12->HorizontalRes(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                TransitionTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
             cl->ResourceBarrier(1, b5);
-            _d3d12->RecordResidualHorizontal(residualMultiplier);
+            _d3d12->RecordResidualHorizontal(*slot, residualMultiplier);
             D3D12_RESOURCE_BARRIER b6[3]{
-                TransitionFromTo(_d3d12->HorizontalRes(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                TransitionFromTo(_d3d12->ReducedColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                TransitionFromTo(_d3d12->ReducedDenoised(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                TransitionFromTo(_d3d12->ReducedColor(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(_d3d12->ReducedDenoised(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             };
             cl->ResourceBarrier(3, b6);
             // vertical composite onto full-size output (input = original color)
             D3D12_RESOURCE_BARRIER b7[1]{
-                TransitionTo(_d3d12->OutputColor(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                TransitionTo(_d3d12->OutputColor(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
             cl->ResourceBarrier(1, b7);
             // move input back to COMMON only after vertical dispatch consumed it;
             // OutputColor stays UAV — the readback copy takes it from there
-            _d3d12->RecordResidualVertical(residualMultiplier);
-            D3D12_RESOURCE_BARRIER b8[4]{
-                TransitionFromTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                TransitionFromTo(_d3d12->HorizontalRes(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                TransitionFromTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                TransitionFromTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            _d3d12->RecordResidualVertical(*slot, residualMultiplier);
+            D3D12_RESOURCE_BARRIER b8[2]{
+                TransitionFromTo(_d3d12->InputColor(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             };
-            cl->ResourceBarrier(4, b8);
+            cl->ResourceBarrier(2, b8);
         } else {
-            // no scaling: NGX wrote OutputColor directly. Reads return to
+            // no scaling: NGX wrote OutputColor directly. Input returns to
             // COMMON here; OutputColor stays UAV — the readback copy takes
             // it from there.
-            D3D12_RESOURCE_BARRIER back[3]{
-                TransitionFromTo(_d3d12->InputColor(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                TransitionFromTo(_d3d12->Motion(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                TransitionFromTo(_d3d12->Depth(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            D3D12_RESOURCE_BARRIER back[1]{
+                TransitionFromTo(_d3d12->InputColor(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             };
-            cl->ResourceBarrier(3, back);
+            cl->ResourceBarrier(1, back);
         }
     }
 
     // OutputColor arrives in UAV (evaluate/vertical write) or COMMON (the
     // diagnostic copy); the readback parks it back in COMMON either way.
-    if (!_d3d12->RecordReadbackCopy(skipEval ? D3D12_RESOURCE_STATE_COMMON
-                                             : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    if (!_d3d12->RecordReadbackCopy(*slot, skipEval ? D3D12_RESOURCE_STATE_COMMON
+                                                    : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                     err, errLen)) {
         return false;
     }
     // NOTE: timestamp disabled, see note above
-    if (!_d3d12->ExecuteAndWait()) {
+    if (!_d3d12->SubmitFrame(*slot, err, errLen)) {
+        if (err && errLen) std::snprintf(err, errLen, "Submit(frame) failed");
+        return false;
+    }
+    if (!_d3d12->WaitFrame(*slot, err, errLen)) {
         // A timed-out fence means GPU hang / device removal: stop evaluating,
         // otherwise every later frame stalls the full 10s fence wait again.
         if (_d3d12->IsDeviceLost()) _ready = false;
-        if (err && errLen) std::snprintf(err, errLen, "Execute(frame) failed");
+        if (err && errLen) std::snprintf(err, errLen, "Wait(frame) failed");
         return false;
     }
     QueryPerformanceCounter(&t3);
-    const bool rb = _d3d12->UnpackOutput(dstPlanes, dstStrides, width, height, err, errLen);
+    const bool rb = _d3d12->UnpackOutput(*slot, dstPlanes, dstStrides, width, height, err, errLen);
     {
+        static std::mutex dumpMutex; // concurrent frame threads: dump at most once, no interleaved writes
+        std::lock_guard<std::mutex> dumpLock(dumpMutex);
         static bool dumped = false;
         if (!dumped && dumpEnabled) {
             dumped = true;
@@ -813,18 +840,19 @@ bool DlssnrContext::ProcessFrame(
             if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
                 std::filesystem::path base = std::filesystem::path(dir).parent_path();
                 const bool scaling = _d3d12->HasScaling();
-                _d3d12->DumpTextureToFile(_d3d12->InputColor(), width, height,
+                std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
+                _d3d12->DumpTextureToFile(_d3d12->InputColor(*slot), width, height,
                                           (base / L"dump_input.bin").c_str());
                 if (scaling) {
-                    _d3d12->DumpTextureToFile(_d3d12->ReducedColor(), _d3d12->InternalWidth(),
+                    _d3d12->DumpTextureToFile(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
                                               _d3d12->InternalHeight(), (base / L"dump_reduced_color.bin").c_str());
-                    _d3d12->DumpTextureToFile(_d3d12->ReducedDenoised(), _d3d12->InternalWidth(),
+                    _d3d12->DumpTextureToFile(_d3d12->ReducedDenoised(*slot), _d3d12->InternalWidth(),
                                               _d3d12->InternalHeight(), (base / L"dump_reduced_denoised.bin").c_str());
-                    _d3d12->DumpTextureToFile(_d3d12->HorizontalRes(), width,
+                    _d3d12->DumpTextureToFile(_d3d12->HorizontalRes(*slot), width,
                                               _d3d12->InternalHeight(), (base / L"dump_horizontal.bin").c_str(),
                                               DXGI_FORMAT_R16G16B16A16_FLOAT);
                 }
-                _d3d12->DumpTextureToFile(_d3d12->OutputColor(), width, height,
+                _d3d12->DumpTextureToFile(_d3d12->OutputColor(*slot), width, height,
                                           (base / L"dump_output.bin").c_str());
             }
         }
@@ -840,40 +868,45 @@ bool DlssnrContext::ProcessFrame(
         // see NOTE above); the submit+wait wall clock stands in for it.
         const double gpuWaitMs = ms(t2, t3, qpcFreq);
         const double unpackMs = ms(t3, t4, qpcFreq);
-        g_timing.Push(gpuWaitMs, packMs, evalCpuMs, unpackMs);
+        // Magpie-style periodic stats (every 60 frames) into dlssnr_timing.log.
+        // TimingLog takes g_timingMutex itself — format the line under the
+        // lock, log outside of it, or this thread self-deadlocks on frame 1
+        // and burns one slot forever.
+        char line[256] = "";
+        {
+            std::lock_guard<std::mutex> timingLock(g_timingMutex);
+            g_timing.Push(gpuWaitMs, packMs, evalCpuMs, unpackMs);
+            static int statFrames = 0;
+            if (++statFrames % 60 == 1) {
+                const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
+                const double gpuLast = g_timing.gpu[lastIdx];
+                const double gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
+                const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
+                const double packEma = TimingWindow::Ema(g_timing.pack, g_timing.count);
+                const double evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
+                const double unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
+                snprintf(line, sizeof(line),
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f eval_cpu=%.1f unpack=%.1f | res=%d%% %dx%d",
+                         gpuLast, gpuEma, gpuP99, packEma, evalCpuEma, unpackEma,
+                         std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
+                         _width, _height);
 
-        // Magpie-style periodic stats (every 60 frames) into dlssnr_timing.log
-        static int statFrames = 0;
-        if (++statFrames % 60 == 1) {
-            const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
-            const double gpuLast = g_timing.gpu[lastIdx];
-            const double gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
-            const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
-            const double packEma = TimingWindow::Ema(g_timing.pack, g_timing.count);
-            const double evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
-            const double unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
-            char line[256];
-            snprintf(line, sizeof(line),
-                     "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f eval_cpu=%.1f unpack=%.1f | res=%d%% %dx%d",
-                     gpuLast, gpuEma, gpuP99, packEma, evalCpuEma, unpackEma,
-                     std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
-                     _width, _height);
-            TimingLog(line);
-
-            // stats via named shared memory (no disk IO; panel reads directly).
-            // Keys must match the SK_* constants in panel_ipc.h.
-            char body[512];
-            snprintf(body, sizeof(body),
-                     "{\"gpu_last\":%.1f,\"gpu_ema\":%.1f,\"gpu_p99\":%.1f,"
-                     "\"pack_ema\":%.1f,\"eval_cpu_ema\":%.1f,\"unpack_ema\":%.1f,"
-                     "\"internal_w\":%d,\"internal_h\":%d,\"width\":%d,\"height\":%d,"
-                     "\"scaling\":%d,\"fps\":%.1f,\"gpu_name\":\"%s\"}",
-                     gpuLast, gpuEma, gpuP99, packEma, evalCpuEma, unpackEma,
-                     _d3d12->InternalWidth(), _d3d12->InternalHeight(), _width, _height,
-                     _d3d12->HasScaling() ? 1 : 0,
-                     _d3d12->FrameRateEma(), _gpuNameUtf8);
-            PublishStatsJson(body);
+                // stats via named shared memory (no disk IO; panel reads directly).
+                // Keys must match the SK_* constants in panel_ipc.h.
+                char body[512];
+                snprintf(body, sizeof(body),
+                         "{\"gpu_last\":%.1f,\"gpu_ema\":%.1f,\"gpu_p99\":%.1f,"
+                         "\"pack_ema\":%.1f,\"eval_cpu_ema\":%.1f,\"unpack_ema\":%.1f,"
+                         "\"internal_w\":%d,\"internal_h\":%d,\"width\":%d,\"height\":%d,"
+                         "\"scaling\":%d,\"fps\":%.1f,\"gpu_name\":\"%s\"}",
+                         gpuLast, gpuEma, gpuP99, packEma, evalCpuEma, unpackEma,
+                         _d3d12->InternalWidth(), _d3d12->InternalHeight(), _width, _height,
+                         _d3d12->HasScaling() ? 1 : 0,
+                         _d3d12->FrameRateEma(), _gpuNameUtf8);
+                PublishStatsJson(body);
+            }
         }
+        if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)
 
         if (vsTiming) {
             std::snprintf(timingOut, timingLen, "pack=%.1f,eval_cpu=%.1f,gpu=%.1f,unpack=%.1f",

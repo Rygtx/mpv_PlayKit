@@ -38,6 +38,7 @@ D3D12Context::~D3D12Context() { Finalize(); }
 
 void D3D12Context::NotifyFrameTick(double qpcSeconds) noexcept {
     // Frame-rate EMA over the last frames (the cadence is decided by the host)
+    std::lock_guard<std::mutex> lock(_tickMutex);
     if (_lastFrameTickSec < 0) {
         _lastFrameTickSec = qpcSeconds;
         return;
@@ -48,6 +49,11 @@ void D3D12Context::NotifyFrameTick(double qpcSeconds) noexcept {
         const double fps = 1.0 / delta;
         _frameRateEma = _frameRateEma > 0 ? _frameRateEma * 0.9 + fps * 0.1 : fps;
     }
+}
+
+double D3D12Context::FrameRateEma() noexcept {
+    std::lock_guard<std::mutex> lock(_tickMutex);
+    return _frameRateEma;
 }
 
 void D3D12Context::SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept {
@@ -136,21 +142,21 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
         return false;
     }
     hr = _device->CreateCommandAllocator(
-        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(_allocator.GetAddressOf()));
+        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(_ctlAllocator.GetAddressOf()));
     if (FAILED(hr)) {
-        SetErr(err, errLen, hr, "CreateCommandAllocator failed");
+        SetErr(err, errLen, hr, "CreateCommandAllocator(ctl) failed");
         return false;
     }
     hr = _device->CreateCommandList(
-        0, D3D12_COMMAND_LIST_TYPE_DIRECT, _allocator.Get(), nullptr,
-        IID_PPV_ARGS(_commandList.GetAddressOf()));
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, _ctlAllocator.Get(), nullptr,
+        IID_PPV_ARGS(_ctlCommandList.GetAddressOf()));
     if (FAILED(hr)) {
-        SetErr(err, errLen, hr, "CreateCommandList failed");
+        SetErr(err, errLen, hr, "CreateCommandList(ctl) failed");
         return false;
     }
-    hr = _commandList->Close();
+    hr = _ctlCommandList->Close();
     if (FAILED(hr)) {
-        SetErr(err, errLen, hr, "Close initial command list failed");
+        SetErr(err, errLen, hr, "Close initial ctl command list failed");
         return false;
     }
     hr = _device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(_fence.GetAddressOf()));
@@ -158,8 +164,8 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
         SetErr(err, errLen, hr, "CreateFence failed");
         return false;
     }
-    _fenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-    if (!_fenceEvent) {
+    _ctlEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+    if (!_ctlEvent) {
         SetErr(err, errLen, E_FAIL, "Create fence event failed");
         return false;
     }
@@ -169,68 +175,89 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
 void D3D12Context::Finalize() noexcept {
     if (_queue && _fence) {
         // Best-effort drain so the GPU is idle before releasing command objects.
-        _queue->Signal(_fence.Get(), ++_fenceValue);
-        if (_fence->GetCompletedValue() < _fenceValue) {
-            _fence->SetEventOnCompletion(_fenceValue, _fenceEvent);
-            WaitForSingleObject(_fenceEvent, 2000);
+        const uint64_t v = _fenceValue.fetch_add(1) + 1;
+        _queue->Signal(_fence.Get(), v);
+        if (_fence->GetCompletedValue() < v) {
+            _fence->SetEventOnCompletion(v, _ctlEvent);
+            WaitForSingleObject(_ctlEvent, 2000);
         }
     }
-    if (_fenceEvent) {
-        CloseHandle(_fenceEvent);
-        _fenceEvent = nullptr;
+    // Slots first: their command lists reference the shared PSOs/heaps.
+    for (int i = 0; i < kSlotCount; ++i) {
+        FrameSlot &s = _slots[i];
+        if (s.fenceEvent) {
+            CloseHandle(s.fenceEvent);
+            s.fenceEvent = nullptr;
+        }
+        s.uploadMapped = nullptr;
+        s.upload.Reset();
+        s.readback.Reset();
+        s.inputColor.Reset();
+        s.outputColor.Reset();
+        s.reducedColor.Reset();
+        s.reducedDenoised.Reset();
+        s.horizontalRes.Reset();
+        s.srvUavHeap.Reset();
+        s.commandList.Reset();
+        s.allocator.Reset();
     }
-    _horizontalRes.Reset();
-    _reducedDenoised.Reset();
-    _reducedColor.Reset();
+    _freeCount = 0;
     _psoVertical.Reset();
     _psoHorizontal.Reset();
     _psoDownsample.Reset();
-    _srvUavHeap.Reset();
     _rsCompute.Reset();
     _scalingReady = false;
     _rtvHeap.Reset();
     _motion.Reset();
     _depth.Reset();
-    _upload.Reset();
-    _readback.Reset();
-    _outputColor.Reset();
-    _inputColor.Reset();
-    _commandList.Reset();
-    _allocator.Reset();
+    if (_ctlEvent) {
+        CloseHandle(_ctlEvent);
+        _ctlEvent = nullptr;
+    }
+    _ctlCommandList.Reset();
+    _ctlAllocator.Reset();
     _queue.Reset();
     _device.Reset();
 }
 
-bool D3D12Context::BeginRecording() noexcept {
-    HRESULT hr = _allocator->Reset();
+bool D3D12Context::BeginCtlRecording() noexcept {
+    HRESULT hr = _ctlAllocator->Reset();
     if (FAILED(hr)) {
-        // A previous frame's mid-recording error return leaves the command
-        // list open, which makes allocator/list Reset fail with E_FAIL from
-        // then on; force-close once and retry so a single SEH doesn't brick
-        // the filter for the rest of the session.
-        _commandList->Close();
-        hr = _allocator->Reset();
+        // A previous error return with the list still open makes Reset fail
+        // with E_FAIL from then on; force-close once and retry so a single
+        // SEH doesn't brick the control path for the rest of the session.
+        _ctlCommandList->Close();
+        hr = _ctlAllocator->Reset();
         if (FAILED(hr)) return false;
     }
-    hr = _commandList->Reset(_allocator.Get(), nullptr);
+    hr = _ctlCommandList->Reset(_ctlAllocator.Get(), nullptr);
     return SUCCEEDED(hr);
 }
 
-bool D3D12Context::ExecuteAndWait() noexcept {
-    HRESULT hr = _commandList->Close();
+bool D3D12Context::ExecuteCtlAndWait() noexcept {
+    HRESULT hr = _ctlCommandList->Close();
     if (FAILED(hr)) return false;
-    ID3D12CommandList *lists[]{ _commandList.Get() };
+    ID3D12CommandList *lists[]{ _ctlCommandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
-    _queue->Signal(_fence.Get(), ++_fenceValue);
-    if (_fence->GetCompletedValue() < _fenceValue) {
-        _fence->SetEventOnCompletion(_fenceValue, _fenceEvent);
+    const uint64_t v = _fenceValue.fetch_add(1) + 1;
+    _queue->Signal(_fence.Get(), v);
+    char ignore[96];
+    return WaitFenceValue(v, _ctlEvent, ignore, sizeof(ignore));
+}
+
+bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept {
+    if (_fence->GetCompletedValue() < value) {
+        if (FAILED(_fence->SetEventOnCompletion(value, event))) {
+            SetErr(err, errLen, E_FAIL, "SetEventOnCompletion failed");
+            return false;
+        }
         // 10s timeout: a device removal would never signal -> don't wait forever
-        if (WaitForSingleObject(_fenceEvent, 10000) != WAIT_OBJECT_0) {
-            char buf[160];
+        if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) {
             HRESULT rr = _device ? _device->GetDeviceRemovedReason() : E_FAIL;
+            char buf[160];
             snprintf(buf, sizeof(buf),
                      "GPU hang/removed: reason=0x%08lX fence=%llu",
-                     static_cast<unsigned long>(rr), static_cast<unsigned long long>(_fenceValue));
+                     static_cast<unsigned long>(rr), static_cast<unsigned long long>(value));
             // surface through the stats mapping so the panel shows it
             // (gpu_hang numeric — the panel parses it via JsonGetInt/SK_GPU_HANG)
             char json[224];
@@ -238,14 +265,37 @@ bool D3D12Context::ExecuteAndWait() noexcept {
                      "{\"gpu_hang\":1,\"removed_reason\":\"0x%08lX\"}",
                      static_cast<unsigned long>(rr));
             PublishStatsJson(json);
-            _deviceLost = true;
+            _deviceLost.store(true, std::memory_order_relaxed);
             OutputDebugStringA("vs_dlssnr: ");
             OutputDebugStringA(buf);
             OutputDebugStringA("\n");
+            SetErr(err, errLen, E_FAIL, buf);
             return false;
         }
     }
     return true;
+}
+
+// --- Slot pool ------------------------------------------------------------
+
+FrameSlot *D3D12Context::AcquireSlot() noexcept {
+    std::unique_lock<std::mutex> lock(_poolMutex);
+    _poolCv.wait(lock, [this] { return _freeCount > 0; });
+    FrameSlot *slot = &_slots[_freeStack[--_freeCount]];
+    return slot;
+}
+
+void D3D12Context::ReleaseSlot(FrameSlot *slot) noexcept {
+    {
+        std::lock_guard<std::mutex> lock(_poolMutex);
+        _freeStack[_freeCount++] = static_cast<int>(slot - _slots);
+    }
+    _poolCv.notify_all();
+}
+
+void D3D12Context::DrainSlots() noexcept {
+    std::unique_lock<std::mutex> lock(_poolMutex);
+    _poolCv.wait(lock, [this] { return _freeCount == kSlotCount; });
 }
 
 bool D3D12Context::CreateColorTexture(
@@ -278,21 +328,10 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
     _width = width;
     _height = height;
 
-    if (!CreateColorTexture(_inputColor.GetAddressOf(), width, height,
-                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_NONE, err, errLen)) {
-        return false;
-    }
-    // NGX binds the output as a UAV; a D3D12-native resource requires
-    // ALLOW_UNORDERED_ACCESS (Magpie's D3D11-shared texture had no such flag
-    // constraint, our native one does).
-    if (!CreateColorTexture(_outputColor.GetAddressOf(), width, height,
-                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
-        return false;
-    }
     // 零 guidance 纹理:R16G16_FLOAT motion + R32_FLOAT depth,内容清 0。
-    // RTV clear 要求 ALLOW_RENDER_TARGET 标志。
+    // RTV clear 要求 ALLOW_RENDER_TARGET 标志。clear 后常驻
+    // NON_PIXEL_SHADER_RESOURCE(evaluate 只读,无每帧状态转换,
+    // 并发帧的命令列表可以同时引用)。
     if (!CreateColorTexture(_motion.GetAddressOf(), width, height,
                             DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, err, errLen)) {
@@ -323,48 +362,108 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
         rtv.Format = DXGI_FORMAT_R32_FLOAT;
         _device->CreateRenderTargetView(_depth.Get(), &rtv, depthRtv);
 
-        if (!BeginRecording()) {
-            SetErr(err, errLen, E_FAIL, "BeginRecording(guidance clear) failed");
+        std::lock_guard<std::mutex> ctlLock(_ctlMutex);
+        if (!BeginCtlRecording()) {
+            SetErr(err, errLen, E_FAIL, "BeginCtlRecording(guidance clear) failed");
             return false;
         }
         D3D12_RESOURCE_BARRIER toRt[2]{
             Transition(_motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(_depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
         };
-        _commandList->ResourceBarrier(2, toRt);
+        _ctlCommandList->ResourceBarrier(2, toRt);
         const float zero[4]{ 0.0f, 0.0f, 0.0f, 0.0f };
-        _commandList->ClearRenderTargetView(base, zero, 0, nullptr);
-        _commandList->ClearRenderTargetView(depthRtv, zero, 0, nullptr);
-        D3D12_RESOURCE_BARRIER toCommon[2]{
-            Transition(_motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON),
-            Transition(_depth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON),
+        _ctlCommandList->ClearRenderTargetView(base, zero, 0, nullptr);
+        _ctlCommandList->ClearRenderTargetView(depthRtv, zero, 0, nullptr);
+        D3D12_RESOURCE_BARRIER toResident[2]{
+            Transition(_motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(_depth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         };
-        _commandList->ResourceBarrier(2, toCommon);
-        if (!ExecuteAndWait()) {
+        _ctlCommandList->ResourceBarrier(2, toResident);
+        if (!ExecuteCtlAndWait()) {
             SetErr(err, errLen, E_FAIL, "Execute(guidance clear) failed");
             return false;
         }
     }
 
-    // Upload staging:RGBA8 行距 256 对齐
-    _uploadPitch = (static_cast<size_t>(width) * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
-                   & ~static_cast<size_t>(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    for (int i = 0; i < kSlotCount; ++i) {
+        if (!CreateSlotResources(_slots[i], err, errLen)) return false;
+    }
+    // Seed the free stack (LIFO) — the pool starts fully free. Without this,
+    // the first DrainSlots (RebuildScaling during Initialize) would wait
+    // forever for slots that were never handed out.
+    _freeCount = kSlotCount;
+    for (int i = 0; i < kSlotCount; ++i) {
+        _freeStack[i] = kSlotCount - 1 - i;
+    }
+    return true;
+}
+
+bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    const int width = _width;
+    const int height = _height;
+    HRESULT hr = _device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(slot.allocator.GetAddressOf()));
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "CreateCommandAllocator(slot) failed");
+        return false;
+    }
+    hr = _device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.allocator.Get(), nullptr,
+        IID_PPV_ARGS(slot.commandList.GetAddressOf()));
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "CreateCommandList(slot) failed");
+        return false;
+    }
+    hr = slot.commandList->Close();
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "Close initial slot command list failed");
+        return false;
+    }
+    slot.fenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+    if (!slot.fenceEvent) {
+        SetErr(err, errLen, E_FAIL, "Create slot fence event failed");
+        return false;
+    }
+
+    if (!CreateColorTexture(slot.inputColor.GetAddressOf(), width, height,
+                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_NONE, err, errLen)) {
+        return false;
+    }
+    // NGX binds the output as a UAV; a D3D12-native resource requires
+    // ALLOW_UNORDERED_ACCESS (Magpie's D3D11-shared texture had no such flag
+    // constraint, our native one does).
+    if (!CreateColorTexture(slot.outputColor.GetAddressOf(), width, height,
+                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
+
+    // Upload staging:RGBA8 行距 256 对齐(persist-mapped once)
+    slot.uploadPitch = (static_cast<size_t>(width) * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+                       & ~static_cast<size_t>(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     {
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = _uploadPitch * static_cast<UINT64>(height);
+        desc.Width = slot.uploadPitch * static_cast<UINT64>(height);
         desc.Height = 1;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        HRESULT hr = _device->CreateCommittedResource(
+        hr = _device->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-            nullptr, IID_PPV_ARGS(_upload.GetAddressOf()));
+            nullptr, IID_PPV_ARGS(slot.upload.GetAddressOf()));
         if (FAILED(hr)) {
             SetErr(err, errLen, hr, "CreateCommittedResource(upload) failed");
+            return false;
+        }
+        hr = slot.upload->Map(0, nullptr, &slot.uploadMapped);
+        if (FAILED(hr)) {
+            SetErr(err, errLen, hr, "Map(upload) failed");
             return false;
         }
     }
@@ -372,47 +471,56 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
         // READBACK heap only accepts buffers on this runtime (texture staging
         // on READBACK heap returns E_INVALIDARG), so copy via placed footprint
         // into a readback buffer.
-        _readbackPitch = _uploadPitch; // same 256-aligned RGBA8 row size
+        slot.readbackPitch = slot.uploadPitch; // same 256-aligned RGBA8 row size
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = _readbackPitch * static_cast<UINT64>(height);
+        desc.Width = slot.readbackPitch * static_cast<UINT64>(height);
         desc.Height = 1;
         desc.DepthOrArraySize = 1;
         desc.MipLevels = 1;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        HRESULT hr = _device->CreateCommittedResource(
+        hr = _device->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-            nullptr, IID_PPV_ARGS(_readback.GetAddressOf()));
+            nullptr, IID_PPV_ARGS(slot.readback.GetAddressOf()));
         if (FAILED(hr)) {
             SetErr(err, errLen, hr, "CreateCommittedResource(readback) failed");
             return false;
         }
     }
+    {
+        // slot-local shader-visible descriptor heap; input/output descriptors
+        // here, the residual pipeline descriptors on every scaling rebuild.
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.NumDescriptors = 16;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
+        if (FAILED(hr)) {
+            SetErr(err, errLen, hr, "CreateDescriptorHeap(SRV/UAV slot) failed");
+            return false;
+        }
+        const D3D12_CPU_DESCRIPTOR_HANDLE base = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, base);
+        const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr,
+                                           D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(7 * inc) });
+    }
     return true;
 }
 
 bool D3D12Context::PackInput(
+    FrameSlot &slot,
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
     int width, int height, char *err, size_t errLen) noexcept {
     if (width != _width || height != _height) {
         SetErr(err, errLen, E_INVALIDARG, "PackInput: size mismatch");
         return false;
     }
-    // Persist-mapped upload heap: map once, never unmap (releasing the
-    // resource at Finalize implicitly unmaps); a per-frame Map/Unmap pair is
-    // pure driver-call overhead.
-    if (!_uploadMapped) {
-        HRESULT hr = _upload->Map(0, nullptr, &_uploadMapped);
-        if (FAILED(hr)) {
-            SetErr(err, errLen, hr, "Map(upload) failed");
-            return false;
-        }
-    }
-    auto *dstRow = static_cast<uint8_t *>(_uploadMapped);
-    for (int y = 0; y < height; ++y, dstRow += _uploadPitch) {
+    auto *dstRow = static_cast<uint8_t *>(slot.uploadMapped);
+    for (int y = 0; y < height; ++y, dstRow += slot.uploadPitch) {
         const float *rowR = reinterpret_cast<const float *>(srcPlanes[0] + srcStrides[0] * y);
         const float *rowG = reinterpret_cast<const float *>(srcPlanes[1] + srcStrides[1] * y);
         const float *rowB = reinterpret_cast<const float *>(srcPlanes[2] + srcStrides[2] * y);
@@ -427,59 +535,99 @@ bool D3D12Context::PackInput(
     return true;
 }
 
-bool D3D12Context::RecordUploadCopy(D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept {
+bool D3D12Context::BeginFrameRecording(FrameSlot &slot) noexcept {
+    HRESULT hr = slot.allocator->Reset();
+    if (FAILED(hr)) {
+        // A previous frame's mid-recording error return leaves the command
+        // list open, which makes allocator/list Reset fail with E_FAIL from
+        // then on; force-close once and retry so a single SEH doesn't brick
+        // this slot for the rest of the session.
+        slot.commandList->Close();
+        hr = slot.allocator->Reset();
+        if (FAILED(hr)) return false;
+    }
+    hr = slot.commandList->Reset(slot.allocator.Get(), nullptr);
+    return SUCCEEDED(hr);
+}
+
+bool D3D12Context::RecordUploadCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept {
+    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     D3D12_RESOURCE_BARRIER toCopyDest[1]{
-        Transition(_inputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
     };
-    _commandList->ResourceBarrier(1, toCopyDest);
+    cl->ResourceBarrier(1, toCopyDest);
     D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = _upload.Get();
+    src.pResource = slot.upload.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Offset = 0;
     src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     src.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
     src.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
     src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(_uploadPitch);
+    src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.uploadPitch);
     D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = _inputColor.Get();
+    dst.pResource = slot.inputColor.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     dst.SubresourceIndex = 0;
-    _commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     D3D12_RESOURCE_BARRIER toAfter[1]{
-        Transition(_inputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, stateAfter),
+        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, stateAfter),
     };
-    _commandList->ResourceBarrier(1, toAfter);
+    cl->ResourceBarrier(1, toAfter);
     return true;
 }
 
-bool D3D12Context::RecordReadbackCopy(D3D12_RESOURCE_STATES stateBefore, char *err, size_t errLen) noexcept {
+bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateBefore, char *err, size_t errLen) noexcept {
+    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     D3D12_RESOURCE_BARRIER toCopySrc[1]{
-        Transition(_outputColor.Get(), stateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(slot.outputColor.Get(), stateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE),
     };
-    _commandList->ResourceBarrier(1, toCopySrc);
+    cl->ResourceBarrier(1, toCopySrc);
     D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = _outputColor.Get();
+    src.pResource = slot.outputColor.Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     src.SubresourceIndex = 0;
     D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = _readback.Get();
+    dst.pResource = slot.readback.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     dst.PlacedFootprint.Offset = 0;
     dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
     dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
     dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(_readbackPitch);
-    _commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.readbackPitch);
+    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     D3D12_RESOURCE_BARRIER backToCommon[1]{
-        Transition(_outputColor.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
-    _commandList->ResourceBarrier(1, backToCommon);
+    cl->ResourceBarrier(1, backToCommon);
     return true;
 }
 
+bool D3D12Context::SubmitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    HRESULT hr = slot.commandList->Close();
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "Close(slot) failed");
+        return false;
+    }
+    // Submit mutex keeps the fence value order identical to the queue's
+    // ExecuteCommandLists order — concurrent frame threads must not let a
+    // later Signal (smaller value) land after an earlier one (fence values
+    // must never regress).
+    std::lock_guard<std::mutex> lock(_submitMutex);
+    ID3D12CommandList *lists[]{ slot.commandList.Get() };
+    _queue->ExecuteCommandLists(1, lists);
+    slot.fenceValue = _fenceValue.fetch_add(1) + 1;
+    _queue->Signal(_fence.Get(), slot.fenceValue);
+    return true;
+}
+
+bool D3D12Context::WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    return WaitFenceValue(slot.fenceValue, slot.fenceEvent, err, errLen);
+}
+
 bool D3D12Context::UnpackOutput(
+    FrameSlot &slot,
     uint8_t **dstPlanes, int64_t *dstStrides,
     int width, int height, char *err, size_t errLen) noexcept {
     if (width != _width || height != _height) {
@@ -488,12 +636,12 @@ bool D3D12Context::UnpackOutput(
     }
 
     void *mapped = nullptr;
-    HRESULT hr = _readback->Map(0, nullptr, &mapped);
+    HRESULT hr = slot.readback->Map(0, nullptr, &mapped);
     if (FAILED(hr)) {
         SetErr(err, errLen, hr, "Map(readback) failed");
         return false;
     }
-    const size_t pitch = _readbackPitch;
+    const size_t pitch = slot.readbackPitch;
     const auto *srcRow = static_cast<const uint8_t *>(mapped);
     for (int y = 0; y < height; ++y, srcRow += pitch) {
         const uint8_t *row = srcRow;
@@ -506,7 +654,7 @@ bool D3D12Context::UnpackOutput(
             rowB[x] = row[x * 4 + 2] * (1.0f / 255.0f);
         }
     }
-    _readback->Unmap(0, nullptr);
+    slot.readback->Unmap(0, nullptr);
     return true;
 }
 
@@ -676,11 +824,11 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
                                                 IID_PPV_ARGS(buffer.GetAddressOf())))) {
         return false;
     }
-    if (!BeginRecording()) return false;
+    if (!BeginCtlRecording()) return false;
     D3D12_RESOURCE_BARRIER b[1]{
         Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
     };
-    _commandList->ResourceBarrier(1, b);
+    _ctlCommandList->ResourceBarrier(1, b);
     D3D12_TEXTURE_COPY_LOCATION src{ tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
     D3D12_TEXTURE_COPY_LOCATION dst{ buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
     dst.PlacedFootprint.Footprint.Format = format;
@@ -688,12 +836,12 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
     dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(height);
     dst.PlacedFootprint.Footprint.Depth = 1;
     dst.PlacedFootprint.Footprint.RowPitch = pitch;
-    _commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    _ctlCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     D3D12_RESOURCE_BARRIER back[1]{
         Transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
-    _commandList->ResourceBarrier(1, back);
-    if (!ExecuteAndWait()) return false;
+    _ctlCommandList->ResourceBarrier(1, back);
+    if (!ExecuteCtlAndWait()) return false;
 
     void *mapped = nullptr;
     if (FAILED(buffer->Map(0, nullptr, &mapped))) return false;
@@ -761,15 +909,8 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
         return false;
     }
 
-    // shader-visible descriptor heap (7 descriptors used)
-    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
-    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    heapDesc.NumDescriptors = 16;
-    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(_srvUavHeap.GetAddressOf())))) {
-        SetErr(err, errLen, E_FAIL, "CreateDescriptorHeap(SRV/UAV) failed");
-        return false;
-    }
+    // PSOs are stateless and shared; the shader-visible descriptor heap is
+    // per-slot (each slot's textures get their own SRV/UAV descriptors).
 
     struct Cso { const char *hlsl; const char *entry; ID3D12PipelineState **pso; };
     const Cso csos[] = {
@@ -795,54 +936,31 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
     return true;
 }
 
-bool D3D12Context::CreateScalingResources(int internalW, int internalH, char *err, size_t errLen) noexcept {
-    if (!_rsCompute && !CreateComputeObjects(err, errLen)) return false;
-
+bool D3D12Context::RebuildScaling(int internalW, int internalH, char *err, size_t errLen) noexcept {
+    // Rebuilds touch every slot's resources: drain the pool first so no
+    // frame's command list still references the old textures (a rebuild only
+    // happens on a panel-driven recreate, so the stall is irrelevant).
+    DrainSlots();
+    for (int i = 0; i < kSlotCount; ++i) {
+        ClearScalingForSlot(_slots[i]);
+        if (!CreateScalingForSlot(_slots[i], internalW, internalH, err, errLen)) {
+            _scalingReady = false;
+            _internalWidth = 0;
+            _internalHeight = 0;
+            return false;
+        }
+    }
     _internalWidth = internalW;
     _internalHeight = internalH;
-
-    // rebuild internal textures (sizes depend on the resolution percent)
-    _reducedColor.Reset();
-    _reducedDenoised.Reset();
-    _horizontalRes.Reset();
-    if (!CreateColorTexture(_reducedColor.GetAddressOf(), internalW, internalH,
-                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
-        return false;
-    }
-    if (!CreateColorTexture(_reducedDenoised.GetAddressOf(), internalW, internalH,
-                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
-        return false;
-    }
-    if (!CreateColorTexture(_horizontalRes.GetAddressOf(), _width, internalH,
-                            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
-        return false;
-    }
-
-    // (re)write SRV/UAV descriptors: 0=srvInput 1=srvReducedColor 2=srvReducedDenoised
-    // 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised 6=uavHorizontal 7=uavOutput
-    const D3D12_CPU_DESCRIPTOR_HANDLE base = _srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto slot = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(i * inc) }; };
-    _device->CreateShaderResourceView(_inputColor.Get(), nullptr, slot(0));
-    _device->CreateShaderResourceView(_reducedColor.Get(), nullptr, slot(1));
-    _device->CreateShaderResourceView(_reducedDenoised.Get(), nullptr, slot(2));
-    _device->CreateShaderResourceView(_horizontalRes.Get(), nullptr, slot(3));
-    _device->CreateUnorderedAccessView(_reducedColor.Get(), nullptr, nullptr, slot(4));
-    _device->CreateUnorderedAccessView(_reducedDenoised.Get(), nullptr, nullptr, slot(5));
-    _device->CreateUnorderedAccessView(_horizontalRes.Get(), nullptr, nullptr, slot(6));
-    _device->CreateUnorderedAccessView(_outputColor.Get(), nullptr, nullptr, slot(7));
-
     _scalingReady = true;
     return true;
 }
 
 void D3D12Context::ClearScalingResources() noexcept {
-    _horizontalRes.Reset();
-    _reducedDenoised.Reset();
-    _reducedColor.Reset();
+    DrainSlots();
+    for (int i = 0; i < kSlotCount; ++i) {
+        ClearScalingForSlot(_slots[i]);
+    }
     // zero the reported internal size too: stats consumers treat 0 as
     // "scaling disabled" instead of a stale percentage of a previous state
     _internalWidth = 0;
@@ -850,48 +968,95 @@ void D3D12Context::ClearScalingResources() noexcept {
     _scalingReady = false;
 }
 
-void D3D12Context::RecordPass(ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
+bool D3D12Context::CreateScalingForSlot(FrameSlot &slot, int internalW, int internalH, char *err, size_t errLen) noexcept {
+    if (!_rsCompute && !CreateComputeObjects(err, errLen)) return false;
+
+    // rebuild internal textures (sizes depend on the resolution percent)
+    slot.reducedColor.Reset();
+    slot.reducedDenoised.Reset();
+    slot.horizontalRes.Reset();
+    if (!CreateColorTexture(slot.reducedColor.GetAddressOf(), internalW, internalH,
+                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
+    if (!CreateColorTexture(slot.reducedDenoised.GetAddressOf(), internalW, internalH,
+                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
+    // R16G16B16A16_FLOAT: the horizontal residual is signed (denoised −
+    // color); a UNORM texture would clamp the negative (darken-noise) half
+    // of the correction away (Magpie DLSSNRFilter.cpp:987 uses 16F too).
+    if (!CreateColorTexture(slot.horizontalRes.GetAddressOf(), _width, internalH,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
+
+    // (re)write SRV/UAV descriptors: 0=srvInput 1=srvReducedColor 2=srvReducedDenoised
+    // 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised 6=uavHorizontal 7=uavOutput
+    const D3D12_CPU_DESCRIPTOR_HANDLE base = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto slotHandle = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(i * inc) }; };
+    _device->CreateShaderResourceView(slot.reducedColor.Get(), nullptr, slotHandle(1));
+    _device->CreateShaderResourceView(slot.reducedDenoised.Get(), nullptr, slotHandle(2));
+    _device->CreateShaderResourceView(slot.horizontalRes.Get(), nullptr, slotHandle(3));
+    _device->CreateUnorderedAccessView(slot.reducedColor.Get(), nullptr, nullptr, slotHandle(4));
+    _device->CreateUnorderedAccessView(slot.reducedDenoised.Get(), nullptr, nullptr, slotHandle(5));
+    _device->CreateUnorderedAccessView(slot.horizontalRes.Get(), nullptr, nullptr, slotHandle(6));
+    return true;
+}
+
+void D3D12Context::ClearScalingForSlot(FrameSlot &slot) noexcept {
+    slot.horizontalRes.Reset();
+    slot.reducedDenoised.Reset();
+    slot.reducedColor.Reset();
+}
+
+void D3D12Context::RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
                               UINT dispatchX, UINT dispatchY, float residualMultiplier) noexcept {
     // NGX's evaluate may rebind its own descriptor heap / root signature on
     // this command list; rebind ours before touching our descriptors.
-    _commandList->SetComputeRootSignature(_rsCompute.Get());
-    _commandList->SetPipelineState(pso);
-    ID3D12DescriptorHeap *heaps[]{ _srvUavHeap.Get() };
-    _commandList->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = _srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+    cl->SetComputeRootSignature(_rsCompute.Get());
+    cl->SetPipelineState(pso);
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
     const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
 
     const UINT srcWH[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
     const UINT dstWH[2]{ static_cast<UINT>(_internalWidth), static_cast<UINT>(_internalHeight) };
-    _commandList->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
-    _commandList->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
+    cl->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
+    cl->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
     const float zero = 0.0f;
-    _commandList->SetComputeRoot32BitConstants(0, 1, &zero, 4);      // Padding0
+    cl->SetComputeRoot32BitConstants(0, 1, &zero, 4);      // Padding0
     const float motion[2]{ 1.0f, 1.0f };
-    _commandList->SetComputeRoot32BitConstants(0, 2, motion, 5);
-    _commandList->SetComputeRoot32BitConstants(0, 1, &residualMultiplier, 7);
+    cl->SetComputeRoot32BitConstants(0, 2, motion, 5);
+    cl->SetComputeRoot32BitConstants(0, 1, &residualMultiplier, 7);
 
-    _commandList->SetComputeRootDescriptorTable(1, gpu(srv0));
-    _commandList->SetComputeRootDescriptorTable(2, gpu(srv1));
-    _commandList->SetComputeRootDescriptorTable(3, gpu(uav));
-    _commandList->Dispatch(dispatchX, dispatchY, 1);
+    cl->SetComputeRootDescriptorTable(1, gpu(srv0));
+    cl->SetComputeRootDescriptorTable(2, gpu(srv1));
+    cl->SetComputeRootDescriptorTable(3, gpu(uav));
+    cl->Dispatch(dispatchX, dispatchY, 1);
 }
 
-void D3D12Context::RecordDownsample(float residualMultiplier) noexcept {
-    RecordPass(_psoDownsample.Get(), 0, 0, 4, // t0 input, t1 dummy, u0 reducedColor
+void D3D12Context::RecordDownsample(FrameSlot &slot, float residualMultiplier) noexcept {
+    RecordPass(slot, _psoDownsample.Get(), 0, 0, 4, // t0 input, t1 dummy, u0 reducedColor
                (static_cast<UINT>(_internalWidth) + 7) / 8,
                (static_cast<UINT>(_internalHeight) + 7) / 8, residualMultiplier);
 }
 
-void D3D12Context::RecordResidualHorizontal(float residualMultiplier) noexcept {
-    RecordPass(_psoHorizontal.Get(), 1, 2, 6, // t0 reducedColor, t1 reducedDenoised, u0 horizontalRes
+void D3D12Context::RecordResidualHorizontal(FrameSlot &slot, float residualMultiplier) noexcept {
+    RecordPass(slot, _psoHorizontal.Get(), 1, 2, 6, // t0 reducedColor, t1 reducedDenoised, u0 horizontalRes
                (static_cast<UINT>(_width) + 7) / 8,
                (static_cast<UINT>(_internalHeight) + 7) / 8, residualMultiplier);
 }
 
-void D3D12Context::RecordResidualVertical(float residualMultiplier) noexcept {
-    RecordPass(_psoVertical.Get(), 0, 3, 7, // t0 original(input), t1 horizontalRes, u0 outputColor
+void D3D12Context::RecordResidualVertical(FrameSlot &slot, float residualMultiplier) noexcept {
+    RecordPass(slot, _psoVertical.Get(), 0, 3, 7, // t0 original(input), t1 horizontalRes, u0 outputColor
                (static_cast<UINT>(_width) + 7) / 8,
                (static_cast<UINT>(_height) + 7) / 8, residualMultiplier);
 }
