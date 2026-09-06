@@ -27,6 +27,22 @@ namespace vsdlssnr {
 
 using Microsoft::WRL::ComPtr;
 
+// Full-subresource transition barrier — the one barrier builder for the whole
+// plugin (frame path, NGX context and diagnostics all used to hand-roll the
+// same struct fill).
+inline D3D12_RESOURCE_BARRIER Transition(
+    ID3D12Resource *resource,
+    D3D12_RESOURCE_STATES before,
+    D3D12_RESOURCE_STATES after) noexcept {
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    return barrier;
+}
+
 // Residual fine-control set (Magpie 0.6.5 r2-fix1/2d37f8c0): applied once per
 // internal-resolution pixel in PrepareResidual, before the Catmull-Rom passes.
 struct ResidualControls {
@@ -49,7 +65,8 @@ struct FrameSlot {
     void *uploadMapped = nullptr;
     ComPtr<ID3D12Resource> inputColor;   // W×H RGBA8
     ComPtr<ID3D12Resource> outputColor;  // W×H RGBA8, UAV (NGX / composite write)
-    ComPtr<ID3D12Resource> readback;     // RGBA8 readback buffer
+    ComPtr<ID3D12Resource> readback;     // RGBA8 readback buffer, persist-mapped
+    void *readbackMapped = nullptr;
     // residual scaling pipeline, sized by the current input_resolution
     ComPtr<ID3D12Resource> reducedColor;
     ComPtr<ID3D12Resource> reducedDenoised;
@@ -172,6 +189,13 @@ private:
     bool CreateScalingForSlot(FrameSlot &slot, int iw, int ih, char *err, size_t errLen) noexcept;
     void ClearScalingForSlot(FrameSlot &slot) noexcept;
     bool WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept;
+    // Shared body of the three raw buffer creations (upload / readback /
+    // diagnostics dump): heap type, initial state and the 256-aligned pitch
+    // are the only differences between them.
+    bool CreateRawBuffer(UINT64 bytes, D3D12_HEAP_TYPE heapType,
+                         D3D12_RESOURCE_STATES initialState,
+                         ID3D12Resource **out, size_t &alignedPitch,
+                         UINT bytesPerRow, char *err, size_t errLen) noexcept;
 
     // Shared prologue of the four residual passes; only the PSO, descriptor
     // slots and dispatch dims differ. cbuffer layout (root constants):

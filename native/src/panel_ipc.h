@@ -10,20 +10,22 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <windows.h>
 
 namespace vsdlssnr {
 
 constexpr wchar_t PARAMS_MAPPING[] = L"vs_dlssnr_panel_params";
 constexpr wchar_t STATS_MAPPING[] = L"vs_dlssnr_stats";
+constexpr wchar_t PARAMS_EVENT[] = L"vs_dlssnr_panel_params_event"; // auto-reset; panel signals after each payload write
 constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";             // saved profile (written/read by both sides)
 constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive"; // filter-lifetime marker (bridge + panel watchdog)
 constexpr uint32_t PAYLOAD_SIZE = 512;
-// "DSSL3": v3 adds the four residual fine-control floats (fields reused from
-// the reserved block). The bump rejects payloads from a v1/v2 panel whose
-// reserved zeros would decode as saturation/lightness = 0 (= "remove the
-// residual change") instead of the neutral 1.
-constexpr uint32_t PAYLOAD_MAGIC = 0x334C5344u; // "DSSL3"
+// "DSSL4": v3 added the four residual fine-control floats; v4 drops the
+// write-only resetRequest command field (a reset is just a payload full of
+// default values). The bump keeps mixed-version panel/plugin pairs from
+// decoding shifted offsets as valid payloads.
+constexpr uint32_t PAYLOAD_MAGIC = 0x344C5344u; // "DSSL4"
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -47,9 +49,8 @@ struct PanelPayload {
     float reflectionGlow;        // 0-2
     int32_t scalingEnabled;      // 0 = ignore inputResolution (treat as 100)
     int32_t saveRequest;         // panel "保存设置" press (applied once per seq)
-    int32_t resetRequest;        // panel "重置默认" press
     int32_t logEnabled;          // perf log toggle state
-    uint32_t reserved[1];
+    uint32_t reserved[2];
 };
 #pragma pack(pop)
 
@@ -120,12 +121,11 @@ struct StatsPayload {
 #pragma pack(pop)
 static_assert(sizeof(StatsPayload) == PAYLOAD_SIZE, "stats payload must fit the mapping");
 
-// Stats JSON schema keys — the single authority. The writer's snprintf
-// format string (dlssnr_context.cpp) must spell exactly these; the panel
-// reader is constant-driven.
+// Stats JSON schema keys — the single authority. The writers' snprintf
+// format strings (dlssnr_context.cpp / d3d12_context.cpp) interpolate exactly
+// these; the panel reader is constant-driven.
 inline constexpr const char *SK_GPU_LAST = "gpu_last";
 inline constexpr const char *SK_GPU_EMA = "gpu_ema";
-inline constexpr const char *SK_GPU_P99 = "gpu_p99";
 inline constexpr const char *SK_PACK_EMA = "pack_ema";
 inline constexpr const char *SK_EVAL_CPU_EMA = "eval_cpu_ema";
 inline constexpr const char *SK_UNPACK_EMA = "unpack_ema";
@@ -139,14 +139,31 @@ inline constexpr const char *SK_GPU_NAME = "gpu_name";
 inline constexpr const char *SK_GPU_HANG = "gpu_hang";        // published as numeric 1
 inline constexpr const char *SK_REMOVED_REASON = "removed_reason";
 
+// Shared publish protocol for both channels: 1) seq = 0 (readers skip 0 /
+// treat it as a write in progress), 2) write the body, 3) interlocked
+// seq = newSeq. Single authority so a future protocol change (extra barrier,
+// generation guard) lands on both writers, not just one.
+template <typename WriteBody>
+inline void PublishWithSeq(volatile uint32_t *seq, uint32_t newSeq, WriteBody &&writeBody) noexcept {
+    *seq = 0;
+    writeBody();
+    _InterlockedExchange(reinterpret_cast<volatile long *>(seq), static_cast<long>(newSeq));
+}
+
 // Plugin-side stats publisher. Mapping + writable view are created once and
 // kept for the process lifetime (the kernel object dies with the plugin
 // process; readers map read-only per refresh). Replacing the mapping handle
 // per write would leak one handle per publish.
 inline bool PublishStatsJson(const char *json) noexcept {
+    // Every publisher (the 60-frame stats tick under the plugin's timing
+    // mutex, the GPU-hang path in WaitFenceValue, Initialize) serializes
+    // here: two writers must never interleave the invalidate/body/publish
+    // sequence, or the reader accepts a torn body with a valid seq.
+    static std::mutex publishLock;
     static HANDLE mapping = nullptr;
     static StatsPayload *view = nullptr;
     static uint32_t seq = 0;
+    std::lock_guard<std::mutex> guard(publishLock);
     if (!view) {
         if (!mapping) {
             mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
@@ -158,12 +175,11 @@ inline bool PublishStatsJson(const char *json) noexcept {
     }
     size_t n = strlen(json);
     if (n > sizeof(view->json) - 1) n = sizeof(view->json) - 1;
-    view->seq = 0; // invalidate while the body lands
-    memcpy(view->json, json, n);
-    view->json[n] = '\0';
-    view->magic = STATS_MAGIC;
-    _InterlockedExchange(reinterpret_cast<volatile long *>(&view->seq),
-                         static_cast<long>(++seq));
+    PublishWithSeq(&view->seq, ++seq, [&] {
+        memcpy(view->json, json, n);
+        view->json[n] = '\0';
+        view->magic = STATS_MAGIC;
+    });
     return true;
 }
 

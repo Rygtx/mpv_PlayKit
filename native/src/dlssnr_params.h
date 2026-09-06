@@ -48,6 +48,17 @@ struct DlssnrParams {
     float residualLightness = 1.0f;
     float shadowStructureMultiplier = 1.0f;
     float reflectionGlowMultiplier = 1.0f;
-    // Absolute path to nvngx_dlssnr.dll; empty = derive from plugin location
-    const char *ngxDllPath = nullptr;
 };
+
+// Create-time trio (preset / input_resolution / scaling_enabled) equivalence
+// — the single "is a feature rebuild worth it" rule. SharedParams::ConsumeRebuild
+// and DlssnrContext::Rebind both compare through this, so the two paths can
+// never disagree on when the NGX feature must be recreated. Resolution only
+// matters while scaling is on: with scaling off the percent is ignored by the
+// pipeline and must never fire a rebuild on its own.
+inline bool CreateParamsChanged(const DlssnrParams &pending, const DlssnrParams &cur) noexcept {
+    if (pending.preset != cur.preset) return true;
+    if (pending.scalingEnabled != cur.scalingEnabled) return true;
+    return pending.scalingEnabled != 0 &&
+           pending.inputResolutionPercent != cur.inputResolutionPercent;
+}

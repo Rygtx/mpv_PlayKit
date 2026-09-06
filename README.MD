@@ -13,7 +13,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 - 纯 D3D12 实现,零 guidance 单帧模式(不需要运动矢量 / 深度)
 - 同分辨率处理(非超分),SDR 色彩空间(非 HDR)
 - 静态 NGX core + snippet 直连 + IAT hook,完整复刻 Magpie 调用链
-- 残差管线:内部推理分辨率 25–100% 可调,Lanczos3 残差重建回源分辨率
+- 残差管线:内部推理分辨率 25–100% 可调,Catmull-Rom 残差重建回源分辨率
 - 全部参数实时生效(preset 切换走热重建),配套 ImGui 独立调参面板
 
 上游的 mpv 通用折腾内容(配置说明、mpv-lazy 使用等)仍见 [上游 Wiki](https://github.com/hooke007/mpv_PlayKit/wiki) 与 [《win10/11 mpv播放器通用教程》](https://hooke007.github.io/unofficial/mpv_start.html)。
@@ -39,6 +39,8 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 3. 将 `vs-plugins\` 内全部内容合并到 mpv 目录下的 `vs-plugins\`
 4. 重启 mpv
 
+> 手改 `portable_config\` 下的 `conf`/`vpy` 文件(含中文注释)时,请保持 **UTF-8 编码**;用记事本另存为 ANSI/GBK 会导致 mpv 解析异常。
+
 本包不含 mpv.exe 与 VapourSynth 运行时,请使用官方 [mpv-lazy](https://github.com/hooke007/mpv_PlayKit/releases) 发行包(建议与打包基线同版或更新,当前基线 mpv-lazy-20260510)。
 
 ## 使用
@@ -56,9 +58,9 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 |---|---|---|---|
 | `Preset` | 0–3 | 0 | NR 预设档位(创建参数,切换触发热重建) |
 | `Style` | 0–2 | 0 | 风格档位(0 默认 / 1 自然 / 2 电影) |
-| `Intensity` | 0–2 | 1.0 | 强度 |
-| `Local_Tone` | 0–2 | 1.0 | 局部色调强度 |
-| `Local_Structure` | 0–2 | 1.0 | 局部结构强度 |
+| `Intensity` | 0–1 | 1.0 | 强度 |
+| `Local_Tone` | 0–1 | 1.0 | 局部色调强度 |
+| `Local_Structure` | 0–1 | 1.0 | 局部结构强度 |
 | `Skin_Structure` | −1–2 | −1 | 皮肤结构强度(−1 = 自动) |
 | `Use_Auto_Mask` | True/False | True | 使用自动蒙版 |
 | `UI_Correction` | True/False | True | UI 文字修正 |

@@ -17,9 +17,11 @@ namespace vsdlssnr {
 namespace {
 
 constexpr wchar_t PANEL_EXE[] = L"dlssnr_panel.exe";
-// INI_FILE / ALIVE_EVENT come from panel_ipc.h (cross-process contract names)
-// Shared-memory polling: no disk IO, so poll fast enough for slider edits to
-// land within a frame or two.
+// INI_FILE / PARAMS_EVENT / ALIVE_EVENT come from panel_ipc.h (cross-process
+// contract names). The bridge is event-driven (the panel signals
+// PARAMS_EVENT after every payload write); POLL_INTERVAL_MS is the fallback
+// poll cadence when the event does not exist, and the retry cadence for
+// opening the panel's mapping.
 constexpr int POLL_INTERVAL_MS = 40;
 
 struct BridgeState {
@@ -31,16 +33,18 @@ struct BridgeState {
 BridgeState *g_bridge = nullptr; // one live bridge at a time (last filter wins)
 
 // Process-lifetime handles (the DLL is pinned, so "process" == one mpv
-// playback session). The alive event and the panel-params read mapping must
-// NOT die with a single filter instance: mpv tears down and recreates the
-// whole VS core on every seek. Per-instance lifetimes made BridgeStop close
-// the event → the panel watchdog exit → BridgeStart relaunch a fresh panel,
-// which found the mapping gone and pushed factory defaults (res=100) through
-// the bridge — recreating the feature behind the user's back on some seeks.
+// playback session). The alive event, the edit-notification event and the
+// panel-params read mapping must NOT die with a single filter instance: mpv
+// tears down and recreates the whole VS core on every seek. Per-instance
+// lifetimes made BridgeStop close the event → the panel watchdog exit →
+// BridgeStart relaunch a fresh panel, which found the mapping gone and
+// pushed factory defaults (res=100) through the bridge — recreating the
+// feature behind the user's back on some seeks.
 // Deliberately never closed: when mpv exits the kernel reclaims them and the
 // panel's OpenEventW poll starts failing, which is exactly the old "panel
 // follows the filter lifetime" semantics.
 HANDLE g_aliveEvent = nullptr;    // named; existence = a live filter in-process
+HANDLE g_paramsEvent = nullptr;   // named auto-reset; panel signals after each write
 HANDLE g_paramsMapping = nullptr; // read handle keeping the payload object alive
 const PanelPayload *g_paramsView = nullptr;
 
@@ -48,18 +52,28 @@ const PanelPayload *g_paramsView = nullptr;
 // ini persistence
 // ---------------------------------------------------------------------------
 
-bool GetSelfIniPath(wchar_t *path, size_t pathLen) noexcept {
+// Directory of this DLL — one module-path resolution shared by the ini path
+// and the panel launch path.
+bool GetSelfDir(wchar_t *dir, size_t dirLen) noexcept {
     HMODULE self = nullptr;
     if (!GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&GetSelfIniPath), &self)) {
+            reinterpret_cast<LPCWSTR>(&GetSelfDir), &self)) {
         return false;
     }
     wchar_t dllPath[MAX_PATH]{};
     if (!GetModuleFileNameW(self, dllPath, MAX_PATH)) return false;
-    std::wstring dir = std::filesystem::path(dllPath).parent_path().wstring();
-    if (dir.size() + 1 + wcslen(INI_FILE) >= pathLen) return false;
-    swprintf_s(path, pathLen, L"%s\\%s", dir.c_str(), INI_FILE);
+    std::wstring dirStr = std::filesystem::path(dllPath).parent_path().wstring();
+    if (dirStr.size() >= dirLen) return false;
+    wcscpy_s(dir, dirLen, dirStr.c_str());
+    return true;
+}
+
+bool GetSelfIniPath(wchar_t *path, size_t pathLen) noexcept {
+    wchar_t dir[MAX_PATH];
+    if (!GetSelfDir(dir, MAX_PATH)) return false;
+    if (wcslen(dir) + 1 + wcslen(INI_FILE) >= pathLen) return false;
+    swprintf_s(path, pathLen, L"%s\\%s", dir, INI_FILE);
     return true;
 }
 
@@ -117,12 +131,17 @@ namespace {
 void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
     DlssnrParams p = state->params->Snapshot();
     LoadLiveParams(p, pl); // shared field mapping (panel_ipc.h), clamps included
-    // Create-time params: request only — their _cur side is synced
-    // exclusively by SharedParams::ConsumeRebuild, otherwise
-    // the pending-vs-current comparison dies and the rebuild never fires.
-    state->params->RequestPreset(std::clamp(pl.preset, kPresetMin, kPresetMax));
-    state->params->RequestResolution(std::clamp(pl.inputResolution, kResPctMin, kResPctMax));
-    state->params->RequestScalingEnabled(pl.scalingEnabled != 0);
+    // Create-time params go through Request* only — their _cur side is synced
+    // exclusively by SharedParams::ConsumeRebuild, otherwise the
+    // pending-vs-current comparison dies and the rebuild never fires (and
+    // Update() preserves them regardless, see shared_params.h). Map them
+    // through LoadCreateParams so a new create-time payload field is picked
+    // up here by construction.
+    DlssnrParams create{};
+    LoadCreateParams(create, pl);
+    state->params->RequestPreset(create.preset);
+    state->params->RequestResolution(create.inputResolutionPercent);
+    state->params->RequestScalingEnabled(create.scalingEnabled);
     state->params->Update(p);
 
     if (pl.saveRequest) {
@@ -148,7 +167,15 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
     uint32_t lastGeneration = 0;
 
     while (state->running) {
-        Sleep(POLL_INTERVAL_MS);
+        // Wake on the panel's signal when possible (an edit lands within
+        // microseconds instead of up to one poll interval); the 40ms timeout
+        // keeps the payload-open retry loop alive while no panel exists, and
+        // is the fallback when the event could not be created.
+        if (g_paramsEvent) {
+            WaitForSingleObject(g_paramsEvent, POLL_INTERVAL_MS);
+        } else {
+            Sleep(POLL_INTERVAL_MS);
+        }
         if (!state->running) break;
 
         if (!g_paramsView) {
@@ -198,19 +225,11 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
 // Silently start the independent panel exe (single-instance guarded there).
 // Called on filter load so the tray icon appears without user action.
 void LaunchPanelSilently() noexcept {
-    wchar_t exePath[MAX_PATH];
-    HMODULE self = nullptr;
-    if (!GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&LaunchPanelSilently), &self)) {
-        return;
-    }
-    wchar_t dllPath[MAX_PATH]{};
-    if (!GetModuleFileNameW(self, dllPath, MAX_PATH)) return;
-    std::wstring dir = std::filesystem::path(dllPath).parent_path().wstring();
-    if (dir.size() + 1 + wcslen(PANEL_EXE) >= MAX_PATH) return;
-    swprintf_s(exePath, L"%s\\%s", dir.c_str(), PANEL_EXE);
-    ShellExecuteW(nullptr, L"open", exePath, nullptr, dir.c_str(), SW_HIDE);
+    wchar_t dir[MAX_PATH], exePath[MAX_PATH];
+    if (!GetSelfDir(dir, MAX_PATH)) return;
+    if (wcslen(dir) + 1 + wcslen(PANEL_EXE) >= MAX_PATH) return;
+    swprintf_s(exePath, L"%s\\%s", dir, PANEL_EXE);
+    ShellExecuteW(nullptr, L"open", exePath, nullptr, dir, SW_HIDE);
     if (GetLastError() == ERROR_FILE_NOT_FOUND) {
         OutputDebugStringW(L"vs_dlssnr: dlssnr_panel.exe not found next to plugin\n");
     }
@@ -219,7 +238,15 @@ void LaunchPanelSilently() noexcept {
 } // namespace
 
 bool BridgeStart(SharedParams *params) noexcept {
-    if (g_bridge) return true; // already running for a live instance
+    if (g_bridge) {
+        if (g_bridge->params == params) return true;
+        // A newer filter instance is going live while the previous one is
+        // still freeing (VS filter free order vs new-core create is not
+        // guaranteed). Transfer ownership here: otherwise BridgeStop(old)
+        // below would stop the only bridge and the new instance would never
+        // see another panel edit.
+        BridgeStop(g_bridge->params);
+    }
     auto *state = new (std::nothrow) BridgeState();
     if (!state) return false;
     state->params = params;
@@ -232,6 +259,12 @@ bool BridgeStart(SharedParams *params) noexcept {
             delete state;
             return false;
         }
+    }
+    // Edit-notification event for the poll loop (see BridgeThreadProc):
+    // process-lifetime like the other handles; the panel opens it by name
+    // and signals after every payload write. Failure falls back to polling.
+    if (!g_paramsEvent) {
+        g_paramsEvent = CreateEventW(nullptr, FALSE, FALSE, PARAMS_EVENT);
     }
     state->thread = CreateThread(nullptr, 0, BridgeThreadProc, state, 0, nullptr);
     if (!state->thread) {
@@ -250,9 +283,19 @@ void BridgeStop(SharedParams *params) noexcept {
     if (!state || state->params != params) return; // newer instance owns the bridge
     state->running = false;
     if (state->thread) {
-        WaitForSingleObject(state->thread, 5000);
+        const DWORD wait = WaitForSingleObject(state->thread, 5000);
         CloseHandle(state->thread);
         state->thread = nullptr;
+        if (wait != WAIT_OBJECT_0) {
+            // The thread is wedged (e.g. blocked writing the ini on a stalled
+            // disk). Deleting `state` now would free objects the resumed
+            // thread still dereferences — leak the tiny state block instead
+            // of risking a use-after-free; the thread exits on its own once
+            // the block clears. The alive event / mapping handles are
+            // process-lifetime either way.
+            g_bridge = nullptr;
+            return;
+        }
     }
     // The alive event and the params mapping are process-lifetime (see the
     // globals): deliberately NOT closed here. mpv re-creates the whole VS

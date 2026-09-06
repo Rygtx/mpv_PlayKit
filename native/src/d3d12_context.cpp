@@ -14,19 +14,6 @@ namespace {
 
 constexpr UINT DEVICE_VENDOR_NVIDIA = 0x10DE;
 
-D3D12_RESOURCE_BARRIER Transition(
-    ID3D12Resource *resource,
-    D3D12_RESOURCE_STATES before,
-    D3D12_RESOURCE_STATES after) noexcept {
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = resource;
-    barrier.Transition.StateBefore = before;
-    barrier.Transition.StateAfter = after;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    return barrier;
-}
-
 float Saturate(float v) noexcept {
     if (!(v > 0.0f)) return 0.0f;   // also catches NaN
     return v < 1.0f ? v : 1.0f;
@@ -109,8 +96,14 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
         if (FAILED(candidate->GetDesc1(&desc))) continue;
         // diagnostic: dump every adapter the enumerator sees
         {
-            char utf8[160], log[224];
-            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, utf8, sizeof(utf8), nullptr, nullptr);
+            // Zero-init + explicit failure check: a failed/too-long
+            // conversion leaves the buffer without a terminator, and the
+            // %s below would read past it into uninitialized stack.
+            char utf8[160] = {}, log[224];
+            if (WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+                                    utf8, sizeof(utf8), nullptr, nullptr) <= 0) {
+                utf8[0] = '\0';
+            }
             snprintf(log, sizeof(log), "adapter[%u]: vendor=0x%04X name=%s\n", i, desc.VendorId, utf8);
             OutputDebugStringA(log);
         }
@@ -190,6 +183,7 @@ void D3D12Context::Finalize() noexcept {
             s.fenceEvent = nullptr;
         }
         s.uploadMapped = nullptr;
+        s.readbackMapped = nullptr;
         s.upload.Reset();
         s.readback.Reset();
         s.inputColor.Reset();
@@ -261,10 +255,11 @@ bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_
                      "GPU hang/removed: reason=0x%08lX fence=%llu",
                      static_cast<unsigned long>(rr), static_cast<unsigned long long>(value));
             // surface through the stats mapping so the panel shows it
-            // (gpu_hang numeric — the panel parses it via JsonGetInt/SK_GPU_HANG)
+            // (gpu_hang numeric + the removal reason — keys from panel_ipc.h)
             char json[224];
             snprintf(json, sizeof(json),
-                     "{\"gpu_hang\":1,\"removed_reason\":\"0x%08lX\"}",
+                     "{\"%s\":1,\"%s\":\"0x%08lX\"}",
+                     SK_GPU_HANG, SK_REMOVED_REASON,
                      static_cast<unsigned long>(rr));
             PublishStatsJson(json);
             _deviceLost.store(true, std::memory_order_relaxed);
@@ -415,7 +410,57 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
     return true;
 }
 
+bool D3D12Context::CreateRawBuffer(UINT64 bytes, D3D12_HEAP_TYPE heapType,
+                                   D3D12_RESOURCE_STATES initialState,
+                                   ID3D12Resource **out, size_t &alignedPitch,
+                                   UINT bytesPerRow, char *err, size_t errLen) noexcept {
+    alignedPitch = (static_cast<size_t>(bytesPerRow) + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+                   & ~static_cast<size_t>(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = heapType;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = alignedPitch * (static_cast<UINT64>(bytes) / bytesPerRow);
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    HRESULT hr = _device->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc, initialState,
+        nullptr, IID_PPV_ARGS(out));
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "CreateCommittedResource(buffer) failed");
+        return false;
+    }
+    return true;
+}
+
 bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    // Re-entrant on the hot path (a resolution change reuses the warm
+    // context): release the previous generation of slot resources first.
+    // Safe because the caller holds a PoolHold — every slot is idle and its
+    // GPU work has completed (slots are only released after WaitFrame).
+    if (slot.fenceEvent) {
+        CloseHandle(slot.fenceEvent);
+        slot.fenceEvent = nullptr;
+    }
+    if (slot.upload && slot.uploadMapped) slot.upload->Unmap(0, nullptr);
+    if (slot.readback && slot.readbackMapped) slot.readback->Unmap(0, nullptr);
+    slot.uploadMapped = nullptr;
+    slot.readbackMapped = nullptr;
+    slot.commandList.Reset();
+    slot.allocator.Reset();
+    slot.upload.Reset();
+    slot.readback.Reset();
+    slot.inputColor.Reset();
+    slot.outputColor.Reset();
+    slot.reducedColor.Reset();
+    slot.reducedDenoised.Reset();
+    slot.controlledRes.Reset();
+    slot.horizontalRes.Reset();
+    slot.srvUavHeap.Reset();
+
     const int width = _width;
     const int height = _height;
     HRESULT hr = _device->CreateCommandAllocator(
@@ -457,24 +502,11 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
     }
 
     // Upload staging:RGBA8 行距 256 对齐(persist-mapped once)
-    slot.uploadPitch = (static_cast<size_t>(width) * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
-                       & ~static_cast<size_t>(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     {
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = slot.uploadPitch * static_cast<UINT64>(height);
-        desc.Height = 1;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        hr = _device->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
-            nullptr, IID_PPV_ARGS(slot.upload.GetAddressOf()));
-        if (FAILED(hr)) {
-            SetErr(err, errLen, hr, "CreateCommittedResource(upload) failed");
+        if (!CreateRawBuffer(static_cast<UINT64>(height) * width * 4, D3D12_HEAP_TYPE_UPLOAD,
+                             D3D12_RESOURCE_STATE_GENERIC_READ,
+                             slot.upload.GetAddressOf(), slot.uploadPitch,
+                             width * 4, err, errLen)) {
             return false;
         }
         hr = slot.upload->Map(0, nullptr, &slot.uploadMapped);
@@ -486,23 +518,18 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
     {
         // READBACK heap only accepts buffers on this runtime (texture staging
         // on READBACK heap returns E_INVALIDARG), so copy via placed footprint
-        // into a readback buffer.
+        // into a readback buffer. Persist-mapped like the upload side: the
+        // per-frame Map/Unmap pair was pure driver-call overhead.
         slot.readbackPitch = slot.uploadPitch; // same 256-aligned RGBA8 row size
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC desc{};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        desc.Width = slot.readbackPitch * static_cast<UINT64>(height);
-        desc.Height = 1;
-        desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1;
-        desc.SampleDesc.Count = 1;
-        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        hr = _device->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST,
-            nullptr, IID_PPV_ARGS(slot.readback.GetAddressOf()));
+        if (!CreateRawBuffer(static_cast<UINT64>(height) * width * 4, D3D12_HEAP_TYPE_READBACK,
+                             D3D12_RESOURCE_STATE_COPY_DEST,
+                             slot.readback.GetAddressOf(), slot.readbackPitch,
+                             width * 4, err, errLen)) {
+            return false;
+        }
+        hr = slot.readback->Map(0, nullptr, &slot.readbackMapped);
         if (FAILED(hr)) {
-            SetErr(err, errLen, hr, "CreateCommittedResource(readback) failed");
+            SetErr(err, errLen, hr, "Map(readback) failed");
             return false;
         }
     }
@@ -651,14 +678,10 @@ bool D3D12Context::UnpackOutput(
         return false;
     }
 
-    void *mapped = nullptr;
-    HRESULT hr = slot.readback->Map(0, nullptr, &mapped);
-    if (FAILED(hr)) {
-        SetErr(err, errLen, hr, "Map(readback) failed");
-        return false;
-    }
+    // The readback buffer is persist-mapped at creation (mirrors the upload
+    // side): the per-frame Map/Unmap pair only bought two driver calls.
     const size_t pitch = slot.readbackPitch;
-    const auto *srcRow = static_cast<const uint8_t *>(mapped);
+    const auto *srcRow = static_cast<const uint8_t *>(slot.readbackMapped);
     for (int y = 0; y < height; ++y, srcRow += pitch) {
         const uint8_t *row = srcRow;
         float *rowR = reinterpret_cast<float *>(dstPlanes[0] + dstStrides[0] * y);
@@ -670,7 +693,6 @@ bool D3D12Context::UnpackOutput(
             rowB[x] = row[x * 4 + 2] * (1.0f / 255.0f);
         }
     }
-    slot.readback->Unmap(0, nullptr);
     return true;
 }
 
@@ -982,22 +1004,12 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
     // RGBA8 (4 B/px) covers the color dumps; the horizontal residual is now
     // R16G16B16A16_FLOAT (8 B/px) since the residual needs a signed range.
     const UINT bpp = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
-    const UINT pitch = (static_cast<UINT>(width) * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
-                       & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = static_cast<UINT64>(pitch) * height;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    size_t pitch = 0;
     ComPtr<ID3D12Resource> buffer;
-    if (FAILED(_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
-                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                IID_PPV_ARGS(buffer.GetAddressOf())))) {
+    char ignore[96];
+    if (!CreateRawBuffer(static_cast<UINT64>(height) * width * bpp, D3D12_HEAP_TYPE_READBACK,
+                         D3D12_RESOURCE_STATE_COPY_DEST, buffer.GetAddressOf(),
+                         pitch, width * bpp, ignore, sizeof(ignore))) {
         return false;
     }
     if (!BeginCtlRecording()) return false;
@@ -1011,7 +1023,7 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
     dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(width);
     dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(height);
     dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = pitch;
+    dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(pitch);
     _ctlCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     D3D12_RESOURCE_BARRIER back[1]{
         Transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
@@ -1244,7 +1256,11 @@ void D3D12Context::RecordDownsampleVertical(FrameSlot &slot, const ResidualContr
 }
 
 void D3D12Context::RecordDownsampleHorizontal(FrameSlot &slot, const ResidualControls &rc) noexcept {
-    RecordPass(slot, _psoDownsampleHorizontal.Get(), 6, 6, 4, // t0 intermediate, t1 dummy, u0 reducedColor
+    // t0/t1 read the vertical pass's output through its SRV descriptor
+    // (slot 3) — slot 6 holds horizontalRes's UAV descriptor, and binding a
+    // UAV descriptor into an SRV root table is invalid per the D3D12 spec
+    // (the debug layer flags it; other drivers may not read it correctly).
+    RecordPass(slot, _psoDownsampleHorizontal.Get(), 3, 3, 4, // t0 intermediate, t1 dummy, u0 reducedColor
                (static_cast<UINT>(_internalWidth) + 7) / 8,
                (static_cast<UINT>(_internalHeight) + 7) / 8, rc);
 }

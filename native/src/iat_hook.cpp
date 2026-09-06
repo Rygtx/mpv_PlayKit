@@ -41,14 +41,6 @@ DWORD WINAPI HookedGetModuleFileNameW(HMODULE module, LPWSTR filename, DWORD siz
     return 0;
 }
 
-template <typename T>
-void *FunctionAddress(T function) noexcept {
-    void *result = nullptr;
-    static_assert(sizeof(function) == sizeof(result));
-    std::memcpy(&result, &function, sizeof(result));
-    return result;
-}
-
 void **FindImportedFunctionSlot(HMODULE module, const char *functionName) noexcept {
     if (!module || !functionName) return nullptr;
     auto *base = reinterpret_cast<std::byte *>(module);

@@ -20,10 +20,19 @@ public:
         return _cur;
     }
 
-    // UI thread: full update from panel state.
+    // UI thread: full live-params update from panel state. The create-time
+    // fields (preset / inputResolutionPercent / scalingEnabled) are
+    // deliberately NOT copied from `next`: their _cur side is owned by
+    // ConsumeRebuild alone (panel_ipc.h invariant). A snapshot taken before
+    // the matching Request* calls could otherwise revert a just-consumed
+    // change and double-fire the rebuild.
     void Update(const DlssnrParams &next) {
         std::unique_lock lock(_lock);
-        _cur = next;
+        DlssnrParams merged = next;
+        merged.preset = _cur.preset;
+        merged.inputResolutionPercent = _cur.inputResolutionPercent;
+        merged.scalingEnabled = _cur.scalingEnabled;
+        _cur = merged;
     }
 
     // UI thread: request a preset / internal-resolution / scaling-toggle change
@@ -47,29 +56,42 @@ public:
     // rebuild is due. _cur for preset/resolution/scaling is synced ONLY here:
     // the bridge's Update() must not pre-sync create-time params, or the
     // pending-vs-current comparison dies (rebuild never fires) — mirrors the
-    // pre-F1 preset invariant.
+    // pre-F1 preset invariant. The rebuild-worthiness rule itself lives in
+    // dlssnr_params.h CreateParamsChanged, shared with DlssnrContext::Rebind.
     bool ConsumeRebuild(int &newPreset, int &newResolution, int &newScalingEnabled) {
         std::unique_lock lock(_lock);
-        const bool presetChanged = _pendingPreset >= 0 && _pendingPreset != _cur.preset;
-        const bool scalingChanged = _pendingScalingEnabled >= 0 && _pendingScalingEnabled != _cur.scalingEnabled;
-        const bool scalingOff = (scalingChanged ? _pendingScalingEnabled : _cur.scalingEnabled) == 0;
-        // Effective pending resolution: forced 100 while scaling ends up
-        // disabled. A resolution change is rebuild-worthy only while scaling
-        // is (staying) on — with scaling off the percent is ignored by the
-        // pipeline, so it must never fire a rebuild on its own (a fresh
-        // scaling-off load with a stored <100 percent used to recreate the
-        // just-created feature on frame 1).
-        const int pendingRes = scalingOff
-                                   ? 100
-                                   : (_pendingResolution > 0 ? _pendingResolution : _cur.inputResolutionPercent);
-        const bool resChanged = !scalingOff && pendingRes != _cur.inputResolutionPercent;
-        if (presetChanged) _cur.preset = _pendingPreset;
-        if (scalingChanged) _cur.scalingEnabled = _pendingScalingEnabled;
-        if (resChanged) _cur.inputResolutionPercent = pendingRes;
+        // Effective pending trio: unset pendings fall back to the current
+        // values; the resolution is forced to 100 while scaling ends up
+        // disabled (with scaling off the percent is ignored by the pipeline,
+        // so it must never fire a rebuild on its own — a fresh scaling-off
+        // load with a stored <100 percent used to recreate the just-created
+        // feature on frame 1).
+        DlssnrParams eff{};
+        eff.preset = _pendingPreset >= 0 ? _pendingPreset : _cur.preset;
+        eff.scalingEnabled = _pendingScalingEnabled >= 0 ? _pendingScalingEnabled : _cur.scalingEnabled;
+        eff.inputResolutionPercent =
+            eff.scalingEnabled
+                ? (_pendingResolution > 0 ? _pendingResolution : _cur.inputResolutionPercent)
+                : 100;
+        if (!CreateParamsChanged(eff, _cur)) {
+            newPreset = _cur.preset;
+            newResolution = _cur.inputResolutionPercent;
+            newScalingEnabled = _cur.scalingEnabled;
+            return false;
+        }
+        // Sync only what changed. The resolution syncs only while scaling is
+        // on: preserving the stored percent otherwise keeps the pending
+        // request alive for the next scaling re-enable (one rebuild instead
+        // of two).
+        if (eff.preset != _cur.preset) _cur.preset = eff.preset;
+        if (eff.scalingEnabled != _cur.scalingEnabled) _cur.scalingEnabled = eff.scalingEnabled;
+        if (eff.scalingEnabled && eff.inputResolutionPercent != _cur.inputResolutionPercent) {
+            _cur.inputResolutionPercent = eff.inputResolutionPercent;
+        }
         newPreset = _cur.preset;
         newResolution = _cur.inputResolutionPercent;
         newScalingEnabled = _cur.scalingEnabled;
-        return presetChanged || resChanged || scalingChanged;
+        return true;
     }
 
     // Preset value a save should persist (pending request wins over current).

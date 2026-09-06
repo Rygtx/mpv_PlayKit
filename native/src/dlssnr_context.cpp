@@ -77,14 +77,6 @@ void DbgLine(const char *msg) noexcept {
     OutputDebugStringA("\n");
 }
 
-template <typename T>
-void *FunctionAddress(T function) noexcept {
-    void *result = nullptr;
-    static_assert(sizeof(function) == sizeof(result));
-    std::memcpy(&result, &function, sizeof(result));
-    return result;
-}
-
 void SetSubrect(NVSDK_NGX_Parameter *parameters, const ResourceParameters &resource, int width, int height) noexcept {
     parameters->Set(resource.baseX, 0);
     parameters->Set(resource.baseY, 0);
@@ -115,26 +107,16 @@ void NVSDK_CONV NgxLogCallback(const char *message, NVSDK_NGX_Logging_Level, NVS
 D3D12_RESOURCE_BARRIER TransitionTo(
     ID3D12Resource *resource,
     D3D12_RESOURCE_STATES after) noexcept {
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = resource;
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    barrier.Transition.StateAfter = after;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    return barrier;
+    // Thin wrappers over the shared builder (d3d12_context.h); the barrier
+    // struct fill itself lives in exactly one place.
+    return Transition(resource, D3D12_RESOURCE_STATE_COMMON, after);
 }
 
 D3D12_RESOURCE_BARRIER TransitionFromTo(
     ID3D12Resource *resource,
     D3D12_RESOURCE_STATES from,
     D3D12_RESOURCE_STATES to) noexcept {
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = resource;
-    barrier.Transition.StateBefore = from;
-    barrier.Transition.StateAfter = to;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    return barrier;
+    return Transition(resource, from, to);
 }
 
 } // namespace (Transition helpers)
@@ -145,27 +127,45 @@ std::atomic<bool> g_timingLogEnabled{ true };
 // fmParallel: several frame threads push timing samples / flush the log
 std::mutex g_timingMutex;
 
+namespace {
+
+// Path + append handle, resolved once under g_timingMutex. A persistent
+// handle avoids a full CreateFile/close cycle (through the filesystem filter
+// stack) on every 60th frame; disabling the toggle closes it again so the
+// log file can be deleted/moved while logging is off.
+wchar_t g_timingLogPath[MAX_PATH] = L"";
+FILE *g_timingLogFile = nullptr;
+
+} // namespace
+
 void SetTimingLogEnabled(bool enabled) noexcept {
     g_timingLogEnabled.store(enabled, std::memory_order_relaxed);
+    if (!enabled) {
+        std::lock_guard<std::mutex> lock(g_timingMutex);
+        if (g_timingLogFile) {
+            fclose(g_timingLogFile);
+            g_timingLogFile = nullptr;
+        }
+    }
 }
 
 namespace {
 
 void TimingLog(const char *line) noexcept {
     if (!g_timingLogEnabled.load(std::memory_order_relaxed)) return;
-    // Frame-thread hot path (60-frame cadence): resolve the log path once —
-    // GetModuleFileNameW + a filesystem rebuild per flush is pure overhead.
-    static wchar_t logPath[MAX_PATH] = L"";
-    if (!logPath[0]) {
+    // concurrent frame threads: serialize appends so lines never interleave;
+    // the lazy path/handle init below lives inside the lock (it used to race
+    // a partially-written path between the first concurrent threads).
+    std::lock_guard<std::mutex> lock(g_timingMutex);
+    if (!g_timingLogPath[0]) {
         wchar_t dir[MAX_PATH];
         if (!GetModuleFileNameW(nullptr, dir, MAX_PATH)) return;
-        swprintf_s(logPath, MAX_PATH, L"%s\\dlssnr_timing.log",
+        swprintf_s(g_timingLogPath, MAX_PATH, L"%s\\dlssnr_timing.log",
                    std::filesystem::path(dir).parent_path().c_str());
     }
-    // concurrent frame threads: serialize appends so lines never interleave
-    std::lock_guard<std::mutex> lock(g_timingMutex);
-    FILE *f = nullptr;
-    if (_wfopen_s(&f, logPath, L"a") != 0 || !f) return;
+    if (!g_timingLogFile) {
+        if (_wfopen_s(&g_timingLogFile, g_timingLogPath, L"a") != 0 || !g_timingLogFile) return;
+    }
     // Timestamp every line: the log is append-only across sessions and hosts,
     // and without timestamps a recreate storm cannot be attributed to the
     // session that caused it.
@@ -174,9 +174,10 @@ void TimingLog(const char *line) noexcept {
     char stamped[336];
     snprintf(stamped, sizeof(stamped), "[%02u:%02u:%02u.%03u] %s",
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
-    fwrite(stamped, 1, strlen(stamped), f);
-    if (!strlen(stamped) || stamped[strlen(stamped) - 1] != '\n') fputc('\n', f);
-    fclose(f);
+    fwrite(stamped, 1, strlen(stamped), g_timingLogFile);
+    if (!strlen(stamped) || stamped[strlen(stamped) - 1] != '\n') fputc('\n', g_timingLogFile);
+    // keep the line on disk even if the session dies before the next flush
+    fflush(g_timingLogFile);
 }
 
 } // namespace (TimingLog helpers)
@@ -538,8 +539,9 @@ bool DlssnrContext::Initialize(
     return true;
 }
 
-bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen) noexcept {
-    if (!_ready || !_snippetReleaseFeature) {
+bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
+                                    int newWidth, int newHeight) noexcept {
+    if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
         return false;
     }
@@ -556,6 +558,18 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // lock is needed. ConsumeRebuild is consumed before any slot is acquired
     // on this thread, so this thread holds no slot and the drain completes.
     D3D12Context::PoolHold pool(*_d3d12);
+    // A video-size change replaces every slot's frame resources first —
+    // outside CtlMutex because the guidance clear inside takes it itself.
+    // All GPU work is complete (slots are only released after WaitFrame).
+    const bool resize = newWidth > 0 && (newWidth != _width || newHeight != _height);
+    if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, err, errLen)) {
+        _ready.store(false, std::memory_order_release);
+        return false;
+    }
+    if (resize) {
+        _width = newWidth;
+        _height = newHeight;
+    }
     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
     {
         DWORD sehCode = 0;
@@ -571,14 +585,14 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         const NVSDK_NGX_Result r = CoreAllocateParametersSafely(&_parameters, &sehCode);
         if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_parameters) {
             if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: AllocateParameters failed");
-            _ready = false;
+            _ready.store(false, std::memory_order_release);
             return false;
         }
         if (scalingEnabled) {
             int iw = _width, ih = _height;
             InternalSize(_width, _height, resPercent, iw, ih);
             if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) {
-                _ready = false;
+                _ready.store(false, std::memory_order_release);
                 return false;
             }
         } else {
@@ -587,42 +601,43 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     }
     if (!_d3d12->BeginCtlRecording()) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: BeginCtlRecording failed");
-        _ready = false;
+        _ready.store(false, std::memory_order_release);
         return false;
     }
     {
         DWORD sehCode = 0;
         if (!SetCreateParametersSafely(&sehCode)) {
             if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: parameter setup raised SEH");
-            _ready = false;
+            _ready.store(false, std::memory_order_release);
             return false;
         }
         const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CtlCommandList(), _parameters, &sehCode);
         if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_feature) {
             if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: CreateFeature failed (0x%x)",
                 static_cast<unsigned>(sehCode ? 0xFFFFFFFFu : r));
-            _ready = false;
+            _ready.store(false, std::memory_order_release);
             return false;
         }
     }
     if (!_d3d12->ExecuteCtlAndWait()) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: Execute failed");
-        _ready = false;
+        _ready.store(false, std::memory_order_release);
         return false;
     }
-    char msg[96];
-    snprintf(msg, sizeof(msg), "DLSSNR STATUS: preset=%d res=%d%% scaling=%d feature recreated",
-             preset, scalingEnabled ? resPercent : 100, scalingEnabled);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "DLSSNR STATUS: preset=%d res=%d%% scaling=%d feature recreated%s",
+             preset, scalingEnabled ? resPercent : 100, scalingEnabled,
+             resize ? " (size changed)" : "");
     DbgLine(msg);
     TimingLog(msg);
     _curPreset = preset;
     _curRes = resPercent;
-    _curScaling = scalingEnabled;
+    _curScaling = scalingEnabled != 0;
     return true;
 }
 
-bool DlssnrContext::Rebind(SharedParams *shared, char *err, size_t errLen) noexcept {
-    if (!_ready || !_snippetReleaseFeature) {
+bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *err, size_t errLen) noexcept {
+    if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "Rebind: context not ready");
         return false;
     }
@@ -633,30 +648,60 @@ bool DlssnrContext::Rebind(SharedParams *shared, char *err, size_t errLen) noexc
     // run in DlssnrCreate before this). Only a real create-time change needs
     // the feature rebuilt; a matching hot context keeps the NGX feature
     // completely warm across mpv's seek-triggered script re-initialization.
-    const bool scalingChanged = p.scalingEnabled != _curScaling;
-    const bool resChanged = p.scalingEnabled && _curScaling && p.inputResolutionPercent != _curRes;
-    if (p.preset == _curPreset && !scalingChanged && !resChanged) {
+    // A different video size rebuilds frame resources + feature inside the
+    // same pool-sealed RecreateFeature pass, so the ~1s bring-up survives
+    // resolution changes too.
+    DlssnrParams cur{};
+    cur.preset = _curPreset;
+    cur.inputResolutionPercent = _curRes;
+    cur.scalingEnabled = _curScaling;
+    const bool dimsChanged = width != _width || height != _height;
+    if (!dimsChanged && !CreateParamsChanged(p, cur)) {
         char msg[128];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d)",
-                      _curPreset, _curScaling ? _curRes : 100, _curScaling);
+                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d %dx%d)",
+                      _curPreset, _curScaling ? _curRes : 100, _curScaling, _width, _height);
         DbgLine(msg);
         TimingLog(msg);
         return true;
     }
-    return RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen);
+    return RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen,
+                           dimsChanged ? width : -1, dimsChanged ? height : -1);
 }
 
 bool DlssnrContext::ProcessFrame(
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
     uint8_t **dstPlanes, int64_t *dstStrides,
-    int width, int height, bool resetHistory,
+    int width, int height, int n,
     char *err, size_t errLen,
     char *timingOut, size_t timingLen) noexcept {
-    if (!_ready) {
-        if (err && errLen) std::snprintf(err, errLen, "context not ready");
+    // Faulted latch: every NGX entry returns instantly, so bail before
+    // paying AcquireSlot + the full-frame CPU pack for a frame that can
+    // never succeed.
+    if (!_ready.load(std::memory_order_relaxed) ||
+        NgxRuntimeGuard::IsFaulted()) {
+        if (err && errLen) {
+            if (NgxRuntimeGuard::IsFaulted()) {
+                std::snprintf(err, errLen,
+                              "NGX faulted (SEH 0x%x); SDK disabled until host restart",
+                              NgxRuntimeGuard::FaultCode());
+            } else {
+                std::snprintf(err, errLen, "context not ready");
+            }
+        }
         return false;
     }
+    // fmParallel: VS activates frames out of order and on several threads, so
+    // a strict n != lastN + 1 would fire NGX's reset path on every reordering
+    // and stall the first seconds of playback. Only real discontinuities
+    // reset (see kFrameGapResetThreshold): backwards jump (seek back) or a
+    // large forward gap (seek past the prefetch window). Relaxed ordering: a
+    // stale read at worst triggers one extra harmless reset on a
+    // zero-guidance (stateless) model.
+    const int lastN = _lastFrame.load(std::memory_order_relaxed);
+    const bool resetHistory =
+        lastN < 0 || n < lastN || n - lastN > kFrameGapResetThreshold;
+    _lastFrame.store(n, std::memory_order_relaxed);
     // Panel preset / internal-resolution / scaling-toggle changes require a
     // feature rebuild; consume before packing.
     if (int newPreset = -1, newRes = -1, newScaling = -1; _shared->ConsumeRebuild(newPreset, newRes, newScaling)) {
@@ -695,6 +740,15 @@ bool DlssnrContext::ProcessFrame(
         FrameSlot *s;
         ~SlotGuard() { if (s) ctx->ReleaseSlot(s); }
     } guard{ _d3d12, slot };
+    // The pool seal only serializes; it does not refresh readiness. A
+    // concurrent RecreateFeature may have failed (leaving _parameters null)
+    // or a device loss may have latched while this thread waited for a slot
+    // — without this re-check the frame would evaluate against a dead/null
+    // parameter block and fault the latch.
+    if (!_ready.load(std::memory_order_acquire) || !_parameters) {
+        if (err && errLen) std::snprintf(err, errLen, "context not ready (rebuild failed or device lost)");
+        return false;
+    }
     // pack-segment clock starts here: PackInput is a pure-CPU RGBS→RGBA8
     // write into the slot's upload heap. RecreateFeature (above, only on the
     // switch frame: PoolHold drain + NGX rebuild) and AcquireSlot waits are
@@ -899,36 +953,40 @@ bool DlssnrContext::ProcessFrame(
     if (!_d3d12->WaitFrame(*slot, err, errLen)) {
         // A timed-out fence means GPU hang / device removal: stop evaluating,
         // otherwise every later frame stalls the full 10s fence wait again.
-        if (_d3d12->IsDeviceLost()) _ready = false;
+        if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
         if (err && errLen) std::snprintf(err, errLen, "Wait(frame) failed");
         return false;
     }
     QueryPerformanceCounter(&t3);
     const bool rb = _d3d12->UnpackOutput(*slot, dstPlanes, dstStrides, width, height, err, errLen);
     {
-        static std::mutex dumpMutex; // concurrent frame threads: dump at most once, no interleaved writes
-        std::lock_guard<std::mutex> dumpLock(dumpMutex);
-        static bool dumped = false;
-        if (!dumped && dumpEnabled) {
-            dumped = true;
-            wchar_t dir[MAX_PATH];
-            if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
-                std::filesystem::path base = std::filesystem::path(dir).parent_path();
-                const bool scaling = _d3d12->HasScaling();
-                std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
-                _d3d12->DumpTextureToFile(_d3d12->InputColor(*slot), width, height,
-                                          (base / L"dump_input.bin").c_str());
-                if (scaling) {
-                    _d3d12->DumpTextureToFile(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
-                                              _d3d12->InternalHeight(), (base / L"dump_reduced_color.bin").c_str());
-                    _d3d12->DumpTextureToFile(_d3d12->ReducedDenoised(*slot), _d3d12->InternalWidth(),
-                                              _d3d12->InternalHeight(), (base / L"dump_reduced_denoised.bin").c_str());
-                    _d3d12->DumpTextureToFile(_d3d12->HorizontalRes(*slot), width,
-                                              _d3d12->InternalHeight(), (base / L"dump_horizontal.bin").c_str(),
-                                              DXGI_FORMAT_R16G16B16A16_FLOAT);
+        // concurrent frame threads: dump at most once, no interleaved writes;
+        // the mutex is only taken when a dump is actually pending (the old
+        // code locked it every frame even with dumping disabled).
+        static std::atomic<bool> dumped{ false };
+        if (dumpEnabled && !dumped.load(std::memory_order_relaxed)) {
+            static std::mutex dumpMutex;
+            std::lock_guard<std::mutex> dumpLock(dumpMutex);
+            if (!dumped.exchange(true)) {
+                wchar_t dir[MAX_PATH];
+                if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
+                    std::filesystem::path base = std::filesystem::path(dir).parent_path();
+                    const bool scaling = _d3d12->HasScaling();
+                    std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
+                    _d3d12->DumpTextureToFile(_d3d12->InputColor(*slot), width, height,
+                                              (base / L"dump_input.bin").c_str());
+                    if (scaling) {
+                        _d3d12->DumpTextureToFile(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
+                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_color.bin").c_str());
+                        _d3d12->DumpTextureToFile(_d3d12->ReducedDenoised(*slot), _d3d12->InternalWidth(),
+                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_denoised.bin").c_str());
+                        _d3d12->DumpTextureToFile(_d3d12->HorizontalRes(*slot), width,
+                                                  _d3d12->InternalHeight(), (base / L"dump_horizontal.bin").c_str(),
+                                                  DXGI_FORMAT_R16G16B16A16_FLOAT);
+                    }
+                    _d3d12->DumpTextureToFile(_d3d12->OutputColor(*slot), width, height,
+                                              (base / L"dump_output.bin").c_str());
                 }
-                _d3d12->DumpTextureToFile(_d3d12->OutputColor(*slot), width, height,
-                                          (base / L"dump_output.bin").c_str());
             }
         }
     }
@@ -967,17 +1025,20 @@ bool DlssnrContext::ProcessFrame(
                          _width, _height);
 
                 // stats via named shared memory (no disk IO; panel reads directly).
-                // Keys must match the SK_* constants in panel_ipc.h.
+                // Keys are the SK_* constants from panel_ipc.h, interpolated
+                // into the format string so the schema cannot drift silently.
                 char body[512];
                 snprintf(body, sizeof(body),
-                         "{\"gpu_last\":%.1f,\"gpu_ema\":%.1f,\"gpu_p99\":%.1f,"
-                         "\"pack_ema\":%.1f,\"eval_cpu_ema\":%.1f,\"unpack_ema\":%.1f,"
-                         "\"internal_w\":%d,\"internal_h\":%d,\"width\":%d,\"height\":%d,"
-                         "\"scaling\":%d,\"fps\":%.1f,\"gpu_name\":\"%s\"}",
-                         gpuLast, gpuEma, gpuP99, packEma, evalCpuEma, unpackEma,
-                         _d3d12->InternalWidth(), _d3d12->InternalHeight(), _width, _height,
-                         _d3d12->HasScaling() ? 1 : 0,
-                         _d3d12->FrameRateEma(), _gpuNameUtf8);
+                         "{\"%s\":%.1f,\"%s\":%.1f,"
+                         "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
+                         "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
+                         "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\"}",
+                         SK_GPU_LAST, gpuLast, SK_GPU_EMA, gpuEma,
+                         SK_PACK_EMA, packEma, SK_EVAL_CPU_EMA, evalCpuEma, SK_UNPACK_EMA, unpackEma,
+                         SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
+                         SK_WIDTH, _width, SK_HEIGHT, _height,
+                         SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
+                         SK_FPS, _d3d12->FrameRateEma(), SK_GPU_NAME, _gpuNameUtf8);
                 PublishStatsJson(body);
             }
         }

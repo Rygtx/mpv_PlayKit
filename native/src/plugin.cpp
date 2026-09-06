@@ -13,6 +13,7 @@
 #include "VSHelper4.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
@@ -26,16 +27,29 @@ constexpr char PLUGIN_NAMESPACE[] = "dlssnr";
 constexpr char PLUGIN_NAME[] = "NVIDIA DLSSNR filter (Magpie port)";
 constexpr char SNIPPET_DLL_NAME[] = "nvngx_dlssnr.dll";
 
-long long GetIntDef(const VSMap *in, const VSAPI *vsapi, const char *key, long long def) {
+// vpy explicit arguments overwrite the DlssnrParams member initializers —
+// the struct defaults in dlssnr_params.h are the single authority, so a
+// default change cannot drift between the vpy layer and the ini/panel layers.
+// Missing keys leave the field untouched; present keys are clamped at the
+// boundary against the same dlssnr_params.h range constants.
+void ApplyIntArg(const VSMap *in, const VSAPI *vsapi, const char *key,
+                 int &field, int lo, int hi) noexcept {
     int err = 0;
     const long long v = vsapi->mapGetInt(in, key, 0, &err);
-    return err ? def : v;
+    if (!err) field = static_cast<int>(std::clamp<long long>(v, lo, hi));
 }
 
-double GetFloatDef(const VSMap *in, const VSAPI *vsapi, const char *key, double def) {
+void ApplyFloatArg(const VSMap *in, const VSAPI *vsapi, const char *key,
+                   float &field, float lo, float hi) noexcept {
     int err = 0;
     const double v = vsapi->mapGetFloat(in, key, 0, &err);
-    return err ? def : v;
+    if (!err) field = vsh::doubleToFloatS(std::clamp(v, static_cast<double>(lo), static_cast<double>(hi)));
+}
+
+void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &field) noexcept {
+    int err = 0;
+    const long long v = vsapi->mapGetInt(in, key, 0, &err);
+    if (!err) field = v != 0;
 }
 
 struct FilterData {
@@ -57,7 +71,9 @@ struct FilterData {
     bool initOk = false;
     int width = 0;
     int height = 0;
-    std::atomic<int> lastN{ -1 << 30 };
+    // Failure-log latch: a wedged context fails every frame at frame rate —
+    // log the first failure only, re-arm on the next success.
+    std::atomic<bool> failureLogged{ false };
 };
 
 // Process-lifetime hot context. mpv's vf_vapoursynth tears down and
@@ -101,17 +117,6 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     if (!d->initOk) return src; // passthrough on any setup failure; the frame
                                 // reference is handed off to the caller
 
-    // fmParallel lets VS activate frames out of order and on several threads
-    // (mpv's startup prefetch especially does), so a strict n != lastN + 1
-    // would fire NGX's reset path on every reordering and stall the first
-    // seconds of playback. Only treat real discontinuities as a reset:
-    // backwards jump (seek back) or a large forward gap (seek past the
-    // prefetch window). Relaxed ordering: a stale read at worst triggers one
-    // extra harmless reset on a zero-guidance (stateless) model.
-    const int lastN = d->lastN.load(std::memory_order_relaxed);
-    const bool resetHistory = lastN < 0 || n < lastN || n - lastN > 32;
-    d->lastN.store(n, std::memory_order_relaxed);
-
     const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
     VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
 
@@ -129,12 +134,16 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     char err[256]{};
     char timing[128]{};
     static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
+    // NGX history-reset policy (frame-gap heuristic) lives in DlssnrContext;
+    // only the frame index is forwarded here.
     if (!d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
-                              d->width, d->height, resetHistory, err, sizeof(err),
+                              d->width, d->height, n, err, sizeof(err),
                               timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0)) {
-        char msg[512];
-        std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", n, err);
-        vsapi->logMessage(mtWarning, msg, core);
+        if (!d->failureLogged.exchange(true)) {
+            char msg[512];
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", n, err);
+            vsapi->logMessage(mtWarning, msg, core);
+        }
         // Failed frames fall back to a plain copy of the source content so the
         // output planes are never left uninitialized.
         vsh::bitblt(dstPlanes[0], dstStrides[0], srcPlanes[0], srcStrides[0],
@@ -143,12 +152,16 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                     static_cast<size_t>(d->width) * 4, d->height);
         vsh::bitblt(dstPlanes[2], dstStrides[2], srcPlanes[2], srcStrides[2],
                     static_cast<size_t>(d->width) * 4, d->height);
+    } else {
+        d->failureLogged.store(false);
     }
 
     if (timingEnabled && timing[0]) {
         // Throttle: log every 30th frame to avoid flooding the log channel
-        static int timingFrameCount = 0;
-        if (++timingFrameCount % 30 == 1) {
+        // (fmParallel: the counter is bumped from several threads — order is
+        // irrelevant for a throttle, atomicity is not).
+        static std::atomic<int> timingFrameCount{ 0 };
+        if (timingFrameCount.fetch_add(1, std::memory_order_relaxed) % 30 == 1) {
             char msg[192];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr timing[%d]: %s", n, timing);
             vsapi->logMessage(mtInformation, msg, core);
@@ -202,23 +215,23 @@ static void VS_CC DlssnrCreate(
     d->width = vi->width;
     d->height = vi->height;
 
-    DlssnrParams initial{};
-    initial.preset = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "preset", 0), kPresetMin, kPresetMax));
-    initial.style = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "style", 0), kStyleMin, kStyleMax));
-    initial.intensity = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "intensity", 1.0), kStrengthMin, kStrengthMax));
-    initial.localToneStrength = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "local_tone", 1.0), kStrengthMin, kStrengthMax));
-    initial.localStructureStrength = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "local_structure", 1.0), kStrengthMin, kStrengthMax));
-    initial.skinStructureStrength = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "skin_structure", -1.0), kSkinMin, kSkinMax));
-    initial.useAutoMask = GetIntDef(in, vsapi, "use_auto_mask", 1) != 0;
-    initial.uiCorrection = GetIntDef(in, vsapi, "ui_correction", 1) != 0;
-    initial.residualMultiplier = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), kResidualMultMin, kResidualMultMax));
-    initial.residualSaturation = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "residual_saturation", 1.0), kResidualFineMin, kResidualFineMax));
-    initial.residualLightness = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "residual_lightness", 1.0), kResidualFineMin, kResidualFineMax));
-    initial.shadowStructureMultiplier = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "shadow_structure", 1.0), kResidualFineMin, kResidualFineMax));
-    initial.reflectionGlowMultiplier = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "reflection_glow", 1.0), kResidualFineMin, kResidualFineMax));
-    initial.inputResolutionPercent = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "input_resolution", 100), kResPctMin, kResPctMax));
+    DlssnrParams initial{}; // member initializers are the default authority
+    ApplyIntArg(in, vsapi, "preset", initial.preset, kPresetMin, kPresetMax);
+    ApplyIntArg(in, vsapi, "style", initial.style, kStyleMin, kStyleMax);
+    ApplyFloatArg(in, vsapi, "intensity", initial.intensity, kStrengthMin, kStrengthMax);
+    ApplyFloatArg(in, vsapi, "local_tone", initial.localToneStrength, kStrengthMin, kStrengthMax);
+    ApplyFloatArg(in, vsapi, "local_structure", initial.localStructureStrength, kStrengthMin, kStrengthMax);
+    ApplyFloatArg(in, vsapi, "skin_structure", initial.skinStructureStrength, kSkinMin, kSkinMax);
+    ApplyFlagArg(in, vsapi, "use_auto_mask", initial.useAutoMask);
+    ApplyFlagArg(in, vsapi, "ui_correction", initial.uiCorrection);
+    ApplyFloatArg(in, vsapi, "residual_multiplier", initial.residualMultiplier, kResidualMultMin, kResidualMultMax);
+    ApplyFloatArg(in, vsapi, "residual_saturation", initial.residualSaturation, kResidualFineMin, kResidualFineMax);
+    ApplyFloatArg(in, vsapi, "residual_lightness", initial.residualLightness, kResidualFineMin, kResidualFineMax);
+    ApplyFloatArg(in, vsapi, "shadow_structure", initial.shadowStructureMultiplier, kResidualFineMin, kResidualFineMax);
+    ApplyFloatArg(in, vsapi, "reflection_glow", initial.reflectionGlowMultiplier, kResidualFineMin, kResidualFineMax);
+    ApplyIntArg(in, vsapi, "input_resolution", initial.inputResolutionPercent, kResPctMin, kResPctMax);
     // scaling_enabled=0 drops the residual pipeline entirely (input_resolution ignored)
-    initial.scalingEnabled = GetIntDef(in, vsapi, "scaling_enabled", 1) != 0;
+    ApplyFlagArg(in, vsapi, "scaling_enabled", initial.scalingEnabled);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
@@ -258,20 +271,20 @@ static void VS_CC DlssnrCreate(
     // Eager init: the D3D12/NGX bring-up costs ~1s (165MB snippet DLL load +
     // CreateFeature + first-evaluate warm-up). Doing it here — script
     // execution, before mpv starts the playback clock — keeps that whole
-    // warm-up period out of playback. A matching hot context (from the
-    // previous filter instance, freed on the last seek) skips the bring-up
-    // entirely: only the SharedParams rebind runs, and even a create-time
-    // parameter change is a warm RecreateFeature. Failure keeps the
-    // passthrough fallback semantics below.
+    // warm-up period out of playback. A hot context from the previous filter
+    // instance (freed on the last seek) skips the bring-up entirely —
+    // including for a DIFFERENT video size: Rebind rebuilds the frame
+    // resources + feature inside one pool-sealed pass. Only a changed
+    // snippet DLL forces the cold path. Failure keeps the passthrough
+    // fallback semantics below.
     char err[256]{};
-    const bool hotMatch = Hot().valid && Hot().width == d->width &&
-                          Hot().height == d->height && Hot().ngxDllPath == d->ngxDllPath;
+    const bool hotMatch = Hot().valid && Hot().ngxDllPath == d->ngxDllPath;
     if (hotMatch) {
         d->d3d12 = std::move(Hot().d3d12);
         d->ngx = std::move(Hot().ngx);
         Hot().valid = false;
         Hot().ngxDllPath.clear();
-        if (d->ngx->Rebind(d->params.get(), err, sizeof(err))) {
+        if (d->ngx->Rebind(d->params.get(), d->width, d->height, err, sizeof(err))) {
             d->initOk = true;
             vsdlssnr::BridgeStart(d->params.get());
             char msg[128];
@@ -288,6 +301,19 @@ static void VS_CC DlssnrCreate(
         }
     }
     if (!d->initOk && !d->d3d12) {
+        // Any parked context left over (different snippet DLL) must be torn
+        // down BEFORE a cold init: the IAT hook and the NGX core are
+        // process-global singletons. A second full Initialize could never
+        // install the hook (its owner CAS is held by the parked context) and
+        // its eventual Shutdown1 would tear down the shared core under the
+        // parked feature — silently degrading every later resolution.
+        if (Hot().valid) {
+            Hot().ngx->Shutdown();
+            Hot().ngx.reset();
+            Hot().d3d12.reset();
+            Hot().valid = false;
+            Hot().ngxDllPath.clear();
+        }
         d->d3d12 = std::make_unique<vsdlssnr::D3D12Context>();
         d->ngx = std::make_unique<vsdlssnr::DlssnrContext>();
         if (d->d3d12->Initialize(err, sizeof(err)) &&

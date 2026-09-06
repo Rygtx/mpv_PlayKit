@@ -41,36 +41,47 @@ constexpr wchar_t TRAY_TIP[] = L"DLSSNR 控制面板";
 constexpr UINT WM_APP_TRAYICON = WM_APP + 1;
 // 字号/间距整体缩小一档(用户偏好:面板在小屏也放得下);1.0 = 跟随 DPI 原尺寸
 inline constexpr float kUiFontScale = 0.85f;
+// 自绘标题栏几何(96dpi 基准,乘 uiScale)——DrawUi 画与 WM_NCHITTEST 判定
+// 共用同一组常量,改动不会留下一条拖不动的死区。
+inline constexpr float kTitleBarH = 38.0f;
+inline constexpr float kCloseBtnSize = 30.0f;
+inline constexpr float kCloseBtnPad = 10.0f;
 
 // clang-format off
 // Labels/tips are UTF-8 (the project compiles with /utf-8); the old
 // wchar_t tables + per-frame WideCharToMultiByte are gone.
-// 成员指针直达字段,避免键名 -> 字段的双份 if 链漂移。
+// 成员指针直达字段,避免键名 -> 字段的双份 if 链漂移;滑块范围同样直接
+// 引用 dlssnr_params.h 的常量(文档注释里的 0-1 等只是给用户看的)。
 constexpr struct { const char *key; const char *label; const char *tip;
                    float lo, hi; float DlssnrParams::*field; } kSliders[] = {
-    { "intensity",         "强度",     "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。", 0, 1, &DlssnrParams::intensity },
-    { "local_tone",        "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。", 0, 1, &DlssnrParams::localToneStrength },
-    { "local_structure",   "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。", 0, 1, &DlssnrParams::localStructureStrength },
-    { "skin_structure",    "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", -1, 2, &DlssnrParams::skinStructureStrength },
-    { "residual_multiplier", "残差乘数", "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", 1, 2, &DlssnrParams::residualMultiplier },
+    { "intensity",         "强度",     "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。", kStrengthMin, kStrengthMax, &DlssnrParams::intensity },
+    { "local_tone",        "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。", kStrengthMin, kStrengthMax, &DlssnrParams::localToneStrength },
+    { "local_structure",   "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。", kStrengthMin, kStrengthMax, &DlssnrParams::localStructureStrength },
+    { "skin_structure",    "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", kSkinMin, kSkinMax, &DlssnrParams::skinStructureStrength },
+    { "residual_multiplier", "残差乘数", "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", kResidualMultMin, kResidualMultMax, &DlssnrParams::residualMultiplier },
 };
 // 残差精调 4 项(Magpie 0.6.5 r1-r10,上游 Detail Control 组):全部是
 // 相对语义 —— 调节"DLSSNR 相对原图造成的变化"的幅度,不是绝对调色滑块。
 // 收进默认折叠的"高级"区:面板默认高度回到精调参数加入之前。
 constexpr struct { const char *key; const char *label; const char *tip;
                    float lo, hi; float DlssnrParams::*field; } kFineSliders[] = {
-    { "residual_saturation", "残差饱和度", "对 DLSSNR 造成的饱和度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", 0, 2, &DlssnrParams::residualSaturation },
-    { "residual_lightness",  "残差亮度",   "对 DLSSNR 造成的明度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", 0, 2, &DlssnrParams::residualLightness },
-    { "shadow_structure",    "阴影结构",   "残差中变暗(负)分量的倍率(0-2,默认 1)。\n调低可减轻暗部噪点被放大,调高增强暗部结构重建。", 0, 2, &DlssnrParams::shadowStructureMultiplier },
-    { "reflection_glow",     "反射辉光",   "残差中变亮(正)分量的倍率(0-2,默认 1)。\n调低可抑制高光泛光,调高增强高光/辉光表现。", 0, 2, &DlssnrParams::reflectionGlowMultiplier },
+    { "residual_saturation", "残差饱和度", "对 DLSSNR 造成的饱和度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualSaturation },
+    { "residual_lightness",  "残差亮度",   "对 DLSSNR 造成的明度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualLightness },
+    { "shadow_structure",    "阴影结构",   "残差中变暗(负)分量的倍率(0-2,默认 1)。\n调低可减轻暗部噪点被放大,调高增强暗部结构重建。", kResidualFineMin, kResidualFineMax, &DlssnrParams::shadowStructureMultiplier },
+    { "reflection_glow",     "反射辉光",   "残差中变亮(正)分量的倍率(0-2,默认 1)。\n调低可抑制高光泛光,调高增强高光/辉光表现。", kResidualFineMin, kResidualFineMax, &DlssnrParams::reflectionGlowMultiplier },
 };
-constexpr struct { const char *key; const char *label; const char *tip; } kEnums[] = {
-    { "preset", "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。" },
-    { "style",  "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。" },
+constexpr const char *kPresetNames[] = { "0(默认)", "1(预设 #1)", "2(预设 #2)", "3(预设 #3)" };
+constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
+constexpr struct { const char *key; const char *label; const char *tip;
+                   int DlssnrParams::*field; int count; const char *const *names; } kEnums[] = {
+    { "preset", "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。",
+      &DlssnrParams::preset, 4, kPresetNames },
+    { "style",  "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。",
+      &DlssnrParams::style, 3, kStyleNames },
 };
-constexpr struct { const char *key; const char *label; const char *tip; } kFlags[] = {
-    { "use_auto_mask", "自动蒙版", "自动蒙版。模型自动识别区域并区别处理。" },
-    { "ui_correction", "UI 文字修正", "UI 修正。降低对画面内文字/UI 元素的涂抹。" },
+constexpr struct { const char *label; const char *tip; int DlssnrParams::*field; } kFlags[] = {
+    { "自动蒙版",     "自动蒙版。模型自动识别区域并区别处理。", &DlssnrParams::useAutoMask },
+    { "UI 文字修正", "UI 修正。降低对画面内文字/UI 元素的涂抹。", &DlssnrParams::uiCorrection },
 };
 // clang-format on
 
@@ -113,9 +124,11 @@ bool BasePath(wchar_t *path, size_t len) noexcept {
 }
 
 // Shared-memory parameter channel: the panel creates the mapping and pushes
-// the full parameter set on every edit (seq-gated); the plugin polls it.
+// the full parameter set on every edit (seq-gated); the plugin waits on the
+// named auto-reset event (with the 40ms poll as fallback) and applies it.
 HANDLE g_paramsMapping = nullptr;
 PanelPayload *g_payload = nullptr;
+HANDLE g_paramsEvent = nullptr; // opened lazily; exists once the filter loads
 uint32_t g_generation = 0;
 
 bool CreateParamsMapping() noexcept {
@@ -139,22 +152,27 @@ bool CreateParamsMapping() noexcept {
     return true;
 }
 
-void WritePayload(int saveRequest = 0, int resetRequest = 0) noexcept {
+void WritePayload(bool saveRequest = false) noexcept {
     if (!g_payload) return;
     static uint32_t seq = 0;
     const uint32_t newSeq = ++seq;
     PanelPayload pl = PayloadFromParams(g_app.params); // shared field mapping; seq stays 0
     pl.generation = g_generation;
-    pl.saveRequest = saveRequest;
-    pl.resetRequest = resetRequest;
+    pl.saveRequest = saveRequest ? 1 : 0;
     pl.logEnabled = g_app.timingLog ? 1 : 0;
-    memcpy(g_payload, &pl, sizeof(pl));
-    // Readers skip seq==0 and re-check the counter after copying, so moving
-    // it only after the body is stable (interlocked store = compiler barrier
-    // on top of the memcpy) closes the old "seq written inside the same
-    // memcpy as the fields" tear window.
-    _InterlockedExchange(reinterpret_cast<volatile long *>(&g_payload->seq),
-                         static_cast<long>(newSeq));
+    // Publish protocol shared with the plugin's stats channel (panel_ipc.h):
+    // body lands with seq 0, the counter moves alone after it is stable.
+    PublishWithSeq(&g_payload->seq, newSeq, [&] {
+        memcpy(g_payload, &pl, sizeof(pl));
+    });
+    // Wake the bridge so the edit lands immediately; opening the event is
+    // lazy because the plugin creates it when the filter loads, which can
+    // happen long after the panel started. Failure (old plugin absent) just
+    // leaves the bridge on its fallback poll.
+    if (!g_paramsEvent) {
+        g_paramsEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, PARAMS_EVENT);
+    }
+    if (g_paramsEvent) SetEvent(g_paramsEvent);
 }
 
 void WriteIniNow() noexcept {
@@ -190,6 +208,18 @@ float JsonGetFloat(const char *body, const char *key, float def) noexcept {
 
 int JsonGetInt(const char *body, const char *key, int def) noexcept {
     return static_cast<int>(JsonGetFloat(body, key, static_cast<float>(def)));
+}
+
+bool JsonGetString(const char *body, const char *key, char *out, size_t outLen) noexcept {
+    char pat[48];
+    std::snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *k = strstr(body, pat);
+    if (!k) return false;
+    k += strlen(pat);
+    const char *end = strchr(k, '"');
+    std::snprintf(out, outLen, "%.*s",
+                  end ? static_cast<int>(end - k) : static_cast<int>(strlen(k)), k);
+    return true;
 }
 
 // Read the plugin's periodic stats from named shared memory (zero disk IO).
@@ -228,8 +258,13 @@ void LoadStats() noexcept {
         const int h = JsonGetInt(body, SK_HEIGHT, 0);
         if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
             // The hang payload has no gpu_last, so the gate below would keep
-            // showing frozen pre-hang stats forever; surface it instead.
+            // showing frozen pre-hang stats forever; surface it — with the
+            // device-removal reason the plugin publishes alongside the flag.
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "GPU 挂起/设备移除(滤镜已回退)");
+            char reason[32];
+            if (JsonGetString(body, SK_REMOVED_REASON, reason, sizeof(reason)) && reason[0]) {
+                snprintf(g_app.statsRes, sizeof(g_app.statsRes), "移除原因 %s", reason);
+            }
         } else if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
             // 分辨率展示:未开启缩放 -> 原生分辨率;开启 -> 处理分辨率 → 回源分辨率
@@ -295,7 +330,7 @@ void DrawUi() noexcept {
     // 绝对定位布局:全部坐标手动计算(96dpi 基准 × uiScale),
     // 窗口高度在末尾按内容实际 y 收口,避免固定尺寸溢出。
     const float s = g_app.uiScale;
-    const float th = 38 * s;
+    const float th = kTitleBarH * s;
     const float marginX = 18 * s;
     const float colCtrl = 140 * s;      // 控件列起点
     const ImVec2 wpos = ImGui::GetWindowPos();
@@ -308,7 +343,7 @@ void DrawUi() noexcept {
 
     // 唯一的标题栏按钮:✕(隐藏到托盘;真正退出在托盘右键菜单)。
     // 线条自绘图标(✕ 字符不在中文字体 glyph 范围,会显示问号)。
-    const float bs = 30 * s, bpad = 10 * s;
+    const float bs = kCloseBtnSize * s, bpad = kCloseBtnPad * s;
     const float bxClose = wsize.x - bs - bpad;
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + bxClose, wpos.y + (th - bs) * 0.5f));
     if (ImGui::Button("##close", ImVec2(bs, bs))) {
@@ -482,28 +517,9 @@ void DrawUi() noexcept {
         if (ImGui::IsItemHovered()) ShowTip(e.tip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
-        int v = (e.key == std::string("preset")) ? g_app.params.preset : g_app.params.style;
-        const char *items[4] = {};
-        char itemBuf[4][64];
-        int count = 0;
-        if (e.key == std::string("preset")) {
-            for (int i = 0; i <= 3; ++i) {
-                snprintf(itemBuf[i], sizeof(itemBuf[i]), "%d(%s)", i,
-                         i == 0 ? "默认" : (i == 1 ? "预设 #1" : i == 2 ? "预设 #2" : "预设 #3"));
-                items[i] = itemBuf[i];
-                ++count;
-            }
-        } else {
-            const char *names[3] = {"0(默认)", "1(自然)", "2(电影)"};
-            for (int i = 0; i <= 2; ++i) {
-                snprintf(itemBuf[i], sizeof(itemBuf[i]), "%s", names[i]);
-                items[i] = itemBuf[i];
-                ++count;
-            }
-        }
-        if (ImGui::Combo(("##" + std::string(e.key)).c_str(), &v, items, count)) {
-            if (e.key == std::string("preset")) g_app.params.preset = v;
-            else g_app.params.style = v;
+        int v = g_app.params.*(e.field);
+        if (ImGui::Combo(("##" + std::string(e.key)).c_str(), &v, e.names, e.count)) {
+            g_app.params.*(e.field) = v;
             g_app.liveDirty = true;
         }
         y += rowH;
@@ -566,7 +582,7 @@ void DrawUi() noexcept {
         ImGui::SameLine(0, 12 * s);
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX - 40 * s);
         int ir = g_app.params.inputResolutionPercent;
-        if (ImGui::SliderInt("##input_resolution", &ir, 25, 100, "%d%%")) {
+        if (ImGui::SliderInt("##input_resolution", &ir, kResPctMin, kResPctMax, "%d%%")) {
             g_app.params.inputResolutionPercent = std::clamp(ir, kResPctMin, kResPctMax);
         }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
@@ -582,10 +598,9 @@ void DrawUi() noexcept {
 
     for (const auto &f : kFlags) {
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-        bool v = f.key == std::string("use_auto_mask") ? g_app.params.useAutoMask : g_app.params.uiCorrection;
+        bool v = g_app.params.*(f.field) != 0;
         if (ImGui::Checkbox(f.label, &v)) {
-            if (f.key == std::string("use_auto_mask")) g_app.params.useAutoMask = v;
-            else g_app.params.uiCorrection = v;
+            g_app.params.*(f.field) = v ? 1 : 0;
             g_app.liveDirty = true;
         }
         if (ImGui::IsItemHovered()) ShowTip(f.tip);
@@ -615,7 +630,7 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     if (ImGui::Button("保存设置", ImVec2(120 * s, 30 * s))) {
         WriteIniNow();
-        WritePayload(1, 0); // persist-through-bridge flag included
+        WritePayload(true); // persist-through-bridge flag included
         snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
     }
     if (ImGui::IsItemHovered()) {
@@ -623,8 +638,11 @@ void DrawUi() noexcept {
     }
     ImGui::SameLine(0, 14 * s);
     if (ImGui::Button("重置默认", ImVec2(120 * s, 30 * s))) {
+        // Reset = push the factory-default payload itself; the plugin applies
+        // it through the same Request*/Update path as any other edit (there
+        // is no separate reset command in the protocol).
         g_app.params = DlssnrParams{};
-        WritePayload(0, 1);
+        WritePayload();
         snprintf(g_app.status, sizeof(g_app.status), "已重置");
     }
     ImGui::SameLine(0, 16 * s);
@@ -725,17 +743,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noex
         return 0;
     }
     case WM_NCHITTEST: {
-        // Borderless drag: title bar (except the button zone, same formula as
-        // DrawUi) behaves as a caption; the system move loop is smoother than
-        // manual SetWindowPos.
+        // Borderless drag: title bar (except the button zone, same constants
+        // as DrawUi) behaves as a caption; the system move loop is smoother
+        // than manual SetWindowPos.
         POINT pt{ static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)) };
         ScreenToClient(hwnd, &pt);
         const float s = g_app.uiScale;
-        const float th = 38 * s;
+        const float th = kTitleBarH * s;
         if (pt.y >= 0 && pt.y <= th) {
             RECT rc{};
             GetClientRect(hwnd, &rc);
-            const float bxClose = rc.right - 30 * s - 10 * s;
+            const float bxClose = rc.right - kCloseBtnSize * s - kCloseBtnPad * s;
             if (pt.x >= bxClose - 10 * s) break; // button zone -> HTCLIENT
             return HTCAPTION;
         }

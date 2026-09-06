@@ -13,6 +13,7 @@
 // before any snippet initialization runs (Magpie does the same).
 
 #include <windows.h>
+#include <cstring>
 
 namespace vsdlssnr {
 
@@ -20,6 +21,17 @@ struct SnippetCallerHook {
     void **iatSlot = nullptr;
     bool installed = false;
 };
+
+// function-pointer → void* via memcpy: the only defined way to inspect a
+// function pointer's object representation. Shared by the hook installer and
+// the NGX parameter callbacks in dlssnr_context.cpp.
+template <typename T>
+inline void *FunctionAddress(T function) noexcept {
+    void *result = nullptr;
+    static_assert(sizeof(function) == sizeof(result));
+    std::memcpy(&result, &function, sizeof(result));
+    return result;
+}
 
 bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook) noexcept;
 bool RestoreSnippetCallerHook(SnippetCallerHook &hook) noexcept;

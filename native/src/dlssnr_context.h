@@ -9,6 +9,7 @@
 #include "dlssnr_params.h"
 #include "iat_hook.h"
 #include "shared_params.h"
+#include <atomic>
 #include <mutex>
 #include <nvsdk_ngx.h>
 
@@ -16,6 +17,13 @@ namespace vsdlssnr {
 
 // Panel toggle for the periodic perf log (dlssnr_timing.log)
 void SetTimingLogEnabled(bool enabled) noexcept;
+
+// A backwards jump (seek back) or a gap larger than the host's prefetch
+// window is a real discontinuity and resets NGX's temporal history; anything
+// else (mpv's startup prefetch activates frames out of order under
+// fmParallel) is ordering noise. The threshold encodes mpv's fetch pipeline
+// depth — raise it only if a host legitimately requests frames further apart.
+constexpr int kFrameGapResetThreshold = 32;
 
 class DlssnrContext {
 public:
@@ -30,23 +38,30 @@ public:
     void Shutdown() noexcept;
 
     // Hot-context rebind: attach this kept-warm context (device, NGX feature,
-    // slot pool all alive) to a new filter instance's SharedParams. Rebuilds
-    // the feature only when a create-time parameter (preset /
-    // input_resolution / scaling_enabled) actually differs from the current
-    // one; otherwise it is free. Returns false (and leaves _ready false) when
-    // the rebuild fails; the caller then falls back to a full Initialize.
-    bool Rebind(SharedParams *shared, char *err, size_t errLen) noexcept;
+    // slot pool all alive) to a new filter instance's SharedParams — including
+    // one for a different video size (frame resources + feature rebuild under
+    // the pool seal; only a changed snippet DLL forces a full re-init at the
+    // caller). The feature is rebuilt only when a create-time parameter
+    // (preset / input_resolution / scaling_enabled) or the size actually
+    // differs; otherwise it is free. Returns false (and leaves _ready false)
+    // when the rebuild fails; the caller then falls back to a full Initialize.
+    bool Rebind(SharedParams *shared, int width, int height, char *err, size_t errLen) noexcept;
 
     // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
     // on panel change the frame thread rebuilds the feature (and scaling
     // textures for resolution changes; disabled = residual pipeline dropped).
-    bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen) noexcept;
+    // newWidth/newHeight >= 0 additionally rebuilds the per-slot frame
+    // resources for that size (used by Rebind across resolutions).
+    bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
+                         int newWidth = -1, int newHeight = -1) noexcept;
 
     // RGBS float32 三平面进 → 处理 → RGBS float32 三平面出(同分辨率)
-    // timingOut 非 NULL 时写入分段耗时(毫秒,逗号分隔:pack,submit+gpu,unpack)
+    // n is the frame index; discontinuity detection (NGX history reset) is
+    // owned here, not by the glue layer. timingOut 非 NULL 时写入分段耗时
+    // (毫秒,逗号分隔:pack,submit+gpu,unpack)
     bool ProcessFrame(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                       uint8_t **dstPlanes, int64_t *dstStrides,
-                      int width, int height, bool resetHistory,
+                      int width, int height, int n,
                       char *err, size_t errLen,
                       char *timingOut = nullptr, size_t timingLen = 0) noexcept;
 
@@ -97,7 +112,12 @@ private:
     char _gpuNameUtf8[160] = "UNAVAILABLE";
     bool _coreInitialized = false;
     bool _snippetInitialized = false;
-    bool _ready = false;
+    // Cross-thread: written by one frame thread (device-lost latch /
+    // failed rebuild) while others read it under fmParallel.
+    std::atomic<bool> _ready{false};
+    // last requested frame index (see kFrameGapResetThreshold) — survives
+    // seeks with the hot context; a seek's n restart triggers the reset.
+    std::atomic<int> _lastFrame{-1 << 30};
     // create-time parameters currently baked into the NGX feature (Rebind
     // compares against these to skip a no-op RecreateFeature)
     int _curPreset = -1;
