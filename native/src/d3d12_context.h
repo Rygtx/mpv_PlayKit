@@ -209,8 +209,12 @@ public:
         if (!realMotion) return _motion.Get();
         return scaling ? s.reducedMotion.Get() : s.motion.Get();
     }
-    double FrameRateEma() noexcept;
-    void NotifyFrameTick(double qpcSeconds) noexcept; // frame-rate EMA (播放节奏由宿主决定)
+    // 最近 1 秒的帧数即帧率(计数式)。播放节奏由宿主决定:卡顿时宿主积压,
+    // 恢复后突发+并发拉帧(fmParallel 入口 Δt 可到亚毫秒),倒数式 EMA 会把
+    // 追赶吞吐当帧率冲高;计数对并发与突发免疫,停顿(窗口内无新帧)读数
+    // 自然回落。
+    double FrameRateWindow() noexcept;
+    void NotifyFrameTick(double qpcSeconds) noexcept; // 帧入口计数打点
     // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
     // motion R16G16_FLOAT、depth R32_FLOAT,内容全 0,常驻 NSR 只读
     ID3D12Resource *Motion() const noexcept { return _motion.Get(); }
@@ -302,8 +306,10 @@ private:
     int _internalHeight = 0;
     bool _scalingReady = false;
     std::mutex _tickMutex;
-    double _lastFrameTickSec = -1.0;
-    double _frameRateEma = 0.0;
+    static constexpr int kTickRingCap = 1024; // 1s 窗的容量上限(超出按 1024fps 封顶)
+    double _tickRing[kTickRingCap] = {};
+    int _tickHead = 0;  // 下一写入位
+    int _tickCount = 0; // 有效条目数(绕环前等于已写个数)
 };
 
 } // namespace vsdlssnr

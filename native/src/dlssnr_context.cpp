@@ -1395,7 +1395,7 @@ bool DlssnrContext::ProcessFrame(
                          SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
                          SK_WIDTH, _width, SK_HEIGHT, _height,
                          SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
-                         SK_FPS, _d3d12->FrameRateEma(), SK_GPU_NAME, _gpuNameUtf8,
+                         SK_FPS, _d3d12->FrameRateWindow(), SK_GPU_NAME, _gpuNameUtf8,
                          SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
                          SK_OF_MODE, OfModeString());
                 PublishStatsJson(body);

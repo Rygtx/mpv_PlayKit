@@ -32,23 +32,24 @@ void DbgProbe(const char *what) noexcept {
 D3D12Context::~D3D12Context() { Finalize(); }
 
 void D3D12Context::NotifyFrameTick(double qpcSeconds) noexcept {
-    // Frame-rate EMA over the last frames (the cadence is decided by the host)
     std::lock_guard<std::mutex> lock(_tickMutex);
-    if (_lastFrameTickSec < 0) {
-        _lastFrameTickSec = qpcSeconds;
-        return;
-    }
-    const double delta = qpcSeconds - _lastFrameTickSec;
-    _lastFrameTickSec = qpcSeconds;
-    if (delta > 1e-4 && delta < 1.0) {
-        const double fps = 1.0 / delta;
-        _frameRateEma = _frameRateEma > 0 ? _frameRateEma * 0.9 + fps * 0.1 : fps;
-    }
+    _tickRing[_tickHead] = qpcSeconds;
+    _tickHead = (_tickHead + 1) % kTickRingCap;
+    if (_tickCount < kTickRingCap) ++_tickCount;
 }
 
-double D3D12Context::FrameRateEma() noexcept {
+double D3D12Context::FrameRateWindow() noexcept {
     std::lock_guard<std::mutex> lock(_tickMutex);
-    return _frameRateEma;
+    if (_tickCount == 0) return 0.0;
+    // now 取最后写入的 tick:读路径不需要 QPC。停顿期间无人发布统计,面板
+    // 本来就冻结;恢复后第一帧的发布会以新 now 淘汰窗口外的旧条目。
+    const double now = _tickRing[(_tickHead + kTickRingCap - 1) % kTickRingCap];
+    const double since = now - 1.0;
+    int count = 0;
+    for (int i = 0; i < _tickCount; ++i) {
+        if (_tickRing[i] >= since) ++count;
+    }
+    return static_cast<double>(count); // 固定 1s 窗:窗口内帧数即 fps
 }
 
 void D3D12Context::SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept {
