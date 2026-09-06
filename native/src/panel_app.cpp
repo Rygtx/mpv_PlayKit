@@ -39,6 +39,8 @@ constexpr wchar_t WINDOW_TITLE[] = L"DLSSNR 控制面板";
 constexpr wchar_t TRAY_TIP[] = L"DLSSNR 控制面板";
 // INI_FILE / ALIVE_EVENT come from panel_ipc.h (cross-process contract names)
 constexpr UINT WM_APP_TRAYICON = WM_APP + 1;
+// 字号/间距整体缩小一档(用户偏好:面板在小屏也放得下);1.0 = 跟随 DPI 原尺寸
+inline constexpr float kUiFontScale = 0.85f;
 
 // clang-format off
 // Labels/tips are UTF-8 (the project compiles with /utf-8); the old
@@ -51,8 +53,12 @@ constexpr struct { const char *key; const char *label; const char *tip;
     { "local_structure",   "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。", 0, 1, &DlssnrParams::localStructureStrength },
     { "skin_structure",    "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", -1, 2, &DlssnrParams::skinStructureStrength },
     { "residual_multiplier", "残差乘数", "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", 1, 2, &DlssnrParams::residualMultiplier },
-    // 残差精调 4 项(Magpie 0.6.5 r1-r10):全部是相对语义 —— 调节
-    // "DLSSNR 相对原图造成的变化" 的幅度,不是绝对调色滑块。
+};
+// 残差精调 4 项(Magpie 0.6.5 r1-r10,上游 Detail Control 组):全部是
+// 相对语义 —— 调节"DLSSNR 相对原图造成的变化"的幅度,不是绝对调色滑块。
+// 收进默认折叠的"高级"区:面板默认高度回到精调参数加入之前。
+constexpr struct { const char *key; const char *label; const char *tip;
+                   float lo, hi; float DlssnrParams::*field; } kFineSliders[] = {
     { "residual_saturation", "残差饱和度", "对 DLSSNR 造成的饱和度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", 0, 2, &DlssnrParams::residualSaturation },
     { "residual_lightness",  "残差亮度",   "对 DLSSNR 造成的明度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", 0, 2, &DlssnrParams::residualLightness },
     { "shadow_structure",    "阴影结构",   "残差中变暗(负)分量的倍率(0-2,默认 1)。\n调低可减轻暗部噪点被放大,调高增强暗部结构重建。", 0, 2, &DlssnrParams::shadowStructureMultiplier },
@@ -74,6 +80,7 @@ struct AppState {
     int dpi = 96;
     bool liveDirty = false;
     bool timingLog = true;
+    bool advancedOpen = false; // 残差精调折叠区(ini [panel] advanced 记忆)
     double lastLiveWrite = 0.0;
     double lastStatsRead = 0.0;
     char status[160]{};
@@ -163,8 +170,10 @@ void LoadIni() noexcept {
     if (!BasePath(base, MAX_PATH)) return;
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\%s", base, INI_FILE);
-    // panel-local setting: perf log toggle (independent of the saved profile)
+    // panel-local settings: perf log toggle + advanced-section state
+    // (independent of the saved profile)
     g_app.timingLog = GetPrivateProfileIntW(L"panel", L"log", 1, path) != 0;
+    g_app.advancedOpen = GetPrivateProfileIntW(L"panel", L"advanced", 0, path) != 0;
     LoadDlssnrIni(g_app.params, path);
 }
 
@@ -329,9 +338,11 @@ void DrawUi() noexcept {
                       IM_COL32(24, 28, 40, 255));
     dl->AddLine(ImVec2(wpos.x, wpos.y + s_bandBottom), ImVec2(wpos.x + wsize.x, wpos.y + s_bandBottom),
                 IM_COL32(58, 62, 78, 255));
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + 16 * s, wpos.y + th + 12 * s));
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + th + 12 * s));
 
-    // Magpie Profiler 头部:GPU 名称 + 帧率(全程显示,无滤镜时占位)
+    // Magpie Profiler 头部:GPU 名称 + 帧率(全程显示,无滤镜时占位)。
+    // 首行必须手动定位到 marginX:后续行自动回流到 WindowPadding.x,历史
+    // 上这里写死 16*s,而 WindowPadding 不缩放,高 DPI 下首行比后续行更靠右。
     ImGui::Text("GPU: %s", g_app.gpuName[0] ? g_app.gpuName : "(等待滤镜加载)");
     ImGui::Text("帧率: %.1f FPS", g_app.fps);
 
@@ -457,8 +468,16 @@ void DrawUi() noexcept {
     dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
     y += 14 * s;
 
+    // Label 与控件垂直居中:控件文本在 frame 内偏移 FramePadding.y,标签
+    // 按同一中心线对齐。旧的硬编码 +7/+8*s 在高 DPI 下漂移(字体随 s 放大,
+    // FramePadding 固定不放大),表现为参数名与滑块错位。
+    const float labelDy = (ImGui::GetFrameHeight() - ImGui::GetTextLineHeight()) * 0.5f;
+    // 行高 = 控件 frame + 间距:s=1 且 16px 字体时 ≈ 旧值 38*s,DPI 放大时
+    // 控件随字体长高、间距随 s 走。
+    const float rowH = ImGui::GetFrameHeight() + 10 * s;
+
     for (const auto &e : kEnums) {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 7 * s));
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
         ImGui::Text("%s", e.label);
         if (ImGui::IsItemHovered()) ShowTip(e.tip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
@@ -487,28 +506,53 @@ void DrawUi() noexcept {
             else g_app.params.style = v;
             g_app.liveDirty = true;
         }
-        y += 38 * s;
+        y += rowH;
     }
 
-    for (const auto &sl : kSliders) {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 8 * s));
-        ImGui::Text("%s", sl.label);
-        if (ImGui::IsItemHovered()) ShowTip(sl.tip);
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-        ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
-        float v = g_app.params.*(sl.field);
-        if (ImGui::SliderFloat(("##" + std::string(sl.key)).c_str(), &v, sl.lo, sl.hi, "%.2f")) {
-            // NGX accepts continuous float steps (verified: 0.01 steps produce
-            // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
-            g_app.params.*(sl.field) = v;
-            g_app.liveDirty = true;
+    auto drawSliderRows = [&](const auto &table) {
+        for (const auto &sl : table) {
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+            ImGui::Text("%s", sl.label);
+            if (ImGui::IsItemHovered()) ShowTip(sl.tip);
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+            ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
+            float v = g_app.params.*(sl.field);
+            if (ImGui::SliderFloat(("##" + std::string(sl.key)).c_str(), &v, sl.lo, sl.hi, "%.2f")) {
+                // NGX accepts continuous float steps (verified: 0.01 steps produce
+                // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
+                g_app.params.*(sl.field) = v;
+                g_app.liveDirty = true;
+            }
+            y += rowH;
         }
-        y += 38 * s;
+    };
+    drawSliderRows(kSliders);
+
+    // 残差精调(高级):默认收起;展开状态记忆在 ini [panel] advanced。
+    // SetNextItemOpen 把 ini 值喂给 ImGui 的内部开合存储——CollapsingHeader
+    // 的状态在 ImGui 自己的 storage 里,不播种的话首帧永远读到"收起",还会
+    // 把 ini 值回写成 0。
+    ImGui::SetNextItemOpen(g_app.advancedOpen, ImGuiCond_Once);
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+    const bool advanced = ImGui::CollapsingHeader("残差精调(高级)");
+    if (ImGui::IsItemHovered())
+        ShowTip("饱和度 / 亮度 / 阴影结构 / 反射辉光。\n相对语义微调(1=保持 DLSSNR 的变化),默认全部中性,一般无需调整。");
+    if (advanced != g_app.advancedOpen) {
+        g_app.advancedOpen = advanced;
+        wchar_t base[MAX_PATH], path[MAX_PATH];
+        if (BasePath(base, MAX_PATH)) {
+            swprintf_s(path, MAX_PATH, L"%s\\%s", base, INI_FILE);
+            WritePrivateProfileStringW(L"panel", L"advanced", advanced ? L"1" : L"0", path);
+        }
     }
+    // 用实际渲染高度推进 y(标题条高度随字体/DPI 变化,硬编码预算会和
+    // 下一个区块贴死或重叠)。
+    y = ImGui::GetItemRectMax().y - wpos.y + 8 * s;
+    if (advanced) drawSliderRows(kFineSliders);
 
     // 内部分辨率(25-100%,int;改动触发热重建)+ 缩放启用开关
     {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 8 * s));
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
         ImGui::Text("%s", "分辨率缩放");
         if (ImGui::IsItemHovered())
             ShowTip("启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Catmull-Rom 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
@@ -608,13 +652,24 @@ void DrawUi() noexcept {
 
 namespace {
 
+// 样式间距随 UI 缩放(基值 × uiScale,幂等,DPI 变更后重应用)。不缩放的话
+// WindowPadding 固定 96dpi 值,高 DPI 下与手动定位的 marginX(18*s)分道扬镳
+// —— stats 首行(GPU 行)的缩进就是这么来的。
+void ApplyUiScale() noexcept {
+    if (!ImGui::GetCurrentContext()) return;
+    ImGuiStyle &style = ImGui::GetStyle();
+    style.WindowPadding = ImVec2(18 * g_app.uiScale, 16 * g_app.uiScale);
+    style.FramePadding = ImVec2(8 * g_app.uiScale, 6 * g_app.uiScale);
+    style.ItemSpacing = ImVec2(10 * g_app.uiScale, 9 * g_app.uiScale);
+}
+
 void RebuildFontDpi(int dpi) noexcept {
     if (!ImGui::GetCurrentContext()) return; // WM_DPICHANGED can precede CreateContext
     ImGuiIO &io = ImGui::GetIO();
     io.Fonts->Clear();
     g_fontUI = g_fontMono = nullptr;
     // Magpie 三字体架构:Segoe UI 主字 + msyh(YaHei UI)中文 merge + 数字等宽
-    if (!vsdlssnr::fonts::BuildFonts(dpi / 96.0f, &g_fontUI, &g_fontMono)) {
+    if (!vsdlssnr::fonts::BuildFonts(dpi / 96.0f * kUiFontScale, &g_fontUI, &g_fontMono)) {
         g_fontUI = g_fontMono = nullptr;
         OutputDebugStringA("vs_dlssnr panel: BuildFonts failed\n");
     }
@@ -657,7 +712,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noex
         return 0;
     case WM_DPICHANGED: {
         g_app.dpi = HIWORD(wParam);
-        g_app.uiScale = g_app.dpi / 96.0f;
+        g_app.uiScale = g_app.dpi / 96.0f * kUiFontScale;
+        ApplyUiScale();
         RebuildFontDpi(g_app.dpi);
         // Width re-scales with DPI; height self-fits to content next frame
         const auto *sug = reinterpret_cast<const RECT *>(lParam);
@@ -790,7 +846,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     // Width must scale with DPI too (height self-fits to content per frame).
     g_app.dpi = GetDpiForWindow(g_hwnd);
-    g_app.uiScale = g_app.dpi / 96.0f;
+    g_app.uiScale = g_app.dpi / 96.0f * kUiFontScale;
     if (g_app.dpi != 96) {
         SetWindowPos(g_hwnd, nullptr, 0, 0, static_cast<int>(460 * g_app.uiScale),
                      static_cast<int>(450 * g_app.uiScale), SWP_NOZORDER | SWP_NOMOVE);
@@ -827,9 +883,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     style.WindowRounding = 0.0f;
     style.FrameRounding = 5.0f;
     style.GrabRounding = 4.0f;
-    style.WindowPadding = ImVec2(18, 16);
-    style.FramePadding = ImVec2(8, 6);
-    style.ItemSpacing = ImVec2(10, 9);
+    ApplyUiScale(); // WindowPadding/FramePadding/ItemSpacing × uiScale(含 kUiFontScale)
 
     ImGui_ImplWin32_Init(g_hwnd);
     ImGui_ImplDX11_Init(g_device, g_context);
