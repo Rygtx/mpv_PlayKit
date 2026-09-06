@@ -654,8 +654,11 @@ void CompositeResidualVertical(uint3 tid : SV_DispatchThreadID) {
 } // namespace
 
 bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
-                                     const wchar_t *path) noexcept {
-    const UINT pitch = (static_cast<UINT>(width) * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+                                     const wchar_t *path, DXGI_FORMAT format) noexcept {
+    // RGBA8 (4 B/px) covers the color dumps; the horizontal residual is now
+    // R16G16B16A16_FLOAT (8 B/px) since the residual needs a signed range.
+    const UINT bpp = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+    const UINT pitch = (static_cast<UINT>(width) * bpp + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
                        & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
     D3D12_HEAP_PROPERTIES heap{};
     heap.Type = D3D12_HEAP_TYPE_READBACK;
@@ -680,7 +683,7 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
     _commandList->ResourceBarrier(1, b);
     D3D12_TEXTURE_COPY_LOCATION src{ tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
     D3D12_TEXTURE_COPY_LOCATION dst{ buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    dst.PlacedFootprint.Footprint.Format = format;
     dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(width);
     dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(height);
     dst.PlacedFootprint.Footprint.Depth = 1;
@@ -699,7 +702,7 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
     if (ok) {
         for (int y = 0; y < height; ++y) {
             fwrite(static_cast<const uint8_t *>(mapped) + static_cast<size_t>(pitch) * y, 1,
-                   static_cast<size_t>(width) * 4, f);
+                   static_cast<size_t>(width) * bpp, f);
         }
         fclose(f);
     }
@@ -813,7 +816,7 @@ bool D3D12Context::CreateScalingResources(int internalW, int internalH, char *er
         return false;
     }
     if (!CreateColorTexture(_horizontalRes.GetAddressOf(), _width, internalH,
-                            DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }

@@ -37,9 +37,12 @@ public:
 
     bool CreateFrameResources(int width, int height, char *err, size_t errLen) noexcept;
 
-    // diagnostics: dump a RGBA8 texture's raw rows to a file (VSDLSSNR_DUMP)
+    // diagnostics: dump a texture's raw rows to a file (VSDLSSNR_DUMP);
+    // format must match the resource (CopyTextureRegion has no cross-family
+    // conversion), the caller passes bytes-per-pixel for the file layout
     bool DumpTextureToFile(ID3D12Resource *tex, int width, int height,
-                           const wchar_t *path) noexcept;
+                           const wchar_t *path,
+                           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) noexcept;
 
     // Residual pipeline resources for internal-resolution scaling
     // (Magpie DLSSNRFilter.cpp:100-308). internalW/H = source * percent/100.

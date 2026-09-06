@@ -821,7 +821,8 @@ bool DlssnrContext::ProcessFrame(
                     _d3d12->DumpTextureToFile(_d3d12->ReducedDenoised(), _d3d12->InternalWidth(),
                                               _d3d12->InternalHeight(), (base / L"dump_reduced_denoised.bin").c_str());
                     _d3d12->DumpTextureToFile(_d3d12->HorizontalRes(), width,
-                                              _d3d12->InternalHeight(), (base / L"dump_horizontal.bin").c_str());
+                                              _d3d12->InternalHeight(), (base / L"dump_horizontal.bin").c_str(),
+                                              DXGI_FORMAT_R16G16B16A16_FLOAT);
                 }
                 _d3d12->DumpTextureToFile(_d3d12->OutputColor(), width, height,
                                           (base / L"dump_output.bin").c_str());
