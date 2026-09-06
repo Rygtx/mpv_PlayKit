@@ -24,6 +24,7 @@ UI_Correction = True
 Scaling_Enabled = True
 Input_Resolution = 100
 Residual_Multiplier = 1.0
+Motion_Vector_Quality = 0
 H_Max = 0
 ## <0-3> 整数, NR 预设档位
 ## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
@@ -41,6 +42,10 @@ H_Max = 0
 ##          但 NGX 固定成本主导, 实测帧耗差异有限
 ##          注意 100% 仍走残差通道 (Magpie 行为), residual_multiplier > 1 时增强细节
 ## <1-2> 浮点, 残差乘数 (默认 1.0), 配合内部分辨率缩放使用
+## <0-5> 整数, NVIDIA 光流 (真运动矢量) 引导档位 (默认 0)
+##          0 = 无 (零 guidance); 1-5 用硬件光流消除运动场景的时域瑕疵
+##          需要 NVIDIA Turing+; 不支持时自动回退零 guidance
+##          播放中可在面板实时切换 (只重建光流会话, 毫秒级)
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
 
@@ -67,6 +72,7 @@ else :
 		scaling_enabled = int(Scaling_Enabled),
 		input_resolution = Input_Resolution,
 		residual_multiplier = Residual_Multiplier,
+		motion_vector_quality = Motion_Vector_Quality,
 	)
 	ret = core.resize.Bilinear(clip=rgb, format=clip.format.id, matrix_s="709")
 

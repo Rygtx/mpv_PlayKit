@@ -15,10 +15,15 @@ endif ()
 if (NOT EXISTS "${DEP_DIR}/vapoursynth/include/VapourSynth4.h")
     message(FATAL_ERROR "VapourSynth headers missing: run scripts/fetch-deps.ps1 to populate dependencies/vapoursynth")
 endif ()
+# NVOF headers(vendor/nvof,fetch-deps.ps1 从公开镜像拉取)——清单 #6
+if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvof/nvOpticalFlowD3D12.h")
+    message(FATAL_ERROR "NVOF headers missing: run scripts/fetch-deps.ps1 to populate vendor/nvof")
+endif ()
 
 add_library(vs_dlssnr SHARED
     src/plugin.cpp
     src/dlssnr_context.cpp
+    src/nvof_context.cpp
     src/iat_hook.cpp
     src/d3d12_context.cpp
     src/bridge.cpp
@@ -26,6 +31,7 @@ add_library(vs_dlssnr SHARED
 
 target_include_directories(vs_dlssnr PRIVATE
     src
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvof"
     "${DEP_DIR}/ngx/include"
     "${DEP_DIR}/vapoursynth/include"
 )

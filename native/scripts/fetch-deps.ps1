@@ -38,6 +38,14 @@ foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
     Fetch "https://raw.githubusercontent.com/VapourSynth/VapourSynth/R73/include/$h" (Join-Path $vsInc $h)
 }
 
+# --- NVOF headers(清单 #6 光流;官方 OpticalFlowSDK 仓库已从 GitHub 撤下,
+#     mbucchia/Optical-Flow-SDK 是完整官方镜像,NvOFInterface 即 SDK 头目录)---
+$nvofDir = Join-Path $root "vendor\nvof"
+New-Item -ItemType Directory -Force $nvofDir | Out-Null
+foreach ($h in @("nvOpticalFlowCommon.h", "nvOpticalFlowD3D12.h", "nvOpticalFlowD3D11.h", "nvOpticalFlowCuda.h")) {
+    Fetch "https://raw.githubusercontent.com/mbucchia/Optical-Flow-SDK/main/NvOFInterface/$h" (Join-Path $nvofDir $h)
+}
+
 # --- Dear ImGui (independent panel UI), unpacked to dependencies\imgui ---
 $imguiDir = Join-Path $root "dependencies\imgui"
 if (-not (Test-Path (Join-Path $imguiDir "imgui.h"))) {

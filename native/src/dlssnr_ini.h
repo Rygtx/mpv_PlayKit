@@ -40,6 +40,7 @@ inline void WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeX100(L"residual_lightness_x100", p.residualLightness);
     writeX100(L"shadow_structure_x100", p.shadowStructureMultiplier);
     writeX100(L"reflection_glow_x100", p.reflectionGlowMultiplier);
+    writeInt(L"motion_vector_quality", std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax));
     writeInt(L"saved", 1);
 }
 
@@ -75,6 +76,7 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.residualLightness = readX100(L"residual_lightness_x100", p.residualLightness, kResidualFineMin, kResidualFineMax);
     p.shadowStructureMultiplier = readX100(L"shadow_structure_x100", p.shadowStructureMultiplier, kResidualFineMin, kResidualFineMax);
     p.reflectionGlowMultiplier = readX100(L"reflection_glow_x100", p.reflectionGlowMultiplier, kResidualFineMin, kResidualFineMax);
+    p.motionVectorQuality = std::clamp(readInt(L"motion_vector_quality", p.motionVectorQuality), kOfQualityMin, kOfQualityMax);
     return true;
 }
 

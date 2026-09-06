@@ -72,13 +72,25 @@ struct FrameSlot {
     ComPtr<ID3D12Resource> reducedDenoised;
     ComPtr<ID3D12Resource> controlledRes; // internalW×internalH, signed FP16 (controls applied)
     ComPtr<ID3D12Resource> horizontalRes;
+    // NVOF guidance(清单 #6):densify 输出的稠密运动/置信度(源尺寸),
+    // 以及缩放启用时的降采样版(内部尺寸)。OF 关闭时保持 COMMON 不被触碰。
+    ComPtr<ID3D12Resource> motion;        // W×H R16G16_FLOAT,UAV(densify 写)
+    ComPtr<ID3D12Resource> confidence;    // W×H R8_UNORM,UAV
+    ComPtr<ID3D12Resource> reducedMotion;     // internalW×internalH R16G16_FLOAT
+    ComPtr<ID3D12Resource> reducedConfidence; // internalW×internalH R8_UNORM
     // slot-local shader-visible heap: 0=srvInput 1=srvReducedColor
     // 2=srvReducedDenoised 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised
     // 6=uavHorizontal 7=uavOutput 8=srvControlled 9=uavControlled
+    // 10=srvMotion 11=srvConfidence 12=uavMotion 13=uavConfidence
+    // 14=srvFlowF 15=srvFlowB 16=srvCostF 17=srvCostB(NVOF 会话纹理,
+    // BindNvofResources 填充)18=srvReducedMotion 19=srvReducedConfidence
+    // 20=uavReducedMotion 21=uavReducedConfidence
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 
     size_t uploadPitch = 0;
     size_t readbackPitch = 0;
+    // 本帧 NVOF done 栅栏值(SubmitFrame 提交前 queue Wait;0 = 无需等待)。
+    uint64_t nvofWaitValue = 0;
 };
 
 class D3D12Context {
@@ -129,6 +141,22 @@ public:
     FrameSlot *AcquireSlot() noexcept;
     void ReleaseSlot(FrameSlot *slot) noexcept;
 
+    // NVOF flow/cost 纹理的 SRV 写入每个槽的描述符堆(14-17);资源为
+    // null 时写空描述符(densify 着色器按 cbuffer 旗标跳过读取)。
+    bool BindNvofResources(ID3D12Resource *flowFwd, ID3D12Resource *flowBwd,
+                           ID3D12Resource *costFwd, ID3D12Resource *costBwd) noexcept;
+    // densify(Magpie NVOF_Densify HLSL 原样):S10.5 网格 → 稠密运动 +
+    // 置信度。在该槽已 BeginFrameRecording 的列表上执行;调用方负责把
+    // motion/confidence 转入 UAV 态。gridSize/旗标来自 NvofContext 会话。
+    void RecordDensify(FrameSlot &slot, uint32_t flowW, uint32_t flowH,
+                       uint32_t gridSize, bool hasForwardCost,
+                       bool hasBackward, bool hasBackwardCost) noexcept;
+    // OF 关闭/播种/失败帧:UAV clear 清零本槽 motion/confidence。
+    void RecordClearGuidance(FrameSlot &slot) noexcept;
+    // 缩放启用时的 guidance 降采样(Magpie DownsampleGuidance;深度输出
+    // 在本宿主是死重 —— depth 恒为零纹理,NGX 直接消费静态零纹理)。
+    void RecordGuidanceDownsample(FrameSlot &slot) noexcept;
+
     // RAII: drain the pool (wait until every slot is released) and hold the
     // pool mutex, so AcquireSlot cannot hand out a slot while the holder
     // replaces shared NGX state / per-slot textures. Never call this while
@@ -153,7 +181,8 @@ public:
     bool RecordUploadCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept;
     // 记录:output stateBefore→COPY_SOURCE→拷贝→COMMON
     bool RecordReadbackCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateBefore, char *err, size_t errLen) noexcept;
-    bool SubmitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept; // close+execute+signal
+    bool SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+                     char *err, size_t errLen) noexcept; // [可选栅栏等待] close+execute+signal
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
     // GPU 完成后调用:readback buffer → RGBS 三平面(纯 CPU)
     bool UnpackOutput(FrameSlot &slot, uint8_t **dstPlanes, int64_t *dstStrides,
@@ -177,6 +206,12 @@ public:
     ID3D12Resource *ReducedDenoised(FrameSlot &s) const noexcept { return s.reducedDenoised.Get(); }
     ID3D12Resource *ControlledRes(FrameSlot &s) const noexcept { return s.controlledRes.Get(); }
     ID3D12Resource *HorizontalRes(FrameSlot &s) const noexcept { return s.horizontalRes.Get(); }
+    // PARAM_MVEC 的取材:真光流(densify/降采样输出)或静态零纹理。
+    ID3D12Resource *MotionResource(FrameSlot &s, bool realMotion,
+                                   bool scaling) const noexcept {
+        if (!realMotion) return _motion.Get();
+        return scaling ? s.reducedMotion.Get() : s.motion.Get();
+    }
     double FrameRateEma() noexcept;
     void NotifyFrameTick(double qpcSeconds) noexcept; // frame-rate EMA (播放节奏由宿主决定)
     // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
@@ -205,6 +240,11 @@ private:
     // four HLSL cbuffer blocks (Magpie ResampleConstants, 48 bytes).
     void RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
                     UINT dispatchX, UINT dispatchY, const ResidualControls &rc) noexcept;
+    // guidance 降采样专用:同 12 常量 cbuffer,但 SRV/UAV 各两个
+    // (t0/t1 = motion/confidence,u0/u1 = reducedMotion/reducedConfidence)。
+    void RecordGuidancePass(FrameSlot &slot, ID3D12PipelineState *pso,
+                            UINT srv0, UINT srv1, UINT uav0, UINT uav1,
+                            UINT dispatchX, UINT dispatchY) noexcept;
 
     bool CreateColorTexture(ID3D12Resource **out, int width, int height,
                             DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
@@ -246,6 +286,12 @@ private:
     ComPtr<ID3D12PipelineState> _psoPrepare;
     ComPtr<ID3D12PipelineState> _psoHorizontal;
     ComPtr<ID3D12PipelineState> _psoVertical;
+    // NVOF guidance(PORTING #6):densify + guidance 降采样各用独立根签名
+    // (densify = 4 SRV + 2 UAV + 8 常量;降采样 = 2 SRV + 2 UAV + 12 常量)。
+    ComPtr<ID3D12RootSignature> _rsDensify;
+    ComPtr<ID3D12PipelineState> _psoDensify;
+    ComPtr<ID3D12RootSignature> _rsGuidance;
+    ComPtr<ID3D12PipelineState> _psoGuidanceDownsample;
 
     // frame slot pool
     static constexpr int kSlotCount = 3;

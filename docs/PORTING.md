@@ -59,7 +59,7 @@ D:\Portable\mpv-lazy\
 |---|---|---|---|---|---|
 | 4 | 可编程 VSR/降噪(VFX SDK:NvCVImage + NvVFX,qualityLevel 映射 RTX Video 档位;D3D11/CUDA interop) | RTXVideoDenoiser.cpp(261 行)+ VFX 运行时(部署目录带许可证) | 高:显式调用 VSR,不受驱动呈现层触发条件限制;附赠驱动级降噪 | 中 | 待做 |
 | 5 | DLSS SR 真 AI 超分(ZeroMV 形态:无 jitter、零 MV/零深度、Preset J;标准 NGX 公开 feature,无需 IAT hook) | DLSSSRUpscaler.cpp(359 行)+ nvngx_dlss.dll(部署目录已有) | 高:可控真超分,放大低分辨率片源的正解 | 中大 | 待做 |
-| 6 | NVOF 光流 guidance(真运动矢量) | NvidiaOpticalFlowProvider.cpp(703 行)+ FrameGuidanceD3D12Interop | 中高:消除零 guidance 的运动时域瑕疵 | 大 | 待做(**目标接口已变**:r1-r10 起 OF 走共享服务(FrameGuidanceService,跨会话复用)+ `motionVectorQuality` 档位,移植以新代码为准) |
+| 6 | NVOF 光流 guidance(真运动矢量) | NvidiaOpticalFlowProvider.cpp(703 行)+ FrameGuidanceD3D12Interop | 中高:消除零 guidance 的运动时域瑕疵 | 大 | **功能完成**(2026-09-07):D3D12 原生 NVOF(`nvofapi64.dll` 的 D3D12 API,设备级会话 + 栅栏同步),不用 Magpie 的 D3D11 互操作层(单消费者纯 D3D12,FrameGuidanceService/Interop 的多消费者 + D3D11 渲染器假设不适用;移植的是 NVOF provider 的会话链/densify/失败语义 + guidance 降采样)。motionVectorQuality 0-5 全链(vpy `motion_vector_quality`/ini `motion_vector_quality`/面板"光流质量"下拉/IPC DSSL5);0=零 guidance,>0 懒建会话,**切换只重建光流会话(PoolHold 内毫秒级)不动 NGX feature**;非 NVIDIA/驱动缺 OF/init 失败/连续 3 败 → 优雅回退零 guidance。densify HLSL 原样移植(S10.5 网格 + 前后向一致性 + cost 置信度);缩放启用时 guidance 置信度加权降采样到内部尺寸(深度输出裁掉:depth 恒零纹理是死重)。时序:帧序门(mutex+cv,超时跳帧)串行 execute;拷贝(槽 upload→NVOF 注册纹理)在专用 CL 上按帧序提交;execute 后 **CPU 等输出栅栏**(官方样例同款;队列级 Wait 实测不可靠);densify 在槽 CL 上执行(SubmitFrame 前栅栏已落位)。实现坑:nvofapi 模块/栅栏进程级永不卸载(FreeLibrary 死锁、fence 释放段错误);**nvOFDestroy 后进程内继续 GPU 工作会触发驱动访问违例** → 旧会话退役不销毁;CreateShaderResourceView(NULL,NULL) 本机驱动触发异步 TDR → 全部用真实占位视图;BGRA 管线切换后 dump footprint 格式必须跟着改(CopyTextureRegion 跨格式 E_INVALIDARG)。实测 320x240:gpu 8.9→9.0ms,nvof 段 ~1.3ms CPU;dump_motion 99.6% 非零运动向量 |
 | 7 | DAV2 深度 guidance | DepthAnythingV2Provider.cpp + FrameGuidanceService.cpp | 低-中;掉卡事件元凶 | 很大 | **不计划** |
 
 ### 建议顺序
@@ -67,6 +67,14 @@ D:\Portable\mpv-lazy\
 1 → 4 → 5 → 6;7 不计划。(1 与 4/5 无依赖,可并行评估;2 已作废并入 6)
 
 > 已否决:GPU 调度优先级 REALTIME(Magpie Renderer.cpp 的 D3DKMTSetProcessSchedulingPriorityClass)——用户确认不需要。
+
+### 关键坑(2026-09-07 清单 #6 实测新增)
+
+11. D3D12 根签名:同一 descriptor table 内两个 range 的 `OffsetInDescriptorsFromTableStart` 都为 0 = 重叠范围(非法),驱动侧表现为 dispatch 挂死(GPU hang,无报错);u0/u1 必须各开一个表参数,且两个参数不得共用同一个 range 结构(寄存器 0/1 各一份),否则序列化直接 E_FAIL。根签名里**所有**参数都必须绑定,漏绑 = dispatch 读垃圾描述符。
+12. `CreateShaderResourceView(nullptr, nullptr, h)` NULL 描述符(文档合法)在本机驱动(RTX 3080)与 NGX snippet 共存时触发**异步 TDR**(DEVICE_HUNG,初始化期瞬间死)——一律用真实资源的占位视图替代,由 cbuffer 旗标守卫不读取。
+13. NVOF D3D12 的输出栅栏点在**队列级 Wait** 语义下可能永不满足(管线卡死);官方样例的 CPU 等待模式(execute 后 `SetEventOnCompletion` + WaitForSingleObject)可靠——CPU 等待落位后再提交消费方 CL。
+14. `nvOFDestroy` 之后进程内继续 GPU 工作(NGX evaluate 等)会触发驱动内部访问违例(nvwgf2umx);`FreeLibrary(nvofapi64.dll)` 在引擎 worker 存活时死锁。对策:NVOF 模块/栅栏/旧会话一律进程级存活,永不销毁、永不卸载。
+15. NVOF 输入格式的 "ABGR8" = DXGI `B8G8R8A8_UNORM`;管线切到 BGRA 后,`CopyTextureRegion` 的 placed footprint 格式必须同步(Cross-format → Close 时 E_INVALIDARG,表现为 dump 静默失败)。
 
 ## 三、2026-09-06 对齐记录(84d9f6ab → 9824d758,v0.6.6)
 

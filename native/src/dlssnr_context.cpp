@@ -182,6 +182,16 @@ void TimingLog(const char *line) noexcept {
 
 } // namespace (TimingLog helpers)
 
+// TimingLog 本体在匿名命名空间;nvof_context 等外部翻译单元经由此包装写
+// STATUS 行(失败必须进 timing log —— 跨进程观测只认它)。
+void TimingStatusLine(const char *line) noexcept { TimingLog(line); }
+
+// 临时管线探针(VSDLSSNR_PROBE=1 启用;逐帧行会淹没 perf 行,平时关)
+static bool ProbeEnabled() noexcept {
+    static const bool on = GetEnvironmentVariableA("VSDLSSNR_PROBE", nullptr, 0) != 0;
+    return on;
+}
+
 // Internal NGX processing size for a resolution percent (25-100; aligned to even)
 // Internal NGX processing size (aligned to even). scalingEnabled == 0 forces
 // the full source size (internal-resolution scaling off).
@@ -200,13 +210,14 @@ static void InternalSize(int w, int h, int pct, int &iw, int &ih) noexcept {
 struct TimingWindow {
     double gpu[120]{};
     double pack[120]{};
+    double nvof[120]{};
     double evalCpu[120]{};
     double unpack[120]{};
     int count = 0;
     int idx = 0;
 
-    void Push(double g, double p, double e, double u) noexcept {
-        gpu[idx] = g; pack[idx] = p; evalCpu[idx] = e; unpack[idx] = u;
+    void Push(double g, double p, double n, double e, double u) noexcept {
+        gpu[idx] = g; pack[idx] = p; nvof[idx] = n; evalCpu[idx] = e; unpack[idx] = u;
         idx = (idx + 1) % 120;
         if (count < 120) ++count;
     }
@@ -338,7 +349,7 @@ bool DlssnrContext::SetCreateParametersSafely(DWORD *sehCode) noexcept {
     }, false, sehCode);
 }
 
-void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory) noexcept {
+void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory, bool realMotion) noexcept {
     NVSDK_NGX_Parameter *p = _parameters;
     const DlssnrParams params = _shared->Snapshot();
     // With internal-resolution scaling, NGX consumes/produces the reduced
@@ -348,7 +359,10 @@ void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHisto
     const int eh = scaling ? _d3d12->InternalHeight() : _height;
     p->Set(PARAM_COLOR, scaling ? _d3d12->ReducedColor(slot) : _d3d12->InputColor(slot));
     p->Set(PARAM_OUTPUT, scaling ? _d3d12->ReducedDenoised(slot) : _d3d12->OutputColor(slot));
-    p->Set(PARAM_MVEC, _d3d12->Motion());
+    // 真光流:缩放启用时消费降采样后的运动(内部尺寸,向量已换算到内部
+    // 像素单位,MVecScale 保持 1);否则直接消费 densify 输出(源尺寸)。
+    // realMotion=false → 静态零纹理(零 guidance 路径)。
+    p->Set(PARAM_MVEC, _d3d12->MotionResource(slot, realMotion, scaling));
     p->Set(PARAM_DEPTH, _d3d12->Depth());
     SetSubrect(p, RESOURCE_PARAMETERS[0], ew, eh);
     SetSubrect(p, RESOURCE_PARAMETERS[1], ew, eh);
@@ -368,9 +382,9 @@ void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHisto
     p->Set(PARAM_UI_CORRECTION, params.uiCorrection ? 1 : 0);
 }
 
-bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, DWORD *sehCode) noexcept {
+bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion, DWORD *sehCode) noexcept {
     return NgxRuntimeGuard::Invoke([&] {
-        SetEvaluateParametersUnsafe(slot, resetHistory);
+        SetEvaluateParametersUnsafe(slot, resetHistory, realMotion);
         return true;
     }, false, sehCode);
 }
@@ -484,6 +498,38 @@ bool DlssnrContext::Initialize(
         if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) return false;
     }
 
+    // 4b) NVOF 光流会话(PORTING #6):quality > 0 时建立;失败优雅回退零
+    // guidance(记 _nvofFailed,不拖垮整个滤镜)。冷初始化单线程、槽池空闲,
+    // 满足 NvofContext::Initialize 的 PoolHold 约束。
+    {
+        const int ofq = std::clamp(_shared->Snapshot().motionVectorQuality, kOfQualityMin, kOfQualityMax);
+        _curOfQuality = ofq;
+        _nvofFailed = false;
+        {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: init of=%d", ofq);
+            TimingStatusLine(msg);
+        }
+        if (ofq > 0) {
+            char nvofErr[160]{};
+            _nvof = std::make_unique<NvofContext>();
+            if (_nvof->Initialize(*_d3d12, _width, _height, ofq, nvofErr, sizeof(nvofErr))) {
+                char msg[160];
+                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: nvof session created quality=%d %dx%d",
+                              ofq, _width, _height);
+                DbgLine(msg);
+                TimingLog(msg);
+            } else {
+                _nvofFailed = true;
+                char msg[288];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: nvof init failed (%s); zero guidance", nvofErr);
+                DbgLine(msg);
+                TimingLog(msg);
+            }
+        }
+    }
+
     // Publish the render GPU's name so the panel shows it before the first
     // frame lands (queried once from the adapter the device was created on;
     // the periodic stats tick reuses the cached string).
@@ -569,6 +615,20 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     if (resize) {
         _width = newWidth;
         _height = newHeight;
+        // NVOF 会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildNvof
+        // —— 那会二次取 PoolHold 死锁)。失败降级零 guidance,不致命。
+        if (_nvof && _curOfQuality > 0 && !_nvofFailed) {
+            char nvofErr[160]{};
+            if (!_nvof->Initialize(*_d3d12, _width, _height, _curOfQuality,
+                                   nvofErr, sizeof(nvofErr))) {
+                _nvofFailed = true;
+                char msg[288];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: nvof resize failed (%s); zero guidance", nvofErr);
+                DbgLine(msg);
+                TimingLog(msg);
+            }
+        }
     }
     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
     {
@@ -636,6 +696,72 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     return true;
 }
 
+bool DlssnrContext::RebuildNvof(int quality, char *err, size_t errLen) noexcept {
+    // NVOF 会话重建(quality 变化)。只重建光流会话,NGX feature 不动。
+    // 内部自取 PoolHold(槽池封死满足 NvofContext 的调用约束)——因此
+    // 绝不能在已持有 PoolHold 的路径上调用(RecreateFeature 的尺寸重建
+    // 内联处理,不走这里)。调用方必须尚未持有槽位(ProcessFrame 在
+    // AcquireSlot 之前消费本请求,与 ConsumeRebuild 同款)。
+    //
+    // _nvofMutex:fmParallel 下多个帧线程会同时看到同一档位变化并并发进入
+    // (实测并发重建互相踩踏挂死);锁内复查 _curOfQuality,后来者直接跳过。
+    std::lock_guard<std::mutex> switchLock(_nvofMutex);
+    const int q = std::clamp(quality, kOfQualityMin, kOfQualityMax);
+    if (q == _curOfQuality && !_nvofFailed) return true;
+    {
+        D3D12Context::PoolHold pool(*_d3d12);
+        if (q == 0) {
+            // 保留会话仅停用:实测 nvOFDestroy 后进程内继续 GPU 工作会触发
+            // 驱动内部访问违例(nvwgf2umx,2026-09-07);空闲会话无 GPU 开销,
+            // 与热上下文同哲学,进程退出统一回收。
+            _nvofFailed = false;
+            _curOfQuality = 0;
+            TimingStatusLine("DLSSNR STATUS: nvof disabled (quality=0; session kept)");
+        } else if (!_nvof || _nvofFailed ||
+                   _nvof->Quality() != q || _nvof->Width() != _width || _nvof->Height() != _height) {
+            // 先建新会话再弃旧(旧会话仅弃引用,不调用 nvOFDestroy —— 同上,
+            // 销毁后继续 GPU 工作不可靠)。弃旧的 GPU 资源随 PoolHold 排空
+            // 后不再被引用,纹理显存由驱动按引用回收(对象随进程生存)。
+            auto next = std::make_unique<NvofContext>();
+            char nvofErr[160]{};
+            if (next->Initialize(*_d3d12, _width, _height, q, nvofErr, sizeof(nvofErr))) {
+                if (_nvof) _retiredNvof.push_back(std::move(_nvof)); // 退役,不销毁
+                _nvof = std::move(next);
+                _nvofFailed = false;
+                _curOfQuality = q;
+            } else {
+                _nvofFailed = true;
+                _curOfQuality = q;
+                char msg[288];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: nvof init failed quality=%d (%s); zero guidance",
+                              q, nvofErr);
+                DbgLine(msg);
+                TimingLog(msg);
+                if (err && errLen) std::snprintf(err, errLen, "%s", nvofErr);
+                return false; // 调用方决定是否视为致命(帧路径上不致命)
+            }
+        } else {
+            _nvofFailed = false;
+            _curOfQuality = q;
+        }
+    }
+    if (_nvof && _nvof->Enabled()) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: nvof rebuilt quality=%d %dx%d",
+                      _curOfQuality, _width, _height);
+        DbgLine(msg);
+        TimingLog(msg);
+    }
+    return _nvof && _nvof->Enabled();
+}
+
+void DlssnrContext::ResetNvofHistory() noexcept {
+    // seek = 新时间线:流历史作废,下一帧重新播种(清零发布 + NGX PARAM_RESET)。
+    // 会话本身保留(热上下文跨 seek 存活)。
+    if (_nvof) _nvof->ResetHistory();
+}
+
 bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *err, size_t errLen) noexcept {
     if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "Rebind: context not ready");
@@ -657,16 +783,32 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *er
     cur.scalingEnabled = _curScaling;
     const bool dimsChanged = width != _width || height != _height;
     if (!dimsChanged && !CreateParamsChanged(p, cur)) {
+        // 热复用:NGX feature 保持,但 seek 是新时间线 —— 光流历史必须
+        // 作废(下一帧播种),光流档位同步到新实例的参数快照;此前建立
+        // 失败的会话在热复用时重试一次。
+        ResetNvofHistory();
+        if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax);
+            ofq != _curOfQuality || (ofq > 0 && _nvofFailed)) {
+            RebuildNvof(ofq, err, errLen); // 失败仅降级零 guidance,热复用不受影响
+        }
         char msg[128];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d %dx%d)",
-                      _curPreset, _curScaling ? _curRes : 100, _curScaling, _width, _height);
+                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%d)",
+                      _curPreset, _curScaling ? _curRes : 100, _curScaling, _curOfQuality, _width, _height);
         DbgLine(msg);
         TimingLog(msg);
         return true;
     }
-    return RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen,
-                           dimsChanged ? width : -1, dimsChanged ? height : -1);
+    const bool nvofOk = RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen,
+                                        dimsChanged ? width : -1, dimsChanged ? height : -1);
+    // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
+    // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。
+    if (nvofOk) {
+        if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax); ofq != _curOfQuality) {
+            RebuildNvof(ofq, err, errLen);
+        }
+    }
+    return nvofOk;
 }
 
 bool DlssnrContext::ProcessFrame(
@@ -708,6 +850,12 @@ bool DlssnrContext::ProcessFrame(
         if (!RecreateFeature(newPreset, newRes, newScaling, err, errLen)) return false;
     }
     const DlssnrParams frameParams = _shared->Snapshot();
+    // NVOF 档位同步(只重建光流会话,不动 NGX feature)。在 AcquireSlot
+    // 之前消费:RebuildNvof 要封池排空。失败只降级零 guidance,帧继续。
+    if (const int ofq = std::clamp(frameParams.motionVectorQuality, kOfQualityMin, kOfQualityMax); ofq != _curOfQuality) {
+        char nvofErr[160]{};
+        RebuildNvof(ofq, nvofErr, sizeof(nvofErr));
+    }
     const ResidualControls residual{
         std::clamp(frameParams.residualMultiplier, kResidualMultMin, kResidualMultMax),
         std::clamp(frameParams.residualSaturation, kResidualFineMin, kResidualFineMax),
@@ -758,6 +906,26 @@ bool DlssnrContext::ProcessFrame(
     if (!_d3d12->PackInput(*slot, srcPlanes, srcStrides, width, height, err, errLen)) return false;
     QueryPerformanceCounter(&t1);
 
+    // NVOF 光流阶段:帧序门 + 拷贝提交 + execute(独立拷贝命令列表,不占
+    // 槽列表)。结果决定槽列表上录 densify 还是清零,以及 SubmitFrame 的
+    // 栅栏等待值。publishZero/历史重置语义见 NvofContext::StageFrame。
+    bool realMotion = false;      // 本帧有真光流(densify 录制 + PARAM_MVEC 指向它)
+    bool nvofPublishZero = false; // 本帧清零发布(播种/失败/过期)
+    bool nvofHistoryReset = false;
+    double nvofMs = 0.0;
+    if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
+        const NvofContext::StageResult st =
+            _nvof->StageFrame(n, slot->upload.Get(), static_cast<UINT>(slot->uploadPitch));
+        slot->nvofWaitValue = st.waitFenceValue;
+        nvofPublishZero = st.publishZero;
+        nvofHistoryReset = st.historyReset;
+        nvofMs = _nvof->LastStageMs();
+        realMotion = st.waitFenceValue != 0;
+    } else {
+        slot->nvofWaitValue = 0;
+    }
+
+    if (ProbeEnabled()) TimingStatusLine("PROBE: post-stage"); // 临时探针(VSDLSSNR_PROBE=1)
     if (!_d3d12->BeginFrameRecording(*slot)) {
         if (err && errLen) std::snprintf(err, errLen, "BeginFrameRecording(frame) failed");
         return false;
@@ -793,9 +961,53 @@ bool DlssnrContext::ProcessFrame(
         auto *cl = slot->commandList.Get();
         const bool scaling = _d3d12->HasScaling();
 
+        // ---- NVOF guidance 段(PORTING #6)----
+        // densify 或清零写在槽列表上;GPU 真实先后由 SubmitFrame 的队列栅栏
+        // 等待(等 NVOF execute 的 flow 输出)+ 本列表内命令顺序共同保证。
+        // OF 关闭/跳过时本段整体不录,motion/confidence 全程 COMMON 不动。
+        if (realMotion || nvofPublishZero) {
+            D3D12_RESOURCE_BARRIER g1[2]{
+                Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            };
+            cl->ResourceBarrier(2, g1);
+            if (realMotion) {
+                const uint32_t flowW =
+                    (static_cast<uint32_t>(_width) + _nvof->GridSize() - 1) / _nvof->GridSize();
+                const uint32_t flowH =
+                    (static_cast<uint32_t>(_height) + _nvof->GridSize() - 1) / _nvof->GridSize();
+                _d3d12->RecordDensify(*slot, flowW, flowH, _nvof->GridSize(),
+                                      _nvof->CostEnabled(), _nvof->Bidirectional(),
+                                      _nvof->Bidirectional() && _nvof->CostEnabled());
+            } else {
+                _d3d12->RecordClearGuidance(*slot);
+            }
+            // densify/清零输出 → NSR(降采样 SRV 输入或 NGX evaluate 输入)。
+            D3D12_RESOURCE_BARRIER g2[2]{
+                Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            };
+            cl->ResourceBarrier(2, g2);
+            if (realMotion && scaling) {
+                // 缩放启用:置信度加权降采样到内部尺寸(运动向量乘
+                // MotionScale 换算到内部像素单位,Magpie 同款)。
+                D3D12_RESOURCE_BARRIER g3[2]{
+                    Transition(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    Transition(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                };
+                cl->ResourceBarrier(2, g3);
+                _d3d12->RecordGuidanceDownsample(*slot);
+                D3D12_RESOURCE_BARRIER g4[2]{
+                    Transition(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    Transition(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                };
+                cl->ResourceBarrier(2, g4);
+            }
+        }
+
         // Pre-evaluate barriers (executed on the GPU before the NGX dispatch).
-        // Motion/depth are resident NON_PIXEL_SHADER_RESOURCE (read-only), no
-        // transitions needed for them on the concurrent frame path.
+        // Zero-guidance motion/depth are resident NON_PIXEL_SHADER_RESOURCE;
+        // the NVOF guidance textures were transitioned to NSR above.
         D3D12_RESOURCE_BARRIER pre[1];
         UINT preCount = 0;
         if (scaling) {
@@ -835,9 +1047,11 @@ bool DlssnrContext::ProcessFrame(
         // The feature + parameter block are singletons: serialize the CPU-side
         // evaluate across concurrent frame threads. GPU dispatches recorded on
         // this slot's list still run overlapped with other slots' work.
+        if (ProbeEnabled()) TimingStatusLine("PROBE: pre-eval-lock"); // 临时探针(VSDLSSNR_PROBE=1)
         std::lock_guard<std::mutex> evalLock(_evaluateMutex);
+        if (ProbeEnabled()) TimingStatusLine("PROBE: eval-locked"); // 临时探针(VSDLSSNR_PROBE=1)
         DWORD sehCode = 0;
-        if (!SetEvaluateParametersSafely(*slot, resetHistory, &sehCode)) {
+        if (!SetEvaluateParametersSafely(*slot, resetHistory || nvofHistoryReset, realMotion, &sehCode)) {
             if (err && errLen) {
                 if (NgxRuntimeGuard::IsFaulted() && !sehCode) {
                     std::snprintf(err, errLen,
@@ -846,6 +1060,7 @@ bool DlssnrContext::ProcessFrame(
                 } else {
                     std::snprintf(err, errLen, "Evaluate parameter setup raised SEH");
                 }
+                TimingStatusLine(err); // 临时探针
             }
             return false;
         }
@@ -856,9 +1071,11 @@ bool DlssnrContext::ProcessFrame(
             snprintf(buf, sizeof(buf), "EvaluateFeature raised SEH 0x%x (scaling=%d); NGX latched, no further SDK entry",
                      sehCode, scaling ? 1 : 0);
             DbgLine(buf);
+            TimingStatusLine(buf); // 临时探针
             if (err && errLen) snprintf(err, errLen, "EvaluateFeature raised SEH 0x%x; NGX disabled until host restart", sehCode);
             return false;
         }
+        if (ProbeEnabled()) TimingStatusLine("PROBE: eval-ok"); // 临时探针(VSDLSSNR_PROBE=1)
         if (!NVSDK_NGX_SUCCEED(r)) {
             if (err && errLen) {
                 if (NgxRuntimeGuard::IsFaulted()) {
@@ -866,8 +1083,9 @@ bool DlssnrContext::ProcessFrame(
                                   "NGX faulted (SEH 0x%x); SDK disabled until host restart",
                                   NgxRuntimeGuard::FaultCode());
                 } else {
-                    std::snprintf(err, errLen, "EvaluateFeature failed (0x%x)", static_cast<unsigned>(r));
+                    snprintf(err, errLen, "EvaluateFeature failed (0x%x)", static_cast<unsigned>(r));
                 }
+                TimingStatusLine(err); // 临时探针
             }
             return false;
         }
@@ -936,6 +1154,22 @@ bool DlssnrContext::ProcessFrame(
             };
             cl->ResourceBarrier(1, back);
         }
+        // guidance 纹理归位 COMMON(仅本帧动过时;dump 与下帧的 COMMON→UAV
+        // 都依赖它)。
+        if (realMotion || nvofPublishZero) {
+            D3D12_RESOURCE_BARRIER gBack[2]{
+                TransitionFromTo(slot->motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(slot->confidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            };
+            cl->ResourceBarrier(2, gBack);
+            if (realMotion && scaling) {
+                D3D12_RESOURCE_BARRIER gBackR[2]{
+                    TransitionFromTo(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    TransitionFromTo(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                };
+                cl->ResourceBarrier(2, gBackR);
+            }
+        }
     }
 
     // OutputColor arrives in UAV (evaluate/vertical write) or COMMON (the
@@ -946,24 +1180,83 @@ bool DlssnrContext::ProcessFrame(
         return false;
     }
     // NOTE: timestamp disabled, see note above
-    if (!_d3d12->SubmitFrame(*slot, err, errLen)) {
-        if (err && errLen) std::snprintf(err, errLen, "Submit(frame) failed");
+    // NVOF flow 已在 StageFrame 里 CPU 等待完成(execute 后的输出栅栏),
+    // 槽 CL 提交时 GPU 侧 flow 已就绪 —— 不再需要队列级 Wait(实测该栅栏
+    // 在队列 Wait 语义下可能永不满足,见 NvofContext::StageFrame 注释)。
+    if (!_d3d12->SubmitFrame(*slot, nullptr, 0, err, errLen)) {
+        if (err && errLen) {
+            TimingStatusLine(err); // 临时探针
+            std::snprintf(err, errLen, "Submit(frame) failed");
+        }
         return false;
     }
+    if (ProbeEnabled()) TimingStatusLine("PROBE: submitted"); // 临时探针(VSDLSSNR_PROBE=1)
     if (!_d3d12->WaitFrame(*slot, err, errLen)) {
         // A timed-out fence means GPU hang / device removal: stop evaluating,
         // otherwise every later frame stalls the full 10s fence wait again.
         if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
-        if (err && errLen) std::snprintf(err, errLen, "Wait(frame) failed");
+        if (err && errLen) {
+            TimingStatusLine(err); // 临时探针
+            std::snprintf(err, errLen, "Wait(frame) failed");
+        }
         return false;
     }
+    if (ProbeEnabled()) TimingStatusLine("PROBE: waited"); // 临时探针(VSDLSSNR_PROBE=1)
     QueryPerformanceCounter(&t3);
     const bool rb = _d3d12->UnpackOutput(*slot, dstPlanes, dstStrides, width, height, err, errLen);
     {
         // concurrent frame threads: dump at most once, no interleaved writes;
         // the mutex is only taken when a dump is actually pending (the old
         // code locked it every frame even with dumping disabled).
+        // 颜色 dump 与 NVOF motion/flow dump 分开锁存:首帧必然是播种帧
+        // (publishZero,无真流),motion dump 要等到第一个 densify 帧。
         static std::atomic<bool> dumped{ false };
+        static std::atomic<bool> dumpedMotion{ false };
+        if (ProbeEnabled()) { // 临时探针
+            char probe[96];
+            std::snprintf(probe, sizeof(probe), "PROBE: dump-site realMotion=%d ofQ=%d",
+                          realMotion ? 1 : 0, _curOfQuality);
+            TimingStatusLine(probe);
+        }
+        if (dumpEnabled && realMotion && !dumpedMotion.load(std::memory_order_relaxed)) {
+            static std::mutex dumpMotionMutex;
+            std::lock_guard<std::mutex> dumpLock(dumpMotionMutex);
+            if (!dumpedMotion.exchange(true)) {
+                TimingStatusLine("DLSSNR STATUS: motion latch fired"); // 临时探针
+                wchar_t dir[MAX_PATH];
+                if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
+                    std::filesystem::path base = std::filesystem::path(dir).parent_path();
+                    const bool scaling = _d3d12->HasScaling();
+                    std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
+                    // NGX 实际消费的运动场(缩放时为降采样版,R16G16_FLOAT)+
+                    // 原始网格流(S10.5,R16G16_SINT)。
+                    bool motionDumped = false;
+                    if (scaling) {
+                        motionDumped = _d3d12->DumpTextureToFile(
+                            slot->reducedMotion.Get(), _d3d12->InternalWidth(),
+                            _d3d12->InternalHeight(), (base / L"dump_motion.bin").c_str(),
+                            DXGI_FORMAT_R16G16_FLOAT);
+                    } else {
+                        motionDumped = _d3d12->DumpTextureToFile(
+                            slot->motion.Get(), width, height,
+                            (base / L"dump_motion.bin").c_str(),
+                            DXGI_FORMAT_R16G16_FLOAT);
+                    }
+                    if (!motionDumped) TimingStatusLine("DLSSNR STATUS: motion dump FAILED");
+                    else TimingStatusLine("DLSSNR STATUS: motion dump OK"); // 临时探针
+                    if (_nvof && _nvof->FlowForward()) {
+                        const uint32_t gs = _nvof->GridSize();
+                        const uint32_t fw = (static_cast<uint32_t>(width) + gs - 1) / gs;
+                        const uint32_t fh = (static_cast<uint32_t>(height) + gs - 1) / gs;
+                        const bool flowOk = _d3d12->DumpTextureToFile(
+                            _nvof->FlowForward(), static_cast<int>(fw),
+                            static_cast<int>(fh), (base / L"dump_flow.bin").c_str(),
+                            DXGI_FORMAT_R16G16_SINT);
+                        if (!flowOk) TimingStatusLine("DLSSNR STATUS: flow dump FAILED");
+                    }
+                }
+            }
+        }
         if (dumpEnabled && !dumped.load(std::memory_order_relaxed)) {
             static std::mutex dumpMutex;
             std::lock_guard<std::mutex> dumpLock(dumpMutex);
@@ -973,19 +1266,23 @@ bool DlssnrContext::ProcessFrame(
                     std::filesystem::path base = std::filesystem::path(dir).parent_path();
                     const bool scaling = _d3d12->HasScaling();
                     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
+                    // 管线色格式为 B8G8R8A8(BGRA 切换):CopyTextureRegion 的
+                    // footprint 格式必须与源一致,跨格式会 E_INVALIDARG
+                    // (memory #30 同族坑)。颜色 dump 统一显式传 BGRA8。
+                    constexpr DXGI_FORMAT kColorDump = DXGI_FORMAT_B8G8R8A8_UNORM;
                     _d3d12->DumpTextureToFile(_d3d12->InputColor(*slot), width, height,
-                                              (base / L"dump_input.bin").c_str());
+                                              (base / L"dump_input.bin").c_str(), kColorDump);
                     if (scaling) {
                         _d3d12->DumpTextureToFile(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
-                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_color.bin").c_str());
+                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_color.bin").c_str(), kColorDump);
                         _d3d12->DumpTextureToFile(_d3d12->ReducedDenoised(*slot), _d3d12->InternalWidth(),
-                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_denoised.bin").c_str());
+                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_denoised.bin").c_str(), kColorDump);
                         _d3d12->DumpTextureToFile(_d3d12->HorizontalRes(*slot), width,
                                                   _d3d12->InternalHeight(), (base / L"dump_horizontal.bin").c_str(),
                                                   DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
                     _d3d12->DumpTextureToFile(_d3d12->OutputColor(*slot), width, height,
-                                              (base / L"dump_output.bin").c_str());
+                                              (base / L"dump_output.bin").c_str(), kColorDump);
                 }
             }
         }
@@ -996,7 +1293,10 @@ bool DlssnrContext::ProcessFrame(
             return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
         };
         const double packMs = ms(t0, t1, qpcFreq);
+        // eval_cpu 的原始窗口包含 NVOF 阶段(t1→t2);nvof 单独上报,这里
+        // 扣除保持各段可加。
         const double evalCpuMs = ms(t1, t2, qpcFreq);
+        const double evalOnlyMs = evalCpuMs > nvofMs ? evalCpuMs - nvofMs : 0.0;
         // Pure-GPU timing is unavailable (timestamp query + NGX evaluate = SEH,
         // see NOTE above); the submit+wait wall clock stands in for it.
         const double gpuWaitMs = ms(t2, t3, qpcFreq);
@@ -1008,7 +1308,7 @@ bool DlssnrContext::ProcessFrame(
         char line[256] = "";
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
-            g_timing.Push(gpuWaitMs, packMs, evalCpuMs, unpackMs);
+            g_timing.Push(gpuWaitMs, packMs, nvofMs, evalOnlyMs, unpackMs);
             static int statFrames = 0;
             if (++statFrames % 60 == 1) {
                 const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
@@ -1016,12 +1316,14 @@ bool DlssnrContext::ProcessFrame(
                 const double gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
                 const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
                 const double packEma = TimingWindow::Ema(g_timing.pack, g_timing.count);
+                const double nvofEma = TimingWindow::Ema(g_timing.nvof, g_timing.count);
                 const double evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
                 const double unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f eval_cpu=%.1f unpack=%.1f | res=%d%% %dx%d",
-                         gpuLast, gpuEma, gpuP99, packEma, evalCpuEma, unpackEma,
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f eval_cpu=%.1f unpack=%.1f | res=%d%% of=%d %dx%d",
+                         gpuLast, gpuEma, gpuP99, packEma, nvofEma, evalCpuEma, unpackEma,
                          std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
+                         _curOfQuality,
                          _width, _height);
 
                 // stats via named shared memory (no disk IO; panel reads directly).
@@ -1045,14 +1347,22 @@ bool DlssnrContext::ProcessFrame(
         if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)
 
         if (vsTiming) {
-            std::snprintf(timingOut, timingLen, "pack=%.1f,eval_cpu=%.1f,gpu=%.1f,unpack=%.1f",
-                          packMs, evalCpuMs, gpuWaitMs, unpackMs);
+            std::snprintf(timingOut, timingLen, "pack=%.1f,nvof=%.1f,eval_cpu=%.1f,gpu=%.1f,unpack=%.1f",
+                          packMs, nvofMs, evalOnlyMs, gpuWaitMs, unpackMs);
         }
     }
     return rb;
 }
 
 void DlssnrContext::Shutdown() noexcept {
+    // NVOF 会话:不调用 nvOFDestroy(销毁后继续进程存活期的 GPU 工作
+    // 会触发驱动访问违例,见 _retiredNvof 注释)—— 弃引用,随进程退出
+    // 由 OS 回收。宿主重启才是真实的生命周期终点。
+    if (_nvof) {
+        _nvof.release();
+        _curOfQuality = 0;
+        _nvofFailed = false;
+    }
     // A faulted latch refuses further SDK entry (Invoke returns the fallback
     // with *sehCode == 0): skip shutdown entirely and keep the faulted modules
     // parked — matching Magpie's fault isolation, only a host restart clears it.

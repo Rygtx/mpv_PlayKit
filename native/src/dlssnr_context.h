@@ -2,14 +2,17 @@
 // Ported from Magpie experimental DLSSNRFilter.cpp / NgxD3D12Core.cpp.
 // NGX static core (nvsdk_ngx_s.lib) owns the parameter block; the signed
 // snippet nvngx_dlssnr.dll (Feature 18) performs CreateFeature/EvaluateFeature.
-// Zero guidance (Magpie guidanceMode=1 Force Zero): all-zero R16G16 motion +
-// R32_FLOAT depth + full-frame subrects.
+// Guidance:零 guidance(静态零纹理,等价 Magpie guidanceMode=1 Force Zero)
+// 或 NVOF 真运动矢量(PORTING #6,NvofContext),由 motionVectorQuality 切换。
 
 #include "d3d12_context.h"
 #include "dlssnr_params.h"
 #include "iat_hook.h"
+#include "nvof_context.h"
 #include "shared_params.h"
 #include <atomic>
+#include <memory>
+#include <vector>
 #include <mutex>
 #include <nvsdk_ngx.h>
 
@@ -17,6 +20,9 @@ namespace vsdlssnr {
 
 // Panel toggle for the periodic perf log (dlssnr_timing.log)
 void SetTimingLogEnabled(bool enabled) noexcept;
+
+// Exported TimingLog wrapper for nvof_context.cpp(TimingLog 本体在匿名命名空间)。
+void TimingStatusLine(const char *line) noexcept;
 
 // A backwards jump (seek back) or a gap larger than the host's prefetch
 // window is a real discontinuity and resets NGX's temporal history; anything
@@ -55,6 +61,14 @@ public:
     bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
                          int newWidth = -1, int newHeight = -1) noexcept;
 
+    // NVOF 会话重建(quality 变化)。只重建光流会话(PoolHold 内,
+    // 毫秒级),NGX feature 不动。quality == 0 时销毁会话回退零 guidance;
+    // 会话建立失败时优雅降级(记档位防逐帧重试风暴)。内部自取 PoolHold:
+    // 调用方必须尚未持有槽位,且不得已在 PoolHold 之中。
+    bool RebuildNvof(int quality, char *err, size_t errLen) noexcept;
+    // 光流历史失效(seek = 新时间线)。热 Rebind 上调用;下一帧重新播种。
+    void ResetNvofHistory() noexcept;
+
     // RGBS float32 三平面进 → 处理 → RGBS float32 三平面出(同分辨率)
     // n is the frame index; discontinuity detection (NGX history reset) is
     // owned here, not by the glue layer. timingOut 非 NULL 时写入分段耗时
@@ -79,8 +93,8 @@ private:
     NVSDK_NGX_Result SnippetShutdownSafely(DWORD *sehCode) noexcept;
     void SetCreateParametersUnsafe() noexcept;
     bool SetCreateParametersSafely(DWORD *sehCode) noexcept;
-    void SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory) noexcept;
-    bool SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, DWORD *sehCode) noexcept;
+    void SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory, bool realMotion) noexcept;
+    bool SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion, DWORD *sehCode) noexcept;
 
     D3D12Context *_d3d12 = nullptr;
     NVSDK_NGX_Parameter *_parameters = nullptr;
@@ -123,6 +137,18 @@ private:
     int _curPreset = -1;
     int _curRes = -1;
     bool _curScaling = false;
+    // NVOF 光流会话(PORTING #6)。_curOfQuality = 当前生效档位(0 = 零
+    // guidance);_nvofFailed = 会话建立失败或连续失败停用(回退零 guidance,
+    // Rebind/换档时重试)。_nvofMutex 串行化 RebuildNvof:fmParallel 下多个
+    // 帧线程会同时看到同一档位变化,不加锁会并发重建互相踩踏。
+    std::unique_ptr<NvofContext> _nvof;
+    // 退役会话:实测 nvOFDestroy + 资源释放后继续 GPU 工作会触发驱动内部
+    // 访问违例(nvwgf2umx,2026-09-07),换档/换尺寸的旧会话转入此名单
+    // 存活到进程退出(热上下文哲学;每会话约 2×W×H×4B 显存)。
+    std::vector<std::unique_ptr<NvofContext>> _retiredNvof;
+    int _curOfQuality = 0;
+    bool _nvofFailed = false;
+    std::mutex _nvofMutex;
     // fmParallel: several frame threads call EvaluateFeature concurrently.
     // The feature and the parameter block are singletons, so evaluate
     // (parameter setup + snippet call) is serialized; GPU-side dispatches

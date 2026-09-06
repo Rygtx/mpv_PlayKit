@@ -72,12 +72,21 @@ constexpr struct { const char *key; const char *label; const char *tip;
 };
 constexpr const char *kPresetNames[] = { "0(默认)", "1(预设 #1)", "2(预设 #2)", "3(预设 #3)" };
 constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
+// 光流质量(上游 motionVectorQuality 0-5,文案对齐上游 resw)
+constexpr const char *kOfQualityNames[] = {
+    "无", "性能", "均衡(推荐)", "质量", "高质量(高开销)", "最高质量(极高开销)"
+};
 constexpr struct { const char *key; const char *label; const char *tip;
                    int DlssnrParams::*field; int count; const char *const *names; } kEnums[] = {
     { "preset", "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。",
       &DlssnrParams::preset, 4, kPresetNames },
     { "style",  "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。",
       &DlssnrParams::style, 3, kStyleNames },
+    { "motion_vector_quality", "光流质量",
+      "NVIDIA 光流(真运动矢量)引导档位:无=零 guidance(旧行为),\n"
+      "其余档位用硬件光流消除运动场景的时域瑕疵。需要 NVIDIA Turing+;\n"
+      "不支持时自动回退零 guidance。切换只重建光流会话(毫秒级,不停顿)。",
+      &DlssnrParams::motionVectorQuality, 6, kOfQualityNames },
 };
 constexpr struct { const char *label; const char *tip; int DlssnrParams::*field; } kFlags[] = {
     { "自动蒙版",     "自动蒙版。模型自动识别区域并区别处理。", &DlssnrParams::useAutoMask },

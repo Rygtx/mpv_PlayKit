@@ -15,6 +15,8 @@ inline constexpr int kResPctMin = 25, kResPctMax = 100;          // internal res
 inline constexpr float kResidualMultMin = 1.0f, kResidualMultMax = 2.0f;
 // 残差精调 4 项(r1-r10 新增):saturation / lightness / shadow structure / reflection glow
 inline constexpr float kResidualFineMin = 0.0f, kResidualFineMax = 2.0f;
+// NVOF 光流质量(上游 motionVectorQuality,0-5;0 = 无光流,保持零 guidance)
+inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
 
 struct DlssnrParams {
     // NGX "DLSSNR.Hint.Render.Preset" 0-3
@@ -48,6 +50,10 @@ struct DlssnrParams {
     float residualLightness = 1.0f;
     float shadowStructureMultiplier = 1.0f;
     float reflectionGlowMultiplier = 1.0f;
+    // NVOF 光流质量(0=无 → 静态零 guidance;1-5 → NVOF 会话档位,
+    // 上游 NvidiaOpticalFlowQuality)。切换只重建 NVOF 会话(PoolHold 内,
+    // 毫秒级),不动 NGX feature;非 NVIDIA/驱动缺 OF 时优雅回退零 guidance。
+    int motionVectorQuality = 0;
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence
