@@ -2,7 +2,7 @@
 
 > 用途:记录 Magpie experimental → mpv 的迁移项清单与迁移结果。只记结论,不记过程。
 
-参考仓库:`F:\Project\Magpie`(experimental,HEAD 84d9f6ab)
+参考仓库:`F:\Project\Magpie`(experimental,HEAD 9824d758,2026-09-06 对齐)
 宿主仓库:`F:\Project\mpv_PlayKit`(本仓库)· 部署:`D:\Portable\mpv-lazy`
 
 ---
@@ -12,9 +12,9 @@
 ### DLSSNR 插件(vs_dlssnr.dll,已完成)
 
 - 形态:VapourSynth API4 原生插件(纯 D3D12、零 guidance 单帧、同分辨率、单次提交管线);NGX Feature 18 经静态 core + snippet 直连 + IAT hook 伪装,Magpie 调用链完整移植。
-- 参数:preset/style/intensity/local_tone/local_structure/skin_structure/use_auto_mask/ui_correction 全部暴露且可实时生效(preset 为创建参数,切换走热重建);residual_multiplier 参数位已留(依赖清单 #1)。
+- 参数:preset/style/intensity/local_tone/local_structure/skin_structure/use_auto_mask/ui_correction 全部暴露且可实时生效(preset 为创建参数,切换走热重建);residual_multiplier + 残差精调 4 项(residual_saturation/residual_lightness/shadow_structure/reflection_glow,r1-r10 新增)实时生效;intensity/local_tone/local_structure 范围已随上游 r2-fix1 收紧为 0-1。
 - 性能(RTX 3080,稳态):720p 18.0ms / 55.7fps;1080p 32.9ms / 30.4fps。首帧 init ~1s。
-- 验证:smoke 数值、150 帧零泄漏、mpv 端到端、10bit 链路(vpy 内 YUV↔RGB matrix_in_s=709)。
+- 验证:smoke 数值、150 帧零泄漏、mpv 端到端、10bit 链路(vpy 内 YUV↔RGB matrix_in_s=709);2026-09-06 4-pass 对齐后 smoke/IPC 契约/生命周期/泄漏复验通过(validate_v066.py:确定性、等宽残差通道、新参数生效、clamp 收紧全过)。
 
 ### 独立控制面板(dlssnr_panel.exe,已完成)
 
@@ -49,8 +49,8 @@ D:\Portable\mpv-lazy\
 
 | # | 功能 | Magpie 源码 | 价值 | 工作量 | 状态 |
 |---|---|---|---|---|---|
-| 1 | Residual 重建 + inputResolutionPercent(25-100% 内部推理 + Lanczos3 残差回源;commit 00be2c15:100% 也走残差通道) | DLSSNRFilter.cpp:100-308、1441-1506、1573-1583 | 高:50% 推理 → eval ~8ms,1080p 有望 60fps;质量/速度可调 | 中:3 个 compute + 中间纹理 + cbuffer;residual_multiplier 参数位已留 | **功能完成**(2026-09-05):三段 compute(Magpie HLSL 原样)+ 单次提交集成 + 热重建 + 面板滑块 + ini/json 持久化;数学验证 output = original + (denoised−color)×M ✓。**性能(文件日志实测,1080p,RTX 3080)**:pack 2.9 + NGX CPU 0.5 + GPU(NGX evaluate + 残差 compute)10.5 + unpack 2.2 ≈ **16.5ms/帧,60fps 能力**——早期 36-38ms 的端到端数字被 python 测试框架自身开销(~20ms 帧搬运)污染。NGX GPU 段对内部分辨率不敏感(100%→50% 仅降 ~1ms,模型固定成本主导 GPU 段);4K 源 python 端 ~105ms(含 74MB×N 帧搬运),mpv 真实路径待实测;vpy H_Max 已放开(=0)。0.01 步进实测有效(NGX 参数为连续 float,Magpie 的 STEP 0.05 仅是其 UI 粒度),面板滑块不吸附。坑:SRV 表若为连续 N 描述符则 t1 只能取相邻槽(vertical 需要 input+horizontal 不相邻)→ 改两个独立单描述符表;NGX evaluate 会重绑自己的 heap/root signature,其后自绘 dispatch 前必须重绑;`SetComputeRoot32BitConstants` 多 DWORD 必须用真数组;**compute dispatch 前忘 SetPipelineState 则 dispatch 被静默忽略**(全 0 输出根因,debug layer 不报);**D3D12 timestamp query 与 NGX evaluate 同命令列表 = 必现 SEH**(GPU 纯时长不可用,延迟指标改用 ExecuteAndWait 墙钟;调用已注释留说明) |
-| 2 | guidanceMode 运行时切换(Available/Force Zero/Motion Only/Depth Only) | SelectGuidance cpp:1813-1842 | 低(随 #6 才有意义) | 小 | 待做 |
+| 1 | Residual 重建 + inputResolutionPercent(25-100% 内部推理 + 残差回源;commit 00be2c15:100% 也走残差通道) | DLSSNRFilter.cpp:100-308、1441-1506、1573-1583 | 高:50% 推理 → eval ~8ms,1080p 有望 60fps;质量/速度可调 | 中:3 个 compute + 中间纹理 + cbuffer;residual_multiplier 参数位已留 | **功能完成**(2026-09-05):三段 compute(Magpie HLSL 原样)+ 单次提交集成 + 热重建 + 面板滑块 + ini/json 持久化;数学验证 output = original + (denoised−color)×M ✓。**性能(文件日志实测,1080p,RTX 3080)**:pack 2.9 + NGX CPU 0.5 + GPU(NGX evaluate + 残差 compute)10.5 + unpack 2.2 ≈ **16.5ms/帧,60fps 能力**——早期 36-38ms 的端到端数字被 python 测试框架自身开销(~20ms 帧搬运)污染。NGX GPU 段对内部分辨率不敏感(100%→50% 仅降 ~1ms,模型固定成本主导 GPU 段);4K 源 python 端 ~105ms(含 74MB×N 帧搬运),mpv 真实路径待实测;vpy H_Max 已放开(=0)。0.01 步进实测有效(NGX 参数为连续 float,Magpie 的 STEP 0.05 仅是其 UI 粒度),面板滑块不吸附。坑:SRV 表若为连续 N 描述符则 t1 只能取相邻槽(vertical 需要 input+horizontal 不相邻)→ 改两个独立单描述符表;NGX evaluate 会重绑自己的 heap/root signature,其后自绘 dispatch 前必须重绑;`SetComputeRoot32BitConstants` 多 DWORD 必须用真数组;**compute dispatch 前忘 SetPipelineState 则 dispatch 被静默忽略**(全 0 输出根因,debug layer 不报);**D3D12 timestamp query 与 NGX evaluate 同命令列表 = 必现 SEH**(GPU 纯时长不可用,延迟指标改用 ExecuteAndWait 墙钟;调用已注释留说明)。**2026-09-06 对齐 v0.6.6(2d37f8c0/r2-fix1/1cde1bae)**:①管线 3→4 pass,新增 PrepareResidual——色调控制(饱和度/亮度/阴影结构/反射辉光)改为在内部低分辨率域、Catmull-Rom 插值前逐像素应用(HLSL 原样移植,含"有符号分段在前、HSL 差值在后"顺序),存 ControlledResidual(FP16);等宽时跳过 horizontal pass(垂直 pass 直读 controlledRes);内核 Lanczos3→Catmull-Rom;根签名 root constants 8→12。②**颜色降采样单 pass area-average → 两 pass 可分离 Lanczos2**(1cde1bae,colorDownsample=lanczos2-aa;负瓣经 FP16 中间纹理保留——移植端复用 horizontalRes 充当中间纹理,与上游 resampleIntermediate 复用方式一致;等尺寸时 Lanczos2 退化为精确拷贝故无需跳过分支)。新验证 validate_v066.py + check_downsample_kernel.py 全过 |
+| 2 | ~~guidanceMode 运行时切换(Available/Force Zero/Motion Only/Depth Only)~~ | SelectGuidance cpp:1813-1842 | 低(随 #6 才有意义) | 小 | **作废**(2026-09-06):上游 r1-r10 删除 `guidanceMode`/`depthInferenceInterval`,参数面改为 `motionVectorQuality`(0-5,OF 质量);等效能力并入 #6 |
 | 3 | GPU timestamp 遥测 | DLSSNRFilter.cpp:1673-1706、FrameGuidancePerformance.h | 低(已有 QPC 分段计时) | 小 | 搁置 |
 
 ### B. 新能力
@@ -59,11 +59,21 @@ D:\Portable\mpv-lazy\
 |---|---|---|---|---|---|
 | 4 | 可编程 VSR/降噪(VFX SDK:NvCVImage + NvVFX,qualityLevel 映射 RTX Video 档位;D3D11/CUDA interop) | RTXVideoDenoiser.cpp(261 行)+ VFX 运行时(部署目录带许可证) | 高:显式调用 VSR,不受驱动呈现层触发条件限制;附赠驱动级降噪 | 中 | 待做 |
 | 5 | DLSS SR 真 AI 超分(ZeroMV 形态:无 jitter、零 MV/零深度、Preset J;标准 NGX 公开 feature,无需 IAT hook) | DLSSSRUpscaler.cpp(359 行)+ nvngx_dlss.dll(部署目录已有) | 高:可控真超分,放大低分辨率片源的正解 | 中大 | 待做 |
-| 6 | NVOF 光流 guidance(真运动矢量) | NvidiaOpticalFlowProvider.cpp(703 行)+ FrameGuidanceD3D12Interop | 中高:消除零 guidance 的运动时域瑕疵 | 大 | 待做 |
+| 6 | NVOF 光流 guidance(真运动矢量) | NvidiaOpticalFlowProvider.cpp(703 行)+ FrameGuidanceD3D12Interop | 中高:消除零 guidance 的运动时域瑕疵 | 大 | 待做(**目标接口已变**:r1-r10 起 OF 走共享服务(FrameGuidanceService,跨会话复用)+ `motionVectorQuality` 档位,移植以新代码为准) |
 | 7 | DAV2 深度 guidance | DepthAnythingV2Provider.cpp + FrameGuidanceService.cpp | 低-中;掉卡事件元凶 | 很大 | **不计划** |
 
 ### 建议顺序
 
-1 → 4 → 5 → 6;7 不计划。(1 与 4/5 无依赖,可并行评估)
+1 → 4 → 5 → 6;7 不计划。(1 与 4/5 无依赖,可并行评估;2 已作废并入 6)
 
 > 已否决:GPU 调度优先级 REALTIME(Magpie Renderer.cpp 的 D3DKMTSetProcessSchedulingPriorityClass)——用户确认不需要。
+
+## 三、2026-09-06 对齐记录(84d9f6ab → 9824d758,v0.6.6)
+
+**对齐范围复核方法**:17 条新提交逐条 `git show` 核对源码(diff 实文,非文档/评审);DLSSNR 实质改动仅 1cde1bae/2d37f8c0/9824d758 三条;移植的 3 段残差 HLSL 与上游 HEAD 逐行比对一致(check_hlsl_vs_upstream.py)。
+
+- **已移植(均为上游源码实改,非文档)**:①残差 4-pass 管线(清单 #1,见上);②两 pass Lanczos2 颜色降采样(1cde1bae,初版对齐时遗漏、复核补上);③残差精调 4 参数全链(vpy/ini/IPC 面板/cbuffer);④intensity 类参数 MAX 收紧 0-1(r2-fix1,ClampFinite);⑤**NgxRuntimeGuard**(9824d758,进程级 NGX 故障闩锁:首个 SDK 内 SEH 后所有 SDK 调用快速失败、故障模块跳过 shutdown,宿主重启才复位;与 43fe80a PoolHold 竞态修复互补)。IPC payload 布局加 4 float,`PAYLOAD_MAGIC` DSSL1→DSSL3(拒绝旧版面板的 reserved 零值被解码为 saturation=0)。
+- **决策**:preset 保留 0-3(出处为上游 P8 v0.5.7 的 `DLSSNR.Hint.Render.Preset` 设计;1cde1bae 实改确认 hint 仍写入只是 `FIXED_PRESET=0`,r2-fix1 仅取消参数暴露),作为移植端扩展功能。
+- **确认不适用(逐条对源码核实)**:r9 WGC 捕获修复(GraphicsCaptureFrameSource/FramePresentationTiming/EffectsProfiler——mpv 直供帧无 WGC)、r10 参数延迟重启(Renderer 整组 teardown 生命周期,Magpie 特有)、PR #4 实时参数编辑(EffectParametersViewModel/Renderer 实时队列——面板共享内存已覆盖;ApplyLiveParameters 的结果复用缓存插件无此机制)、PR #16 参数本地化(resw/XAML)、帧同步/Front Edge Sync(FramePacingOptions/OverlayDrawer——mpv 自管呈现)、FrameTrace/FramePacing 诊断、DLSSFrameGenerator/GraphicsCaptureFrameSource(v0.6.6 部分)、ZeroFrameGuidanceProvider/FrameGuidanceService(插件为静态零 guidance 纹理,等价 motionVectorQuality=None)、colorConvert(插件链路本身是 RGBA8)。
+- **清单变化**:#2 guidanceMode 作废(上游删参数→motionVectorQuality 0-5,并入 #6);#6 目标接口改为共享 OF 服务。
+- **测试状态**:test_smoke / test_ipc(新布局)/ test_lifecycle / test_leak / validate_v066 / check_downsample_kernel(高频图案验证内核路径)/ check_hlsl_vs_upstream(HLSL 逐行比对)全过;test_bridge、test_residual、test_4k 等 10 个引用 `dlssnr_live.json` 机制的陈旧死测试(旧 JSON 桥,已被共享内存桥取代)已清理。
