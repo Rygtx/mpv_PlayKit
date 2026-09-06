@@ -497,7 +497,6 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
     slot.reducedMotion.Reset();
     slot.reducedConfidence.Reset();
     slot.srvUavHeap.Reset();
-    slot.nvofWaitValue = 0;
 
     const int width = _width;
     const int height = _height;
@@ -1708,11 +1707,13 @@ bool D3D12Context::BindNvofResources(ID3D12Resource *flowFwd, ID3D12Resource *fl
     return true;
 }
 
-void D3D12Context::RecordDensify(FrameSlot &slot, uint32_t flowW, uint32_t flowH,
-                                 uint32_t gridSize, bool hasForwardCost,
-                                 bool hasBackward, bool hasBackwardCost) noexcept {
-    // NGX evaluate 可能重绑自己的堆/根签名;与 RecordPass 同款先重绑。
-    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                 uint32_t flowW, uint32_t flowH, uint32_t gridSize,
+                                 bool hasForwardCost, bool hasBackward,
+                                 bool hasBackwardCost) noexcept {
+    // 在 NVOF 会话的 nvof CL 上执行(门内、execute 完成后)。NGX evaluate
+    // 可能重绑堆/根签名;槽列表上的其它 pass 仍各自先重绑(同款)。
+    ID3D12GraphicsCommandList *cl = &clRef;
     cl->SetComputeRootSignature(_rsDensify.Get());
     cl->SetPipelineState(_psoDensify.Get());
     ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
@@ -1739,9 +1740,9 @@ void D3D12Context::RecordDensify(FrameSlot &slot, uint32_t flowW, uint32_t flowH
                  (static_cast<UINT>(_height) + 7) / 8, 1);
 }
 
-void D3D12Context::RecordClearGuidance(FrameSlot &slot) noexcept {
+void D3D12Context::RecordClearGuidance(ID3D12GraphicsCommandList &clRef, FrameSlot &slot) noexcept {
     // 播种/失败/过期帧:发布零运动(与零 guidance 的旧行为等价)。
-    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+    ID3D12GraphicsCommandList *cl = &clRef;
     cl->SetComputeRootSignature(_rsDensify.Get());
     ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
     cl->SetDescriptorHeaps(1, heaps);

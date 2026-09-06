@@ -5,26 +5,32 @@
 // 因为它的渲染器是 D3D11、多消费者;本插件单消费者、纯 D3D12,直接用
 // nvofapi64.dll 的 D3D12 API(设备级会话,栅栏同步,无命令列表参数)。
 //
-// 时序模型(与 fmParallel 三槽乱序提交共存,全部栅栏边、顺序无关、无死锁):
+// 时序模型(与 fmParallel 三槽乱序提交共存,全部栅栏边、顺序无关、无死锁)。
+// 注意 flow/cost 输出缓冲是**固定**的(execute 双向时两块都写),不是
+// ping-pong —— 帧间保护靠“densify 也在门内、按帧序提交”的链式栅栏:
 //   1. copy(n)  [我们的 DIRECT 队列]   waits doneFence >= m_{n-1}
 //      —— copy(n+1) 覆写 nvofInput 的 reference 槽位前,上一帧 execute 必须
 //         已经读完它(queue Wait,顺序无关)。
 //   2. execute(n) [NVOF 内部引擎]      waits copyFence >= k_n(输入内容就绪)
 //                                      + doneFence >= m_{同槽位上一次}
-//      —— flow 输出纹理 ping-pong,execute(n) 与 execute(n-2) 同槽位,
-//         W-W 竞争由 done 栅栏点封住。
-//   3. slot CL(n) 的 densify           waits doneFence >= m_n(SubmitFrame
-//      里 queue Wait,顺序无关;常规顺序下已满足,零开销)。
+//   3. execute 后 CPU 等 doneFence >= m_n(官方样例模式;队列级 Wait 实测
+//      不可靠),然后在门内把 densify 记录到同一 nvof CL 上二次提交并
+//      Signal(copyFence, k')—— execute(n+1) 的输入栅栏点含 k_{n+1} > k',
+//      GPU 队列 FIFO 保证 densify(n) 先于 copy(n+1) 先于 execute(n+1)。
+//   4. 槽 CL(n) 的 NGX evaluate:与 densifyCL(n) 同队列、由同线程后提交,
+//      FIFO 顺序 ✓;跨 CL 状态链(UAV→NSR 于 nvofCL,NSR→COMMON 于槽 CL)
+//      合法(同队列保序)。
 //
 // 帧序门(_gateMutex):VS fmParallel 激活顺序单调但可重叠,门只放行
 // _nextSeq 当前帧;前驱未到时 cv 等待(有超时),超时按跳帧处理(重置历史)。
-// 门内工作 = 拷贝 CL 提交 + nvOFExecuteD3D12 调用,天然按帧序串行。
+// 门内工作 = 拷贝提交 + execute + CPU 等 + densify 提交,天然按帧序串行。
 
 #include <d3d12.h>
 #include <wrl/client.h>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <windows.h>
 
@@ -84,9 +90,17 @@ public:
     }
 
     // 帧路径:PackInput 之后(槽 upload 已含本帧 BGRA8)、SubmitFrame 之前,
-    // 在帧线程上调用。帧序门 → 拷贝 CL 提交 → (历史有效时) execute。
+    // 在帧线程上调用。帧序门 → 拷贝 CL 提交 → (历史有效时) execute →
+    // CPU 等输出栅栏 → postExecute 回调(门内、同一 nvof CL 上二次提交,
+    // 调用方在此记录 densify/清零 —— 与 execute 的完成构成栅栏链)。
+    // postExecute 为空(OF 停用帧)时跳过 densify,其余语义不变。
+    using PostExecuteFn = std::function<void(ID3D12GraphicsCommandList *cl)>;
     StageResult StageFrame(int frameIndex, ID3D12Resource *uploadBuffer,
-                           UINT uploadRowPitch) noexcept;
+                           UINT uploadRowPitch, const PostExecuteFn &postExecute) noexcept;
+
+    // 本帧 NVOF 拷贝的完成等待(early-return 路径释放槽位前调用,防宿主
+    // 复用 upload 缓冲撕裂在途拷贝;正常路径已被 execute 栅栏覆盖,no-op)。
+    void WaitCopyIdle() noexcept;
 
     // 最近一次 StageFrame 的 CPU 耗时(门等待 + 拷贝提交 + execute 调用),ms。
     double LastStageMs() const noexcept { return _lastStageMs; }

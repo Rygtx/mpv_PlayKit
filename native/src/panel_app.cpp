@@ -84,7 +84,7 @@ constexpr struct { const char *key; const char *label; const char *tip;
       &DlssnrParams::style, 3, kStyleNames },
     { "motion_vector_quality", "光流质量",
       "NVIDIA 光流(真运动矢量)引导档位:无=零 guidance(旧行为),\n"
-      "其余档位用硬件光流消除运动场景的时域瑕疵。需要 NVIDIA Turing+;\n"
+      "其余档位用硬件光流减轻运动场景的时域伪影。需要 NVIDIA Turing+;\n"
       "不支持时自动回退零 guidance。切换只重建光流会话(毫秒级,不停顿)。",
       &DlssnrParams::motionVectorQuality, 6, kOfQualityNames },
 };

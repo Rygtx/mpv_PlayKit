@@ -83,13 +83,16 @@ static HMODULE GetNvofModule() noexcept {
 
 // 栅栏/事件进程级单例:队列里可能挂着对 doneFence 的 Wait(StageFrame 拷贝
 // 路径),会话销毁时释放栅栏对象 = 驱动侧悬空引用(实测段错误)。热上下文
-// 哲学:进程退出由 OS 回收。
+// 哲学:进程退出由 OS 回收。按创建时的 device 键控:冷重建会换 device,
+// 旧 device 的栅栏对新队列无效,必须重建;计数器在 CreateSession 里按
+// 栅栏当前完成值播种(单例值空间单调,会话重建不得从 0 重新计数)。
 struct NvofFences {
     Microsoft::WRL::ComPtr<ID3D12Fence> copy;
     Microsoft::WRL::ComPtr<ID3D12Fence> done;
     HANDLE event = nullptr;
+    ID3D12Device *device = nullptr;
     bool ok = false;
-    explicit NvofFences(ID3D12Device *device) {
+    explicit NvofFences(ID3D12Device *dev) : device(dev) {
         ok = device &&
              SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(copy.GetAddressOf()))) &&
              SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(done.GetAddressOf())));
@@ -105,8 +108,10 @@ static NvofFences &GetNvofFences(ID3D12Device *device) noexcept {
 
 NvofContext::~NvofContext() { Finalize(); }
 
-// 释放会话与驱动 DLL。调用方持 PoolHold(槽池排空 ⇒ 无 in-flight 拷贝/
-// execute 引用注册纹理);等两个栅栏落位后再注销 + 销毁。
+// 释放会话引用。绝不调用 nvOFDestroy/Unregister:实测销毁后进程内继续
+// GPU 工作会触发驱动内部访问违例(nvwgf2umx,2026-09-07),而本插件的
+// 宿主(DLL 钉住 + 热上下文)本来就以进程为生命周期终点 —— 会话句柄、
+// 注册纹理与驱动侧状态一律泄漏给 OS 回收,与 HotContext 同哲学。
 void NvofContext::Finalize() noexcept { DestroySession(); }
 
 void NvofContext::DestroySession() noexcept {
@@ -125,22 +130,9 @@ void NvofContext::DestroySession() noexcept {
         }
     }
     TimingStatusLine("PROBE: destroy begin"); // 临时探针
-    if (_session && _api.nvOFUnregisterResourceD3D12) {
-        for (NvOFGPUBufferHandle &h : _registered) {
-            if (h) {
-                NV_OF_UNREGISTER_RESOURCE_PARAMS_D3D12 up{};
-                up.hOFGpuBuffer = h;
-                _api.nvOFUnregisterResourceD3D12(&up);
-                h = nullptr;
-            }
-        }
-    }
-    TimingStatusLine("PROBE: destroy unregistered"); // 临时探针
-    if (_session && _api.nvOFDestroy) {
-        _api.nvOFDestroy(_session);
-    }
-    TimingStatusLine("PROBE: destroy done"); // 临时探针
+    // 注意:不调用 nvOFUnregisterResourceD3D12 / nvOFDestroy(见上)。
     _session = nullptr;
+    for (NvOFGPUBufferHandle &h : _registered) h = nullptr;
     for (auto &t : _input) t.Reset();
     for (auto &t : _flow) t.Reset();
     for (auto &t : _cost) t.Reset();
@@ -355,13 +347,20 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
 
     // 栅栏/拷贝命令路径先于注册创建:注册也走栅栏点(输出点单调递增,
     // 与 execute 共用 doneFence 计数)。栅栏/事件为进程级单例(见
-    // GetNvofFences 注释)。
+    // GetNvofFences 注释):device 变化(冷重建)时重建,并把会话计数器
+    // 播种到栅栏当前完成值 —— 单例值空间必须单调,从 0 重计会让重建后
+    // 所有栅栏点对引擎恒已满足(同步全部失效)。
     {
         NvofFences &fences = GetNvofFences(device);
-        if (!fences.ok) return fail("nvof: CreateFence failed");
+        if (!fences.ok || fences.device != device) {
+            fences = NvofFences(device);
+            if (!fences.ok) return fail("nvof: CreateFence failed");
+        }
         _copyFence = fences.copy;
         _doneFence = fences.done;
         _copyFenceEvent = fences.event;
+        _copySeq = _lastCopyFence = _copyFence->GetCompletedValue();
+        _doneSeq = _lastDone = _doneFence->GetCompletedValue();
     }
     if (FAILED(device->CreateCommandAllocator(
             D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -413,12 +412,14 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
 }
 
 // ---- 帧路径 ----------------------------------------------------------------
-// 门内持锁完成拷贝提交 + execute 调用(状态与提交的串行点);cv 等待期间
-// 放锁,前驱帧得以推进。整段是 CPU 快速路径(亚毫秒),持锁不影响吞吐。
+// 门内持锁完成拷贝提交 + execute + CPU 等 + densify 二次提交(状态与提交的
+// 串行点);cv 等待期间放锁,前驱帧得以推进。门内含 execute 输出栅栏的 CPU
+// 等待(有界 10s),device 丢失时短路快速降级。
 
 NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                                                  ID3D12Resource *uploadBuffer,
-                                                 UINT uploadRowPitch) noexcept {
+                                                 UINT uploadRowPitch,
+                                                 const PostExecuteFn &postExecute) noexcept {
     StageResult result{};
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) {
         result.publishZero = true;
@@ -458,10 +459,22 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 _historyValid = false;
             }
         }
+        // 设备丢失:栅栏永不满足,直接降级(下帧 ProcessFrame 顶部会因
+        // _ready 闩锁早退)。
+        if (_d3d12->IsDeviceLost()) {
+            result.publishZero = true;
+            result.historyReset = true;
+            _historyValid = false;
+            _lastStageMs = 0.0;
+            return result;
+        }
 
         const int cur = _curInput;
         const bool seed = !_historyValid;
         bool execute = !seed;
+        // densify/清零在本帧 nvof CL 上录制;execute 帧拆成两次提交
+        // (copy → execute → CPU 等 → densify),播种帧合并为一次。
+        bool densifyPending = false;
 
         ID3D12CommandQueue *queue = _d3d12->Queue();
 
@@ -492,6 +505,9 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.SubresourceIndex = 0;
             _copyCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            // 播种帧:清零(densify 回调)合并进同一次提交 —— 分配器刚提交
+            // 完拷贝尚未执行,拆两次提交会撞 allocator Reset 失败。
+            if (seed && postExecute) postExecute(_copyCommandList.Get());
             copyOk = SUCCEEDED(_copyCommandList->Close());
         }
         if (copyOk) {
@@ -514,8 +530,8 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
 
         if (execute) {
             // execute(n):输入栅栏点 = {copyFence, k_n}(输入内容就绪)
-            // + {doneFence, doneByParity[cur]}(本槽位 flow 空出);
-            // 输出栅栏点 = {doneFence, 新值}(SubmitFrame 等它)。
+            // + {doneFence, doneByParity[cur]}(纵深防御);输出栅栏点 =
+            // {doneFence, 新值}。
             NV_OF_EXECUTE_INPUT_PARAMS_D3D12 in{};
             in.inputFrame = _registered[cur];
             in.referenceFrame = _registered[1 - cur];
@@ -541,9 +557,8 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             const NV_OF_STATUS st = _api.nvOFExecuteD3D12(_session, &in, &out);
             if (st == NV_OF_SUCCESS) {
                 // 官方样例同款:execute 后 CPU 等输出栅栏(NVOF 自有引擎完成
-                // 后置位)。等待落位后再提交槽 CL,densify 在 GPU 上执行时
-                // flow 已就绪 —— 不需要(也不可靠)队列级 Wait:NVOF 的输出
-                // 栅栏在队列 Wait 语义下可能永不满足(实测 2026-09-07)。
+                // 后置位)。等待落位后再提交 densify —— 不用(也不可靠)队列
+                // 级 Wait:NVOF 的输出栅栏在队列 Wait 语义下可能永不满足。
                 bool done = true;
                 if (_doneFence->GetCompletedValue() < outFence.value) {
                     _doneFence->SetEventOnCompletion(outFence.value, _copyFenceEvent);
@@ -559,7 +574,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                         TimingStatusLine("DLSSNR STATUS: nvof disabled after consecutive failures");
                     }
                 } else {
-                    result.waitFenceValue = outFence.value; // 仅作 densify 录制判据
+                    result.waitFenceValue = outFence.value; // densify 录制判据
                     _lastDone = outFence.value;
                     _doneByParity[cur] = outFence.value;
                     _consecutiveFailures = 0;
@@ -601,8 +616,40 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                     TimingStatusLine(msg2);
                 }
             }
+
+            // densify 二次提交:execute 的 flow 输出就绪(CPU 等已落位),
+            // 在门内、同一线程上追加提交 —— 队列 FIFO 保证它先于下一帧的
+            // copy/execute(execute(n+1) 的输入栅栏点 k_{n+1} > k'_n),
+            // 封死“下一帧覆写 flow 而本帧 densify 未读”的窗口。
+            if (result.waitFenceValue && postExecute) {
+                // 分配器此刻必然空闲:本帧拷贝 CL 已被 NVOF 引擎消费
+                // (doneFence m_n 蕴含 copyFence k_n)。
+                densifyPending = SUCCEEDED(_copyAllocator->Reset()) &&
+                                 SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
+                if (densifyPending) {
+                    postExecute(_copyCommandList.Get());
+                    densifyPending = SUCCEEDED(_copyCommandList->Close());
+                }
+                if (densifyPending) {
+                    ID3D12CommandList *lists[]{ _copyCommandList.Get() };
+                    queue->ExecuteCommandLists(1, lists);
+                    _lastCopyFence = ++_copySeq;
+                    queue->Signal(_copyFence.Get(), _lastCopyFence);
+                } else {
+                    // densify 提交失败:本帧运动场未生成,按失败帧降级。
+                    TimingStatusLine("DLSSNR STATUS: nvof densify submit failed");
+                    result.publishZero = true;
+                    result.historyReset = true;
+                    result.waitFenceValue = 0;
+                    _historyValid = false;
+                }
+            } else if (result.waitFenceValue) {
+                result.waitFenceValue = 0; // 无回调:无 densify,按零 guidance
+                result.publishZero = true;
+            }
         } else if (copyOk) {
             // 播种帧:发布零运动 + NGX 重置(首帧/重置后的第一帧)。
+            // 清零已随拷贝合并为同一次提交(见上方 postExecute 调用)。
             result.publishZero = true;
             result.historyReset = true;
         }
@@ -621,6 +668,14 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
     _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
                    static_cast<double>(freq.QuadPart);
     return result;
+}
+
+void NvofContext::WaitCopyIdle() noexcept {
+    // early-return 路径释放槽位前排空在途拷贝(宿主会复用 upload 缓冲)。
+    if (!_ready.load(std::memory_order_acquire) || !_d3d12 || _d3d12->IsDeviceLost()) return;
+    if (!_lastCopyFence || _copyFence->GetCompletedValue() >= _lastCopyFence) return;
+    _copyFence->SetEventOnCompletion(_lastCopyFence, _copyFenceEvent);
+    WaitForSingleObject(_copyFenceEvent, 10000);
 }
 
 } // namespace vsdlssnr

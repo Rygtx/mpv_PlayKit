@@ -616,11 +616,16 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         _width = newWidth;
         _height = newHeight;
         // NVOF 会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildNvof
-        // —— 那会二次取 PoolHold 死锁)。失败降级零 guidance,不致命。
+        // —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见 _retiredNvof
+        // 注释),失败降级零 guidance,不致命。
         if (_nvof && _curOfQuality > 0 && !_nvofFailed) {
+            auto next = std::make_unique<NvofContext>();
             char nvofErr[160]{};
-            if (!_nvof->Initialize(*_d3d12, _width, _height, _curOfQuality,
-                                   nvofErr, sizeof(nvofErr))) {
+            if (next->Initialize(*_d3d12, _width, _height, _curOfQuality,
+                                 nvofErr, sizeof(nvofErr))) {
+                _retiredNvof.push_back(std::move(_nvof));
+                _nvof = std::move(next);
+            } else {
                 _nvofFailed = true;
                 char msg[288];
                 std::snprintf(msg, sizeof(msg),
@@ -742,6 +747,9 @@ bool DlssnrContext::RebuildNvof(int quality, char *err, size_t errLen) noexcept 
                 return false; // 调用方决定是否视为致命(帧路径上不致命)
             }
         } else {
+            // 复用保留的会话(q=0 期间停用):帧序门与历史都已在停用期冻结,
+            // 重置让下一帧重新播种,避免旧参考帧产生一次错误流。
+            _nvof->ResetHistory();
             _nvofFailed = false;
             _curOfQuality = q;
         }
@@ -844,6 +852,12 @@ bool DlssnrContext::ProcessFrame(
     const bool resetHistory =
         lastN < 0 || n < lastN || n - lastN > kFrameGapResetThreshold;
     _lastFrame.store(n, std::memory_order_relaxed);
+    if (resetHistory && _nvof) {
+        // 向后 seek(单实例内回退):帧序门必须随 NGX 历史一并复位,否则
+        // 回退后的所有帧都判过期 → 永久零 guidance(mpv 靠 Rebind 掩盖,
+        // 其它宿主/脚本内 seek 不重建脚本)。
+        _nvof->ResetHistory();
+    }
     // Panel preset / internal-resolution / scaling-toggle changes require a
     // feature rebuild; consume before packing.
     if (int newPreset = -1, newRes = -1, newScaling = -1; _shared->ConsumeRebuild(newPreset, newRes, newScaling)) {
@@ -906,24 +920,55 @@ bool DlssnrContext::ProcessFrame(
     if (!_d3d12->PackInput(*slot, srcPlanes, srcStrides, width, height, err, errLen)) return false;
     QueryPerformanceCounter(&t1);
 
-    // NVOF 光流阶段:帧序门 + 拷贝提交 + execute(独立拷贝命令列表,不占
-    // 槽列表)。结果决定槽列表上录 densify 还是清零,以及 SubmitFrame 的
-    // 栅栏等待值。publishZero/历史重置语义见 NvofContext::StageFrame。
+    // NVOF 光流阶段:帧序门 + 拷贝提交 + execute + densify(独立 nvof CL,
+    // 不占槽列表)。densify 经 postExecute 回调在门内、execute 完成后录制
+    // 并二次提交 —— 栅栏链(copyFence k_{n+1} > k'_n)封死“下一帧覆写 flow
+    // 而本帧 densify 未读”的窗口。publishZero/历史重置语义见 StageFrame。
     bool realMotion = false;      // 本帧有真光流(densify 录制 + PARAM_MVEC 指向它)
     bool nvofPublishZero = false; // 本帧清零发布(播种/失败/过期)
     bool nvofHistoryReset = false;
     double nvofMs = 0.0;
     if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
+        const uint32_t gs = _nvof->GridSize();
+        const uint32_t flowW = (static_cast<uint32_t>(width) + gs - 1) / gs;
+        const uint32_t flowH = (static_cast<uint32_t>(height) + gs - 1) / gs;
+        const bool hasBwd = _nvof->Bidirectional();
+        const bool hasCost = _nvof->CostEnabled();
+        NvofContext::PostExecuteFn post =
+            [this, &slot, flowW, flowH, gs, hasCost, hasBwd](ID3D12GraphicsCommandList *cl) {
+                D3D12_RESOURCE_BARRIER g1[2]{
+                    Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                };
+                cl->ResourceBarrier(2, g1);
+                _d3d12->RecordDensify(*cl, *slot, flowW, flowH, gs,
+                                      hasCost, hasBwd, hasBwd && hasCost);
+                D3D12_RESOURCE_BARRIER g2[2]{
+                    Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                };
+                cl->ResourceBarrier(2, g2);
+            };
         const NvofContext::StageResult st =
-            _nvof->StageFrame(n, slot->upload.Get(), static_cast<UINT>(slot->uploadPitch));
-        slot->nvofWaitValue = st.waitFenceValue;
+            _nvof->StageFrame(n, slot->upload.Get(), static_cast<UINT>(slot->uploadPitch), post);
         nvofPublishZero = st.publishZero;
         nvofHistoryReset = st.historyReset;
         nvofMs = _nvof->LastStageMs();
         realMotion = st.waitFenceValue != 0;
-    } else {
-        slot->nvofWaitValue = 0;
     }
+    // 3 连败停用(会话内部闩锁)在帧线程侧只发现不重试,防风暴;
+    // Rebind/换档时经 _nvofFailed 条目重试一次。
+    if (_curOfQuality > 0 && _nvof && !_nvof->Enabled() && !_nvofFailed) {
+        _nvofFailed = true;
+        TimingStatusLine("DLSSNR STATUS: nvof disabled (exhausted); zero guidance until rebind");
+    }
+    // early-return 路径释放槽位前排空在途拷贝(宿主复用 upload 缓冲;
+    // 正常路径已被 execute 栅栏覆盖,no-op)。
+    struct CopyDrainGuard {
+        NvofContext *n;
+        bool on;
+        ~CopyDrainGuard() { if (n && on) n->WaitCopyIdle(); }
+    } drainGuard{ _nvof.get(), _nvof && _curOfQuality > 0 };
 
     if (ProbeEnabled()) TimingStatusLine("PROBE: post-stage"); // 临时探针(VSDLSSNR_PROBE=1)
     if (!_d3d12->BeginFrameRecording(*slot)) {
@@ -962,47 +1007,24 @@ bool DlssnrContext::ProcessFrame(
         const bool scaling = _d3d12->HasScaling();
 
         // ---- NVOF guidance 段(PORTING #6)----
-        // densify 或清零写在槽列表上;GPU 真实先后由 SubmitFrame 的队列栅栏
-        // 等待(等 NVOF execute 的 flow 输出)+ 本列表内命令顺序共同保证。
-        // OF 关闭/跳过时本段整体不录,motion/confidence 全程 COMMON 不动。
-        if (realMotion || nvofPublishZero) {
-            D3D12_RESOURCE_BARRIER g1[2]{
-                Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        // densify/清零已挪进 NVOF 会话的 nvof CL(门内、execute 完成后,
+        // 经 postExecute 回调录制)—— 本槽列表只剩缩放启用时的 guidance
+        // 降采样(读 nvofCL 转入 NSR 的 motion/confidence,同队列 FIFO
+        // 保序)。OF 关闭/跳过时 motion/confidence 全程 COMMON 不动。
+        if (realMotion && scaling) {
+            // 缩放启用:置信度加权降采样到内部尺寸(运动向量乘
+            // MotionScale 换算到内部像素单位,Magpie 同款)。
+            D3D12_RESOURCE_BARRIER g3[2]{
+                Transition(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                Transition(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
-            cl->ResourceBarrier(2, g1);
-            if (realMotion) {
-                const uint32_t flowW =
-                    (static_cast<uint32_t>(_width) + _nvof->GridSize() - 1) / _nvof->GridSize();
-                const uint32_t flowH =
-                    (static_cast<uint32_t>(_height) + _nvof->GridSize() - 1) / _nvof->GridSize();
-                _d3d12->RecordDensify(*slot, flowW, flowH, _nvof->GridSize(),
-                                      _nvof->CostEnabled(), _nvof->Bidirectional(),
-                                      _nvof->Bidirectional() && _nvof->CostEnabled());
-            } else {
-                _d3d12->RecordClearGuidance(*slot);
-            }
-            // densify/清零输出 → NSR(降采样 SRV 输入或 NGX evaluate 输入)。
-            D3D12_RESOURCE_BARRIER g2[2]{
-                Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            cl->ResourceBarrier(2, g3);
+            _d3d12->RecordGuidanceDownsample(*slot);
+            D3D12_RESOURCE_BARRIER g4[2]{
+                Transition(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                Transition(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
-            cl->ResourceBarrier(2, g2);
-            if (realMotion && scaling) {
-                // 缩放启用:置信度加权降采样到内部尺寸(运动向量乘
-                // MotionScale 换算到内部像素单位,Magpie 同款)。
-                D3D12_RESOURCE_BARRIER g3[2]{
-                    Transition(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                    Transition(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                };
-                cl->ResourceBarrier(2, g3);
-                _d3d12->RecordGuidanceDownsample(*slot);
-                D3D12_RESOURCE_BARRIER g4[2]{
-                    Transition(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                    Transition(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                };
-                cl->ResourceBarrier(2, g4);
-            }
+            cl->ResourceBarrier(2, g4);
         }
 
         // Pre-evaluate barriers (executed on the GPU before the NGX dispatch).

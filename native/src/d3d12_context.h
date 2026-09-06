@@ -89,8 +89,6 @@ struct FrameSlot {
 
     size_t uploadPitch = 0;
     size_t readbackPitch = 0;
-    // 本帧 NVOF done 栅栏值(SubmitFrame 提交前 queue Wait;0 = 无需等待)。
-    uint64_t nvofWaitValue = 0;
 };
 
 class D3D12Context {
@@ -146,13 +144,14 @@ public:
     bool BindNvofResources(ID3D12Resource *flowFwd, ID3D12Resource *flowBwd,
                            ID3D12Resource *costFwd, ID3D12Resource *costBwd) noexcept;
     // densify(Magpie NVOF_Densify HLSL 原样):S10.5 网格 → 稠密运动 +
-    // 置信度。在该槽已 BeginFrameRecording 的列表上执行;调用方负责把
-    // motion/confidence 转入 UAV 态。gridSize/旗标来自 NvofContext 会话。
-    void RecordDensify(FrameSlot &slot, uint32_t flowW, uint32_t flowH,
-                       uint32_t gridSize, bool hasForwardCost,
-                       bool hasBackward, bool hasBackwardCost) noexcept;
+    // 置信度。在 NVOF 会话的 nvof CL 上执行(门内、execute 完成后),
+    // 调用方负责 motion/confidence 的 UAV 态转移。gridSize/旗标来自
+    // NvofContext 会话。
+    void RecordDensify(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                       uint32_t flowW, uint32_t flowH, uint32_t gridSize,
+                       bool hasForwardCost, bool hasBackward, bool hasBackwardCost) noexcept;
     // OF 关闭/播种/失败帧:UAV clear 清零本槽 motion/confidence。
-    void RecordClearGuidance(FrameSlot &slot) noexcept;
+    void RecordClearGuidance(ID3D12GraphicsCommandList &cl, FrameSlot &slot) noexcept;
     // 缩放启用时的 guidance 降采样(Magpie DownsampleGuidance;深度输出
     // 在本宿主是死重 —— depth 恒为零纹理,NGX 直接消费静态零纹理)。
     void RecordGuidanceDownsample(FrameSlot &slot) noexcept;
