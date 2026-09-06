@@ -43,13 +43,20 @@ constexpr UINT WM_APP_TRAYICON = WM_APP + 1;
 // clang-format off
 // Labels/tips are UTF-8 (the project compiles with /utf-8); the old
 // wchar_t tables + per-frame WideCharToMultiByte are gone.
+// 成员指针直达字段,避免键名 -> 字段的双份 if 链漂移。
 constexpr struct { const char *key; const char *label; const char *tip;
-                   float lo, hi; } kSliders[] = {
-    { "intensity",         "强度",     "整体处理强度(0-2,默认 1)。数值越高降噪/增强越明显。", 0, 2 },
-    { "local_tone",        "局部色调", "局部色调强度(0-2,默认 1)。影响明暗过渡区域的处理力度。", 0, 2 },
-    { "local_structure",   "局部结构", "局部结构强度(0-2,默认 1)。越高保留越多细节纹理。", 0, 2 },
-    { "skin_structure",    "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", -1, 2 },
-    { "residual_multiplier", "残差乘数", "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", 1, 2 },
+                   float lo, hi; float DlssnrParams::*field; } kSliders[] = {
+    { "intensity",         "强度",     "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。", 0, 1, &DlssnrParams::intensity },
+    { "local_tone",        "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。", 0, 1, &DlssnrParams::localToneStrength },
+    { "local_structure",   "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。", 0, 1, &DlssnrParams::localStructureStrength },
+    { "skin_structure",    "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", -1, 2, &DlssnrParams::skinStructureStrength },
+    { "residual_multiplier", "残差乘数", "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", 1, 2, &DlssnrParams::residualMultiplier },
+    // 残差精调 4 项(Magpie 0.6.5 r1-r10):全部是相对语义 —— 调节
+    // "DLSSNR 相对原图造成的变化" 的幅度,不是绝对调色滑块。
+    { "residual_saturation", "残差饱和度", "对 DLSSNR 造成的饱和度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", 0, 2, &DlssnrParams::residualSaturation },
+    { "residual_lightness",  "残差亮度",   "对 DLSSNR 造成的明度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", 0, 2, &DlssnrParams::residualLightness },
+    { "shadow_structure",    "阴影结构",   "残差中变暗(负)分量的倍率(0-2,默认 1)。\n调低可减轻暗部噪点被放大,调高增强暗部结构重建。", 0, 2, &DlssnrParams::shadowStructureMultiplier },
+    { "reflection_glow",     "反射辉光",   "残差中变亮(正)分量的倍率(0-2,默认 1)。\n调低可抑制高光泛光,调高增强高光/辉光表现。", 0, 2, &DlssnrParams::reflectionGlowMultiplier },
 };
 constexpr struct { const char *key; const char *label; const char *tip; } kEnums[] = {
     { "preset", "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。" },
@@ -489,19 +496,11 @@ void DrawUi() noexcept {
         if (ImGui::IsItemHovered()) ShowTip(sl.tip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
-        float v = sl.key == std::string("intensity")            ? g_app.params.intensity
-                  : sl.key == std::string("local_tone")         ? g_app.params.localToneStrength
-                  : sl.key == std::string("local_structure")    ? g_app.params.localStructureStrength
-                  : sl.key == std::string("residual_multiplier") ? g_app.params.residualMultiplier
-                                                                 : g_app.params.skinStructureStrength;
+        float v = g_app.params.*(sl.field);
         if (ImGui::SliderFloat(("##" + std::string(sl.key)).c_str(), &v, sl.lo, sl.hi, "%.2f")) {
             // NGX accepts continuous float steps (verified: 0.01 steps produce
             // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
-            if (sl.key == std::string("intensity")) g_app.params.intensity = v;
-            else if (sl.key == std::string("local_tone")) g_app.params.localToneStrength = v;
-            else if (sl.key == std::string("local_structure")) g_app.params.localStructureStrength = v;
-            else if (sl.key == std::string("residual_multiplier")) g_app.params.residualMultiplier = v;
-            else g_app.params.skinStructureStrength = v;
+            g_app.params.*(sl.field) = v;
             g_app.liveDirty = true;
         }
         y += 38 * s;
@@ -512,7 +511,7 @@ void DrawUi() noexcept {
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + 8 * s));
         ImGui::Text("%s", "分辨率缩放");
         if (ImGui::IsItemHovered())
-            ShowTip("启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Lanczos3 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
+            ShowTip("启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Catmull-Rom 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
         ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
         bool scalingOn = g_app.params.scalingEnabled != 0;

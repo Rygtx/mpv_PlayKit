@@ -212,6 +212,10 @@ static void VS_CC DlssnrCreate(
     initial.useAutoMask = GetIntDef(in, vsapi, "use_auto_mask", 1) != 0;
     initial.uiCorrection = GetIntDef(in, vsapi, "ui_correction", 1) != 0;
     initial.residualMultiplier = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "residual_multiplier", 1.0), kResidualMultMin, kResidualMultMax));
+    initial.residualSaturation = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "residual_saturation", 1.0), kResidualFineMin, kResidualFineMax));
+    initial.residualLightness = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "residual_lightness", 1.0), kResidualFineMin, kResidualFineMax));
+    initial.shadowStructureMultiplier = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "shadow_structure", 1.0), kResidualFineMin, kResidualFineMax));
+    initial.reflectionGlowMultiplier = vsh::doubleToFloatS(std::clamp<double>(GetFloatDef(in, vsapi, "reflection_glow", 1.0), kResidualFineMin, kResidualFineMax));
     initial.inputResolutionPercent = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "input_resolution", 100), kResPctMin, kResPctMax));
     // scaling_enabled=0 drops the residual pipeline entirely (input_resolution ignored)
     initial.scalingEnabled = GetIntDef(in, vsapi, "scaling_enabled", 1) != 0;
@@ -336,6 +340,10 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "use_auto_mask:int:opt;"
         "ui_correction:int:opt;"
         "residual_multiplier:float:opt;"
+        "residual_saturation:float:opt;"
+        "residual_lightness:float:opt;"
+        "shadow_structure:float:opt;"
+        "reflection_glow:float:opt;"
         "scaling_enabled:int:opt;"
         "input_resolution:int:opt;",
         "clip:vnode;",

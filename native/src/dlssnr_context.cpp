@@ -1,5 +1,6 @@
 // Ported from Magpie experimental DLSSNRFilter.cpp / NgxD3D12Core.cpp (see header).
 #include "dlssnr_context.h"
+#include "ngx_runtime_guard.h"
 #include "panel_ipc.h"
 
 #include <algorithm>
@@ -69,11 +70,6 @@ constexpr ResourceParameters RESOURCE_PARAMETERS[]{
     { "DLSSNR.DepthSubrectBaseX", "DLSSNR.DepthSubrectBaseY",
         "DLSSNR.DepthSubrectWidth", "DLSSNR.DepthSubrectHeight" }
 };
-
-LONG CaptureNgxException(DWORD code, DWORD *sehCode) noexcept {
-    *sehCode = code;
-    return EXCEPTION_EXECUTE_HANDLER;
-}
 
 void DbgLine(const char *msg) noexcept {
     OutputDebugStringA("vs_dlssnr: ");
@@ -235,92 +231,68 @@ TimingWindow g_timing;
 DlssnrContext::~DlssnrContext() { Shutdown(); }
 
 // ---- SEH-wrapped core calls (NgxD3D12Core.cpp:22-89) ----
+// All SDK entries go through NgxRuntimeGuard::Invoke: after the first SEH the
+// process-level latch fails every further SDK call fast (the SEH may have
+// left NGX's internal critical section held — re-entering would deadlock).
 
 NVSDK_NGX_Result DlssnrContext::CoreInitSafely(
     const wchar_t *appDir, ID3D12Device *device,
     const NVSDK_NGX_FeatureCommonInfo *info, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return NVSDK_NGX_D3D12_Init_with_ProjectID(
             PROJECT_ID, NVSDK_NGX_ENGINE_TYPE_CUSTOM, ENGINE_NAME,
             appDir, device, info, NVSDK_NGX_Version_API);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::CoreAllocateParametersSafely(NVSDK_NGX_Parameter **out, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return NVSDK_NGX_D3D12_AllocateParameters(out);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::CoreDestroyParametersSafely(NVSDK_NGX_Parameter *p, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return NVSDK_NGX_D3D12_DestroyParameters(p);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::CoreShutdownSafely(ID3D12Device *device, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return NVSDK_NGX_D3D12_Shutdown1(device);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::SnippetInitSafely(const wchar_t *appDataPath, ID3D12Device *device, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return _snippetInitExt(
             DLSSNR_SIGNED_SNIPPET_APPLICATION_ID, appDataPath,
             device, NVSDK_NGX_Version_API, nullptr);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::SnippetCreateFeatureSafely(ID3D12GraphicsCommandList *cl, NVSDK_NGX_Parameter *params, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return _snippetCreateFeature(cl, FEATURE_DLSSNR, params, &_feature);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::SnippetEvaluateSafely(ID3D12GraphicsCommandList *cl, NVSDK_NGX_Parameter *params, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return _snippetEvaluateFeature(cl, _feature, params, nullptr);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::SnippetReleaseSafely(DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return _snippetReleaseFeature(_feature);
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 NVSDK_NGX_Result DlssnrContext::SnippetShutdownSafely(DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         return _snippetShutdown(_d3d12->Device());
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return NVSDK_NGX_Result_FAIL_PlatformError;
-    }
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
 // ---- Parameter assembly (Magpie DLSSNRFilter.cpp:1104-1130 / 1197-1230) ----
@@ -359,13 +331,10 @@ void DlssnrContext::SetCreateParametersUnsafe() noexcept {
 }
 
 bool DlssnrContext::SetCreateParametersSafely(DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         SetCreateParametersUnsafe();
         return true;
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return false;
-    }
+    }, false, sehCode);
 }
 
 void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory) noexcept {
@@ -399,13 +368,10 @@ void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHisto
 }
 
 bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
+    return NgxRuntimeGuard::Invoke([&] {
         SetEvaluateParametersUnsafe(slot, resetHistory);
         return true;
-    } __except (CaptureNgxException(GetExceptionCode(), sehCode)) {
-        return false;
-    }
+    }, false, sehCode);
 }
 
 // ---- Lifecycle ----
@@ -697,7 +663,13 @@ bool DlssnrContext::ProcessFrame(
         if (!RecreateFeature(newPreset, newRes, newScaling, err, errLen)) return false;
     }
     const DlssnrParams frameParams = _shared->Snapshot();
-    const float residualMultiplier = std::clamp(frameParams.residualMultiplier, kResidualMultMin, kResidualMultMax);
+    const ResidualControls residual{
+        std::clamp(frameParams.residualMultiplier, kResidualMultMin, kResidualMultMax),
+        std::clamp(frameParams.residualSaturation, kResidualFineMin, kResidualFineMax),
+        std::clamp(frameParams.residualLightness, kResidualFineMin, kResidualFineMax),
+        std::clamp(frameParams.shadowStructureMultiplier, kResidualFineMin, kResidualFineMax),
+        std::clamp(frameParams.reflectionGlowMultiplier, kResidualFineMin, kResidualFineMax),
+    };
     // Telemetry is always on (QPC reads cost ~ns); timingOut additionally
     // receives a per-frame segment string for the VS-log channel.
     const bool vsTiming = timingOut && timingLen > 0;
@@ -773,14 +745,24 @@ bool DlssnrContext::ProcessFrame(
         D3D12_RESOURCE_BARRIER pre[1];
         UINT preCount = 0;
         if (scaling) {
-            // downsample source -> reducedColor (area average, Magpie HLSL);
-            // InputColor is already NSR (the upload copy landed it there)
-            D3D12_RESOURCE_BARRIER b1[1]{
+            // Two-pass Lanczos2 color downsample (upstream 1cde1bae). At equal
+            // extents Lanczos2 degenerates to an exact copy, so no skip needed.
+            // horizontalRes doubles as the downsample intermediate (upstream
+            // reuses resampleIntermediate the same way).
+            D3D12_RESOURCE_BARRIER b1[2]{
                 TransitionTo(_d3d12->ReducedColor(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                TransitionTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
-            cl->ResourceBarrier(1, b1);
-            _d3d12->RecordDownsample(*slot, residualMultiplier);
-            // reducedColor: UAV (write) -> NSR (NGX input)
+            cl->ResourceBarrier(2, b1);
+            _d3d12->RecordDownsampleVertical(*slot, residual);
+            // vertical output becomes the horizontal pass's SRV only after the
+            // UAV->SRV transition
+            D3D12_RESOURCE_BARRIER b1b[1]{
+                TransitionFromTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            };
+            cl->ResourceBarrier(1, b1b);
+            _d3d12->RecordDownsampleHorizontal(*slot, residual);
+            // reducedColor: UAV (downsample write) -> NSR (NGX input)
             D3D12_RESOURCE_BARRIER b2[1]{
                 TransitionFromTo(_d3d12->ReducedColor(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
@@ -802,54 +784,95 @@ bool DlssnrContext::ProcessFrame(
         std::lock_guard<std::mutex> evalLock(_evaluateMutex);
         DWORD sehCode = 0;
         if (!SetEvaluateParametersSafely(*slot, resetHistory, &sehCode)) {
-            if (err && errLen) std::snprintf(err, errLen, "Evaluate parameter setup raised SEH");
+            if (err && errLen) {
+                if (NgxRuntimeGuard::IsFaulted() && !sehCode) {
+                    std::snprintf(err, errLen,
+                                  "NGX faulted (SEH 0x%x); SDK disabled until host restart",
+                                  NgxRuntimeGuard::FaultCode());
+                } else {
+                    std::snprintf(err, errLen, "Evaluate parameter setup raised SEH");
+                }
+            }
             return false;
         }
         const NVSDK_NGX_Result r = SnippetEvaluateSafely(cl, _parameters, &sehCode);
         QueryPerformanceCounter(&t2);
         if (sehCode) {
-            char buf[96];
-            snprintf(buf, sizeof(buf), "EvaluateFeature raised SEH 0x%x (scaling=%d)", sehCode, scaling ? 1 : 0);
+            char buf[160];
+            snprintf(buf, sizeof(buf), "EvaluateFeature raised SEH 0x%x (scaling=%d); NGX latched, no further SDK entry",
+                     sehCode, scaling ? 1 : 0);
             DbgLine(buf);
-            if (err && errLen) snprintf(err, errLen, "EvaluateFeature raised SEH 0x%x", sehCode);
+            if (err && errLen) snprintf(err, errLen, "EvaluateFeature raised SEH 0x%x; NGX disabled until host restart", sehCode);
             return false;
         }
         if (!NVSDK_NGX_SUCCEED(r)) {
-            if (err && errLen) std::snprintf(err, errLen, "EvaluateFeature failed (0x%x)", static_cast<unsigned>(r));
+            if (err && errLen) {
+                if (NgxRuntimeGuard::IsFaulted()) {
+                    std::snprintf(err, errLen,
+                                  "NGX faulted (SEH 0x%x); SDK disabled until host restart",
+                                  NgxRuntimeGuard::FaultCode());
+                } else {
+                    std::snprintf(err, errLen, "EvaluateFeature failed (0x%x)", static_cast<unsigned>(r));
+                }
+            }
             return false;
         }
 
         if (scaling) {
-            // reducedDenoised: UAV (NGX write) -> NSR (residual read)
+            // reducedDenoised: UAV (NGX write) -> NSR (prepare read)
             D3D12_RESOURCE_BARRIER b4[1]{
                 TransitionFromTo(_d3d12->ReducedDenoised(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
             cl->ResourceBarrier(1, b4);
-            // Lanczos3 horizontal residual upsample (reducedColor still NSR)
+            // PrepareResidual: fine controls per internal-resolution pixel
+            // (Magpie 2d37f8c0); reducedColor is still NSR from the NGX input
             D3D12_RESOURCE_BARRIER b5[1]{
-                TransitionTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                TransitionTo(_d3d12->ControlledRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
             cl->ResourceBarrier(1, b5);
-            _d3d12->RecordResidualHorizontal(*slot, residualMultiplier);
-            D3D12_RESOURCE_BARRIER b6[3]{
-                TransitionFromTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            _d3d12->RecordResidualPrepare(*slot, residual);
+            D3D12_RESOURCE_BARRIER b6[1]{
+                TransitionFromTo(_d3d12->ControlledRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            };
+            cl->ResourceBarrier(1, b6);
+            // Catmull-Rom horizontal residual upsample; equal internal width
+            // skips it and the vertical pass reads controlledRes directly.
+            // horizontalRes is in NSR here (downsample intermediate), so the
+            // re-use as UAV target needs an explicit NSR->UAV transition.
+            const bool equalWidth = _d3d12->InternalWidth() == width;
+            if (!equalWidth) {
+                D3D12_RESOURCE_BARRIER b7[1]{
+                    TransitionFromTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                };
+                cl->ResourceBarrier(1, b7);
+                _d3d12->RecordResidualHorizontal(*slot, residual);
+                D3D12_RESOURCE_BARRIER b8[1]{
+                    TransitionFromTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                };
+                cl->ResourceBarrier(1, b8);
+            }
+            // prepare is done with the reduced textures; park them back in COMMON
+            D3D12_RESOURCE_BARRIER b9[2]{
                 TransitionFromTo(_d3d12->ReducedColor(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                 TransitionFromTo(_d3d12->ReducedDenoised(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             };
-            cl->ResourceBarrier(3, b6);
+            cl->ResourceBarrier(2, b9);
             // vertical composite onto full-size output (input = original color)
-            D3D12_RESOURCE_BARRIER b7[1]{
+            D3D12_RESOURCE_BARRIER b10[1]{
                 TransitionTo(_d3d12->OutputColor(*slot), D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
-            cl->ResourceBarrier(1, b7);
-            // move input back to COMMON only after vertical dispatch consumed it;
-            // OutputColor stays UAV — the readback copy takes it from there
-            _d3d12->RecordResidualVertical(*slot, residualMultiplier);
-            D3D12_RESOURCE_BARRIER b8[2]{
+            cl->ResourceBarrier(1, b10);
+            // move inputs back to COMMON only after the vertical dispatch
+            // consumed them; OutputColor stays UAV — the readback copy takes
+            // it from there. horizontalRes always left COMMON this frame
+            // (downsample intermediate), so it always transitions back.
+            _d3d12->RecordResidualVertical(*slot, residual, equalWidth);
+            D3D12_RESOURCE_BARRIER b11[3]{
                 TransitionFromTo(_d3d12->InputColor(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(_d3d12->ControlledRes(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                 TransitionFromTo(_d3d12->HorizontalRes(*slot), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
             };
-            cl->ResourceBarrier(2, b8);
+            cl->ResourceBarrier(3, b11);
         } else {
             // no scaling: NGX wrote OutputColor directly. Input returns to
             // COMMON here; OutputColor stays UAV — the readback copy takes
@@ -969,6 +992,20 @@ bool DlssnrContext::ProcessFrame(
 }
 
 void DlssnrContext::Shutdown() noexcept {
+    // A faulted latch refuses further SDK entry (Invoke returns the fallback
+    // with *sehCode == 0): skip shutdown entirely and keep the faulted modules
+    // parked — matching Magpie's fault isolation, only a host restart clears it.
+    if (NgxRuntimeGuard::IsFaulted()) {
+        DbgLine("NGX faulted earlier; skipping SDK shutdown (isolation, no re-entry)");
+        RestoreSnippetCallerHook(_hook);
+        if (_snippetModule) {
+            if (!_hook.installed) FreeLibrary(_snippetModule);
+            _snippetModule = nullptr;
+        }
+        _ready = false;
+        _d3d12 = nullptr;
+        return;
+    }
     if (_feature && _snippetReleaseFeature) {
         DWORD sehCode = 0;
         SnippetReleaseSafely(&sehCode);
@@ -984,12 +1021,16 @@ void DlssnrContext::Shutdown() noexcept {
     }
     if (_snippetInitialized && _snippetShutdown && _d3d12) {
         DWORD sehCode = 0;
-        SnippetShutdownSafely(&sehCode);
+        const NVSDK_NGX_Result r = SnippetShutdownSafely(&sehCode);
+        // A final shutdown failure is equally unsafe to retry (upstream marks
+        // this state non-recoverable) — latch the process.
+        if (sehCode || !NVSDK_NGX_SUCCEED(r)) NgxRuntimeGuard::MarkShutdownFailed();
         _snippetInitialized = false;
     }
     if (_coreInitialized && _d3d12) {
         DWORD sehCode = 0;
-        CoreShutdownSafely(_d3d12->Device(), &sehCode);
+        const NVSDK_NGX_Result r = CoreShutdownSafely(_d3d12->Device(), &sehCode);
+        if (sehCode || !NVSDK_NGX_SUCCEED(r)) NgxRuntimeGuard::MarkShutdownFailed();
         _coreInitialized = false;
     }
     RestoreSnippetCallerHook(_hook);

@@ -36,6 +36,10 @@ inline void WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax));
     writeInt(L"scaling_enabled", p.scalingEnabled ? 1 : 0);
     writeX100(L"residual_multiplier_x100", p.residualMultiplier);
+    writeX100(L"residual_saturation_x100", p.residualSaturation);
+    writeX100(L"residual_lightness_x100", p.residualLightness);
+    writeX100(L"shadow_structure_x100", p.shadowStructureMultiplier);
+    writeX100(L"reflection_glow_x100", p.reflectionGlowMultiplier);
     writeInt(L"saved", 1);
 }
 
@@ -67,6 +71,10 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), kResPctMin, kResPctMax);
     p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled);
     p.residualMultiplier = readX100(L"residual_multiplier_x100", p.residualMultiplier, kResidualMultMin, kResidualMultMax);
+    p.residualSaturation = readX100(L"residual_saturation_x100", p.residualSaturation, kResidualFineMin, kResidualFineMax);
+    p.residualLightness = readX100(L"residual_lightness_x100", p.residualLightness, kResidualFineMin, kResidualFineMax);
+    p.shadowStructureMultiplier = readX100(L"shadow_structure_x100", p.shadowStructureMultiplier, kResidualFineMin, kResidualFineMax);
+    p.reflectionGlowMultiplier = readX100(L"reflection_glow_x100", p.reflectionGlowMultiplier, kResidualFineMin, kResidualFineMax);
     return true;
 }
 

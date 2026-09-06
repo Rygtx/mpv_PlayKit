@@ -19,7 +19,11 @@ constexpr wchar_t STATS_MAPPING[] = L"vs_dlssnr_stats";
 constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";             // saved profile (written/read by both sides)
 constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive"; // filter-lifetime marker (bridge + panel watchdog)
 constexpr uint32_t PAYLOAD_SIZE = 512;
-constexpr uint32_t PAYLOAD_MAGIC = 0x314C5344u; // "DSSL1"
+// "DSSL3": v3 adds the four residual fine-control floats (fields reused from
+// the reserved block). The bump rejects payloads from a v1/v2 panel whose
+// reserved zeros would decode as saturation/lightness = 0 (= "remove the
+// residual change") instead of the neutral 1.
+constexpr uint32_t PAYLOAD_MAGIC = 0x334C5344u; // "DSSL3"
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -29,19 +33,23 @@ struct PanelPayload {
     uint32_t generation;         // panel process instance (GetTickCount at start)
     int32_t preset;              // 0-3
     int32_t style;               // 0-2
-    float intensity;             // 0-2
-    float localTone;             // 0-2
-    float localStructure;        // 0-2
+    float intensity;             // 0-1
+    float localTone;             // 0-1
+    float localStructure;        // 0-1
     float skinStructure;         // -1-2
     int32_t useAutoMask;         // 0/1
     int32_t uiCorrection;        // 0/1
     int32_t inputResolution;     // 25-100
     float residualMultiplier;    // 1-2
+    float residualSaturation;    // 0-2 (relative to DLSSNR's own change)
+    float residualLightness;     // 0-2
+    float shadowStructure;       // 0-2
+    float reflectionGlow;        // 0-2
     int32_t scalingEnabled;      // 0 = ignore inputResolution (treat as 100)
     int32_t saveRequest;         // panel "保存设置" press (applied once per seq)
     int32_t resetRequest;        // panel "重置默认" press
     int32_t logEnabled;          // perf log toggle state
-    uint32_t reserved[5];
+    uint32_t reserved[1];
 };
 #pragma pack(pop)
 
@@ -64,6 +72,10 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.useAutoMask = pl.useAutoMask != 0;
     p.uiCorrection = pl.uiCorrection != 0;
     p.residualMultiplier = std::clamp(pl.residualMultiplier, kResidualMultMin, kResidualMultMax);
+    p.residualSaturation = std::clamp(pl.residualSaturation, kResidualFineMin, kResidualFineMax);
+    p.residualLightness = std::clamp(pl.residualLightness, kResidualFineMin, kResidualFineMax);
+    p.shadowStructureMultiplier = std::clamp(pl.shadowStructure, kResidualFineMin, kResidualFineMax);
+    p.reflectionGlowMultiplier = std::clamp(pl.reflectionGlow, kResidualFineMin, kResidualFineMax);
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
@@ -87,6 +99,10 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.inputResolution = p.inputResolutionPercent;
     pl.scalingEnabled = p.scalingEnabled ? 1 : 0;
     pl.residualMultiplier = p.residualMultiplier;
+    pl.residualSaturation = p.residualSaturation;
+    pl.residualLightness = p.residualLightness;
+    pl.shadowStructure = p.shadowStructureMultiplier;
+    pl.reflectionGlow = p.reflectionGlowMultiplier;
     return pl;
 }
 

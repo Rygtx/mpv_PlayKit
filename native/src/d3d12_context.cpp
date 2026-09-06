@@ -204,7 +204,9 @@ void D3D12Context::Finalize() noexcept {
     _freeCount = 0;
     _psoVertical.Reset();
     _psoHorizontal.Reset();
-    _psoDownsample.Reset();
+    _psoPrepare.Reset();
+    _psoDownsampleVertical.Reset();
+    _psoDownsampleHorizontal.Reset();
     _rsCompute.Reset();
     _scalingReady = false;
     _rtvHeap.Reset();
@@ -673,14 +675,20 @@ bool D3D12Context::UnpackOutput(
 }
 
 // ---------------------------------------------------------------------------
-// Residual pipeline (ported from Magpie DLSSNRFilter.cpp:100-308):
-// downsample color (area average) -> NGX evaluate at internal resolution ->
-// Lanczos3 horizontal residual upsample -> Lanczos3 vertical + composite
-// (original + residual * ResidualMultiplier).
+// Residual pipeline (ported from Magpie DLSSNRFilter.cpp, 2d37f8c0 / v0.6.6):
+// two-pass Lanczos2 color downsample (vertical -> horizontal, 1cde1bae
+// "lanczos2-aa"; at equal extents Lanczos2 degenerates to an exact copy) ->
+// NGX evaluate at internal resolution ->
+// PrepareResidual (per-pixel fine controls in the low-resolution domain) ->
+// Catmull-Rom horizontal residual upsample (skipped at equal width) ->
+// Catmull-Rom vertical + composite (saturate(original + residual)).
 // ---------------------------------------------------------------------------
 
 namespace {
 
+// Upstream COLOR_DOWNSAMPLE_HLSL verbatim: vertical pass writes the shared
+// FP16 intermediate (negative lobes survive), horizontal pass lands the
+// reduced color in the NGX input texture.
 constexpr char DOWNSAMPLE_HLSL[] = R"(
 Texture2D<float4> InputColor : register(t0);
 RWTexture2D<float4> OutputColor : register(u0);
@@ -691,35 +699,181 @@ cbuffer ResampleParams : register(b0) {
     uint Padding0;
     float2 MotionScale;
     float ResidualMultiplier;
+    float ResidualSaturation;
+    float ResidualLightness;
+    float ShadowStructureMultiplier;
+    float ReflectionGlowMultiplier;
 };
 
+float Sinc(float x) {
+    if (abs(x) < 1e-5) return 1.0;
+    x *= 3.14159265358979323846;
+    return sin(x) / x;
+}
+
+float Lanczos2(float x) {
+    return abs(x) < 2.0 ? Sinc(x) * Sinc(x * 0.5) : 0.0;
+}
+
 [numthreads(8, 8, 1)]
-void DownsampleColor(uint3 tid : SV_DispatchThreadID) {
-    if (any(tid.xy >= TargetExtent)) return;
-    float2 sourceStart = float2(tid.xy) * float2(SourceExtent) / float2(TargetExtent);
-    float2 sourceEnd = float2(tid.xy + 1) * float2(SourceExtent) / float2(TargetExtent);
-    int2 first = int2(floor(sourceStart));
-    int2 last = int2(ceil(sourceEnd));
+void DownsampleColorVertical(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= SourceExtent.x || tid.y >= TargetExtent.y) return;
+    float scale = float(TargetExtent.y) / float(SourceExtent.y);
+    float position = (float(tid.y) + 0.5) / scale - 0.5;
+    float support = 2.0 / scale;
+    int first = int(ceil(position - support));
+    int last = int(floor(position + support));
     float4 total = 0.0;
     float totalWeight = 0.0;
     [loop]
-    for (int y = first.y; y < last.y; ++y) {
-        float weightY = max(0.0, min(sourceEnd.y, float(y + 1)) - max(sourceStart.y, float(y)));
-        [loop]
-        for (int x = first.x; x < last.x; ++x) {
-            float weightX = max(0.0, min(sourceEnd.x, float(x + 1)) - max(sourceStart.x, float(x)));
-            float weight = weightX * weightY;
-            total += InputColor.Load(int3(clamp(int2(x, y), int2(0, 0), int2(SourceExtent) - 1), 0)) * weight;
-            totalWeight += weight;
-        }
+    for (int y = first; y <= last; ++y) {
+        float weight = Lanczos2((float(y) - position) * scale);
+        total += InputColor.Load(int3(tid.x,
+            clamp(y, 0, int(SourceExtent.y) - 1), 0)) * weight;
+        totalWeight += weight;
     }
-    OutputColor[tid.xy] = total / max(totalWeight, 1e-6);
+    // Keep negative lobes in the shared FP16 intermediate, including alpha.
+    OutputColor[tid.xy] = total / (abs(totalWeight) > 1e-6 ? totalWeight : 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void DownsampleColorHorizontal(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= TargetExtent)) return;
+    float scale = float(TargetExtent.x) / float(SourceExtent.x);
+    float position = (float(tid.x) + 0.5) / scale - 0.5;
+    float support = 2.0 / scale;
+    int first = int(ceil(position - support));
+    int last = int(floor(position + support));
+    float4 total = 0.0;
+    float totalWeight = 0.0;
+    [loop]
+    for (int x = first; x <= last; ++x) {
+        float weight = Lanczos2((float(x) - position) * scale);
+        total += InputColor.Load(int3(
+            clamp(x, 0, int(SourceExtent.x) - 1), tid.y, 0)) * weight;
+        totalWeight += weight;
+    }
+    OutputColor[tid.xy] = total / (abs(totalWeight) > 1e-6 ? totalWeight : 1.0);
+}
+)";
+
+constexpr char RESIDUAL_PREPARE_HLSL[] = R"(
+Texture2D<float4> ReducedColor : register(t0);
+Texture2D<float4> ReducedDenoised : register(t1);
+RWTexture2D<float4> ControlledResidual : register(u0);
+
+cbuffer ResampleParams : register(b0) {
+    uint2 SourceExtent;
+    uint2 TargetExtent;
+    uint Padding0;
+    float2 MotionScale;
+    float ResidualMultiplier;
+    float ResidualSaturation;
+    float ResidualLightness;
+    float ShadowStructureMultiplier;
+    float ReflectionGlowMultiplier;
+};
+
+float3 RGBToHSL(float3 color) {
+    float maximum = max(color.r, max(color.g, color.b));
+    float minimum = min(color.r, min(color.g, color.b));
+    float delta = maximum - minimum;
+    float lightness = (maximum + minimum) * 0.5;
+    if (delta <= 1e-6) {
+        return float3(0.0, 0.0, lightness);
+    }
+
+    float hue = 0.0;
+    if (maximum == color.r) {
+        hue = (color.g - color.b) / delta;
+        if (hue < 0.0) hue += 6.0;
+    } else if (maximum == color.g) {
+        hue = (color.b - color.r) / delta + 2.0;
+    } else {
+        hue = (color.r - color.g) / delta + 4.0;
+    }
+    float saturation = delta / max(1.0 - abs(2.0 * lightness - 1.0), 1e-6);
+    return float3(hue / 6.0, saturate(saturation), saturate(lightness));
+}
+
+float HueToRGB(float p, float q, float hue) {
+    hue = frac(hue);
+    if (hue < 1.0 / 6.0) return p + (q - p) * 6.0 * hue;
+    if (hue < 1.0 / 2.0) return q;
+    if (hue < 2.0 / 3.0) return p + (q - p) * (2.0 / 3.0 - hue) * 6.0;
+    return p;
+}
+
+float3 HSLToRGB(float3 hsl) {
+    if (hsl.y <= 1e-6) {
+        return float3(hsl.z, hsl.z, hsl.z);
+    }
+    float q = hsl.z < 0.5 ?
+        hsl.z * (1.0 + hsl.y) : hsl.z + hsl.y - hsl.z * hsl.y;
+    float p = 2.0 * hsl.z - q;
+    return saturate(float3(
+        HueToRGB(p, q, hsl.x + 1.0 / 3.0),
+        HueToRGB(p, q, hsl.x),
+        HueToRGB(p, q, hsl.x - 1.0 / 3.0)));
+}
+
+float3 ToLinear(float3 color) {
+    return float3(
+        color.r <= 0.04045 ? color.r / 12.92 : pow(max(color.r + 0.055, 0.0) / 1.055, 2.4),
+        color.g <= 0.04045 ? color.g / 12.92 : pow(max(color.g + 0.055, 0.0) / 1.055, 2.4),
+        color.b <= 0.04045 ? color.b / 12.92 : pow(max(color.b + 0.055, 0.0) / 1.055, 2.4));
+}
+
+float3 ApplyResidualControls(float3 original, float3 residual) {
+    residual *= ResidualMultiplier;
+    if (all(residual == 0.0)) return original;
+    float4 fineControls = float4(
+        ResidualSaturation, ResidualLightness,
+        ShadowStructureMultiplier, ReflectionGlowMultiplier);
+    // Neutral fine controls preserve the multiplied residual in this low-resolution domain.
+    float3 output = saturate(original + residual);
+    [branch]
+    if (any(abs(fineControls - 1.0) >= 1e-6)) {
+        // Classify the whole pixel before directional/HSL controls. The
+        // reference cannot depend on the multiplier selected by this branch.
+        float deltaY = dot(ToLinear(output) - ToLinear(original),
+            float3(0.2126, 0.7152, 0.0722));
+        float directionalMultiplier = deltaY < 0.0 ? ShadowStructureMultiplier :
+            (deltaY > 0.0 ? ReflectionGlowMultiplier : 1.0);
+        float3 controlledResidual = residual * directionalMultiplier;
+        float3 candidate = saturate(original + controlledResidual);
+        [branch]
+        if (abs(ResidualSaturation - 1.0) >= 1e-6 ||
+            abs(ResidualLightness - 1.0) >= 1e-6) {
+            // The SRVs are non-sRGB UNORM views, so HSL operates on normalized
+            // stored SDR RGB values without an implicit transfer conversion.
+            float3 originalHSL = RGBToHSL(original);
+            float3 candidateHSL = RGBToHSL(candidate);
+            candidateHSL.y = saturate(originalHSL.y +
+                (candidateHSL.y - originalHSL.y) * ResidualSaturation);
+            candidateHSL.z = saturate(originalHSL.z +
+                (candidateHSL.z - originalHSL.z) * ResidualLightness);
+            candidate = HSLToRGB(candidateHSL);
+        }
+        output = candidate;
+    }
+    return output;
+}
+
+[numthreads(8, 8, 1)]
+void PrepareResidual(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= TargetExtent)) return;
+    float3 original = ReducedColor.Load(int3(tid.xy, 0)).rgb;
+    float3 denoised = ReducedDenoised.Load(int3(tid.xy, 0)).rgb;
+    // Apply every residual control once per low-resolution pixel, before
+    // either Catmull-Rom pass. Keep signed differences in an FP16 texture.
+    ControlledResidual[tid.xy] = float4(
+        ApplyResidualControls(original, denoised - original) - original, 0.0);
 }
 )";
 
 constexpr char RESIDUAL_HORIZONTAL_HLSL[] = R"(
-Texture2D<float4> ReducedColor : register(t0);
-Texture2D<float4> ReducedDenoised : register(t1);
+Texture2D<float4> ControlledResidual : register(t0);
 RWTexture2D<float4> HorizontalResidual : register(u0);
 
 cbuffer ResampleParams : register(b0) {
@@ -728,35 +882,38 @@ cbuffer ResampleParams : register(b0) {
     uint Padding0;
     float2 MotionScale;
     float ResidualMultiplier;
+    float ResidualSaturation;
+    float ResidualLightness;
+    float ShadowStructureMultiplier;
+    float ReflectionGlowMultiplier;
 };
 
-static const float PI = 3.14159265358979323846;
-
-float Lanczos3(float value) {
-    value = abs(value);
-    if (value < 1e-5) return 1.0;
-    if (value >= 3.0) return 0.0;
-    float x = PI * value;
-    return (sin(x) / x) * (sin(x / 3.0) / (x / 3.0));
+float CatmullRom(float x) {
+    x = abs(x);
+    if (x < 1.0) return ((1.5 * x - 2.5) * x) * x + 1.0;
+    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+    return 0.0;
 }
 
 [numthreads(8, 8, 1)]
 void UpsampleResidualHorizontal(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= SourceExtent.x || tid.y >= TargetExtent.y) return;
     if (SourceExtent.x == TargetExtent.x) {
-        HorizontalResidual[tid.xy] = ReducedDenoised.Load(int3(tid.xy, 0)) - ReducedColor.Load(int3(tid.xy, 0));
+        HorizontalResidual[tid.xy] =
+            ControlledResidual.Load(int3(tid.xy, 0));
         return;
     }
-    float reducedPosition = (float(tid.x) + 0.5) * float(TargetExtent.x) / float(SourceExtent.x) - 0.5;
+    float reducedPosition = (float(tid.x) + 0.5) *
+        float(TargetExtent.x) / float(SourceExtent.x) - 0.5;
     int center = int(floor(reducedPosition));
     float3 residual = 0.0;
     float totalWeight = 0.0;
     [unroll]
-    for (int x = -2; x <= 3; ++x) {
-        float weight = Lanczos3(reducedPosition - float(center + x));
+    for (int x = -1; x <= 2; ++x) {
+        float weight = CatmullRom(reducedPosition - float(center + x));
         int sampleX = clamp(center + x, 0, int(TargetExtent.x) - 1);
         int3 samplePixel = int3(sampleX, tid.y, 0);
-        residual += (ReducedDenoised.Load(samplePixel).rgb - ReducedColor.Load(samplePixel).rgb) * weight;
+        residual += ControlledResidual.Load(samplePixel).rgb * weight;
         totalWeight += weight;
     }
     residual /= abs(totalWeight) > 1e-6 ? totalWeight : 1.0;
@@ -775,41 +932,46 @@ cbuffer ResampleParams : register(b0) {
     uint Padding0;
     float2 MotionScale;
     float ResidualMultiplier;
+    float ResidualSaturation;
+    float ResidualLightness;
+    float ShadowStructureMultiplier;
+    float ReflectionGlowMultiplier;
 };
 
-static const float PI = 3.14159265358979323846;
-
-float Lanczos3(float value) {
-    value = abs(value);
-    if (value < 1e-5) return 1.0;
-    if (value >= 3.0) return 0.0;
-    float x = PI * value;
-    return (sin(x) / x) * (sin(x / 3.0) / (x / 3.0));
+float CatmullRom(float x) {
+    x = abs(x);
+    if (x < 1.0) return ((1.5 * x - 2.5) * x) * x + 1.0;
+    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+    return 0.0;
 }
 
 [numthreads(8, 8, 1)]
 void CompositeResidualVertical(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= SourceExtent)) return;
     float4 storedOriginal = OriginalColor.Load(int3(tid.xy, 0));
+    // A typed BGRA SRV already returns logical RGBA components.
     float3 original = storedOriginal.rgb;
-    if (SourceExtent.y == TargetExtent.y) {
-        float3 residual = HorizontalResidual.Load(int3(tid.xy, 0)).rgb;
-        OutputColor[tid.xy] = float4(saturate(original + residual * ResidualMultiplier), storedOriginal.a);
-        return;
-    }
-    float reducedPosition = (float(tid.y) + 0.5) * float(TargetExtent.y) / float(SourceExtent.y) - 0.5;
-    int center = int(floor(reducedPosition));
     float3 residual = 0.0;
-    float totalWeight = 0.0;
-    [unroll]
-    for (int y = -2; y <= 3; ++y) {
-        float weight = Lanczos3(reducedPosition - float(center + y));
-        int sampleY = clamp(center + y, 0, int(TargetExtent.y) - 1);
-        residual += HorizontalResidual.Load(int3(tid.x, sampleY, 0)).rgb * weight;
-        totalWeight += weight;
+    if (SourceExtent.y == TargetExtent.y) {
+        residual = HorizontalResidual.Load(int3(tid.xy, 0)).rgb;
+    } else {
+        float reducedPosition = (float(tid.y) + 0.5) *
+            float(TargetExtent.y) / float(SourceExtent.y) - 0.5;
+        int center = int(floor(reducedPosition));
+        residual = 0.0;
+        float totalWeight = 0.0;
+        [unroll]
+        for (int y = -1; y <= 2; ++y) {
+            float weight = CatmullRom(reducedPosition - float(center + y));
+            int sampleY = clamp(center + y, 0, int(TargetExtent.y) - 1);
+            residual += HorizontalResidual.Load(
+                int3(tid.x, sampleY, 0)).rgb * weight;
+            totalWeight += weight;
+        }
+        residual /= abs(totalWeight) > 1e-6 ? totalWeight : 1.0;
     }
-    residual /= abs(totalWeight) > 1e-6 ? totalWeight : 1.0;
-    OutputColor[tid.xy] = float4(saturate(original + residual * ResidualMultiplier), storedOriginal.a);
+    OutputColor[tid.xy] = float4(
+        saturate(original + residual), storedOriginal.a);
 }
 )";
 
@@ -873,8 +1035,9 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
 }
 
 bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
-    // root signature: b0 = 8 root constants, t0/t1 as independent SRV tables
-    // (the three passes need non-adjacent descriptor pairs), (u0) UAV table
+    // root signature: b0 = 12 root constants (Magpie ResampleConstants, 48B),
+    // t0/t1 as independent SRV tables (the passes need non-adjacent descriptor
+    // pairs), (u0) UAV table
     D3D12_DESCRIPTOR_RANGE srvRange0{};
     srvRange0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     srvRange0.NumDescriptors = 1;
@@ -894,7 +1057,7 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
     D3D12_ROOT_PARAMETER params[4]{};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 8;
+    params[0].Constants.Num32BitValues = 12;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -928,7 +1091,9 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
 
     struct Cso { const char *hlsl; const char *entry; ID3D12PipelineState **pso; };
     const Cso csos[] = {
-        { DOWNSAMPLE_HLSL, "DownsampleColor", _psoDownsample.GetAddressOf() },
+        { DOWNSAMPLE_HLSL, "DownsampleColorVertical", _psoDownsampleVertical.GetAddressOf() },
+        { DOWNSAMPLE_HLSL, "DownsampleColorHorizontal", _psoDownsampleHorizontal.GetAddressOf() },
+        { RESIDUAL_PREPARE_HLSL, "PrepareResidual", _psoPrepare.GetAddressOf() },
         { RESIDUAL_HORIZONTAL_HLSL, "UpsampleResidualHorizontal", _psoHorizontal.GetAddressOf() },
         { RESIDUAL_VERTICAL_HLSL, "CompositeResidualVertical", _psoVertical.GetAddressOf() },
     };
@@ -986,6 +1151,7 @@ bool D3D12Context::CreateScalingForSlot(FrameSlot &slot, int internalW, int inte
     // rebuild internal textures (sizes depend on the resolution percent)
     slot.reducedColor.Reset();
     slot.reducedDenoised.Reset();
+    slot.controlledRes.Reset();
     slot.horizontalRes.Reset();
     if (!CreateColorTexture(slot.reducedColor.GetAddressOf(), internalW, internalH,
                             DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
@@ -997,9 +1163,14 @@ bool D3D12Context::CreateScalingForSlot(FrameSlot &slot, int internalW, int inte
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }
-    // R16G16B16A16_FLOAT: the horizontal residual is signed (denoised −
-    // color); a UNORM texture would clamp the negative (darken-noise) half
-    // of the correction away (Magpie DLSSNRFilter.cpp:987 uses 16F too).
+    // R16G16B16A16_FLOAT: the controlled residual is signed (denoised − color
+    // after fine controls); a UNORM texture would clamp the negative (darken-
+    // noise) half of the correction away (Magpie DLSSNRFilter.cpp uses 16F).
+    if (!CreateColorTexture(slot.controlledRes.GetAddressOf(), internalW, internalH,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
     if (!CreateColorTexture(slot.horizontalRes.GetAddressOf(), _width, internalH,
                             DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
@@ -1008,6 +1179,7 @@ bool D3D12Context::CreateScalingForSlot(FrameSlot &slot, int internalW, int inte
 
     // (re)write SRV/UAV descriptors: 0=srvInput 1=srvReducedColor 2=srvReducedDenoised
     // 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised 6=uavHorizontal 7=uavOutput
+    // 8=srvControlled 9=uavControlled
     const D3D12_CPU_DESCRIPTOR_HANDLE base = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
     const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto slotHandle = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(i * inc) }; };
@@ -1017,17 +1189,20 @@ bool D3D12Context::CreateScalingForSlot(FrameSlot &slot, int internalW, int inte
     _device->CreateUnorderedAccessView(slot.reducedColor.Get(), nullptr, nullptr, slotHandle(4));
     _device->CreateUnorderedAccessView(slot.reducedDenoised.Get(), nullptr, nullptr, slotHandle(5));
     _device->CreateUnorderedAccessView(slot.horizontalRes.Get(), nullptr, nullptr, slotHandle(6));
+    _device->CreateShaderResourceView(slot.controlledRes.Get(), nullptr, slotHandle(8));
+    _device->CreateUnorderedAccessView(slot.controlledRes.Get(), nullptr, nullptr, slotHandle(9));
     return true;
 }
 
 void D3D12Context::ClearScalingForSlot(FrameSlot &slot) noexcept {
     slot.horizontalRes.Reset();
+    slot.controlledRes.Reset();
     slot.reducedDenoised.Reset();
     slot.reducedColor.Reset();
 }
 
 void D3D12Context::RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
-                              UINT dispatchX, UINT dispatchY, float residualMultiplier) noexcept {
+                              UINT dispatchX, UINT dispatchY, const ResidualControls &rc) noexcept {
     // NGX's evaluate may rebind its own descriptor heap / root signature on
     // this command list; rebind ours before touching our descriptors.
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
@@ -1047,7 +1222,11 @@ void D3D12Context::RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT sr
     cl->SetComputeRoot32BitConstants(0, 1, &zero, 4);      // Padding0
     const float motion[2]{ 1.0f, 1.0f };
     cl->SetComputeRoot32BitConstants(0, 2, motion, 5);
-    cl->SetComputeRoot32BitConstants(0, 1, &residualMultiplier, 7);
+    // SetComputeRoot32BitConstants with more than one DWORD needs a real array
+    // (a scalar temporary's address won't do).
+    const float controls[5]{ rc.multiplier, rc.saturation, rc.lightness,
+                             rc.shadowStructure, rc.reflectionGlow };
+    cl->SetComputeRoot32BitConstants(0, 5, controls, 7);
 
     cl->SetComputeRootDescriptorTable(1, gpu(srv0));
     cl->SetComputeRootDescriptorTable(2, gpu(srv1));
@@ -1055,22 +1234,41 @@ void D3D12Context::RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT sr
     cl->Dispatch(dispatchX, dispatchY, 1);
 }
 
-void D3D12Context::RecordDownsample(FrameSlot &slot, float residualMultiplier) noexcept {
-    RecordPass(slot, _psoDownsample.Get(), 0, 0, 4, // t0 input, t1 dummy, u0 reducedColor
+void D3D12Context::RecordDownsampleVertical(FrameSlot &slot, const ResidualControls &rc) noexcept {
+    // full -> (fullW x internalH) into the shared FP16 intermediate; upstream
+    // reuses one texture for this and the residual horizontal pass, the port
+    // reuses horizontalRes the same way.
+    RecordPass(slot, _psoDownsampleVertical.Get(), 0, 0, 6, // t0 input, t1 dummy, u0 horizontalRes
+               (static_cast<UINT>(_width) + 7) / 8,
+               (static_cast<UINT>(_internalHeight) + 7) / 8, rc);
+}
+
+void D3D12Context::RecordDownsampleHorizontal(FrameSlot &slot, const ResidualControls &rc) noexcept {
+    RecordPass(slot, _psoDownsampleHorizontal.Get(), 6, 6, 4, // t0 intermediate, t1 dummy, u0 reducedColor
                (static_cast<UINT>(_internalWidth) + 7) / 8,
-               (static_cast<UINT>(_internalHeight) + 7) / 8, residualMultiplier);
+               (static_cast<UINT>(_internalHeight) + 7) / 8, rc);
 }
 
-void D3D12Context::RecordResidualHorizontal(FrameSlot &slot, float residualMultiplier) noexcept {
-    RecordPass(slot, _psoHorizontal.Get(), 1, 2, 6, // t0 reducedColor, t1 reducedDenoised, u0 horizontalRes
-               (static_cast<UINT>(_width) + 7) / 8,
-               (static_cast<UINT>(_internalHeight) + 7) / 8, residualMultiplier);
+void D3D12Context::RecordResidualPrepare(FrameSlot &slot, const ResidualControls &rc) noexcept {
+    RecordPass(slot, _psoPrepare.Get(), 1, 2, 9, // t0 reducedColor, t1 reducedDenoised, u0 controlledRes
+               (static_cast<UINT>(_internalWidth) + 7) / 8,
+               (static_cast<UINT>(_internalHeight) + 7) / 8, rc);
 }
 
-void D3D12Context::RecordResidualVertical(FrameSlot &slot, float residualMultiplier) noexcept {
-    RecordPass(slot, _psoVertical.Get(), 0, 3, 7, // t0 original(input), t1 horizontalRes, u0 outputColor
+void D3D12Context::RecordResidualHorizontal(FrameSlot &slot, const ResidualControls &rc) noexcept {
+    RecordPass(slot, _psoHorizontal.Get(), 8, 8, 6, // t0 controlledRes, t1 dummy, u0 horizontalRes
                (static_cast<UINT>(_width) + 7) / 8,
-               (static_cast<UINT>(_height) + 7) / 8, residualMultiplier);
+               (static_cast<UINT>(_internalHeight) + 7) / 8, rc);
+}
+
+void D3D12Context::RecordResidualVertical(FrameSlot &slot, const ResidualControls &rc,
+                                          bool equalWidth) noexcept {
+    // Equal internal width skips the horizontal pass (Magpie binds the
+    // controlled residual straight into the vertical pass's t1).
+    const UINT residualSrv = equalWidth ? 8 : 3;
+    RecordPass(slot, _psoVertical.Get(), 0, residualSrv, 7, // t0 input, t1 residual, u0 output
+               (static_cast<UINT>(_width) + 7) / 8,
+               (static_cast<UINT>(_height) + 7) / 8, rc);
 }
 
 } // namespace vsdlssnr

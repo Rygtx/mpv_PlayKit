@@ -27,6 +27,16 @@ namespace vsdlssnr {
 
 using Microsoft::WRL::ComPtr;
 
+// Residual fine-control set (Magpie 0.6.5 r2-fix1/2d37f8c0): applied once per
+// internal-resolution pixel in PrepareResidual, before the Catmull-Rom passes.
+struct ResidualControls {
+    float multiplier = 1.0f;
+    float saturation = 1.0f;
+    float lightness = 1.0f;
+    float shadowStructure = 1.0f;
+    float reflectionGlow = 1.0f;
+};
+
 // Per-frame-in-flight resources; acquired from the slot pool for the duration
 // of one getFrame call.
 struct FrameSlot {
@@ -43,10 +53,11 @@ struct FrameSlot {
     // residual scaling pipeline, sized by the current input_resolution
     ComPtr<ID3D12Resource> reducedColor;
     ComPtr<ID3D12Resource> reducedDenoised;
+    ComPtr<ID3D12Resource> controlledRes; // internalW×internalH, signed FP16 (controls applied)
     ComPtr<ID3D12Resource> horizontalRes;
     // slot-local shader-visible heap: 0=srvInput 1=srvReducedColor
     // 2=srvReducedDenoised 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised
-    // 6=uavHorizontal 7=uavOutput
+    // 6=uavHorizontal 7=uavOutput 8=srvControlled 9=uavControlled
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 
     size_t uploadPitch = 0;
@@ -131,15 +142,23 @@ public:
     bool UnpackOutput(FrameSlot &slot, uint8_t **dstPlanes, int64_t *dstStrides,
                       int width, int height, char *err, size_t errLen) noexcept;
 
-    // 三条残差 compute 路径的命令记录(在该槽已 BeginFrameRecording 的列表上)
-    void RecordDownsample(FrameSlot &slot, float residualMultiplier) noexcept;
-    void RecordResidualHorizontal(FrameSlot &slot, float residualMultiplier) noexcept;
-    void RecordResidualVertical(FrameSlot &slot, float residualMultiplier) noexcept;
+    // 五段残差 compute 路径的命令记录(在该槽已 BeginFrameRecording 的列表上)。
+    // 降采样两段可分离(Lanczos2),horizontalRes 复用为降采样 FP16 中间纹理
+    // (与上游 resampleIntermediate 的复用方式一致)。
+    void RecordDownsampleVertical(FrameSlot &slot, const ResidualControls &rc) noexcept;
+    void RecordDownsampleHorizontal(FrameSlot &slot, const ResidualControls &rc) noexcept;
+    void RecordResidualPrepare(FrameSlot &slot, const ResidualControls &rc) noexcept;
+    void RecordResidualHorizontal(FrameSlot &slot, const ResidualControls &rc) noexcept;
+    // equalWidth: 内部宽度与源一致时跳过 horizontal pass,垂直 pass 直读
+    // controlledRes(Magpie 的 verticalResidual 绑定切换)。
+    void RecordResidualVertical(FrameSlot &slot, const ResidualControls &rc,
+                                bool equalWidth) noexcept;
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
     ID3D12Resource *ReducedColor(FrameSlot &s) const noexcept { return s.reducedColor.Get(); }
     ID3D12Resource *ReducedDenoised(FrameSlot &s) const noexcept { return s.reducedDenoised.Get(); }
+    ID3D12Resource *ControlledRes(FrameSlot &s) const noexcept { return s.controlledRes.Get(); }
     ID3D12Resource *HorizontalRes(FrameSlot &s) const noexcept { return s.horizontalRes.Get(); }
     double FrameRateEma() noexcept;
     void NotifyFrameTick(double qpcSeconds) noexcept; // frame-rate EMA (播放节奏由宿主决定)
@@ -154,12 +173,14 @@ private:
     void ClearScalingForSlot(FrameSlot &slot) noexcept;
     bool WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept;
 
-    // Shared prologue of the three residual passes; only the PSO, descriptor
+    // Shared prologue of the four residual passes; only the PSO, descriptor
     // slots and dispatch dims differ. cbuffer layout (root constants):
     // SourceExtent@0, TargetExtent@2, Padding0@4, MotionScale@5,
-    // ResidualMultiplier@7 — mirrors the three HLSL cbuffer blocks.
+    // ResidualMultiplier@7, ResidualSaturation@8, ResidualLightness@9,
+    // ShadowStructureMultiplier@10, ReflectionGlowMultiplier@11 — mirrors the
+    // four HLSL cbuffer blocks (Magpie ResampleConstants, 48 bytes).
     void RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
-                    UINT dispatchX, UINT dispatchY, float residualMultiplier) noexcept;
+                    UINT dispatchX, UINT dispatchY, const ResidualControls &rc) noexcept;
 
     bool CreateColorTexture(ID3D12Resource **out, int width, int height,
                             DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
@@ -196,7 +217,9 @@ private:
 
     // residual compute objects (shared: PSOs are stateless)
     ComPtr<ID3D12RootSignature> _rsCompute;
-    ComPtr<ID3D12PipelineState> _psoDownsample;
+    ComPtr<ID3D12PipelineState> _psoDownsampleVertical;
+    ComPtr<ID3D12PipelineState> _psoDownsampleHorizontal;
+    ComPtr<ID3D12PipelineState> _psoPrepare;
     ComPtr<ID3D12PipelineState> _psoHorizontal;
     ComPtr<ID3D12PipelineState> _psoVertical;
 
