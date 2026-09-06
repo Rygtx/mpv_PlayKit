@@ -150,8 +150,6 @@ public:
     void RecordDensify(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                        uint32_t flowW, uint32_t flowH, uint32_t gridSize,
                        bool hasForwardCost, bool hasBackward, bool hasBackwardCost) noexcept;
-    // OF 关闭/播种/失败帧:UAV clear 清零本槽 motion/confidence。
-    void RecordClearGuidance(ID3D12GraphicsCommandList &cl, FrameSlot &slot) noexcept;
     // 缩放启用时的 guidance 降采样(Magpie DownsampleGuidance;深度输出
     // 在本宿主是死重 —— depth 恒为零纹理,NGX 直接消费静态零纹理)。
     void RecordGuidanceDownsample(FrameSlot &slot) noexcept;

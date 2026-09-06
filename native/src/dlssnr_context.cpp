@@ -925,7 +925,6 @@ bool DlssnrContext::ProcessFrame(
     // 并二次提交 —— 栅栏链(copyFence k_{n+1} > k'_n)封死“下一帧覆写 flow
     // 而本帧 densify 未读”的窗口。publishZero/历史重置语义见 StageFrame。
     bool realMotion = false;      // 本帧有真光流(densify 录制 + PARAM_MVEC 指向它)
-    bool nvofPublishZero = false; // 本帧清零发布(播种/失败/过期)
     bool nvofHistoryReset = false;
     double nvofMs = 0.0;
     if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
@@ -951,7 +950,6 @@ bool DlssnrContext::ProcessFrame(
             };
         const NvofContext::StageResult st =
             _nvof->StageFrame(n, slot->upload.Get(), static_cast<UINT>(slot->uploadPitch), post);
-        nvofPublishZero = st.publishZero;
         nvofHistoryReset = st.historyReset;
         nvofMs = _nvof->LastStageMs();
         realMotion = st.waitFenceValue != 0;
@@ -1176,9 +1174,9 @@ bool DlssnrContext::ProcessFrame(
             };
             cl->ResourceBarrier(1, back);
         }
-        // guidance 纹理归位 COMMON(仅本帧动过时;dump 与下帧的 COMMON→UAV
-        // 都依赖它)。
-        if (realMotion || nvofPublishZero) {
+        // guidance 纹理归位 COMMON(仅 realMotion 帧动过:播种/失败帧的
+        // 发布走静态零纹理,per-slot motion 全程 COMMON 不被触碰)。
+        if (realMotion) {
             D3D12_RESOURCE_BARRIER gBack[2]{
                 TransitionFromTo(slot->motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                 TransitionFromTo(slot->confidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),

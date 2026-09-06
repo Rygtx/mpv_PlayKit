@@ -1,4 +1,5 @@
 #include "d3d12_context.h"
+#include "dlssnr_context.h" // TimingStatusLine(临时探针)
 #include "panel_ipc.h"
 
 #include <cstdio>
@@ -178,7 +179,10 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
         SetErr(err, errLen, E_FAIL, "Create fence event failed");
         return false;
     }
-    return true;
+    // 计算 PSO 一次性构建(残差 + NVOF densify/guidance)。densify 不能等
+    // scaling 路径才创建:OF 会话在 scaling_enabled=0 时同样要录 densify
+    // (实测 2026-09-07:耦合在 CreateScalingForSlot 里导致 null PSO 崩溃)。
+    return CreateComputeObjects(err, errLen);
 }
 
 void D3D12Context::Finalize() noexcept {
@@ -1525,7 +1529,7 @@ void D3D12Context::ClearScalingResources() noexcept {
 }
 
 bool D3D12Context::CreateScalingForSlot(FrameSlot &slot, int internalW, int internalH, char *err, size_t errLen) noexcept {
-    if (!_rsCompute && !CreateComputeObjects(err, errLen)) return false;
+    if (!_rsCompute && !CreateComputeObjects(err, errLen)) return false; // 幂等保护(Initialize 已建)
 
     // rebuild internal textures (sizes depend on the resolution percent)
     slot.reducedColor.Reset();
@@ -1714,6 +1718,7 @@ void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
     // 在 NVOF 会话的 nvof CL 上执行(门内、execute 完成后)。NGX evaluate
     // 可能重绑堆/根签名;槽列表上的其它 pass 仍各自先重绑(同款)。
     ID3D12GraphicsCommandList *cl = &clRef;
+
     cl->SetComputeRootSignature(_rsDensify.Get());
     cl->SetPipelineState(_psoDensify.Get());
     ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
@@ -1738,26 +1743,6 @@ void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
     cl->SetComputeRootDescriptorTable(6, gpu(13)); // u1 DenseConfidence(uavConfidence)
     cl->Dispatch((static_cast<UINT>(_width) + 7) / 8,
                  (static_cast<UINT>(_height) + 7) / 8, 1);
-}
-
-void D3D12Context::RecordClearGuidance(ID3D12GraphicsCommandList &clRef, FrameSlot &slot) noexcept {
-    // 播种/失败/过期帧:发布零运动(与零 guidance 的旧行为等价)。
-    ID3D12GraphicsCommandList *cl = &clRef;
-    cl->SetComputeRootSignature(_rsDensify.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const D3D12_CPU_DESCRIPTOR_HANDLE cpuBase = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto clear = [&](UINT desc, ID3D12Resource *res) {
-        static constexpr UINT kZero[4]{};
-        cl->ClearUnorderedAccessViewUint(
-            D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(desc * inc) },
-            D3D12_CPU_DESCRIPTOR_HANDLE{ cpuBase.ptr + static_cast<SIZE_T>(desc * inc) },
-            res, kZero, 0, nullptr);
-    };
-    clear(12, slot.motion.Get());
-    clear(13, slot.confidence.Get());
 }
 
 void D3D12Context::RecordGuidancePass(FrameSlot &slot, ID3D12PipelineState *pso,

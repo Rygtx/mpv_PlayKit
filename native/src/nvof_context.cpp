@@ -89,21 +89,38 @@ static HMODULE GetNvofModule() noexcept {
 struct NvofFences {
     Microsoft::WRL::ComPtr<ID3D12Fence> copy;
     Microsoft::WRL::ComPtr<ID3D12Fence> done;
-    HANDLE event = nullptr;
+    HANDLE event = nullptr;     // copyFence 等待用
+    HANDLE doneEvent = nullptr; // doneFence 等待用(事件按栅栏分家,防唤醒窃取)
     ID3D12Device *device = nullptr;
     bool ok = false;
     explicit NvofFences(ID3D12Device *dev) : device(dev) {
         ok = device &&
              SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(copy.GetAddressOf()))) &&
              SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(done.GetAddressOf())));
-        if (ok) event = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-        ok = ok && event;
+        if (ok) {
+            event = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+            doneEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+        }
+        ok = ok && event && doneEvent;
     }
 };
 
 static NvofFences &GetNvofFences(ID3D12Device *device) noexcept {
     static NvofFences fences(device);
     return fences;
+}
+
+// 栅栏值到达等待:共享 auto-reset 事件的唤醒可能被同事件的其它等待者窃取
+// (单次 Wait 返回不代表本等待的目标值已达成),循环复查完成值;栅栏值
+// 单调 ⇒ 有界退出。
+bool NvofContext::WaitFenceReached(ID3D12Fence *fence, uint64_t value,
+                                   HANDLE event, DWORD timeoutMs) noexcept {
+    for (;;) {
+        if (fence->GetCompletedValue() >= value) return true;
+        if (FAILED(fence->SetEventOnCompletion(value, event))) return false;
+        if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
+        // 唤醒被窃取时回到顶部复查;值单调,最终到达或超时。
+    }
 }
 
 NvofContext::~NvofContext() { Finalize(); }
@@ -118,15 +135,11 @@ void NvofContext::DestroySession() noexcept {
     // 设备已挂(闩锁/移除)时跳过栅栏等待:永不满值,干等 10s×2。
     const bool gpuOk = _d3d12 && _d3d12->Queue() && !_d3d12->IsDeviceLost();
     if (gpuOk && _copyFenceEvent) {
-        if (_copyFence && _lastCopyFence &&
-            _copyFence->GetCompletedValue() < _lastCopyFence) {
-            _copyFence->SetEventOnCompletion(_lastCopyFence, _copyFenceEvent);
-            WaitForSingleObject(_copyFenceEvent, 10000);
+        if (_copyFence && _lastCopyFence) {
+            WaitFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000);
         }
-        if (_doneFence && _lastDone &&
-            _doneFence->GetCompletedValue() < _lastDone) {
-            _doneFence->SetEventOnCompletion(_lastDone, _copyFenceEvent);
-            WaitForSingleObject(_copyFenceEvent, 10000);
+        if (_doneFence && _lastDone) {
+            WaitFenceReached(_doneFence.Get(), _lastDone, _doneFenceEvent, 10000);
         }
     }
     TimingStatusLine("PROBE: destroy begin"); // 临时探针
@@ -145,6 +158,7 @@ void NvofContext::DestroySession() noexcept {
     _copyFence.Reset();
     _doneFence.Reset();
     _copyFenceEvent = nullptr;
+    _doneFenceEvent = nullptr;
     _copySeq = 0;
     _lastCopyFence = 0;
     _doneSeq = 0;
@@ -353,12 +367,15 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
     {
         NvofFences &fences = GetNvofFences(device);
         if (!fences.ok || fences.device != device) {
+            // 旧 event 句柄有意不关:可能仍有旧 device 栅栏的注册等待引用;
+            // 每次冷重建泄漏 1 个句柄,量级有界(热上下文哲学)。
             fences = NvofFences(device);
             if (!fences.ok) return fail("nvof: CreateFence failed");
         }
         _copyFence = fences.copy;
         _doneFence = fences.done;
         _copyFenceEvent = fences.event;
+        _doneFenceEvent = fences.doneEvent;
         _copySeq = _lastCopyFence = _copyFence->GetCompletedValue();
         _doneSeq = _lastDone = _doneFence->GetCompletedValue();
     }
@@ -387,10 +404,13 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
             return fail("nvof: RegisterResource failed");
         }
     }
-    // 注册的 GPU 侧工作落位后再开始逐帧拷贝。
-    if (_doneSeq && _doneFence->GetCompletedValue() < _doneSeq) {
-        _doneFence->SetEventOnCompletion(_doneSeq, _copyFenceEvent);
-        WaitForSingleObject(_copyFenceEvent, 10000);
+    // 注册的 GPU 侧工作落位后再开始逐帧拷贝;落位值并入 _lastDone,
+    // 使首帧 copy 的 queue Wait 覆盖注册(等待失败 = 会话不可用)。
+    if (_doneSeq) {
+        _lastDone = _doneSeq;
+        if (!WaitFenceReached(_doneFence.Get(), _doneSeq, _doneFenceEvent, 10000)) {
+            return fail("nvof: registration fence timeout");
+        }
     }
 
     // flow/cost SRV 写入每个槽的描述符堆(densify 在槽列表上执行)。
@@ -484,12 +504,18 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             queue->Wait(_doneFence.Get(), _lastDone);
         }
         if (_lastCopyFence &&
-            _copyFence->GetCompletedValue() < _lastCopyFence) {
-            _copyFence->SetEventOnCompletion(_lastCopyFence, _copyFenceEvent);
-            WaitForSingleObject(_copyFenceEvent, 10000);
+            !WaitFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000)) {
+            TimingStatusLine("DLSSNR STATUS: nvof copy fence timeout");
         }
-        bool copyOk = SUCCEEDED(_copyAllocator->Reset()) &&
-                      SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
+        // force-close 自愈:上次 Close 失败留下的 open CL 会让 allocator
+        // Reset 永久 E_FAIL(对齐 BeginCtlRecording 的恢复模式)。
+        bool copyOk = SUCCEEDED(_copyAllocator->Reset());
+        if (!copyOk) {
+            _copyCommandList->Close();
+            copyOk = SUCCEEDED(_copyAllocator->Reset());
+        }
+        copyOk = copyOk &&
+                 SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
         if (copyOk) {
             D3D12_TEXTURE_COPY_LOCATION src{};
             src.pResource = uploadBuffer;
@@ -505,9 +531,8 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.SubresourceIndex = 0;
             _copyCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-            // 播种帧:清零(densify 回调)合并进同一次提交 —— 分配器刚提交
-            // 完拷贝尚未执行,拆两次提交会撞 allocator Reset 失败。
-            if (seed && postExecute) postExecute(_copyCommandList.Get());
+            // 播种帧不录 densify/清零:发布走静态零纹理(MotionResource),
+            // per-slot motion 保持 COMMON 不被触碰(状态机按 realMotion 归位)。
             copyOk = SUCCEEDED(_copyCommandList->Close());
         }
         if (copyOk) {
@@ -559,20 +584,15 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 // 官方样例同款:execute 后 CPU 等输出栅栏(NVOF 自有引擎完成
                 // 后置位)。等待落位后再提交 densify —— 不用(也不可靠)队列
                 // 级 Wait:NVOF 的输出栅栏在队列 Wait 语义下可能永不满足。
-                bool done = true;
-                if (_doneFence->GetCompletedValue() < outFence.value) {
-                    _doneFence->SetEventOnCompletion(outFence.value, _copyFenceEvent);
-                    done = WaitForSingleObject(_copyFenceEvent, 10000) == WAIT_OBJECT_0;
-                }
-                if (!done) {
-                    TimingStatusLine("DLSSNR STATUS: nvof output fence timeout");
+                // 输出栅栏超时 = 引擎状态不可信(僵尸 execute 会继续写
+                // 固定 flow 缓冲),会话立即作废,由 RebuildNvof 重建。
+                if (!WaitFenceReached(_doneFence.Get(), outFence.value,
+                                      _doneFenceEvent, 10000)) {
+                    TimingStatusLine("DLSSNR STATUS: nvof output fence timeout; session retired");
                     result.publishZero = true;
                     result.historyReset = true;
                     _historyValid = false;
-                    if (++_consecutiveFailures >= 3) {
-                        _ready.store(false, std::memory_order_release);
-                        TimingStatusLine("DLSSNR STATUS: nvof disabled after consecutive failures");
-                    }
+                    _ready.store(false, std::memory_order_release);
                 } else {
                     result.waitFenceValue = outFence.value; // densify 录制判据
                     _lastDone = outFence.value;
@@ -622,8 +642,8 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             // copy/execute(execute(n+1) 的输入栅栏点 k_{n+1} > k'_n),
             // 封死“下一帧覆写 flow 而本帧 densify 未读”的窗口。
             if (result.waitFenceValue && postExecute) {
-                // 分配器此刻必然空闲:本帧拷贝 CL 已被 NVOF 引擎消费
-                // (doneFence m_n 蕴含 copyFence k_n)。
+                // 分配器此刻应当空闲:doneFence m_n 蕴含 copyFence k_n
+                // (引擎先等输入再置输出);失败则按失败帧降级。
                 densifyPending = SUCCEEDED(_copyAllocator->Reset()) &&
                                  SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
                 if (densifyPending) {

@@ -102,6 +102,14 @@ public:
     // 复用 upload 缓冲撕裂在途拷贝;正常路径已被 execute 栅栏覆盖,no-op)。
     void WaitCopyIdle() noexcept;
 
+private:
+    // 栅栏值到达等待:循环检查完成值(共享 auto-reset 事件的唤醒可能被
+    // 其它等待者窃取,单次 Wait 结果不可信),单调值保证有界退出。
+    static bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
+                                 HANDLE event, DWORD timeoutMs) noexcept;
+
+public:
+
     // 最近一次 StageFrame 的 CPU 耗时(门等待 + 拷贝提交 + execute 调用),ms。
     double LastStageMs() const noexcept { return _lastStageMs; }
 
@@ -138,7 +146,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> _copyCommandList;
     Microsoft::WRL::ComPtr<ID3D12Fence> _copyFence;  // 我方拷贝完成(app → NVOF)
     Microsoft::WRL::ComPtr<ID3D12Fence> _doneFence;  // NVOF 输出完成(NVOF → 我方)
+    // 两个自动重置事件按栅栏分家:auto-reset 事件被多等待者共享时会发生
+    // 唤醒窃取(一个等待者消费掉另一个的唤醒),跨栅栏窃取会把"未完成"
+    // 误判为"已完成"—— copyFence 的等待(WaitCopyIdle 不持门)与
+    // doneFence 的等待(门内串行)绝不共用。
     HANDLE _copyFenceEvent = nullptr;
+    HANDLE _doneFenceEvent = nullptr;
     uint64_t _copySeq = 0;        // copyFence 单调计数
     uint64_t _lastCopyFence = 0;  // 最近一次拷贝提交的值
     uint64_t _doneSeq = 0;        // doneFence 单调计数(注册 + execute 共用)
