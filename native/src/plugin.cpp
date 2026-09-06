@@ -46,15 +46,42 @@ struct FilterData {
 
     // Eagerly initialized in DlssnrCreate (before playback starts); VS may
     // call getFrame on several threads under fmParallel, but each frame runs
-    // on its own D3D12 slot, so no further locking is needed here.
-    vsdlssnr::D3D12Context d3d12;
-    vsdlssnr::DlssnrContext ngx;
+    // on its own D3D12 slot, so no further locking is needed here. Both are
+    // unique_ptr because they move into the process-level hot context on
+    // Free and move back out on the next Create (mpv re-runs the whole VS
+    // script on every seek; without the hot context that pays the ~1s
+    // D3D12+NGX bring-up each time).
+    std::unique_ptr<vsdlssnr::D3D12Context> d3d12;
+    std::unique_ptr<vsdlssnr::DlssnrContext> ngx;
     std::wstring ngxDllPath;
     bool initOk = false;
     int width = 0;
     int height = 0;
     std::atomic<int> lastN{ -1 << 30 };
 };
+
+// Process-lifetime hot context. mpv's vf_vapoursynth tears down and
+// re-creates the whole VS script on every seek; keeping the D3D12 device,
+// NGX feature and slot pool alive across filter instances turns that from a
+// ~1s reload into a near-free Rebind. Single-threaded by construction: VS
+// serializes filter create/free, and the plugin is process-level single
+// instance (IAT hook).
+//
+// Deliberately leaked (never destroyed): tearing the kept-warm context down
+// from static teardown / DllMain(process exit) would run NGX shutdown under
+// the loader lock and deadlock; the OS reclaims everything at exit anyway.
+struct HotContext {
+    std::unique_ptr<vsdlssnr::D3D12Context> d3d12;
+    std::unique_ptr<vsdlssnr::DlssnrContext> ngx;
+    std::wstring ngxDllPath;
+    int width = 0;
+    int height = 0;
+    bool valid = false;
+};
+HotContext &Hot() {
+    static HotContext *inst = new HotContext();
+    return *inst;
+}
 
 } // namespace
 
@@ -102,9 +129,9 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     char err[256]{};
     char timing[128]{};
     static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
-    if (!d->ngx.ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
-                             d->width, d->height, resetHistory, err, sizeof(err),
-                             timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0)) {
+    if (!d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
+                              d->width, d->height, resetHistory, err, sizeof(err),
+                              timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0)) {
         char msg[512];
         std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", n, err);
         vsapi->logMessage(mtWarning, msg, core);
@@ -137,8 +164,19 @@ static const VSFrame *VS_CC DlssnrGetFrame(
 static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI *vsapi) {
     auto *d = static_cast<FilterData *>(instanceData);
     if (d->node) vsapi->freeNode(d->node);
-    // Stop the bridge before tearing down the contexts it observes.
+    // Stop the bridge before tearing down the contexts it observes. The D3D12
+    // + NGX contexts themselves move into the hot context instead of being
+    // destroyed: mpv re-runs the VS script on every seek, and a warm context
+    // makes the next filter instance near-free to create.
     vsdlssnr::BridgeStop(d->params.get());
+    if (d->initOk && d->d3d12 && d->ngx) {
+        Hot().d3d12 = std::move(d->d3d12);
+        Hot().ngx = std::move(d->ngx);
+        Hot().ngxDllPath = std::move(d->ngxDllPath);
+        Hot().width = d->width;
+        Hot().height = d->height;
+        Hot().valid = true;
+    }
     delete d;
 }
 
@@ -211,27 +249,56 @@ static void VS_CC DlssnrCreate(
     // Eager init: the D3D12/NGX bring-up costs ~1s (165MB snippet DLL load +
     // CreateFeature + first-evaluate warm-up). Doing it here — script
     // execution, before mpv starts the playback clock — keeps that whole
-    // warm-up period out of playback; lazily initializing on the first
-    // getFrame made the first seconds of playback stutter. Failure keeps the
+    // warm-up period out of playback. A matching hot context (from the
+    // previous filter instance, freed on the last seek) skips the bring-up
+    // entirely: only the SharedParams rebind runs, and even a create-time
+    // parameter change is a warm RecreateFeature. Failure keeps the
     // passthrough fallback semantics below.
     char err[256]{};
-    if (d->d3d12.Initialize(err, sizeof(err)) &&
-        d->ngx.Initialize(d->d3d12, d->ngxDllPath.c_str(),
-                          d->width, d->height, d->params.get(), err, sizeof(err))) {
-        d->initOk = true;
-        // Filter is live: start the mpv-side parameter bridge
-        vsdlssnr::BridgeStart(d->params.get());
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
-        vsapi->logMessage(mtInformation, msg, core);
-    } else {
-        char msg[512];
-        std::snprintf(msg, sizeof(msg),
-                      "vs_dlssnr init failed, falling back to passthrough: %s", err);
-        vsapi->logMessage(mtWarning, msg, core);
-        OutputDebugStringA("vs_dlssnr: init failed: ");
-        OutputDebugStringA(err);
-        OutputDebugStringA("\n");
+    const bool hotMatch = Hot().valid && Hot().width == d->width &&
+                          Hot().height == d->height && Hot().ngxDllPath == d->ngxDllPath;
+    if (hotMatch) {
+        d->d3d12 = std::move(Hot().d3d12);
+        d->ngx = std::move(Hot().ngx);
+        Hot().valid = false;
+        Hot().ngxDllPath.clear();
+        if (d->ngx->Rebind(d->params.get(), err, sizeof(err))) {
+            d->initOk = true;
+            vsdlssnr::BridgeStart(d->params.get());
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr ready from hot context (%dx%d)", d->width, d->height);
+            vsapi->logMessage(mtInformation, msg, core);
+        } else {
+            // The warm context is wedged (NGX state lost): drop it and fall
+            // through to a full re-initialization below.
+            char msg[512];
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr hot rebind failed, re-initializing: %s", err);
+            vsapi->logMessage(mtWarning, msg, core);
+            d->ngx.reset();
+            d->d3d12.reset();
+        }
+    }
+    if (!d->initOk && !d->d3d12) {
+        d->d3d12 = std::make_unique<vsdlssnr::D3D12Context>();
+        d->ngx = std::make_unique<vsdlssnr::DlssnrContext>();
+        if (d->d3d12->Initialize(err, sizeof(err)) &&
+            d->ngx->Initialize(*d->d3d12, d->ngxDllPath.c_str(),
+                               d->width, d->height, d->params.get(), err, sizeof(err))) {
+            d->initOk = true;
+            // Filter is live: start the mpv-side parameter bridge
+            vsdlssnr::BridgeStart(d->params.get());
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
+            vsapi->logMessage(mtInformation, msg, core);
+        } else {
+            char msg[512];
+            std::snprintf(msg, sizeof(msg),
+                          "vs_dlssnr init failed, falling back to passthrough: %s", err);
+            vsapi->logMessage(mtWarning, msg, core);
+            OutputDebugStringA("vs_dlssnr: init failed: ");
+            OutputDebugStringA(err);
+            OutputDebugStringA("\n");
+        }
     }
 
     VSFilterDependency deps[]{ { node, rpStrictSpatial } };
@@ -244,6 +311,16 @@ static void VS_CC DlssnrCreate(
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {
+    // Pin the DLL: mpv's vf_vapoursynth tears down and recreates the whole VS
+    // core on every seek, which unloads and reloads every plugin DLL. Without
+    // the pin, the process-level hot context (device + NGX feature + slot
+    // pool) would die with our CRT heap at unload and every seek would pay
+    // the ~1s bring-up again. Pinned modules never unload (FreeLibrary is
+    // ignored); the OS reclaims them at process exit.
+    HMODULE self = nullptr;
+    GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCWSTR>(&VapourSynthPluginInit2), &self);
     vspapi->configPlugin(PLUGIN_IDENTIFIER, PLUGIN_NAMESPACE, PLUGIN_NAME,
                          VS_MAKE_VERSION(0, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(

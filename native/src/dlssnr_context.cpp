@@ -557,9 +557,17 @@ bool DlssnrContext::Initialize(
 
     _ready = true;
     {
+        const DlssnrParams p = _shared->Snapshot();
+        _curPreset = p.preset;
+        _curRes = p.inputResolutionPercent;
+        _curScaling = p.scalingEnabled;
         char msg[160];
         std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: Feature=18 created=true path=signed-snippet %dx%d disabled=false", _width, _height);
         DbgLine(msg);
+        // Rebind/RecreateFeature already log through TimingLog; log the cold
+        // path too so the three lifecycle outcomes are distinguishable in
+        // dlssnr_timing.log alone (logMessage does not reach mpv's log).
+        TimingLog(msg);
     }
     return true;
 }
@@ -641,7 +649,36 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
              preset, scalingEnabled ? resPercent : 100, scalingEnabled);
     DbgLine(msg);
     TimingLog(msg);
+    _curPreset = preset;
+    _curRes = resPercent;
+    _curScaling = scalingEnabled;
     return true;
+}
+
+bool DlssnrContext::Rebind(SharedParams *shared, char *err, size_t errLen) noexcept {
+    if (!_ready || !_snippetReleaseFeature) {
+        if (err && errLen) std::snprintf(err, errLen, "Rebind: context not ready");
+        return false;
+    }
+    _shared = shared;
+    const DlssnrParams p = _shared->Snapshot();
+    // Snapshot already carries the ini overrides the new filter instance
+    // loaded (BridgeLoadIni runs in DlssnrCreate before this). Only a real
+    // create-time change needs the feature rebuilt; a matching hot context
+    // keeps the NGX feature completely warm across mpv's seek-triggered
+    // script re-initialization.
+    const bool scalingChanged = p.scalingEnabled != _curScaling;
+    const bool resChanged = p.scalingEnabled && _curScaling && p.inputResolutionPercent != _curRes;
+    if (p.preset == _curPreset && !scalingChanged && !resChanged) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d)",
+                      _curPreset, _curScaling ? _curRes : 100, _curScaling);
+        DbgLine(msg);
+        TimingLog(msg);
+        return true;
+    }
+    return RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen);
 }
 
 bool DlssnrContext::ProcessFrame(

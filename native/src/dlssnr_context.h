@@ -29,6 +29,14 @@ public:
                     char *err, size_t errLen) noexcept;
     void Shutdown() noexcept;
 
+    // Hot-context rebind: attach this kept-warm context (device, NGX feature,
+    // slot pool all alive) to a new filter instance's SharedParams. Rebuilds
+    // the feature only when a create-time parameter (preset /
+    // input_resolution / scaling_enabled) actually differs from the current
+    // one; otherwise it is free. Returns false (and leaves _ready false) when
+    // the rebuild fails; the caller then falls back to a full Initialize.
+    bool Rebind(SharedParams *shared, char *err, size_t errLen) noexcept;
+
     // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
     // on panel change the frame thread rebuilds the feature (and scaling
     // textures for resolution changes; disabled = residual pipeline dropped).
@@ -90,6 +98,11 @@ private:
     bool _coreInitialized = false;
     bool _snippetInitialized = false;
     bool _ready = false;
+    // create-time parameters currently baked into the NGX feature (Rebind
+    // compares against these to skip a no-op RecreateFeature)
+    int _curPreset = -1;
+    int _curRes = -1;
+    bool _curScaling = false;
     // fmParallel: several frame threads call EvaluateFeature concurrently.
     // The feature and the parameter block are singletons, so evaluate
     // (parameter setup + snippet call) is serialized; GPU-side dispatches
