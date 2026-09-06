@@ -398,9 +398,17 @@ bool DlssnrContext::Initialize(
     auto fail = [&](const char *what) {
         if (err && errLen) std::snprintf(err, errLen, "%s", what);
         DbgLine(what);
+        // 初始化失败 = 本实例整体直通:原因串同时发进 stats,面板可见
+        // (mpv 日志在 GUI 下不可见,只留这里是又一次静默降级)。
+        PublishDeadState("passthrough", what);
         return false;
     };
-    (void)fail;
+    // err 已由被调方填好时的失败出口(CreateFrameResources / RebuildScaling)
+    auto failWithExistingErr = [&]() {
+        DbgLine(err);
+        PublishDeadState("passthrough", err);
+        return false;
+    };
 
     _d3d12 = &d3d12;
     _width = width;
@@ -432,7 +440,7 @@ bool DlssnrContext::Initialize(
         }
         DWORD sehCode = 0;
         const NVSDK_NGX_Result r = CoreInitSafely(_appDataPath, _d3d12->Device(), &featureInfo, &sehCode);
-        if (sehCode) return false;
+        if (sehCode) return fail("NGX core Init_with_ProjectID raised SEH");
         if (!NVSDK_NGX_SUCCEED(r)) {
             char msg[96];
             std::snprintf(msg, sizeof(msg), "NGX core Init_with_ProjectID failed (0x%x)", static_cast<unsigned>(r));
@@ -446,7 +454,13 @@ bool DlssnrContext::Initialize(
     {
         DWORD sehCode = 0;
         const NVSDK_NGX_Result r = CoreAllocateParametersSafely(&_parameters, &sehCode);
-        if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_parameters) return false;
+        if (sehCode) return fail("CoreAllocateParameters raised SEH");
+        if (!NVSDK_NGX_SUCCEED(r) || !_parameters) {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg), "CoreAllocateParameters failed (0x%x)",
+                          static_cast<unsigned>(r));
+            return fail(msg);
+        }
     }
 
     // 3) Signed snippet load (Magpie InitializeSignedSnippet, cpp:1146-1195).
@@ -490,12 +504,12 @@ bool DlssnrContext::Initialize(
     // 4) Frame resources incl. zero-guidance textures + residual scaling
     //    textures/compute at the internal resolution (skipped entirely when
     //    internal-resolution scaling is disabled)
-    if (!_d3d12->CreateFrameResources(_width, _height, err, errLen)) return false;
+    if (!_d3d12->CreateFrameResources(_width, _height, err, errLen)) return failWithExistingErr();
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
         int iw = _width, ih = _height;
         InternalSize(_width, _height, pct, iw, ih);
-        if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) return false;
+        if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) return failWithExistingErr();
     }
 
     // 4b) NVOF 光流会话(PORTING #6):quality > 0 时建立;失败优雅回退零
@@ -532,16 +546,23 @@ bool DlssnrContext::Initialize(
 
     // Publish the render GPU's name so the panel shows it before the first
     // frame lands (queried once from the adapter the device was created on;
-    // the periodic stats tick reuses the cached string).
+    // the periodic stats tick reuses the cached string). Body also carries the
+    // initial filter state + actual NVOF mode: a failed NVOF init (zero
+    // guidance) is a degradation, and the panel must not wait for the first
+    // stats tick to learn it.
     {
         DXGI_ADAPTER_DESC desc{};
         if (_d3d12->Adapter() && SUCCEEDED(_d3d12->Adapter()->GetDesc(&desc))) {
             WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
                                 _gpuNameUtf8, sizeof(_gpuNameUtf8), nullptr, nullptr);
         }
-        char body[224];
-        std::snprintf(body, sizeof(body), "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d}",
-                      _gpuNameUtf8, _width, _height);
+        char body[288];
+        std::snprintf(body, sizeof(body),
+                      "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d,"
+                      "\"%s\":\"%s\",\"%s\":\"%s\"}",
+                      _gpuNameUtf8, _width, _height,
+                      SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
+                      SK_OF_MODE, OfModeString());
         PublishStatsJson(body);
     }
 
@@ -839,6 +860,14 @@ bool DlssnrContext::ProcessFrame(
                 std::snprintf(err, errLen, "context not ready");
             }
         }
+        // 面板可见的死亡状态(边缘发布一次):NGX fault 与重建失败在这里;
+        // 设备丢失不走 —— WaitFenceValue 已发布更具体的 gpu_hang body,
+        // 这里的 passthrough 会把它覆盖掉。
+        if (NgxRuntimeGuard::IsFaulted()) {
+            PublishDeadState("ngx_faulted", err);
+        } else if (!_d3d12->IsDeviceLost()) {
+            PublishDeadState("passthrough", err);
+        }
         return false;
     }
     // fmParallel: VS activates frames out of order and on several threads, so
@@ -861,7 +890,12 @@ bool DlssnrContext::ProcessFrame(
     // Panel preset / internal-resolution / scaling-toggle changes require a
     // feature rebuild; consume before packing.
     if (int newPreset = -1, newRes = -1, newScaling = -1; _shared->ConsumeRebuild(newPreset, newRes, newScaling)) {
-        if (!RecreateFeature(newPreset, newRes, newScaling, err, errLen)) return false;
+        if (!RecreateFeature(newPreset, newRes, newScaling, err, errLen)) {
+            // 面板可见:重建失败 = 本会话整体直通,具体原因进 stats。后续帧
+            // 顶部 !ready 早退的发布被边缘去重,不会覆盖这条更具体的原因。
+            PublishDeadState("passthrough", err);
+            return false;
+        }
     }
     const DlssnrParams frameParams = _shared->Snapshot();
     // NVOF 档位同步(只重建光流会话,不动 NGX feature)。在 AcquireSlot
@@ -1354,13 +1388,16 @@ bool DlssnrContext::ProcessFrame(
                          "{\"%s\":%.1f,\"%s\":%.1f,"
                          "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                          "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
-                         "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\"}",
+                         "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
+                         "\"%s\":\"%s\",\"%s\":\"%s\"}",
                          SK_GPU_LAST, gpuLast, SK_GPU_EMA, gpuEma,
                          SK_PACK_EMA, packEma, SK_EVAL_CPU_EMA, evalCpuEma, SK_UNPACK_EMA, unpackEma,
                          SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
                          SK_WIDTH, _width, SK_HEIGHT, _height,
                          SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
-                         SK_FPS, _d3d12->FrameRateEma(), SK_GPU_NAME, _gpuNameUtf8);
+                         SK_FPS, _d3d12->FrameRateEma(), SK_GPU_NAME, _gpuNameUtf8,
+                         SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
+                         SK_OF_MODE, OfModeString());
                 PublishStatsJson(body);
             }
         }
@@ -1372,6 +1409,24 @@ bool DlssnrContext::ProcessFrame(
         }
     }
     return rb;
+}
+
+void DlssnrContext::PublishDeadState(const char *state, const char *detail) noexcept {
+    // 边缘触发:同一死亡状态只发布一次(多帧线程并发早退时第一个写入者
+    // 定内容,后来者跳过)。死亡的 tick 不再运行,这条写入必须替换共享
+    // 内存里的旧统计 body,面板才不会一直显示冻结的"NGX 延迟"。
+    const int code = std::strcmp(state, "ngx_faulted") == 0 ? 1 : 0;
+    if (_lastDeadState.exchange(code) == code) return;
+    char safe[288];
+    SanitizeJsonDetail(detail, safe, sizeof(safe));
+    char body[512];
+    if (safe[0]) {
+        std::snprintf(body, sizeof(body), "{\"%s\":\"%s\",\"%s\":\"%.200s\"}",
+                      SK_FILTER_STATE, state, SK_STATE_DETAIL, safe);
+    } else {
+        std::snprintf(body, sizeof(body), "{\"%s\":\"%s\"}", SK_FILTER_STATE, state);
+    }
+    PublishStatsJson(body);
 }
 
 void DlssnrContext::Shutdown() noexcept {

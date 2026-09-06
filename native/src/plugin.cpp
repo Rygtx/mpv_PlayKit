@@ -7,6 +7,7 @@
 #include "d3d12_context.h"
 #include "dlssnr_context.h"
 #include "dlssnr_params.h"
+#include "panel_ipc.h"
 #include "shared_params.h"
 
 #include "VapourSynth4.h"
@@ -288,7 +289,12 @@ static void VS_CC DlssnrCreate(
         Hot().ngxDllPath.clear();
         if (d->ngx->Rebind(d->params.get(), d->width, d->height, err, sizeof(err))) {
             d->initOk = true;
-            vsdlssnr::BridgeStart(d->params.get());
+            // Filter is live: start the mpv-side parameter bridge
+            if (!vsdlssnr::BridgeStart(d->params.get())) {
+                vsapi->logMessage(mtWarning,
+                                  "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
+                                  core);
+            }
             char msg[128];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr ready from hot context (%dx%d)", d->width, d->height);
             vsapi->logMessage(mtInformation, msg, core);
@@ -323,7 +329,11 @@ static void VS_CC DlssnrCreate(
                                d->width, d->height, d->params.get(), err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
-            vsdlssnr::BridgeStart(d->params.get());
+            if (!vsdlssnr::BridgeStart(d->params.get())) {
+                vsapi->logMessage(mtWarning,
+                                  "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
+                                  core);
+            }
             char msg[128];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
             vsapi->logMessage(mtInformation, msg, core);
@@ -335,6 +345,14 @@ static void VS_CC DlssnrCreate(
             OutputDebugStringA("vs_dlssnr: init failed: ");
             OutputDebugStringA(err);
             OutputDebugStringA("\n");
+            // 面板可见状态:D3D12/NGX 初始化失败 = 本实例整体直通。原因串
+            // 可能含 D3D12 debug-layer 文本(引号),消毒后再进 stats。
+            char safe[288];
+            vsdlssnr::SanitizeJsonDetail(err, safe, sizeof(safe));
+            char body[384];
+            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"%.200s\"}",
+                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL, safe);
+            vsdlssnr::PublishStatsJson(body);
         }
     }
 

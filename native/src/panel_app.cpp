@@ -107,6 +107,9 @@ struct AppState {
     char statsBig[64]{};
     char statsRes[96]{};
     char gpuName[128]{};
+    char filterState[16]{};  // SK_FILTER_STATE: ok / nvof_zero / passthrough / ngx_faulted
+    char stateDetail[160]{}; // SK_STATE_DETAIL: 死亡状态的原因串
+    char ofMode[20]{};       // SK_OF_MODE: off / zero / forward[+cost] / both[+cost]
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f;
     bool hasSegments = false;
@@ -237,9 +240,14 @@ bool JsonGetString(const char *body, const char *key, char *out, size_t outLen) 
 void LoadStats() noexcept {
     const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
     if (!m) {
-        g_app.statsDirty = g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0;
+        g_app.statsDirty = g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0 ||
+                           g_app.filterState[0] != 0 || g_app.stateDetail[0] != 0 ||
+                           g_app.ofMode[0] != 0;
         g_app.statsBig[0] = 0;
         g_app.statsRes[0] = 0;
+        g_app.filterState[0] = 0;
+        g_app.stateDetail[0] = 0;
+        g_app.ofMode[0] = 0;
         return;
     }
     // Seq-gated snapshot (protocol mirrors PublishStatsJson): a copy whose
@@ -259,25 +267,37 @@ void LoadStats() noexcept {
     if (!valid) return;
     const AppState before = g_app; // display snapshot for the redraw gate below
     const char *body = st.json;
-    {
+    // 缺键即清零(JsonGetString 命中失败不写 out;旧版本插件的 body 没有
+    // 新键,残留旧值会让状态行说谎)。
+    if (!JsonGetString(body, SK_FILTER_STATE, g_app.filterState, sizeof(g_app.filterState)))
+        g_app.filterState[0] = 0;
+    if (!JsonGetString(body, SK_STATE_DETAIL, g_app.stateDetail, sizeof(g_app.stateDetail)))
+        g_app.stateDetail[0] = 0;
+    if (!JsonGetString(body, SK_OF_MODE, g_app.ofMode, sizeof(g_app.ofMode)))
+        g_app.ofMode[0] = 0;
+    if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
+        // The hang payload has no gpu_last, so the gate below would keep
+        // showing frozen pre-hang stats forever; surface it — with the
+        // device-removal reason the plugin publishes alongside the flag.
+        snprintf(g_app.statsBig, sizeof(g_app.statsBig), "GPU 挂起/设备移除(滤镜已回退)");
+        char reason[32];
+        if (JsonGetString(body, SK_REMOVED_REASON, reason, sizeof(reason)) && reason[0]) {
+            snprintf(g_app.statsRes, sizeof(g_app.statsRes), "移除原因 %s", reason);
+        }
+        // hang 有自己的展示行,清掉状态字段防上一 body 的残留
+        g_app.filterState[0] = 0;
+        g_app.stateDetail[0] = 0;
+        g_app.ofMode[0] = 0;
+    } else {
         const double gpuLast = JsonGetFloat(body, SK_GPU_LAST, -1);
-        const int iw = JsonGetInt(body, SK_INTERNAL_W, 0);
-        const int ih = JsonGetInt(body, SK_INTERNAL_H, 0);
-        const int w = JsonGetInt(body, SK_WIDTH, 0);
-        const int h = JsonGetInt(body, SK_HEIGHT, 0);
-        if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
-            // The hang payload has no gpu_last, so the gate below would keep
-            // showing frozen pre-hang stats forever; surface it — with the
-            // device-removal reason the plugin publishes alongside the flag.
-            snprintf(g_app.statsBig, sizeof(g_app.statsBig), "GPU 挂起/设备移除(滤镜已回退)");
-            char reason[32];
-            if (JsonGetString(body, SK_REMOVED_REASON, reason, sizeof(reason)) && reason[0]) {
-                snprintf(g_app.statsRes, sizeof(g_app.statsRes), "移除原因 %s", reason);
-            }
-        } else if (gpuLast >= 0) {
+        if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
             // 分辨率展示:未开启缩放 -> 原生分辨率;开启 -> 处理分辨率 → 回源分辨率
             const int scaling = JsonGetInt(body, SK_SCALING, 0);
+            const int iw = JsonGetInt(body, SK_INTERNAL_W, 0);
+            const int ih = JsonGetInt(body, SK_INTERNAL_H, 0);
+            const int w = JsonGetInt(body, SK_WIDTH, 0);
+            const int h = JsonGetInt(body, SK_HEIGHT, 0);
             if (scaling && iw > 0 && ih > 0) {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d → %dx%d", iw, ih, w, h);
@@ -303,11 +323,22 @@ void LoadStats() noexcept {
                     g_app.gpuName[len] = 0;
                 }
             }
+        } else {
+            // 死亡 body(passthrough / ngx_faulted):清掉冻结的旧统计与
+            // 分段,让状态行成为唯一内容。
+            g_app.statsBig[0] = 0;
+            g_app.statsRes[0] = 0;
+            g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = 0.0f;
+            g_app.hasSegments = false;
+            g_app.fps = 0.0;
         }
     }
     g_app.statsDirty = memcmp(before.statsBig, g_app.statsBig, sizeof(g_app.statsBig)) != 0 ||
                        memcmp(before.statsRes, g_app.statsRes, sizeof(g_app.statsRes)) != 0 ||
                        memcmp(before.gpuName, g_app.gpuName, sizeof(g_app.gpuName)) != 0 ||
+                       memcmp(before.filterState, g_app.filterState, sizeof(g_app.filterState)) != 0 ||
+                       memcmp(before.stateDetail, g_app.stateDetail, sizeof(g_app.stateDetail)) != 0 ||
+                       memcmp(before.ofMode, g_app.ofMode, sizeof(g_app.ofMode)) != 0 ||
                        before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
                        before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
                        before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack;
@@ -396,6 +427,27 @@ void DrawUi() noexcept {
     ImGui::SetWindowFontScale(1.0f);
     if (g_app.statsRes[0]) {
         ImGui::TextDisabled("%s", g_app.statsRes);
+    }
+    // 滤镜状态行(SK_FILTER_STATE):这是降级/故障在面板上的唯一可见信号
+    // (GUI mpv 看不到日志,timing log 没人看)。空 = 正常。
+    {
+        const ImVec4 warnCol(1.0f, 0.62f, 0.20f, 1.0f);
+        const ImVec4 errCol(1.0f, 0.45f, 0.45f, 1.0f);
+        if (std::strcmp(g_app.filterState, "passthrough") == 0) {
+            ImGui::TextColored(warnCol, "滤镜已回退直通(画面未增强)");
+            if (g_app.stateDetail[0]) ImGui::TextDisabled("%s", g_app.stateDetail);
+        } else if (std::strcmp(g_app.filterState, "ngx_faulted") == 0) {
+            ImGui::TextColored(errCol, "NGX 故障,滤镜已停用 —— 重启 mpv 恢复");
+            if (g_app.stateDetail[0]) ImGui::TextDisabled("%s", g_app.stateDetail);
+        } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
+            ImGui::TextColored(warnCol, "光流已降级为零 guidance(增强继续)");
+            if (g_app.stateDetail[0]) ImGui::TextDisabled("%s", g_app.stateDetail);
+        }
+        // 实际光流模式:请求档位 ≠ 实际能力(Turing 无 cost / 驱动拒双向)
+        // 时在这里暴露;档位关闭(off)不显示。
+        if (g_app.ofMode[0] && std::strcmp(g_app.ofMode, "off") != 0) {
+            ImGui::TextDisabled("光流模式: %s", g_app.ofMode);
+        }
     }
     ImGui::Spacing();
 

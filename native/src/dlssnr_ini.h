@@ -70,7 +70,10 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.useAutoMask = readInt(L"use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
     p.uiCorrection = readInt(L"ui_correction", p.uiCorrection ? 1 : 0) != 0;
     p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), kResPctMin, kResPctMax);
-    p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled);
+    // 与其它布尔位同款 != 0 归一:GetPrivateProfileInt 对非数字("true")
+    // 返回 0 会静默关掉缩放;>1 的值又会让 CreateParamsChanged 每次热复用
+    // 误判为变更而多付一次 feature 重建。
+    p.scalingEnabled = readInt(L"scaling_enabled", p.scalingEnabled) != 0;
     p.residualMultiplier = readX100(L"residual_multiplier_x100", p.residualMultiplier, kResidualMultMin, kResidualMultMax);
     p.residualSaturation = readX100(L"residual_saturation_x100", p.residualSaturation, kResidualFineMin, kResidualFineMax);
     p.residualLightness = readX100(L"residual_lightness_x100", p.residualLightness, kResidualFineMin, kResidualFineMax);

@@ -427,6 +427,22 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         _nextSeq = -1;         // 下一帧自定起点
         _gateCv.notify_all();
     }
+    // 实际能力记录:bidir/cost 的逐级回退(BOTH+cost → BOTH → FORWARD →
+    // FORWARD 无 cost)成功时原先无任何日志 —— 观测只认 timing log,这里
+    // 补一条"实际模式",防止"请求档位 ≠ 实际能力"(Turing 无 cost、驱动
+    // 拒 BOTH 方向)被静默吞掉。实际模式同时经 SK_OF_MODE 进 stats。
+    {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: nvof session mode=%s quality=%d grid=%u %dx%d",
+                      _bidirectional ? (_costEnabled ? "both+cost" : "both")
+                                     : (_costEnabled ? "forward+cost" : "forward"),
+                      quality, _gridSize, width, height);
+        OutputDebugStringA("vs_dlssnr: ");
+        OutputDebugStringA(msg);
+        OutputDebugStringA("\n");
+        TimingStatusLine(msg);
+    }
     _ready.store(true, std::memory_order_release);
     return true;
 }

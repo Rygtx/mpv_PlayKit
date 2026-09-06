@@ -229,9 +229,11 @@ void LaunchPanelSilently() noexcept {
     if (!GetSelfDir(dir, MAX_PATH)) return;
     if (wcslen(dir) + 1 + wcslen(PANEL_EXE) >= MAX_PATH) return;
     swprintf_s(exePath, L"%s\\%s", dir, PANEL_EXE);
-    ShellExecuteW(nullptr, L"open", exePath, nullptr, dir, SW_HIDE);
-    if (GetLastError() == ERROR_FILE_NOT_FOUND) {
-        OutputDebugStringW(L"vs_dlssnr: dlssnr_panel.exe not found next to plugin\n");
+    // 失败判定看返回值(<= 32),不看 GetLastError:ShellExecuteW 成功时
+    // last-error 是 stale 值,原来的判定可能拿上次调用的残留误报。
+    const HINSTANCE exec = ShellExecuteW(nullptr, L"open", exePath, nullptr, dir, SW_HIDE);
+    if (reinterpret_cast<intptr_t>(exec) <= 32) {
+        OutputDebugStringW(L"vs_dlssnr: dlssnr_panel.exe launch failed (missing next to plugin?)\n");
     }
 }
 

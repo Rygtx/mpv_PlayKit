@@ -96,6 +96,19 @@ private:
     void SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory, bool realMotion) noexcept;
     bool SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion, DWORD *sehCode) noexcept;
 
+    // 死亡状态边缘发布(state = "passthrough" | "ngx_faulted",detail 为原因
+    // 串,内部消毒)。发布即替换共享内存里的旧统计 body —— 帧已不再成功,
+    // tick 停摆,不替换面板就会一直显示冻结的"NGX 延迟"。
+    void PublishDeadState(const char *state, const char *detail) noexcept;
+    // NVOF 实际模式串(SK_OF_MODE):档位关闭 = "off",会话死亡 = "zero",
+    // 存活 = 双向/cost 能力组合。tick 与 Initialize 的 stats 发布共用。
+    const char *OfModeString() const noexcept {
+        if (_curOfQuality <= 0) return "off";
+        if (!_nvof || !_nvof->Enabled()) return "zero";
+        if (_nvof->Bidirectional()) return _nvof->CostEnabled() ? "both+cost" : "both";
+        return _nvof->CostEnabled() ? "forward+cost" : "forward";
+    }
+
     D3D12Context *_d3d12 = nullptr;
     NVSDK_NGX_Parameter *_parameters = nullptr;
     NVSDK_NGX_Handle *_feature = nullptr;
@@ -154,6 +167,10 @@ private:
     // (parameter setup + snippet call) is serialized; GPU-side dispatches
     // still overlap via each slot's own command list.
     std::mutex _evaluateMutex;
+    // 面板可见的死亡状态发布(passthrough / ngx_faulted):边缘触发,每状态
+    // 每实例一次。存活态(ok / nvof_zero)由周期 stats tick 携带,不走这里。
+    // 0 = passthrough,1 = ngx_faulted,-1 = 尚未发布过。
+    std::atomic<int> _lastDeadState{ -1 };
 };
 
 } // namespace vsdlssnr

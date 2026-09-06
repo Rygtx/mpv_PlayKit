@@ -142,6 +142,30 @@ inline constexpr const char *SK_FPS = "fps";
 inline constexpr const char *SK_GPU_NAME = "gpu_name";
 inline constexpr const char *SK_GPU_HANG = "gpu_hang";        // published as numeric 1
 inline constexpr const char *SK_REMOVED_REASON = "removed_reason";
+// 滤镜状态(面板可见的降级报告;GUI mpv 看不到日志,timing log 没人看):
+//   ok / nvof_zero  — 存活态,由周期 stats tick 携带(缺省 = ok)
+//   passthrough / ngx_faulted — 死亡态,边缘发布一次,替换冻结的旧统计 body
+inline constexpr const char *SK_FILTER_STATE = "filter_state";
+// 死亡状态的原因串(已经 SanitizeJsonDetail 消毒:无引号/控制字符)
+inline constexpr const char *SK_STATE_DETAIL = "state_detail";
+// NVOF 实际模式(请求档位 ≠ 实际能力时在这里暴露,如 Turing 无 cost):
+// off | zero | forward | forward+cost | both | both+cost
+inline constexpr const char *SK_OF_MODE = "of_mode";
+
+// stats JSON 的 detail 字段走面板的朴素解析(strstr + 下一个引号):剔除
+// 引号、反斜杠与控制字符,防止 D3D12 debug-layer 文本(VSDLSSNR_D3D12_DEBUG=1
+// 时可含引号)截断或污染 JSON。plugin.cpp 与 dlssnr_context 的死亡状态
+// 发布共用。
+inline void SanitizeJsonDetail(const char *src, char *dst, size_t dstLen) noexcept {
+    if (!dst || !dstLen) return;
+    if (!src) { dst[0] = '\0'; return; }
+    size_t o = 0;
+    for (size_t i = 0; src[i] && o + 1 < dstLen; ++i) {
+        const unsigned char c = static_cast<unsigned char>(src[i]);
+        dst[o++] = (c == '"' || c == '\\' || c < 0x20 || c == 0x7F) ? ' ' : static_cast<char>(c);
+    }
+    dst[o] = '\0';
+}
 
 // Shared publish protocol for both channels: 1) seq = 0 (readers skip 0 /
 // treat it as a write in progress), 2) write the body, 3) interlocked
