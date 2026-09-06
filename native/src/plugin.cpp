@@ -219,8 +219,13 @@ static void VS_CC DlssnrCreate(
     initial.inputResolutionPercent = static_cast<int>(std::clamp<long long>(GetIntDef(in, vsapi, "input_resolution", 100), kResPctMin, kResPctMax));
     // scaling_enabled=0 drops the residual pipeline entirely (input_resolution ignored)
     initial.scalingEnabled = GetIntDef(in, vsapi, "scaling_enabled", 1) != 0;
-    // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present.
+    // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
+    // the panel's CURRENT payload (last live state) overrides the ini. Without
+    // the adopt step a seek rebuilds the filter from stale ini/vpy values —
+    // the bridge poll skips the existing payload (history), so the panel's
+    // parameters only came back after touching the panel again.
     vsdlssnr::BridgeLoadIni(initial);
+    vsdlssnr::BridgeAdoptPanelPayload(initial);
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
 
     int dllErr = 0;

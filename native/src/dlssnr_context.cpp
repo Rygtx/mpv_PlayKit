@@ -628,11 +628,11 @@ bool DlssnrContext::Rebind(SharedParams *shared, char *err, size_t errLen) noexc
     }
     _shared = shared;
     const DlssnrParams p = _shared->Snapshot();
-    // Snapshot already carries the ini overrides the new filter instance
-    // loaded (BridgeLoadIni runs in DlssnrCreate before this). Only a real
-    // create-time change needs the feature rebuilt; a matching hot context
-    // keeps the NGX feature completely warm across mpv's seek-triggered
-    // script re-initialization.
+    // Snapshot already carries the ini overrides and the panel-payload adopt
+    // the new filter instance loaded (BridgeLoadIni + BridgeAdoptPanelPayload
+    // run in DlssnrCreate before this). Only a real create-time change needs
+    // the feature rebuilt; a matching hot context keeps the NGX feature
+    // completely warm across mpv's seek-triggered script re-initialization.
     const bool scalingChanged = p.scalingEnabled != _curScaling;
     const bool resChanged = p.scalingEnabled && _curScaling && p.inputResolutionPercent != _curRes;
     if (p.preset == _curPreset && !scalingChanged && !resChanged) {

@@ -19,4 +19,10 @@ void BridgeStop(SharedParams *params) noexcept;
 // Returns true when a saved profile was applied onto `p`.
 bool BridgeLoadIni(DlssnrParams &p) noexcept;
 
+// Adopt the panel's CURRENT payload (last live state, create-time params
+// included) onto `p`. Call at filter-create time, after BridgeLoadIni:
+// panel state wins over the ini, mirroring the panel's own startup adopt.
+// Returns false when no panel payload exists (mapping absent / empty / torn).
+bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept;
+
 } // namespace vsdlssnr

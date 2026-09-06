@@ -58,6 +58,38 @@ bool BridgeLoadIni(DlssnrParams &p) noexcept {
     return LoadDlssnrIni(p, iniPath); // shared key list + clamps (dlssnr_ini.h)
 }
 
+// Adopt the panel's CURRENT payload (last live state) onto `p`. Called once
+// per filter instance at create time, after BridgeLoadIni: a seek tears down
+// the whole VS core, so the new SharedParams would otherwise start from the
+// stale ini/vpy values while the bridge's skip-history guard never applies
+// the panel's existing payload — the parameters visibly fell back to the ini
+// after every seek until the user touched the panel again. This mirrors the
+// panel's own startup adopt (panel_ipc.h CreateParamsMapping): last live
+// state wins over the ini. Tear-safe read, same protocol as the poll thread.
+bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept {
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, PARAMS_MAPPING);
+    if (!mapping) return false; // no panel this session: keep ini/vpy values
+    const PanelPayload *view = static_cast<const PanelPayload *>(
+        MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
+    if (!view) {
+        CloseHandle(mapping);
+        return false;
+    }
+    bool adopted = false;
+    if (view->magic == PAYLOAD_MAGIC && view->seq != 0) {
+        PanelPayload snap;
+        memcpy(&snap, view, sizeof(snap));
+        if (static_cast<const volatile PanelPayload *>(view)->seq == snap.seq) {
+            LoadLiveParams(p, snap); // shared field mapping, clamps included
+            LoadCreateParams(p, snap);
+            adopted = true;
+        }
+    }
+    UnmapViewOfFile(view);
+    CloseHandle(mapping);
+    return adopted;
+}
+
 namespace {
 
 // Apply one panel payload onto SharedParams. Create-time params
