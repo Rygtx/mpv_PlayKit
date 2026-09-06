@@ -25,11 +25,24 @@ constexpr int POLL_INTERVAL_MS = 40;
 struct BridgeState {
     SharedParams *params = nullptr;
     HANDLE thread = nullptr;
-    HANDLE aliveEvent = nullptr; // existence marks a live filter (panel watches it)
     volatile bool running = false;
 };
 
 BridgeState *g_bridge = nullptr; // one live bridge at a time (last filter wins)
+
+// Process-lifetime handles (the DLL is pinned, so "process" == one mpv
+// playback session). The alive event and the panel-params read mapping must
+// NOT die with a single filter instance: mpv tears down and recreates the
+// whole VS core on every seek. Per-instance lifetimes made BridgeStop close
+// the event → the panel watchdog exit → BridgeStart relaunch a fresh panel,
+// which found the mapping gone and pushed factory defaults (res=100) through
+// the bridge — recreating the feature behind the user's back on some seeks.
+// Deliberately never closed: when mpv exits the kernel reclaims them and the
+// panel's OpenEventW poll starts failing, which is exactly the old "panel
+// follows the filter lifetime" semantics.
+HANDLE g_aliveEvent = nullptr;    // named; existence = a live filter in-process
+HANDLE g_paramsMapping = nullptr; // read handle keeping the payload object alive
+const PanelPayload *g_paramsView = nullptr;
 
 // ---------------------------------------------------------------------------
 // ini persistence
@@ -129,8 +142,8 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
 
     // Panel parameters come over shared memory (panel creates the mapping;
     // we wait for it - without a panel there is simply nothing to apply).
-    HANDLE mapping = nullptr;
-    const PanelPayload *view = nullptr;
+    // Handles are process-level (g_paramsMapping/g_paramsView): they survive
+    // bridge restarts so the payload survives seeks and panel restarts.
     uint32_t lastSeq = 0;
     uint32_t lastGeneration = 0;
 
@@ -138,17 +151,18 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
         Sleep(POLL_INTERVAL_MS);
         if (!state->running) break;
 
-        if (!view) {
-            mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, PARAMS_MAPPING);
-            if (!mapping) continue;
-            view = static_cast<const PanelPayload *>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
-            if (!view) {
-                CloseHandle(mapping);
-                mapping = nullptr;
+        if (!g_paramsView) {
+            g_paramsMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, PARAMS_MAPPING);
+            if (!g_paramsMapping) continue;
+            g_paramsView = static_cast<const PanelPayload *>(
+                MapViewOfFile(g_paramsMapping, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
+            if (!g_paramsView) {
+                CloseHandle(g_paramsMapping);
+                g_paramsMapping = nullptr;
                 continue;
             }
-            lastGeneration = view->generation;
-            lastSeq = view->seq; // skip history: apply only future edits
+            lastGeneration = g_paramsView->generation;
+            lastSeq = g_paramsView->seq; // skip history: apply only future edits
             continue;
         }
 
@@ -156,19 +170,19 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
         // zero seq means the (re)started panel has not written yet. A changed
         // generation resets the seq baseline so restarts never collide with
         // the previous instance's seq history.
-        if (view->generation != lastGeneration) {
-            lastGeneration = view->generation;
+        if (g_paramsView->generation != lastGeneration) {
+            lastGeneration = g_paramsView->generation;
             lastSeq = 0;
         }
-        if (view->magic != PAYLOAD_MAGIC) continue;
-        if (view->seq == 0 || view->seq == lastSeq) continue;
+        if (g_paramsView->magic != PAYLOAD_MAGIC) continue;
+        if (g_paramsView->seq == 0 || g_paramsView->seq == lastSeq) continue;
         // Snapshot under the writer: copy the payload, then confirm the seq
         // did not move mid-copy (the panel publishes the counter only after
         // the body is stable — a volatile re-read keeps the compiler from
         // forwarding the pre-copy load).
         PanelPayload snap;
-        memcpy(&snap, view, sizeof(snap));
-        if (static_cast<const volatile PanelPayload *>(view)->seq != snap.seq ||
+        memcpy(&snap, g_paramsView, sizeof(snap));
+        if (static_cast<const volatile PanelPayload *>(g_paramsView)->seq != snap.seq ||
             snap.seq == lastSeq) {
             continue;
         }
@@ -176,8 +190,8 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
         ApplyPanelPayload(state, snap);
     }
 
-    if (view) UnmapViewOfFile(view);
-    if (mapping) CloseHandle(mapping);
+    // No UnmapViewOfFile/CloseHandle here: the handles are process-lifetime
+    // (see the globals) so the payload survives seeks and panel restarts.
     return 0;
 }
 
@@ -210,12 +224,17 @@ bool BridgeStart(SharedParams *params) noexcept {
     if (!state) return false;
     state->params = params;
     state->running = true;
-    // Existence marker for the panel's watchdog (closed in BridgeStop, and
-    // destroyed by the kernel even if mpv dies without cleanup).
-    state->aliveEvent = CreateEventW(nullptr, TRUE, FALSE, ALIVE_EVENT);
+    // Existence marker for the panel's watchdog: process-lifetime (never
+    // closed) so a seek's BridgeStop/Start cycle doesn't kill the panel.
+    if (!g_aliveEvent) {
+        g_aliveEvent = CreateEventW(nullptr, TRUE, FALSE, ALIVE_EVENT);
+        if (!g_aliveEvent) {
+            delete state;
+            return false;
+        }
+    }
     state->thread = CreateThread(nullptr, 0, BridgeThreadProc, state, 0, nullptr);
     if (!state->thread) {
-        if (state->aliveEvent) CloseHandle(state->aliveEvent);
         delete state;
         return false;
     }
@@ -235,13 +254,12 @@ void BridgeStop(SharedParams *params) noexcept {
         CloseHandle(state->thread);
         state->thread = nullptr;
     }
-    // Release the alive marker first: the panel watchdog sees it disappear and
-    // exits, taking the tray icon with it.
-    if (state->aliveEvent) {
-        CloseHandle(state->aliveEvent);
-        state->aliveEvent = nullptr;
-    }
-    // The panel process is independent; its watchdog decides its lifetime.
+    // The alive event and the params mapping are process-lifetime (see the
+    // globals): deliberately NOT closed here. mpv re-creates the whole VS
+    // core on every seek; a per-instance event made the panel watchdog exit
+    // and the relaunched panel push factory defaults mid-playback. When mpv
+    // exits, the kernel reclaims the handles and the panel's OpenEventW poll
+    // starts failing — the watchdog semantics are unchanged.
     delete state;
     g_bridge = nullptr;
 }
