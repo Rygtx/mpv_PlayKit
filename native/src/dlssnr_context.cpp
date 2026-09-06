@@ -666,8 +666,13 @@ bool DlssnrContext::ProcessFrame(
     const bool vsTiming = timingOut && timingLen > 0;
     LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3{}, t4{};
     QueryPerformanceFrequency(&qpcFreq);
-    QueryPerformanceCounter(&t0);
-    _d3d12->NotifyFrameTick(static_cast<double>(t0.QuadPart) / static_cast<double>(qpcFreq.QuadPart));
+    {
+        // Frame-cadence tick at the real frame entry (before a possible
+        // RecreateFeature wait below would skew the interval).
+        LARGE_INTEGER entry{};
+        QueryPerformanceCounter(&entry);
+        _d3d12->NotifyFrameTick(static_cast<double>(entry.QuadPart) / static_cast<double>(qpcFreq.QuadPart));
+    }
     // Diagnostic: VSDLSSNR_SKIP_EVAL=1 measures the pipe without NGX evaluate
     static const bool skipEval = GetEnvironmentVariableA("VSDLSSNR_SKIP_EVAL", nullptr, 0) != 0;
     static const bool dumpEnabled = GetEnvironmentVariableA("VSDLSSNR_DUMP", nullptr, 0) != 0;
@@ -681,6 +686,12 @@ bool DlssnrContext::ProcessFrame(
         FrameSlot *s;
         ~SlotGuard() { if (s) ctx->ReleaseSlot(s); }
     } guard{ _d3d12, slot };
+    // pack-segment clock starts here: PackInput is a pure-CPU RGBS→RGBA8
+    // write into the slot's upload heap. RecreateFeature (above, only on the
+    // switch frame: PoolHold drain + NGX rebuild) and AcquireSlot waits are
+    // scheduling events, not pack work — counting them made the switch frame
+    // report a bogus pack=70-160ms.
+    QueryPerformanceCounter(&t0);
     if (!_d3d12->PackInput(*slot, srcPlanes, srcStrides, width, height, err, errLen)) return false;
     QueryPerformanceCounter(&t1);
 
