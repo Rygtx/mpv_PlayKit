@@ -42,7 +42,7 @@ constexpr wchar_t TRAY_TIP[] = L"DLSSNR 控制面板";
 // INI_FILE / ALIVE_EVENT come from panel_ipc.h (cross-process contract names)
 constexpr UINT WM_APP_TRAYICON = WM_APP + 1;
 // 字号/间距整体缩小一档(用户偏好:面板在小屏也放得下);1.0 = 跟随 DPI 原尺寸
-inline constexpr float kUiFontScale = 0.85f;
+inline constexpr float kUiFontScale = 0.80f;
 // 自绘标题栏几何(96dpi 基准,乘 uiScale)——DrawUi 画与 WM_NCHITTEST 判定
 // 共用同一组常量,改动不会留下一条拖不动的死区。
 inline constexpr float kTitleBarH = 38.0f;
@@ -54,17 +54,6 @@ inline constexpr float kCloseBtnPad = 10.0f;
 // wchar_t tables + per-frame WideCharToMultiByte are gone.
 // 成员指针直达字段,避免键名 -> 字段的双份 if 链漂移;滑块范围同样直接
 // 引用 dlssnr_params.h 的常量(文档注释里的 0-1 等只是给用户看的)。
-constexpr struct { const char *key; const char *label; const char *tip;
-                   float lo, hi; float DlssnrParams::*field; } kSliders[] = {
-    { "intensity",         "强度",     "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。", kStrengthMin, kStrengthMax, &DlssnrParams::intensity },
-    { "local_tone",        "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。", kStrengthMin, kStrengthMax, &DlssnrParams::localToneStrength },
-    { "local_structure",   "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。", kStrengthMin, kStrengthMax, &DlssnrParams::localStructureStrength },
-    { "skin_structure",    "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。", kSkinMin, kSkinMax, &DlssnrParams::skinStructureStrength },
-    { "residual_multiplier", "残差乘数", "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。", kResidualMultMin, kResidualMultMax, &DlssnrParams::residualMultiplier },
-};
-// 残差精调 4 项(Magpie 0.6.5 r1-r10,上游 Detail Control 组):全部是
-// 相对语义 —— 调节"DLSSNR 相对原图造成的变化"的幅度,不是绝对调色滑块。
-// 收进默认折叠的"高级"区:面板默认高度回到精调参数加入之前。
 constexpr struct { const char *key; const char *label; const char *tip;
                    float lo, hi; float DlssnrParams::*field; } kFineSliders[] = {
     { "residual_saturation", "残差饱和度", "对 DLSSNR 造成的饱和度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualSaturation },
@@ -78,25 +67,9 @@ constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
 constexpr const char *kOfQualityNames[] = {
     "无", "性能", "均衡(推荐)", "质量", "高质量(高开销)", "最高质量(极高开销)"
 };
-constexpr struct { const char *key; const char *label; const char *tip;
-                   int DlssnrParams::*field; int count; const char *const *names; } kEnums[] = {
-    { "preset", "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。",
-      &DlssnrParams::preset, 4, kPresetNames },
-    { "style",  "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。",
-      &DlssnrParams::style, 3, kStyleNames },
-    { "motion_vector_quality", "光流质量",
-      "NVIDIA 光流(真运动矢量)引导档位:无=零 guidance(旧行为),\n"
-      "其余档位用硬件光流减轻运动场景的时域伪影。需要 NVIDIA Turing+;\n"
-      "不支持时自动回退零 guidance。切换只重建光流会话(毫秒级,不停顿)。",
-      &DlssnrParams::motionVectorQuality, 6, kOfQualityNames },
-};
-constexpr struct { const char *label; const char *tip; int DlssnrParams::*field; } kFlags[] = {
-    { "自动蒙版",     "自动蒙版。模型自动识别区域并区别处理。", &DlssnrParams::useAutoMask },
-    { "UI 文字修正", "UI 修正。降低对画面内文字/UI 元素的涂抹。", &DlssnrParams::uiCorrection },
-};
-// 光流跟随降采样不进 kFlags:语义属于光流引导组(依赖分辨率缩放,与
-// 光流质量相邻),且此前的 kFlags 区用硬编码行距,高 DPI 下复选框互相
-// 挤压 —— 归位后在 DrawUi 里与枚举行同节奏渲染。
+// 预设/风格/光流质量/各滑块/开关原以 kEnums/kSliders/kFlags 成员指针表
+// 驱动通用循环;两列归并后每行控件异构(组合/滑块/复选框/整行),改为
+// DrawUi 内联 + pairLabel/pairCombo/pairSlider lambda,tip 随行内联。
 // clang-format on
 
 struct AppState {
@@ -456,8 +429,9 @@ void DrawUi() noexcept {
     ImGui::Text("GPU: %s", g_app.gpuName[0] ? g_app.gpuName : "(等待滤镜加载)");
     ImGui::Text("帧率: %.1f FPS", g_app.fps);
 
-    // 大号:NGX 纯延迟(窗口级字体缩放, imgui 1.91 的 PushFont 是单参)
-    ImGui::SetWindowFontScale(1.4f);
+    // 大号:NGX 纯延迟(窗口级字体缩放, imgui 1.91 的 PushFont 是单参;
+    // 1.4→1.25 高度收紧,辨识度足够)
+    ImGui::SetWindowFontScale(1.25f);
     ImGui::TextColored(ImVec4(120 / 255.0f, 190 / 255.0f, 1.0f, 1.0f), "%s", g_app.statsBig);
     ImGui::SetWindowFontScale(1.0f);
     if (g_app.statsRes[0]) {
@@ -592,10 +566,7 @@ void DrawUi() noexcept {
     s_bandBottom = ImGui::GetCursorPosY() + 10 * s;
     float y = s_bandBottom + 12 * s;
 
-    // --- 内容 ---
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-    ImGui::TextDisabled("参数改动在下一帧生效");
-    y += ImGui::GetTextLineHeight() + 8 * s; // 行进用实测行高:硬编码 24*s 在高 DPI 下会被文字压线
+    // --- 内容(独立提示行已删:live-apply 语义并入 保存设置 的 tooltip) ---
     dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
     y += 14 * s;
 
@@ -603,38 +574,140 @@ void DrawUi() noexcept {
     // 按同一中心线对齐。旧的硬编码 +7/+8*s 在高 DPI 下漂移(字体随 s 放大,
     // FramePadding 固定不放大),表现为参数名与滑块错位。
     const float labelDy = (ImGui::GetFrameHeight() - ImGui::GetTextLineHeight()) * 0.5f;
-    // 行高 = 控件 frame + 间距:s=1 且 16px 字体时 ≈ 旧值 38*s,DPI 放大时
-    // 控件随字体长高、间距随 s 走。
-    const float rowH = ImGui::GetFrameHeight() + 10 * s;
+    // 行高 = 控件 frame + 紧凑间距(#38 度量驱动;间距从 10*s 收紧到 4*s
+    // —— 高度预算的主压缩之一,控件 frame 本体不动)。
+    const float rowH = ImGui::GetFrameHeight() + 4 * s;
 
-    for (const auto &e : kEnums) {
+    // 参数行布局:相关短控件两两并排(预设|风格、四条强度滑杆),复杂控件
+    // 保整行 —— 13 行 → 9 行。控件列统一对齐:整行与半格行的控件都从
+    // colCtrl(半格行第二列从 colCtrl+halfW)起步,标签列宽 = colCtrl−marginX。
+    // 整行控件宽度封顶 260*s(下拉/滑杆拉满整行会过长);半格控件 ~102*s。
+    const float halfW = (wsize.x - 2 * marginX) * 0.5f;
+    const float pairLabelW = colCtrl - marginX;
+    auto pairLabel = [&](int col, const char *label, const char *tip) {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW, wpos.y + y + labelDy));
+        ImGui::TextUnformatted(label);
+        if (tip && ImGui::IsItemHovered()) ShowTip(tip);
+    };
+    auto pairCombo = [&](const char *key, int DlssnrParams::*f, int count,
+                         const char *const *names, int col) {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW + pairLabelW, wpos.y + y));
+        ImGui::SetNextItemWidth(halfW - pairLabelW - 8 * s);
+        int v = g_app.params.*f;
+        if (ImGui::Combo((std::string("##") + key).c_str(), &v, names, count)) {
+            g_app.params.*f = v;
+            g_app.liveDirty = true;
+        }
+    };
+    auto pairSlider = [&](const char *key, float DlssnrParams::*f, float lo, float hi, int col) {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW + pairLabelW, wpos.y + y));
+        ImGui::SetNextItemWidth(halfW - pairLabelW - 8 * s);
+        float v = g_app.params.*f;
+        if (ImGui::SliderFloat((std::string("##") + key).c_str(), &v, lo, hi, "%.2f")) {
+            // NGX accepts continuous float steps (verified: 0.01 steps produce
+            // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
+            g_app.params.*f = v;
+            g_app.liveDirty = true;
+        }
+    };
+    auto fullSlider = [&](const char *key, const char *label, const char *tip,
+                          float DlssnrParams::*f, float lo, float hi) {
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-        ImGui::Text("%s", e.label);
-        if (ImGui::IsItemHovered()) ShowTip(e.tip);
+        ImGui::TextUnformatted(label);
+        if (ImGui::IsItemHovered()) ShowTip(tip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-        ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
-        int v = g_app.params.*(e.field);
-        if (ImGui::Combo(("##" + std::string(e.key)).c_str(), &v, e.names, e.count)) {
-            g_app.params.*(e.field) = v;
+        // (std::min) 括号抑制 windows.h 的 min 宏(无 NOMINMAX)
+        ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
+        float v = g_app.params.*f;
+        if (ImGui::SliderFloat((std::string("##") + key).c_str(), &v, lo, hi, "%.2f")) {
+            g_app.params.*f = v;
             g_app.liveDirty = true;
         }
         y += rowH;
-    }
+    };
 
-    // 光流跟随降采样:与光流质量同组(依赖分辨率缩放),枚举行同节奏。
+    // (预设 | 风格)
+    pairLabel(0, "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。");
+    pairCombo("preset", &DlssnrParams::preset, 4, kPresetNames, 0);
+    pairLabel(1, "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。");
+    pairCombo("style", &DlssnrParams::style, 3, kStyleNames, 1);
+    y += rowH;
+
+    // 光流质量(整行:档位文案长,半宽会截断)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("光流质量");
+    if (ImGui::IsItemHovered())
+        ShowTip("NVIDIA 光流(真运动矢量)引导档位:无=零 guidance(旧行为),\n其余档位用硬件光流减轻运动场景的时域伪影。需要 NVIDIA Turing+;\n不支持时自动回退零 guidance。切换只重建光流会话(毫秒级,不停顿)。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
     {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-        ImGui::TextUnformatted("光流跟随降采样");
-        if (ImGui::IsItemHovered())
-            ShowTip("光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。");
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+        int v = g_app.params.motionVectorQuality;
+        if (ImGui::Combo("##motion_vector_quality", &v, kOfQualityNames, 6)) {
+            g_app.params.motionVectorQuality = v;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
+    // 光流跟随降采样(整行)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("光流跟随降采样");
+    if (ImGui::IsItemHovered())
+        ShowTip("光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
         bool v = g_app.params.nvofFollowScaling != 0;
         if (ImGui::Checkbox("##nvof_follow_scaling", &v)) {
             g_app.params.nvofFollowScaling = v ? 1 : 0;
             g_app.liveDirty = true;
         }
-        y += rowH;
     }
+    y += rowH;
+
+    // (强度 | 局部色调)
+    pairLabel(0, "强度", "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。");
+    pairSlider("intensity", &DlssnrParams::intensity, kStrengthMin, kStrengthMax, 0);
+    pairLabel(1, "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。");
+    pairSlider("local_tone", &DlssnrParams::localToneStrength, kStrengthMin, kStrengthMax, 1);
+    y += rowH;
+
+    // (局部结构 | 皮肤结构)
+    pairLabel(0, "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。");
+    pairSlider("local_structure", &DlssnrParams::localStructureStrength, kStrengthMin, kStrengthMax, 0);
+    pairLabel(1, "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。");
+    pairSlider("skin_structure", &DlssnrParams::skinStructureStrength, kSkinMin, kSkinMax, 1);
+    y += rowH;
+
+    // 残差乘数(整行)
+    fullSlider("residual_multiplier", "残差乘数",
+               "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。",
+               &DlssnrParams::residualMultiplier, kResidualMultMin, kResidualMultMax);
+
+    // 分辨率缩放(整行:开关 + 百分比滑杆)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("分辨率缩放");
+    if (ImGui::IsItemHovered())
+        ShowTip("启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Catmull-Rom 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        bool scalingOn = g_app.params.scalingEnabled != 0;
+        if (ImGui::Checkbox("##scaling_enabled", &scalingOn)) {
+            g_app.params.scalingEnabled = scalingOn ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+        ImGui::SameLine(0, 12 * s);
+        ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX - 60 * s, 200 * s));
+        int ir = g_app.params.inputResolutionPercent;
+        if (ImGui::SliderInt("##input_resolution", &ir, kResPctMin, kResPctMax, "%d%%")) {
+            g_app.params.inputResolutionPercent = std::clamp(ir, kResPctMin, kResPctMax);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // Debounce: rebuilding per drag tick would recreate the feature +
+            // textures every frame; push once on slider release instead.
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
 
     auto drawSliderRows = [&](const auto &table) {
         for (const auto &sl : table) {
@@ -642,7 +715,7 @@ void DrawUi() noexcept {
             ImGui::Text("%s", sl.label);
             if (ImGui::IsItemHovered()) ShowTip(sl.tip);
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-            ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
+            ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
             float v = g_app.params.*(sl.field);
             if (ImGui::SliderFloat(("##" + std::string(sl.key)).c_str(), &v, sl.lo, sl.hi, "%.2f")) {
                 // NGX accepts continuous float steps (verified: 0.01 steps produce
@@ -653,7 +726,6 @@ void DrawUi() noexcept {
             y += rowH;
         }
     };
-    drawSliderRows(kSliders);
 
     // 残差精调(高级):默认收起;展开状态记忆在 ini [panel] advanced。
     // SetNextItemOpen 把 ini 值喂给 ImGui 的内部开合存储——CollapsingHeader
@@ -677,50 +749,26 @@ void DrawUi() noexcept {
     y = ImGui::GetItemRectMax().y - wpos.y + 8 * s;
     if (advanced) drawSliderRows(kFineSliders);
 
-    // 内部分辨率(25-100%,int;改动触发热重建)+ 缩放启用开关
-    {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-        ImGui::Text("%s", "分辨率缩放");
-        if (ImGui::IsItemHovered())
-            ShowTip("启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Catmull-Rom 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-        ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX);
-        bool scalingOn = g_app.params.scalingEnabled != 0;
-        if (ImGui::Checkbox("##scaling_enabled", &scalingOn)) {
-            g_app.params.scalingEnabled = scalingOn ? 1 : 0;
-            g_app.liveDirty = true;
-        }
-        ImGui::SameLine(0, 12 * s);
-        ImGui::SetNextItemWidth(wsize.x - colCtrl - marginX - 40 * s);
-        int ir = g_app.params.inputResolutionPercent;
-        if (ImGui::SliderInt("##input_resolution", &ir, kResPctMin, kResPctMax, "%d%%")) {
-            g_app.params.inputResolutionPercent = std::clamp(ir, kResPctMin, kResPctMax);
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-            // Debounce: rebuilding per drag tick would recreate the feature +
-            // textures every frame; push once on slider release instead.
-            g_app.liveDirty = true;
-        }
-        y += rowH; // 原 38*s 硬编码:与 kFlags 同款高 DPI 重叠类问题
-    }
-
     dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
     y += 14 * s;
 
-    for (const auto &f : kFlags) {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-        bool v = g_app.params.*(f.field) != 0;
-        if (ImGui::Checkbox(f.label, &v)) {
-            g_app.params.*(f.field) = v ? 1 : 0;
+    // 模型行为开关 + 性能日志:三个短复选框一行(高度压缩;tooltip 不变)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+    {
+        bool autoMask = g_app.params.useAutoMask != 0;
+        if (ImGui::Checkbox("自动蒙版", &autoMask)) {
+            g_app.params.useAutoMask = autoMask ? 1 : 0;
             g_app.liveDirty = true;
         }
-        if (ImGui::IsItemHovered()) ShowTip(f.tip);
-        y += rowH; // 原硬编码 26*s:高 DPI 下控件随字体长高,行距不跟 → 重叠
-    }
-
-    // 性能日志开关(经共享内存参数通道通知插件;状态持久化在 ini [panel] 节)
-    {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+        if (ImGui::IsItemHovered()) ShowTip("自动蒙版。模型自动识别区域并区别处理。");
+        ImGui::SameLine(0, 24 * s);
+        bool uiFix = g_app.params.uiCorrection != 0;
+        if (ImGui::Checkbox("UI 文字修正", &uiFix)) {
+            g_app.params.uiCorrection = uiFix ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+        if (ImGui::IsItemHovered()) ShowTip("UI 修正。降低对画面内文字/UI 元素的涂抹。");
+        ImGui::SameLine(0, 24 * s);
         bool logOn = g_app.timingLog;
         if (ImGui::Checkbox("写入性能日志", &logOn)) {
             g_app.timingLog = logOn;
@@ -734,8 +782,8 @@ void DrawUi() noexcept {
             g_app.liveDirty = false;
         }
         if (ImGui::IsItemHovered()) ShowTip("每秒一行性能统计(与帧率无关),追加到 mpv 同目录 dlssnr_timing.log。\n排查性能问题时把该文件一并附上。");
-        y += rowH;
     }
+    y += rowH;
 
     y += 8 * s;
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
@@ -745,7 +793,7 @@ void DrawUi() noexcept {
         snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
     }
     if (ImGui::IsItemHovered()) {
-        ShowTip("将当前设置保存为默认值(dlssnr_ui.ini),下次加载滤镜时自动生效。");
+        ShowTip("当前设置即时生效(下一帧画面);保存为默认值(dlssnr_ui.ini)后,下次加载滤镜自动生效。");
     }
     ImGui::SameLine(0, 14 * s);
     if (ImGui::Button("重置默认", ImVec2(120 * s, 30 * s))) {
@@ -787,9 +835,9 @@ namespace {
 void ApplyUiScale() noexcept {
     if (!ImGui::GetCurrentContext()) return;
     ImGuiStyle &style = ImGui::GetStyle();
-    style.WindowPadding = ImVec2(18 * g_app.uiScale, 16 * g_app.uiScale);
-    style.FramePadding = ImVec2(8 * g_app.uiScale, 6 * g_app.uiScale);
-    style.ItemSpacing = ImVec2(10 * g_app.uiScale, 9 * g_app.uiScale);
+    style.WindowPadding = ImVec2(18 * g_app.uiScale, 14 * g_app.uiScale);
+    style.FramePadding = ImVec2(8 * g_app.uiScale, 5 * g_app.uiScale);
+    style.ItemSpacing = ImVec2(10 * g_app.uiScale, 5 * g_app.uiScale);
 }
 
 void RebuildFontDpi(int dpi) noexcept {
@@ -848,7 +896,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noex
         const auto *sug = reinterpret_cast<const RECT *>(lParam);
         RECT wrc{};
         GetWindowRect(hwnd, &wrc);
-        const int wantW = static_cast<int>(460 * g_app.uiScale);
+        const int wantW = static_cast<int>(500 * g_app.uiScale);
         SetWindowPos(hwnd, nullptr, sug->left, sug->top,
                      wantW, wrc.bottom - wrc.top, SWP_NOZORDER | SWP_NOACTIVATE);
         return 0;
@@ -973,7 +1021,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // Tray-first start: window hidden until tray click (per original request:
     // "滤镜加载后任务栏图标,点击后开启控制面板")
     g_hwnd = CreateWindowExW(0, WINDOW_CLASS, WINDOW_TITLE,
-                             WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, 460, 450,
+                             WS_POPUP, CW_USEDEFAULT, CW_USEDEFAULT, 500, 450,
                              nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;
 
@@ -985,7 +1033,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     g_app.dpi = GetDpiForWindow(g_hwnd);
     g_app.uiScale = g_app.dpi / 96.0f * kUiFontScale;
     if (g_app.dpi != 96) {
-        SetWindowPos(g_hwnd, nullptr, 0, 0, static_cast<int>(460 * g_app.uiScale),
+        SetWindowPos(g_hwnd, nullptr, 0, 0, static_cast<int>(500 * g_app.uiScale),
                      static_cast<int>(450 * g_app.uiScale), SWP_NOZORDER | SWP_NOMOVE);
     }
 
