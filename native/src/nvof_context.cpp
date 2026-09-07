@@ -475,22 +475,33 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             // 过期帧:槽纹理里是别的帧的流,清零发布;不推进门、不重置。
             result.publishZero = true;
             _lastStageMs = 0.0;
+            ++_gateExpired; // 临时探针
+            _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
             return result;
         }
         if (frameIndex > _nextSeq) {
             // 前驱可能仍在飞行(VS 重叠激活):有界等待;超时按跳帧处理
             // (前驱从未被激活 —— 重置历史,跳到本帧)。
+            // 等待只该覆盖"前驱已在 ProcessFrame 里、pack 未完"的窗口
+            // (pack p99 ~17ms);mpv 追帧丢帧会让前驱**永远不会被激活**,
+            // 每次都白等满超时。实测 250ms 时(6 帧预算@25fps)追帧期
+            // 每次 host 丢帧 = 一次 250ms 门停顿,停顿加剧落后 → 更多丢帧,
+            // 自持成"跳转后持续掉帧";50ms 保留 3 倍 pack 尖峰裕量,
+            // 丢帧代价降到 ~1.25 帧(探针 s/x 计数 + last≈超时值可验证)。
             const int64_t target = frameIndex;
-            if (_gateCv.wait_for(lock, std::chrono::milliseconds(250),
+            if (_gateCv.wait_for(lock, std::chrono::milliseconds(50),
                                  [&] { return _nextSeq >= target; })) {
                 // 顺序恢复。但若另一个超时跳帧已越过本帧,本帧已成过期帧:
                 // 清零发布、不推进门(防 _nextSeq 回退)。
                 if (_nextSeq > frameIndex) {
                     result.publishZero = true;
                     _lastStageMs = 0.0;
+                    ++_gateExpired; // 临时探针
+                    _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
                     return result;
                 }
             } else {
+                ++_gateSkips; // 临时探针
                 _nextSeq = frameIndex;
                 _historyValid = false;
             }
@@ -502,8 +513,14 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             result.historyReset = true;
             _historyValid = false;
             _lastStageMs = 0.0;
+            _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
             return result;
         }
+        // 临时探针:门等待终点(互斥竞争 + cv 等待合计)。
+        LARGE_INTEGER tG{};
+        QueryPerformanceCounter(&tG);
+        _lastGateWaitMs = static_cast<double>(tG.QuadPart - t0.QuadPart) * 1000.0 /
+                          static_cast<double>(freq.QuadPart);
 
         const int cur = _curInput;
         const bool seed = !_historyValid;
@@ -519,9 +536,19 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         if (_lastDone) {
             queue->Wait(_doneFence.Get(), _lastDone);
         }
-        if (_lastCopyFence &&
-            !WaitFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000)) {
-            TimingStatusLine("DLSSNR STATUS: nvof copy fence timeout");
+        if (_lastCopyFence) {
+            // 临时探针:前帧拷贝(含 densify,同一 allocator)完成 CPU 等待。
+            LARGE_INTEGER tc0{}, tc1{};
+            QueryPerformanceCounter(&tc0);
+            const bool reached = WaitFenceReached(_copyFence.Get(), _lastCopyFence,
+                                                  _copyFenceEvent, 10000);
+            QueryPerformanceCounter(&tc1);
+            _lastCpyWaitMs = static_cast<double>(tc1.QuadPart - tc0.QuadPart) * 1000.0 /
+                             static_cast<double>(freq.QuadPart);
+            if (!reached)
+                TimingStatusLine("DLSSNR STATUS: nvof copy fence timeout");
+        } else {
+            _lastCpyWaitMs = 0.0; // 临时探针
         }
         // force-close 自愈:上次 Close 失败留下的 open CL 会让 allocator
         // Reset 永久 E_FAIL(对齐 BeginCtlRecording 的恢复模式)。
@@ -569,6 +596,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             execute = false;
         }
 
+        _lastExeWaitMs = 0.0; // 临时探针:非 execute 帧(播种/拷贝失败)无引擎等待
         if (execute) {
             // execute(n):输入栅栏点 = {copyFence, k_n}(输入内容就绪)
             // + {doneFence, doneByParity[cur]}(纵深防御);输出栅栏点 =
@@ -602,8 +630,15 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 // 级 Wait:NVOF 的输出栅栏在队列 Wait 语义下可能永不满足。
                 // 输出栅栏超时 = 引擎状态不可信(僵尸 execute 会继续写
                 // 固定 flow 缓冲),会话立即作废,由 RebuildNvof 重建。
-                if (!WaitFenceReached(_doneFence.Get(), outFence.value,
-                                      _doneFenceEvent, 10000)) {
+                // 临时探针:引擎输出完成 CPU 等待。
+                LARGE_INTEGER te0{}, te1{};
+                QueryPerformanceCounter(&te0);
+                const bool reached = WaitFenceReached(_doneFence.Get(), outFence.value,
+                                                      _doneFenceEvent, 10000);
+                QueryPerformanceCounter(&te1);
+                _lastExeWaitMs = static_cast<double>(te1.QuadPart - te0.QuadPart) * 1000.0 /
+                                 static_cast<double>(freq.QuadPart);
+                if (!reached) {
                     TimingStatusLine("DLSSNR STATUS: nvof output fence timeout; session retired");
                     result.publishZero = true;
                     result.historyReset = true;

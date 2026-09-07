@@ -295,6 +295,9 @@ bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_
                      SK_GPU_HANG, SK_REMOVED_REASON,
                      static_cast<unsigned long>(rr));
             PublishStatsJson(json);
+            // 项目惯例:GPU 级失败必须进 timing log —— 之前只上面板+DebugView,
+            // 跨进程观测时(面板没开)日志完全静默,无法定位。
+            TimingStatusLine(buf);
             _deviceLost.store(true, std::memory_order_relaxed);
             OutputDebugStringA("vs_dlssnr: ");
             OutputDebugStringA(buf);

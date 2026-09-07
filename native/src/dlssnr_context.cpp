@@ -1359,7 +1359,7 @@ bool DlssnrContext::ProcessFrame(
         // TimingLog takes g_timingMutex itself — format the line under the
         // lock, log outside of it, or this thread self-deadlocks on frame 1
         // and burns one slot forever.
-        char line[256] = "";
+        char line[384] = "";
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
             g_timing.Push(gpuWaitMs, packMs, nvofMs, evalOnlyMs, unpackMs);
@@ -1374,11 +1374,20 @@ bool DlssnrContext::ProcessFrame(
                 const double evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
                 const double unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f eval_cpu=%.1f unpack=%.1f | res=%d%% of=%d %dx%d",
-                         gpuLast, gpuEma, gpuP99, packEma, nvofEma, evalCpuEma, unpackEma,
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u | eval_cpu=%.1f unpack=%.1f | res=%d%% of=%d %dx%d",
+                         gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
+                         _nvof ? _nvof->LastGateWaitMs() : 0.0,
+                         _nvof ? _nvof->LastCpyWaitMs() : 0.0,
+                         _nvof ? _nvof->LastExeWaitMs() : 0.0,
+                         _nvof ? _nvof->GateSkips() : 0u,
+                         _nvof ? _nvof->GateExpired() : 0u,
+                         evalCpuEma, unpackEma,
                          std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
                          _curOfQuality,
                          _width, _height);
+                // nvof=ema/last;后缀 g/c/e = 门等待/前帧拷贝等待/引擎输出等待,
+                // s/x = 门超时跳帧/过期帧累计(临时探针,定位 seek 后持续掉帧,
+                // 与 NvofContext 内探针同期删除)。
 
                 // stats via named shared memory (no disk IO; panel reads directly).
                 // Keys are the SK_* constants from panel_ipc.h, interpolated

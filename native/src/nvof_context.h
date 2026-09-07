@@ -113,6 +113,14 @@ public:
     // 最近一次 StageFrame 的 CPU 耗时(门等待 + 拷贝提交 + execute 调用),ms。
     double LastStageMs() const noexcept { return _lastStageMs; }
 
+    // ---- 临时探针(定位 seek 后持续掉帧,验证后删除)----
+    // StageFrame 内三段 CPU 等待细分 + 门异常事件累计。
+    double LastGateWaitMs() const noexcept { return _lastGateWaitMs; } // 门互斥+cv 等待
+    double LastCpyWaitMs() const noexcept { return _lastCpyWaitMs; }   // 前帧拷贝完成 CPU 等待
+    double LastExeWaitMs() const noexcept { return _lastExeWaitMs; }   // execute 输出栅栏 CPU 等待
+    uint32_t GateSkips() const noexcept { return _gateSkips; }         // cv 超时跳帧累计
+    uint32_t GateExpired() const noexcept { return _gateExpired; }     // 过期帧累计
+
 private:
     void DestroySession() noexcept;
     bool CreateSession(D3D12Context &d3d12, int width, int height, int quality,
@@ -169,6 +177,11 @@ private:
     std::atomic<bool> _ready{ false };
 
     double _lastStageMs = 0.0;
+    double _lastGateWaitMs = 0.0; // 临时探针(验证后删除)
+    double _lastCpyWaitMs = 0.0;  // 临时探针(验证后删除)
+    double _lastExeWaitMs = 0.0;  // 临时探针(验证后删除)
+    uint32_t _gateSkips = 0;      // 临时探针(验证后删除)
+    uint32_t _gateExpired = 0;    // 临时探针(验证后删除)
 };
 
 } // namespace vsdlssnr
