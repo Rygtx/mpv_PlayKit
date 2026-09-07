@@ -11,6 +11,7 @@
 #include "nvof_context.h"
 #include "shared_params.h"
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -97,12 +98,19 @@ private:
     // tick 停摆,不替换面板就会一直显示冻结的"NGX 延迟"。
     void PublishDeadState(const char *state, const char *detail) noexcept;
     // NVOF 实际模式串(SK_OF_MODE):档位关闭 = "off",会话死亡 = "zero",
-    // 存活 = 双向/cost 能力组合。tick 与 Initialize 的 stats 发布共用。
-    const char *OfModeString() const noexcept {
+    // 存活 = 能力组合 + 当前档位/网格("both+cost q2 grid4")——能力在同
+    // 一块 GPU 上不随档位变化,档位/网格才是切档可见的反馈。tick 与
+    // Initialize 的 stats 发布共用。
+    char _ofModeBuf[28] = "";
+    const char *OfModeString() noexcept {
         if (_curOfQuality <= 0) return "off";
         if (!_nvof || !_nvof->Enabled()) return "zero";
-        if (_nvof->Bidirectional()) return _nvof->CostEnabled() ? "both+cost" : "both";
-        return _nvof->CostEnabled() ? "forward+cost" : "forward";
+        std::snprintf(_ofModeBuf, sizeof(_ofModeBuf), "%s q%d grid%u",
+                      _nvof->Bidirectional()
+                          ? (_nvof->CostEnabled() ? "both+cost" : "both")
+                          : (_nvof->CostEnabled() ? "forward+cost" : "forward"),
+                      _curOfQuality, _nvof->GridSize());
+        return _ofModeBuf;
     }
 
     D3D12Context *_d3d12 = nullptr;
