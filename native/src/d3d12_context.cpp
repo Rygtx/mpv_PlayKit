@@ -8,6 +8,8 @@
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgidebug.h>
+#include <immintrin.h>
+#include <intrin.h>
 
 namespace vsdlssnr {
 
@@ -18,6 +20,23 @@ constexpr UINT DEVICE_VENDOR_NVIDIA = 0x10DE;
 float Saturate(float v) noexcept {
     if (!(v > 0.0f)) return 0.0f;   // also catches NaN
     return v < 1.0f ? v : 1.0f;
+}
+
+// AVX2 检测(结果缓存):PackInput/UnpackOutput 的向量路径门。缺 AVX 的
+// 机器走原标量路径 —— 两条路径必须逐位等价(舍入语义见各自的实现注释)。
+// VSDLSSNR_SCALAR=1 强制标量(向量/标量逐位等价性的 A/B 验收 + 诊断)。
+bool HasAvx2() noexcept {
+    static const bool ok = [] {
+        if (GetEnvironmentVariableA("VSDLSSNR_SCALAR", nullptr, 0) != 0) return false;
+        int regs[4];
+        __cpuid(regs, 1);
+        if (!(regs[2] & (1u << 27))) return false; // OSXSAVE
+        if (!(regs[2] & (1u << 28))) return false; // AVX
+        if ((_xgetbv(_XCR_XFEATURE_ENABLED_MASK) & 0x6) != 0x6) return false; // XMM+YMM
+        __cpuidex(regs, 7, 0);
+        return (regs[1] & (1u << 5)) != 0;         // AVX2
+    }();
+    return ok;
 }
 
 } // namespace
@@ -686,13 +705,39 @@ bool D3D12Context::PackInput(
         SetErr(err, errLen, E_INVALIDARG, "PackInput: size mismatch");
         return false;
     }
+    const bool avx2 = HasAvx2();
+    // 常量提在行循环外;mul/add 分开各舍入一次 —— 禁用 FMA 合并(fmadd
+    // 只舍入一次,与标量 (v*255 舍入) + 0.5 (再舍入) 在边界值差 1 LSB)。
+    const __m256 k255 = _mm256_set1_ps(255.0f);
+    const __m256 kHalf = _mm256_set1_ps(0.5f);
+    const __m256 kOne = _mm256_set1_ps(1.0f);
+    const __m256 kZero = _mm256_setzero_ps();
     auto *dstRow = static_cast<uint8_t *>(slot.uploadMapped);
     for (int y = 0; y < height; ++y, dstRow += slot.uploadPitch) {
         const float *rowR = reinterpret_cast<const float *>(srcPlanes[0] + srcStrides[0] * y);
         const float *rowG = reinterpret_cast<const float *>(srcPlanes[1] + srcStrides[1] * y);
         const float *rowB = reinterpret_cast<const float *>(srcPlanes[2] + srcStrides[2] * y);
         uint32_t *dstPx = reinterpret_cast<uint32_t *>(dstRow);
-        for (int x = 0; x < width; ++x) {
+        int x = 0;
+        if (avx2) {
+            // 向量路径:与标量路径逐位等价。Saturate ≡ maxps(NaN/负值返回
+            // 第二操作数 0,标量 !(v>0)→0 同款) + minps 封顶 1;
+            // *255+0.5 截断 ≡ cvttps_epi32(向零截断,值域 0..255 无差异)。
+            for (; x + 8 <= width; x += 8) {
+                const __m256 vr = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(rowR + x), kZero), kOne);
+                const __m256 vg = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(rowG + x), kZero), kOne);
+                const __m256 vb = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(rowB + x), kZero), kOne);
+                const __m256i ri = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(vr, k255), kHalf));
+                const __m256i gi = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(vg, k255), kHalf));
+                const __m256i bi = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(vb, k255), kHalf));
+                // BGRA 字节序(byte0=B):NVOF 输入格式 + Magpie 管线同款。
+                const __m256i px = _mm256_or_si256(_mm256_set1_epi32((int)0xFF000000),
+                    _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(ri, 16),
+                                                    _mm256_slli_epi32(gi, 8)), bi));
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(dstPx + x), px);
+            }
+        }
+        for (; x < width; ++x) {
             const uint32_t r = static_cast<uint32_t>(Saturate(rowR[x]) * 255.0f + 0.5f);
             const uint32_t g = static_cast<uint32_t>(Saturate(rowG[x]) * 255.0f + 0.5f);
             const uint32_t b = static_cast<uint32_t>(Saturate(rowB[x]) * 255.0f + 0.5f);
@@ -829,12 +874,28 @@ bool D3D12Context::UnpackOutput(
     // side): the per-frame Map/Unmap pair only bought two driver calls.
     const size_t pitch = slot.readbackPitch;
     const auto *srcRow = static_cast<const uint8_t *>(slot.readbackMapped);
+    // 标量公式是乘常数 (1/255.0f)(编译期折叠),向量路径用同一常数 ——
+    // cvtdq2ps 对 0..255 整数精确,float 乘法逐位等价。禁用除法改写。
+    const __m256 kRecip = _mm256_set1_ps(1.0f / 255.0f);
     for (int y = 0; y < height; ++y, srcRow += pitch) {
         const uint8_t *row = srcRow;
         float *rowR = reinterpret_cast<float *>(dstPlanes[0] + dstStrides[0] * y);
         float *rowG = reinterpret_cast<float *>(dstPlanes[1] + dstStrides[1] * y);
         float *rowB = reinterpret_cast<float *>(dstPlanes[2] + dstStrides[2] * y);
-        for (int x = 0; x < width; ++x) {
+        int x = 0;
+        if (HasAvx2()) {
+            // 向量路径:与标量路径逐位等价(与 PackInput 的写入换位成对)。
+            for (; x + 8 <= width; x += 8) {
+                const __m256i px = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row + x * 4));
+                const __m256i bI = _mm256_and_si256(px, _mm256_set1_epi32(0xFF));
+                const __m256i gI = _mm256_srli_epi32(_mm256_and_si256(px, _mm256_set1_epi32(0xFF00)), 8);
+                const __m256i rI = _mm256_srli_epi32(_mm256_and_si256(px, _mm256_set1_epi32(0xFF0000)), 16);
+                _mm256_storeu_ps(rowB + x, _mm256_mul_ps(_mm256_cvtepi32_ps(bI), kRecip));
+                _mm256_storeu_ps(rowG + x, _mm256_mul_ps(_mm256_cvtepi32_ps(gI), kRecip));
+                _mm256_storeu_ps(rowR + x, _mm256_mul_ps(_mm256_cvtepi32_ps(rI), kRecip));
+            }
+        }
+        for (; x < width; ++x) {
             // BGRA 字节序(byte0=B):与 PackInput 的写入换位成对。
             rowB[x] = row[x * 4 + 0] * (1.0f / 255.0f);
             rowG[x] = row[x * 4 + 1] * (1.0f / 255.0f);
