@@ -24,13 +24,6 @@ void SetTimingLogEnabled(bool enabled) noexcept;
 // Exported TimingLog wrapper for nvof_context.cpp(TimingLog 本体在匿名命名空间)。
 void TimingStatusLine(const char *line) noexcept;
 
-// A backwards jump (seek back) or a gap larger than the host's prefetch
-// window is a real discontinuity and resets NGX's temporal history; anything
-// else (mpv's startup prefetch activates frames out of order under
-// fmParallel) is ordering noise. The threshold encodes mpv's fetch pipeline
-// depth — raise it only if a host legitimately requests frames further apart.
-constexpr int kFrameGapResetThreshold = 32;
-
 class DlssnrContext {
 public:
     DlssnrContext() = default;
@@ -142,9 +135,6 @@ private:
     // Cross-thread: written by one frame thread (device-lost latch /
     // failed rebuild) while others read it under fmParallel.
     std::atomic<bool> _ready{false};
-    // last requested frame index (see kFrameGapResetThreshold) — survives
-    // seeks with the hot context; a seek's n restart triggers the reset.
-    std::atomic<int> _lastFrame{-1 << 30};
     // create-time parameters currently baked into the NGX feature (Rebind
     // compares against these to skip a no-op RecreateFeature)
     int _curPreset = -1;

@@ -469,41 +469,42 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
     {
         std::unique_lock<std::mutex> lock(_gateMutex);
 
-        // ---- 帧序门 ----
+        // ---- 帧序门:_nextSeq = 上一完成帧 + 1,匹配才 execute ----
         if (_nextSeq < 0) _nextSeq = frameIndex;
         if (frameIndex < _nextSeq) {
-            // 过期帧:槽纹理里是别的帧的流,清零发布;不推进门、不重置。
+            // 迟到帧(乱序/回退,其序号已被越过):清零发布,不推进门。
+            // 零等待门下无需簿记,链不受影响。
             result.publishZero = true;
             _lastStageMs = 0.0;
             ++_gateExpired; // 临时探针
             _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
             return result;
         }
+        bool gapSkip = false; // 缺口且未等到前驱:参考非紧邻前驱 → 播种
         if (frameIndex > _nextSeq) {
-            // 前驱可能仍在飞行(VS 重叠激活):有界等待;超时按跳帧处理
-            // (前驱从未被激活 —— 重置历史,跳到本帧)。
-            // 等待只该覆盖"前驱已在 ProcessFrame 里、pack 未完"的窗口
-            // (pack p99 ~17ms);mpv 追帧丢帧会让前驱**永远不会被激活**,
-            // 每次都白等满超时。实测 250ms 时(6 帧预算@25fps)追帧期
-            // 每次 host 丢帧 = 一次 250ms 门停顿,停顿加剧落后 → 更多丢帧,
-            // 自持成"跳转后持续掉帧";50ms 保留 3 倍 pack 尖峰裕量,
-            // 丢帧代价降到 ~1.25 帧(探针 s/x 计数 + last≈超时值可验证)。
-            const int64_t target = frameIndex;
-            if (_gateCv.wait_for(lock, std::chrono::milliseconds(50),
-                                 [&] { return _nextSeq >= target; })) {
-                // 顺序恢复。但若另一个超时跳帧已越过本帧,本帧已成过期帧:
-                // 清零发布、不推进门(防 _nextSeq 回退)。
-                if (_nextSeq > frameIndex) {
-                    result.publishZero = true;
-                    _lastStageMs = 0.0;
-                    ++_gateExpired; // 临时探针
-                    _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
-                    return result;
-                }
-            } else {
+            // 缺口 = 参考槽位不是本帧的紧邻前驱。恰缺 1 帧时前驱大概率在飞
+            // (fmParallel 相邻竞争卡在门 mutex 上、或正在 pack):cv 让路
+            // 15ms,前驱插队完成后两帧都保住 guidance;真丢帧(宿主不再
+            // 请求)或更大缺口立即播种。**不做长等待**——等待叠加进序列化
+            // 延迟链,让帧错过呈现 deadline,宿主丢帧 → 更多突发 → 更多缺
+            // 口,自持成"过载恢复后持续卡顿"(实测 4K of=3:60/235ms 等待
+            // 期 s 以 4 次/秒爬升、切档自愈失效)。播种一次即恢复链,迟到
+            // 的前驱走上方迟到分支。
+            if (frameIndex == _nextSeq + 1) {
+                _gateCv.wait_for(lock, std::chrono::milliseconds(15),
+                                 [&] { return _nextSeq >= frameIndex; });
+            }
+            if (_nextSeq > frameIndex) {
+                // 等待期间另一帧已越过本帧:按迟到帧处理。
+                result.publishZero = true;
+                _lastStageMs = 0.0;
+                ++_gateExpired; // 临时探针
+                _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
+                return result;
+            }
+            if (_nextSeq < frameIndex) {
                 ++_gateSkips; // 临时探针
-                _nextSeq = frameIndex;
-                _historyValid = false;
+                gapSkip = true; // 参考非紧邻前驱 → 播种(不碰 _nextSeq,结尾统一推进)
             }
         }
         // 设备丢失:栅栏永不满足,直接降级(下帧 ProcessFrame 顶部会因
@@ -523,7 +524,9 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                           static_cast<double>(freq.QuadPart);
 
         const int cur = _curInput;
-        const bool seed = !_historyValid;
+        // execute 的前提:参考槽位恰好是紧邻前驱的输入。首帧(_historyValid
+        // false)或缺口未等到前驱(gapSkip)一律播种。
+        const bool seed = !_historyValid || gapSkip;
         bool execute = !seed;
         // densify/清零在本帧 nvof CL 上录制;execute 帧拆成两次提交
         // (copy → execute → CPU 等 → densify),播种帧合并为一次。

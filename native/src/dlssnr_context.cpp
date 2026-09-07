@@ -870,23 +870,10 @@ bool DlssnrContext::ProcessFrame(
         }
         return false;
     }
-    // fmParallel: VS activates frames out of order and on several threads, so
-    // a strict n != lastN + 1 would fire NGX's reset path on every reordering
-    // and stall the first seconds of playback. Only real discontinuities
-    // reset (see kFrameGapResetThreshold): backwards jump (seek back) or a
-    // large forward gap (seek past the prefetch window). Relaxed ordering: a
-    // stale read at worst triggers one extra harmless reset on a
-    // zero-guidance (stateless) model.
-    const int lastN = _lastFrame.load(std::memory_order_relaxed);
-    const bool resetHistory =
-        lastN < 0 || n < lastN || n - lastN > kFrameGapResetThreshold;
-    _lastFrame.store(n, std::memory_order_relaxed);
-    if (resetHistory && _nvof) {
-        // 向后 seek(单实例内回退):帧序门必须随 NGX 历史一并复位,否则
-        // 回退后的所有帧都判过期 → 永久零 guidance(mpv 靠 Rebind 掩盖,
-        // 其它宿主/脚本内 seek 不重建脚本)。
-        _nvof->ResetHistory();
-    }
+    // 帧序不连续性(乱序/回退/大跳)全部由 NvofContext 的帧序门自愈:到达帧
+    // 与 _nextSeq(上一完成帧+1)不匹配即播种(零 guidance),链下一帧立即
+    // 恢复 —— 曾在此按 lastN 差值触发 ResetHistory,但全量重置会连带清掉
+    // 门状态,与门自身的消化路径重复且有 churn 副作用,已删。
     // Panel preset / internal-resolution / scaling-toggle changes require a
     // feature rebuild; consume before packing.
     if (int newPreset = -1, newRes = -1, newScaling = -1; _shared->ConsumeRebuild(newPreset, newRes, newScaling)) {
@@ -1105,7 +1092,8 @@ bool DlssnrContext::ProcessFrame(
         std::lock_guard<std::mutex> evalLock(_evaluateMutex);
         if (ProbeEnabled()) TimingStatusLine("PROBE: eval-locked"); // 临时探针(VSDLSSNR_PROBE=1)
         DWORD sehCode = 0;
-        if (!SetEvaluateParametersSafely(*slot, resetHistory || nvofHistoryReset, realMotion, &sehCode)) {
+        // NGX PARAM_RESET 只由帧序门的播种帧携带(大跳/回退/缺口的恢复路径)。
+        if (!SetEvaluateParametersSafely(*slot, nvofHistoryReset, realMotion, &sehCode)) {
             if (err && errLen) {
                 if (NgxRuntimeGuard::IsFaulted() && !sehCode) {
                     std::snprintf(err, errLen,
@@ -1374,13 +1362,14 @@ bool DlssnrContext::ProcessFrame(
                 const double evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
                 const double unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u | eval_cpu=%.1f unpack=%.1f | res=%d%% of=%d %dx%d",
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f unpack=%.1f | res=%d%% of=%d %dx%d",
                          gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
                          _nvof ? _nvof->LastGateWaitMs() : 0.0,
                          _nvof ? _nvof->LastCpyWaitMs() : 0.0,
                          _nvof ? _nvof->LastExeWaitMs() : 0.0,
                          _nvof ? _nvof->GateSkips() : 0u,
                          _nvof ? _nvof->GateExpired() : 0u,
+                         _nvof ? _nvof->ResetCount() : 0u,
                          evalCpuEma, unpackEma,
                          std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
                          _curOfQuality,

@@ -21,9 +21,13 @@
 //      FIFO 顺序 ✓;跨 CL 状态链(UAV→NSR 于 nvofCL,NSR→COMMON 于槽 CL)
 //      合法(同队列保序)。
 //
-// 帧序门(_gateMutex):VS fmParallel 激活顺序单调但可重叠,门只放行
-// _nextSeq 当前帧;前驱未到时 cv 等待(有超时),超时按跳帧处理(重置历史)。
-// 门内工作 = 拷贝提交 + execute + CPU 等 + densify 提交,天然按帧序串行。
+// 帧序门(_gateMutex):_nextSeq = 上一完成帧 + 1。到达帧 == _nextSeq 才
+// execute;不匹配一律播种(零 guidance)—— 到得早的(乱序/回退)与缺了
+// 前驱的(host 丢帧/大跳)都走播种,链在下一帧立即恢复,不做簿记。
+// 唯一等待:缺口恰为 1 时 cv 让路 15ms(fmParallel 相邻竞争下前驱大概率
+// 正卡在门 mutex 上,cv 释放锁的语义让它插队完成,两帧都保住 guidance);
+// 真丢帧则 15ms 后播种,代价钉死。门内工作 = 拷贝提交 + execute + CPU 等
+// + densify 提交,天然按帧序串行。
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -80,12 +84,14 @@ public:
     ID3D12Fence *DoneFence() const noexcept { return _doneFence.Get(); }
 
     // 历史失效(seek = 新滤镜实例):下一帧重新播种(清零发布,不 execute)。
-    // 同时复位帧序门 —— 新时间线的帧号与旧时间线无关,不清会让所有新帧
-    // 被判过期。
+    // 同时复位帧序门 —— 新时间线的帧号与旧时间线无关,不清会让新帧被判
+    // 迟到帧。零等待门下乱序/大跳均自愈(播种一次即恢复),此复位只服务
+    // "门内残留旧时间线状态"的场景。
     void ResetHistory() noexcept {
         std::lock_guard<std::mutex> lock(_gateMutex);
         _historyValid = false;
         _nextSeq = -1;
+        ++_resetCount; // 临时探针
         _gateCv.notify_all();
     }
 
@@ -120,6 +126,7 @@ public:
     double LastExeWaitMs() const noexcept { return _lastExeWaitMs; }   // execute 输出栅栏 CPU 等待
     uint32_t GateSkips() const noexcept { return _gateSkips; }         // cv 超时跳帧累计
     uint32_t GateExpired() const noexcept { return _gateExpired; }     // 过期帧累计
+    uint32_t ResetCount() const noexcept { return _resetCount; }       // ResetHistory 累计
 
 private:
     void DestroySession() noexcept;
@@ -169,7 +176,7 @@ private:
     // 帧序门 + 会话状态(gateMutex 保护)。
     std::mutex _gateMutex;
     std::condition_variable _gateCv;
-    int64_t _nextSeq = -1;        // 下一帧序;-1 = 未定(首帧自定)
+    int64_t _nextSeq = -1;        // 上一完成帧 + 1;-1 = 未定(首帧自定)
     bool _historyValid = false;
     int _curInput = 0;            // ping-pong 当前写槽位
     uint32_t _consecutiveFailures = 0;
@@ -182,6 +189,7 @@ private:
     double _lastExeWaitMs = 0.0;  // 临时探针(验证后删除)
     uint32_t _gateSkips = 0;      // 临时探针(验证后删除)
     uint32_t _gateExpired = 0;    // 临时探针(验证后删除)
+    uint32_t _resetCount = 0;     // 临时探针(验证后删除)
 };
 
 } // namespace vsdlssnr
