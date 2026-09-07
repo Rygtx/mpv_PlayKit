@@ -1512,21 +1512,31 @@ bool DlssnrContext::ProcessFrame(
         // lock, log outside of it, or this thread self-deadlocks on frame 1
         // and burns one slot forever.
         char line[384] = "";
+        double gpuLast = 0.0, gpuEma = 0.0, packEma = 0.0, nvofEma = 0.0,
+               evalCpuEma = 0.0, unpackEma = 0.0;
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
             const double slotWaitMs = ms(tSlot0, tSlot1, qpcFreq);
             const double lockWaitMs = ms(tLock0, tLock1, qpcFreq);
             g_timing.Push(gpuWaitMs, packMs, nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
-            static int statFrames = 0;
-            if (++statFrames % 60 == 1) {
-                const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
-                const double gpuLast = g_timing.gpu[lastIdx];
-                const double gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
+            const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
+            gpuLast = g_timing.gpu[lastIdx];
+            gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
+            packEma = TimingWindow::Ema(g_timing.pack, g_timing.count);
+            nvofEma = TimingWindow::Ema(g_timing.nvof, g_timing.count);
+            evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
+            unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
+            // perf 行按时间门(≥1s 一行)而非帧数:诊断日志的样本密度不应
+            // 随源帧率漂(60fps=1s 一行而 30fps=2s 一行)。静态量在
+            // g_timingMutex 内读写,fmParallel 并发安全;首帧立即落一行。
+            static LARGE_INTEGER lastPerfQpc{};
+            LARGE_INTEGER nowQpc{};
+            QueryPerformanceCounter(&nowQpc);
+            const bool perfDue = lastPerfQpc.QuadPart == 0 ||
+                                 (nowQpc.QuadPart - lastPerfQpc.QuadPart) >= qpcFreq.QuadPart;
+            if (perfDue) lastPerfQpc = nowQpc;
+            if (perfDue) {
                 const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
-                const double packEma = TimingWindow::Ema(g_timing.pack, g_timing.count);
-                const double nvofEma = TimingWindow::Ema(g_timing.nvof, g_timing.count);
-                const double evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
-                const double unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
                 const double slotEma = TimingWindow::Ema(g_timing.slotW, g_timing.count);
                 const double lockEma = TimingWindow::Ema(g_timing.lockW, g_timing.count);
                 snprintf(line, sizeof(line),
@@ -1551,27 +1561,30 @@ bool DlssnrContext::ProcessFrame(
                 // 第一手证据)。slot/lock = 槽池等待 / evaluate 互斥等待
                 // (ema/last);f = 本行前一帧的帧号(与 STATUS 行对齐用);
                 // fps = 1s 窗口帧入口计数,处理帧率 < 源帧率 = 宿主侧没来帧。
-
-                // stats via named shared memory (no disk IO; panel reads directly).
-                // Keys are the SK_* constants from panel_ipc.h, interpolated
-                // into the format string so the schema cannot drift silently.
-                char body[512];
-                snprintf(body, sizeof(body),
-                         "{\"%s\":%.1f,\"%s\":%.1f,"
-                         "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
-                         "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
-                         "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
-                         "\"%s\":\"%s\",\"%s\":\"%s\"}",
-                         SK_GPU_LAST, gpuLast, SK_GPU_EMA, gpuEma,
-                         SK_PACK_EMA, packEma, SK_EVAL_CPU_EMA, evalCpuEma, SK_UNPACK_EMA, unpackEma,
-                         SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
-                         SK_WIDTH, _width, SK_HEIGHT, _height,
-                         SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
-                         SK_FPS, _d3d12->FrameRateWindow(), SK_GPU_NAME, _gpuNameUtf8,
-                         SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
-                         SK_OF_MODE, OfModeString());
-                PublishStatsJson(body);
             }
+        }
+        // stats 每帧发布(EMA 是滚动窗口读数,每帧重算 ~600 flops + 512B
+        // 共享内存写,开销可忽略):面板"处理用时"随帧呼吸,不再按日志
+        // 节流跳变。perf 行(磁盘 IO)按时间门 ≥1s 一行(与帧率无关)。
+        // Snapshot/FrameRateWindow 在锁外取(各自持独立互斥,勿在
+        // g_timingMutex 内叠锁)。
+        {
+            char body[512];
+            snprintf(body, sizeof(body),
+                     "{\"%s\":%.1f,\"%s\":%.1f,"
+                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
+                     "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
+                     "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
+                     "\"%s\":\"%s\",\"%s\":\"%s\"}",
+                     SK_GPU_LAST, gpuLast, SK_GPU_EMA, gpuEma,
+                     SK_PACK_EMA, packEma, SK_EVAL_CPU_EMA, evalCpuEma, SK_UNPACK_EMA, unpackEma,
+                     SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
+                     SK_WIDTH, _width, SK_HEIGHT, _height,
+                     SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
+                     SK_FPS, _d3d12->FrameRateWindow(), SK_GPU_NAME, _gpuNameUtf8,
+                     SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
+                     SK_OF_MODE, OfModeString());
+            PublishStatsJson(body);
         }
         if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)
 
