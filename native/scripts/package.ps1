@@ -1,7 +1,7 @@
 ﻿# 打包 mpv_PlayKit DLSSNR 完整发行包: dlssnr 分支 portable_config 全目录 + vs_dlssnr 插件三件套
 # 全部输入取自仓库树内, 无本机绝对路径
-# 用法: pwsh -File scripts\package.ps1 [-Version 0.2.0]  (必须在 dlssnr 分支上运行)
-# 产物: dist\mpv_PlayKit-dlssnr-<版本>-full.zip
+# 用法: pwsh -File scripts\package.ps1 [-Version 2026.09.07]  (必须在 dlssnr 分支上运行)
+# 产物: dist\mpv_PlayKit-dlssnr-v<版本>-full.zip
 param([string]$Version)
 
 $ErrorActionPreference = "Stop"
@@ -10,13 +10,11 @@ $repo   = Split-Path -Parent $native         # 仓库根
 $branch = git -C $repo rev-parse --abbrev-ref HEAD
 if ($branch -ne "dlssnr") { throw "请在 dlssnr 分支上运行 (当前: $branch, 该分支的 portable_config 才是发行基线+DLSSNR 定制)" }
 
-# 未显式指定版本时尝试取最近的 git tag (去掉 v 前缀)
+# 版本默认取打包当日日期 (vyyyy.MM.dd); 显式传入时兼容带/不带 v 前缀
 if (-not $PSBoundParameters.ContainsKey("Version")) {
-    $tag = git -C $repo describe --tags --abbrev=0 2>$null
-    if ($LASTEXITCODE -eq 0 -and $tag) { $Version = $tag.TrimStart("v") }
-    else { $Version = "0.1.0" }
+    $Version = Get-Date -Format "yyyy.MM.dd"
 }
-$global:LASTEXITCODE = 0
+$Version = $Version.TrimStart("v")
 
 $binDll   = Join-Path $native "bin\vs_dlssnr.dll"
 $binPanel = Join-Path $native "bin\dlssnr_panel.exe"
@@ -27,7 +25,7 @@ if (-not (Test-Path $model))    { throw "缺少模型文件: $model (把 nvngx_d
 
 $dist  = Join-Path $native "dist"
 $stage = Join-Path $dist "stage"
-$zip   = Join-Path $dist "mpv_PlayKit-dlssnr-$Version-full.zip"
+$zip   = Join-Path $dist "mpv_PlayKit-dlssnr-v$Version-full.zip"
 if (Test-Path $dist) { Remove-Item $dist -Recurse -Force -Confirm:$false }
 New-Item -ItemType Directory -Force "$stage\vs-plugins\ngx" | Out-Null
 
