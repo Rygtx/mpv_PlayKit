@@ -18,10 +18,12 @@ using namespace vsdlssnr;
 #include <shellapi.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <string>
 
 #pragma comment(lib, "d3d11.lib")
@@ -136,6 +138,33 @@ bool BasePath(wchar_t *path, size_t len) noexcept {
     return true;
 }
 
+// 面板侧事件日志(dlssnr_panel.log,独立于插件的 dlssnr_timing.log ——
+// 两个进程写同一文件会交错)。只记低频生命周期事件:#39 的面板死亡螺旋
+// 当时只能靠外部 5ms 轮询脚本取证,这里补上原生记录。每次写入 open/close
+// (事件频率为个位数/会话,不值得常驻句柄)。
+void PanelLog(const char *fmt, ...) noexcept {
+    char line[512];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char stamped[560];
+    std::snprintf(stamped, sizeof(stamped), "[%02u:%02u:%02u.%03u] %s\n",
+                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
+    static std::mutex m; // 主线程 + 看门狗线程两个写者
+    std::lock_guard<std::mutex> lock(m);
+    wchar_t base[MAX_PATH];
+    if (!BasePath(base, MAX_PATH)) return;
+    wchar_t path[MAX_PATH];
+    swprintf_s(path, L"%s\\dlssnr_panel.log", base);
+    FILE *f = nullptr;
+    if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
+    fwrite(stamped, 1, strlen(stamped), f);
+    fclose(f);
+}
+
 // Shared-memory parameter channel: the panel creates the mapping and pushes
 // the full parameter set on every edit (seq-gated); the plugin waits on the
 // named auto-reset event (with the 40ms poll as fallback) and applies it.
@@ -193,7 +222,9 @@ void WriteIniNow() noexcept {
     if (!BasePath(base, MAX_PATH)) return;
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\%s", base, INI_FILE);
-    WriteDlssnrIni(g_app.params, path); // shared key list (dlssnr_ini.h)
+    if (!WriteDlssnrIni(g_app.params, path)) { // shared key list (dlssnr_ini.h)
+        PanelLog("panel: save ini FAILED (file locked?)");
+    }
 }
 
 void LoadIni() noexcept {
@@ -873,13 +904,20 @@ DWORD WINAPI ExitWatchProc(LPVOID) noexcept {
         }
         Sleep(500);
     }
-    if (!following) return 0;
+    if (!following) {
+        PanelLog("panel: no filter seen in 30s; staying resident (manual mode)");
+        return 0;
+    }
+    PanelLog("panel: watchdog following filter (alive event present)");
     while (!g_quit) {
         Sleep(500);
         if (g_quit) break;
         if (const HANDLE h = OpenEventW(SYNCHRONIZE, FALSE, ALIVE_EVENT)) {
             CloseHandle(h);
         } else {
+            // 探针:看门狗退出(#39 死亡螺旋的计数锚点 —— 该行高频出现
+            // = alive 事件在反复消失,直接指向插件侧 BridgeStop/生命周期)。
+            PanelLog("panel: watchdog alive event LOST -> exit");
             PostThreadMessageW(g_mainThreadId, WM_QUIT, 0, 0);
             break;
         }
@@ -897,6 +935,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     // silent no-ops; the user opens the panel via the panel's own tray icon.
     CreateMutexW(nullptr, TRUE, L"vs_dlssnr_panel_single");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        PanelLog("panel: duplicate launch exits (single-instance guard)");
         return 0;
     }
 
@@ -946,6 +985,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (FAILED(D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
                                              nullptr, 0, D3D11_SDK_VERSION, &scd,
                                              &g_swap, &g_device, &fl, &g_context))) {
+        PanelLog("panel: D3D11 device/swapchain create FAILED");
         return 1;
     }
     CreateRenderTarget();
@@ -981,8 +1021,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     LoadIni();
-    CreateParamsMapping(); // adopts previous session's live params if present
+    const bool mappingOk = CreateParamsMapping(); // adopts previous session's live params if present
+    // 探针:启动行(build 戳 + 上一会话遗留 payload 的 seq —— 面板 adopt
+    // 了什么、以及"面板和插件版本是否成对"从此处一行可见)。adopt_seq 在
+    // mapping 之后、首次 WritePayload 之前读,才是上一会话遗留的值。
+    const uint32_t adoptSeq = (mappingOk && g_payload) ? g_payload->seq : 0;
+    if (!mappingOk) PanelLog("panel: params mapping create FAILED");
     WritePayload();        // announce current values to the plugin
+    PanelLog("panel: start build=\"%s %s\" gen=%lu adopt_seq=%u magic=0x%08X",
+             __DATE__, __TIME__,
+             static_cast<unsigned long>(g_generation), static_cast<unsigned>(adoptSeq),
+             static_cast<unsigned>(PAYLOAD_MAGIC));
 
     HANDLE watch = CreateThread(nullptr, 0, ExitWatchProc, nullptr, 0, nullptr);
 
@@ -1058,5 +1107,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (g_context) g_context->Release();
     if (g_device) g_device->Release();
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
+    PanelLog("panel: exit");
     return 0;
 }

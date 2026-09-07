@@ -133,6 +133,7 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook) no
         // RestoreSnippetCallerHook, so leaving the hook armed would serve
         // ERROR_INVALID_FUNCTION from this IAT slot for the whole session
         // and block every future context from installing.
+        OutputDebugStringA("vs_dlssnr: IAT hook null import (GetModuleFileNameW slot is null); hook disarmed\n");
         InterlockedExchangePointer(
             reinterpret_cast<void *volatile *>(hook.iatSlot), original);
         g_originalGetModuleFileNameW.store(nullptr, std::memory_order_release);
@@ -151,6 +152,10 @@ bool RestoreSnippetCallerHook(SnippetCallerHook &hook) noexcept {
     const auto original = g_originalGetModuleFileNameW.load(std::memory_order_acquire);
     DWORD oldProtection = 0;
     if (!hook.iatSlot || !VirtualProtect(hook.iatSlot, sizeof(void *), PAGE_READWRITE, &oldProtection)) {
+        // 探针:恢复失败 = IAT 槽位永远指向 hook(会话内无实际危害,但
+        // "hook 为什么没还原"这类问题需要留痕)。OutputDebugString 层级,
+        // 不引入对 dlssnr_context 的反向依赖。
+        OutputDebugStringA("vs_dlssnr: IAT hook restore FAILED (VirtualProtect); slot left hooked\n");
         return false;
     }
 

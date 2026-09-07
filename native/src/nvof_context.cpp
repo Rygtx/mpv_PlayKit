@@ -745,11 +745,24 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
 }
 
 void NvofContext::WaitCopyIdle() noexcept {
-    // early-return 路径释放槽位前排空在途拷贝(宿主会复用 upload 缓冲)。
+    // early-return 路径释放槽位前 + follow 模式每帧覆写前的排空等待。
+    // 常态瞬间返回(完成值已达标);真正进入等待且 >50ms = 在途拷贝积压,
+    // 留痕(此等待在门外,卡在这里的帧槽位被占着)。
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || _d3d12->IsDeviceLost()) return;
     if (!_lastCopyFence || _copyFence->GetCompletedValue() >= _lastCopyFence) return;
+    LARGE_INTEGER t0{}, t1{}, tf{};
+    QueryPerformanceCounter(&t0);
     _copyFence->SetEventOnCompletion(_lastCopyFence, _copyFenceEvent);
     WaitForSingleObject(_copyFenceEvent, 10000);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&tf);
+    const double waitMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                          static_cast<double>(tf.QuadPart);
+    if (waitMs > 50.0) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "DLSSNR STATUS: nvof copy idle wait=%.0fms (in-flight copy backlog)", waitMs);
+        TimingStatusLine(buf);
+    }
 }
 
 } // namespace vsdlssnr

@@ -110,7 +110,25 @@ bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept {
             LoadLiveParams(p, snap); // shared field mapping, clamps included
             LoadCreateParams(p, snap);
             adopted = true;
+            // 探针:采纳了面板哪一版 payload(#37"seek 后参数回退"的
+            // 决定性证据 —— 采纳失败时这行缺失,配合 create params 行
+            // 立刻看出 fallback 到了 ini 值)。
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: adopt payload seq=%u preset=%d res=%d%% scaling=%d of=%d follow=%d",
+                          snap.seq, p.preset, p.inputResolutionPercent,
+                          p.scalingEnabled ? 1 : 0, p.motionVectorQuality,
+                          p.nvofFollowScaling ? 1 : 0);
+            TimingStatusLine(msg);
         }
+    } else {
+        // 探针:映射在但载荷不可用 = 异常态,必须留痕。magic 不符 =
+        // 面板/插件版本不配对(DSSL5 面板 + DSSL6 插件,成对部署被破坏的
+        // 第一现场);seq==0 = 面板创建映射后尚未写过(崩溃窗口)。
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: adopt skipped (magic=0x%08X seq=%u)",
+                      static_cast<unsigned>(view->magic), static_cast<unsigned>(view->seq));
+        TimingStatusLine(msg);
     }
     UnmapViewOfFile(view);
     CloseHandle(mapping);
@@ -129,6 +147,19 @@ namespace {
 // them (writing Initial() into _cur directly would stomp the create-time
 // fields past the rebuild machinery and leave NGX on the old preset).
 void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
+    // 探针:每次应用的 payload 全量留痕(用户调参是低频事件)。与面板侧
+    // 操作时间对齐后,"滑块动了没生效"可以直接看出是没写进来(seq 没动)、
+    // 被 clamp、还是到了 SharedParams 之后才丢。
+    {
+        char msg[224];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: bridge apply seq=%u gen=%u preset=%d res=%d%% scaling=%d of=%d follow=%d save=%d log=%d",
+                      static_cast<unsigned>(pl.seq), static_cast<unsigned>(pl.generation),
+                      pl.preset, pl.inputResolution, pl.scalingEnabled,
+                      pl.motionVectorQuality, pl.nvofFollowScaling,
+                      pl.saveRequest, pl.logEnabled);
+        TimingStatusLine(msg);
+    }
     DlssnrParams p = state->params->Snapshot();
     LoadLiveParams(p, pl); // shared field mapping (panel_ipc.h), clamps included
     // Create-time params go through Request* only — their _cur side is synced
@@ -150,7 +181,11 @@ void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
             DlssnrParams s = state->params->Snapshot();
             s.preset = state->params->SaveTimePreset();
             s.inputResolutionPercent = state->params->SaveTimeResolution();
-            WriteDlssnrIni(s, iniPath);
+            // 探针:"保存设置"失败(文件被占/权限)此前完全静默,用户以为
+            // 存上了,下次加载却又回到旧值。
+            if (!WriteDlssnrIni(s, iniPath)) {
+                TimingStatusLine("DLSSNR STATUS: save ini FAILED (bridge saveRequest)");
+            }
         }
     }
     SetTimingLogEnabled(pl.logEnabled != 0);
@@ -190,6 +225,14 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
             }
             lastGeneration = g_paramsView->generation;
             lastSeq = g_paramsView->seq; // skip history: apply only future edits
+            // 探针:参数通道建立(首启或面板重启后重开)。
+            {
+                char msg[128];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: bridge mapping open (seq=%u gen=%u)",
+                              static_cast<unsigned>(lastSeq), static_cast<unsigned>(lastGeneration));
+                TimingStatusLine(msg);
+            }
             continue;
         }
 
@@ -198,10 +241,32 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
         // generation resets the seq baseline so restarts never collide with
         // the previous instance's seq history.
         if (g_paramsView->generation != lastGeneration) {
+            // 探针:面板重启边界(#39 面板死亡螺旋的计数锚点 —— 每次重启
+            // 一行,几秒内连出多行 = 面板在反复被拉起)。
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: bridge generation %u -> %u (panel restart)",
+                          static_cast<unsigned>(lastGeneration), static_cast<unsigned>(g_paramsView->generation));
+            TimingStatusLine(msg);
             lastGeneration = g_paramsView->generation;
             lastSeq = 0;
         }
-        if (g_paramsView->magic != PAYLOAD_MAGIC) continue;
+        if (g_paramsView->magic != PAYLOAD_MAGIC) {
+            // 探针:magic 不符 = 面板/插件版本不配对(成对部署被破坏)。
+            // 此前静默 continue,"面板调参完全无效"无任何痕迹。按 magic 值
+            // 边缘去重(同一错值只报一次)。
+            static uint32_t reportedMagic = 0;
+            const uint32_t m = g_paramsView->magic;
+            if (m != reportedMagic) {
+                reportedMagic = m;
+                char msg[160];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: bridge payload magic mismatch (got=0x%08X want=0x%08X); panel/plugin must be deployed as a pair",
+                              static_cast<unsigned>(m), static_cast<unsigned>(PAYLOAD_MAGIC));
+                TimingStatusLine(msg);
+            }
+            continue;
+        }
         if (g_paramsView->seq == 0 || g_paramsView->seq == lastSeq) continue;
         // Snapshot under the writer: copy the payload, then confirm the seq
         // did not move mid-copy (the panel publishes the counter only after
@@ -234,6 +299,8 @@ void LaunchPanelSilently() noexcept {
     const HINSTANCE exec = ShellExecuteW(nullptr, L"open", exePath, nullptr, dir, SW_HIDE);
     if (reinterpret_cast<intptr_t>(exec) <= 32) {
         OutputDebugStringW(L"vs_dlssnr: dlssnr_panel.exe launch failed (missing next to plugin?)\n");
+        // 探针:面板拉起失败此前只进 DebugView;"面板没出现"的排障从这行开始。
+        TimingStatusLine("DLSSNR STATUS: dlssnr_panel.exe launch failed (missing next to plugin?)");
     }
 }
 
@@ -247,10 +314,14 @@ bool BridgeStart(SharedParams *params) noexcept {
         // guaranteed). Transfer ownership here: otherwise BridgeStop(old)
         // below would stop the only bridge and the new instance would never
         // see another panel edit.
+        TimingStatusLine("DLSSNR STATUS: bridge ownership handoff (new filter instance)");
         BridgeStop(g_bridge->params);
     }
     auto *state = new (std::nothrow) BridgeState();
-    if (!state) return false;
+    if (!state) {
+        TimingStatusLine("DLSSNR STATUS: bridge start FAILED (oom)");
+        return false;
+    }
     state->params = params;
     state->running = true;
     // Existence marker for the panel's watchdog: process-lifetime (never
@@ -259,6 +330,7 @@ bool BridgeStart(SharedParams *params) noexcept {
         g_aliveEvent = CreateEventW(nullptr, TRUE, FALSE, ALIVE_EVENT);
         if (!g_aliveEvent) {
             delete state;
+            TimingStatusLine("DLSSNR STATUS: bridge start FAILED (alive event create)");
             return false;
         }
     }
@@ -271,9 +343,13 @@ bool BridgeStart(SharedParams *params) noexcept {
     state->thread = CreateThread(nullptr, 0, BridgeThreadProc, state, 0, nullptr);
     if (!state->thread) {
         delete state;
+        TimingStatusLine("DLSSNR STATUS: bridge start FAILED (thread create)");
         return false;
     }
     g_bridge = state;
+    // 探针:bridge 生命周期锚点(每次 seek 的 stop/start 各一行,与
+    // "hot rebind kept" 行构成完整的 seek 生命周期序列)。
+    TimingStatusLine("DLSSNR STATUS: bridge started");
     // Bring up the independent panel (tray-only, silent start). The panel
     // process is single-instance, so repeated filter loads are no-ops there.
     LaunchPanelSilently();
@@ -295,6 +371,7 @@ void BridgeStop(SharedParams *params) noexcept {
             // of risking a use-after-free; the thread exits on its own once
             // the block clears. The alive event / mapping handles are
             // process-lifetime either way.
+            TimingStatusLine("DLSSNR STATUS: bridge stop TIMED OUT (5s); state leaked, thread wedged");
             g_bridge = nullptr;
             return;
         }
@@ -305,6 +382,7 @@ void BridgeStop(SharedParams *params) noexcept {
     // and the relaunched panel push factory defaults mid-playback. When mpv
     // exits, the kernel reclaims the handles and the panel's OpenEventW poll
     // starts failing — the watchdog semantics are unchanged.
+    TimingStatusLine("DLSSNR STATUS: bridge stopped");
     delete state;
     g_bridge = nullptr;
 }

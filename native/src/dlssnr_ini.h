@@ -14,12 +14,15 @@
 namespace vsdlssnr {
 
 // Persist the parameter profile (the [panel] log toggle is panel-local and
-// stays with the panel).
-inline void WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexcept {
+// stays with the panel). Returns false when any key write failed (file
+// locked / permission) — callers log it; a silent false-save reads back as
+// "settings reset themselves" on the next load.
+inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexcept {
     wchar_t buf[32];
+    bool ok = true;
     auto writeInt = [&](const wchar_t *key, int v) {
         swprintf_s(buf, L"%d", v);
-        WritePrivateProfileStringW(L"dlssnr", key, buf, iniPath);
+        ok = WritePrivateProfileStringW(L"dlssnr", key, buf, iniPath) && ok;
     };
     // std::lround rounds half away from zero; (int)(v*100+0.5) would eat negatives
     auto writeX100 = [&](const wchar_t *key, float v) {
@@ -43,6 +46,7 @@ inline void WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeInt(L"motion_vector_quality", std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax));
     writeInt(L"nvof_follow_scaling", p.nvofFollowScaling ? 1 : 0);
     writeInt(L"saved", 1);
+    return ok;
 }
 
 // Load the saved profile into p (fields absent from the file keep their

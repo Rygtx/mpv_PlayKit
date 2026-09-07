@@ -200,10 +200,26 @@ inline bool PublishStatsJson(const char *json) noexcept {
         if (!mapping) {
             mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
                                          0, PAYLOAD_SIZE, STATS_MAPPING);
-            if (!mapping) return false;
+            if (!mapping) {
+                // 探针:stats 通道建立失败一次(此后每次发布都失败,面板
+                // 永远空 stats —— 只报一次,不刷 DebugView)。
+                static bool warnedCreate = false;
+                if (!warnedCreate) {
+                    warnedCreate = true;
+                    OutputDebugStringA("vs_dlssnr: stats mapping create FAILED; panel stats unavailable\n");
+                }
+                return false;
+            }
         }
         view = static_cast<StatsPayload *>(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, PAYLOAD_SIZE));
-        if (!view) return false;
+        if (!view) {
+            static bool warnedMap = false;
+            if (!warnedMap) {
+                warnedMap = true;
+                OutputDebugStringA("vs_dlssnr: stats mapping MapViewOfFile FAILED\n");
+            }
+            return false;
+        }
     }
     size_t n = strlen(json);
     if (n > sizeof(view->json) - 1) n = sizeof(view->json) - 1;

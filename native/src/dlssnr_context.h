@@ -24,6 +24,9 @@ void SetTimingLogEnabled(bool enabled) noexcept;
 // Exported TimingLog wrapper for nvof_context.cpp(TimingLog 本体在匿名命名空间)。
 void TimingStatusLine(const char *line) noexcept;
 
+// 逐帧级探针开关(VSDLSSNR_PROBE=1);d3d12_context 的 init 细分探针共用。
+bool ProbeEnabled() noexcept;
+
 class DlssnrContext {
 public:
     DlssnrContext() = default;
@@ -161,6 +164,9 @@ private:
     // 每实例一次。存活态(ok / nvof_zero)由周期 stats tick 携带,不走这里。
     // 0 = passthrough,1 = ngx_faulted,-1 = 尚未发布过。
     std::atomic<int> _lastDeadState{ -1 };
+    // 最近一次进入 ProcessFrame 的帧号(recreate/错误 STATUS 行带上它,
+    // 用户"第几秒看到异常"即可与 timing log 的帧号对上)。
+    std::atomic<int> _lastFrameN{ -1 };
 };
 
 } // namespace vsdlssnr

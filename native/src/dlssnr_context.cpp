@@ -136,10 +136,20 @@ namespace {
 wchar_t g_timingLogPath[MAX_PATH] = L"";
 FILE *g_timingLogFile = nullptr;
 
+// 前置声明:SetTimingLogEnabled 的翻转留痕要在定义之前调用 TimingLog。
+void TimingLog(const char *line) noexcept;
+
 } // namespace
 
 void SetTimingLogEnabled(bool enabled) noexcept {
+    const bool prev = g_timingLogEnabled.load(std::memory_order_relaxed);
+    if (prev == enabled) return;
+    // 翻转本身留痕:日志中段的"空白期"从此可以定责(面板关了开关),
+    // 而不是被误读为"插件没写日志"。OFF 必须在翻标志之前写(标志关了
+    // TimingLog 直接 no-op)。
+    if (!enabled) TimingLog("DLSSNR STATUS: timing log disabled (panel toggle)");
     g_timingLogEnabled.store(enabled, std::memory_order_relaxed);
+    if (enabled) TimingLog("DLSSNR STATUS: timing log enabled (panel toggle)");
     if (!enabled) {
         std::lock_guard<std::mutex> lock(g_timingMutex);
         if (g_timingLogFile) {
@@ -164,14 +174,45 @@ void TimingLog(const char *line) noexcept {
                    std::filesystem::path(dir).parent_path().c_str());
     }
     if (!g_timingLogFile) {
-        if (_wfopen_s(&g_timingLogFile, g_timingLogPath, L"a") != 0 || !g_timingLogFile) return;
+        if (_wfopen_s(&g_timingLogFile, g_timingLogPath, L"a") != 0 || !g_timingLogFile) {
+            // 探针:日志自身打不开(磁盘满/文件被锁)只报一次 —— 否则每行
+            // 静默丢失,"日志里怎么没有"无从查起。
+            static bool warnedOpen = false;
+            if (!warnedOpen) {
+                warnedOpen = true;
+                OutputDebugStringA("vs_dlssnr: timing log open FAILED (disk full? file locked?)\n");
+            }
+            return;
+        }
+        // 会话头:标记这份日志来自哪个二进制。#35(部署错位置/旧时间戳
+        // 误判)与 #44(增量编译陈旧造成 ABI 撕裂)两起事故的定位成本都
+        // 卡在"这份日志是不是新代码写的" —— build 戳 + pid + 协议 magic
+        // 一行定案。flags 回显诊断环境变量现场:忘关的 SKIP_EVAL/DUMP
+        // 会把测量结论整个带偏,这里直接留痕。重新打开(面板开关 OFF→ON)
+        // 会再写一条,顺带标记续写点。
+        const auto envOn = [](const char *name) {
+            return GetEnvironmentVariableA(name, nullptr, 0) != 0;
+        };
+        char header[256];
+        snprintf(header, sizeof(header),
+                 "DLSSNR STATUS: session start pid=%lu build=\"%s %s\" payload_magic=0x%08X flags=[%s%s%s%s%s]",
+                 GetCurrentProcessId(), __DATE__, __TIME__,
+                 static_cast<unsigned>(PAYLOAD_MAGIC),
+                 envOn("VSDLSSNR_DUMP") ? " dump" : "",
+                 envOn("VSDLSSNR_SKIP_EVAL") ? " skip_eval" : "",
+                 envOn("VSDLSSNR_D3D12_DEBUG") ? " d3d12_debug" : "",
+                 envOn("VSDLSSNR_NGX_LOG") ? " ngx_log" : "",
+                 envOn("VSDLSSNR_PROBE") ? " probe" : "");
+        fwrite(header, 1, strlen(header), g_timingLogFile);
+        fputc('\n', g_timingLogFile);
+        fflush(g_timingLogFile);
     }
     // Timestamp every line: the log is append-only across sessions and hosts,
     // and without timestamps a recreate storm cannot be attributed to the
     // session that caused it.
     SYSTEMTIME st;
     GetLocalTime(&st);
-    char stamped[336];
+    char stamped[512];
     snprintf(stamped, sizeof(stamped), "[%02u:%02u:%02u.%03u] %s",
              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
     fwrite(stamped, 1, strlen(stamped), g_timingLogFile);
@@ -186,8 +227,9 @@ void TimingLog(const char *line) noexcept {
 // STATUS 行(失败必须进 timing log —— 跨进程观测只认它)。
 void TimingStatusLine(const char *line) noexcept { TimingLog(line); }
 
-// 临时管线探针(VSDLSSNR_PROBE=1 启用;逐帧行会淹没 perf 行,平时关)
-static bool ProbeEnabled() noexcept {
+// 逐帧级探针开关(VSDLSSNR_PROBE=1 启用;逐帧行会淹没 perf 行,平时关)。
+// 导出到头文件供 d3d12_context 的 init 期细分探针共用。
+bool ProbeEnabled() noexcept {
     static const bool on = GetEnvironmentVariableA("VSDLSSNR_PROBE", nullptr, 0) != 0;
     return on;
 }
@@ -213,11 +255,14 @@ struct TimingWindow {
     double nvof[120]{};
     double evalCpu[120]{};
     double unpack[120]{};
+    double slotW[120]{}; // AcquireSlot 等待(池耗尽 = 吞吐瓶颈第一现场)
+    double lockW[120]{}; // _evaluateMutex 等待(NGX 单例串行化的排队)
     int count = 0;
     int idx = 0;
 
-    void Push(double g, double p, double n, double e, double u) noexcept {
+    void Push(double g, double p, double n, double e, double u, double sw, double lw) noexcept {
         gpu[idx] = g; pack[idx] = p; nvof[idx] = n; evalCpu[idx] = e; unpack[idx] = u;
+        slotW[idx] = sw; lockW[idx] = lw;
         idx = (idx + 1) % 120;
         if (count < 120) ++count;
     }
@@ -469,6 +514,27 @@ bool DlssnrContext::Initialize(
         ngxDllPath, nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!_snippetModule) return fail("LoadLibraryExW(nvngx_dlssnr.dll) failed");
+    // 探针:snippet 模型文件的部署指纹(大小 + 修改时间)。模型 DLL 与
+    // 插件/面板是三件套分离部署,#11 模型 fallback、装错/装旧模型这类
+    // 问题从这一行直接核对。
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetFileAttributesExW(ngxDllPath, GetFileExInfoStandard, &fa)) {
+            SYSTEMTIME stUtc{}, stLoc{};
+            FileTimeToSystemTime(&fa.ftLastWriteTime, &stUtc);
+            SystemTimeToTzSpecificLocalTime(nullptr, &stUtc, &stLoc);
+            ULARGE_INTEGER sz{};
+            sz.HighPart = fa.nFileSizeHigh;
+            sz.LowPart = fa.nFileSizeLow;
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: snippet dll %llu bytes mtime=%04u-%02u-%02u %02u:%02u:%02u",
+                          static_cast<unsigned long long>(sz.QuadPart),
+                          stLoc.wYear, stLoc.wMonth, stLoc.wDay,
+                          stLoc.wHour, stLoc.wMinute, stLoc.wSecond);
+            TimingLog(msg);
+        }
+    }
 
     _snippetInitExt = reinterpret_cast<SnippetInitExtFn>(
         GetProcAddress(_snippetModule, "NVSDK_NGX_D3D12_Init_Ext"));
@@ -595,8 +661,10 @@ bool DlssnrContext::Initialize(
         _curPreset = p.preset;
         _curRes = p.inputResolutionPercent;
         _curScaling = p.scalingEnabled;
-        char msg[160];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: Feature=18 created=true path=signed-snippet %dx%d disabled=false", _width, _height);
+        char msg[288];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: Feature=18 created=true path=signed-snippet %dx%d disabled=false gpu=%.60s",
+                      _width, _height, _gpuNameUtf8);
         DbgLine(msg);
         // Rebind/RecreateFeature already log through TimingLog; log the cold
         // path too so the three lifecycle outcomes are distinguishable in
@@ -716,10 +784,12 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         _ready.store(false, std::memory_order_release);
         return false;
     }
-    char msg[128];
-    snprintf(msg, sizeof(msg), "DLSSNR STATUS: preset=%d res=%d%% scaling=%d feature recreated%s",
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+             "DLSSNR STATUS: preset=%d res=%d%% scaling=%d internal=%dx%d feature recreated%s frame=%d",
              preset, scalingEnabled ? resPercent : 100, scalingEnabled,
-             resize ? " (size changed)" : "");
+             _d3d12->InternalWidth(), _d3d12->InternalHeight(),
+             resize ? " (size changed)" : "", _lastFrameN.load(std::memory_order_relaxed));
     DbgLine(msg);
     TimingLog(msg);
     _curPreset = preset;
@@ -837,10 +907,11 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *er
             (ofq > 0 && _nvofFailed)) {
             RebuildNvof(ofq, nvW, nvH, err, errLen); // 失败仅降级零 guidance,热复用不受影响
         }
-        char msg[128];
+        char msg[160];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%d)",
-                      _curPreset, _curScaling ? _curRes : 100, _curScaling, _curOfQuality, _width, _height);
+                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%d internal=%dx%d)",
+                      _curPreset, _curScaling ? _curRes : 100, _curScaling, _curOfQuality,
+                      _width, _height, _d3d12->InternalWidth(), _d3d12->InternalHeight());
         DbgLine(msg);
         TimingLog(msg);
         return true;
@@ -893,6 +964,8 @@ bool DlssnrContext::ProcessFrame(
         }
         return false;
     }
+    // 帧号打点(本帧后续 recreate/失败 STATUS 行的关联锚点)。
+    _lastFrameN.store(n, std::memory_order_relaxed);
     // 帧序不连续性(乱序/回退/大跳)全部由 NvofContext 的帧序门自愈:到达帧
     // 与 _nextSeq(上一完成帧+1)不匹配即播种(零 guidance),链下一帧立即
     // 恢复 —— 曾在此按 lastN 差值触发 ResetHistory,但全量重置会连带清掉
@@ -932,6 +1005,8 @@ bool DlssnrContext::ProcessFrame(
     // receives a per-frame segment string for the VS-log channel.
     const bool vsTiming = timingOut && timingLen > 0;
     LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3{}, t4{};
+    LARGE_INTEGER tSlot0{}, tSlot1{}; // AcquireSlot 等待(perf 行 slot=)
+    LARGE_INTEGER tLock0{}, tLock1{}; // evaluate 互斥等待(perf 行 lock=)
     QueryPerformanceFrequency(&qpcFreq);
     {
         // Frame-cadence tick at the real frame entry (before a possible
@@ -947,7 +1022,12 @@ bool DlssnrContext::ProcessFrame(
     // (command list, staging, textures). The queue serializes the GPU work in
     // submit order, so slots overlap CPU pack/unpack with other slots' GPU
     // time instead of idling it away between frames.
+    // 探针:AcquireSlot 等待 = 槽池耗尽时长(3 槽全在飞)。吞吐类问题
+    // (启动低帧率/丢帧,#31 类)的第一现场:gpu 段正常而 slot 等待大 =
+    // GPU 超容量;两者都小而 fps 低 = 宿主侧问题。
+    QueryPerformanceCounter(&tSlot0);
     FrameSlot *slot = _d3d12->AcquireSlot();
+    QueryPerformanceCounter(&tSlot1);
     struct SlotGuard {
         D3D12Context *ctx;
         FrameSlot *s;
@@ -1142,7 +1222,11 @@ bool DlssnrContext::ProcessFrame(
         // evaluate across concurrent frame threads. GPU dispatches recorded on
         // this slot's list still run overlapped with other slots' work.
         if (ProbeEnabled()) TimingStatusLine("PROBE: pre-eval-lock"); // 临时探针(VSDLSSNR_PROBE=1)
+        // 探针:evaluate 互斥等待。eval_cpu 段包含它(无法从分段里拆出),
+        // 这里单独测量:"NGX CPU 变慢"与"被别的槽的 evaluate 排队"由此分家。
+        QueryPerformanceCounter(&tLock0);
         std::lock_guard<std::mutex> evalLock(_evaluateMutex);
+        QueryPerformanceCounter(&tLock1);
         if (ProbeEnabled()) TimingStatusLine("PROBE: eval-locked"); // 临时探针(VSDLSSNR_PROBE=1)
         DWORD sehCode = 0;
         // NGX PARAM_RESET 只由帧序门的播种帧携带(大跳/回退/缺口的恢复路径)。
@@ -1365,19 +1449,28 @@ bool DlssnrContext::ProcessFrame(
                     // footprint 格式必须与源一致,跨格式会 E_INVALIDARG
                     // (memory #30 同族坑)。颜色 dump 统一显式传 BGRA8。
                     constexpr DXGI_FORMAT kColorDump = DXGI_FORMAT_B8G8R8A8_UNORM;
-                    _d3d12->DumpTextureToFile(_d3d12->InputColor(*slot), width, height,
-                                              (base / L"dump_input.bin").c_str(), kColorDump);
+                    // 探针:dump 失败逐个留痕(footprint/格式不匹配时
+                    // CopyTextureRegion 静默 E_INVALIDARG,#41-④ 同族坑;
+                    // "dump 文件缺失/尺寸不对"从这行直接定位)。
+                    auto dumpOrLog = [&](ID3D12Resource *tex, int w, int h,
+                                         const wchar_t *name, DXGI_FORMAT fmt) {
+                        if (!_d3d12->DumpTextureToFile(tex, w, h, (base / name).c_str(), fmt)) {
+                            char msg[160];
+                            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED", name);
+                            TimingStatusLine(msg);
+                        }
+                    };
+                    dumpOrLog(_d3d12->InputColor(*slot), width, height, L"dump_input.bin", kColorDump);
                     if (scaling) {
-                        _d3d12->DumpTextureToFile(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
-                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_color.bin").c_str(), kColorDump);
-                        _d3d12->DumpTextureToFile(_d3d12->ReducedDenoised(*slot), _d3d12->InternalWidth(),
-                                                  _d3d12->InternalHeight(), (base / L"dump_reduced_denoised.bin").c_str(), kColorDump);
-                        _d3d12->DumpTextureToFile(_d3d12->HorizontalRes(*slot), width,
-                                                  _d3d12->InternalHeight(), (base / L"dump_horizontal.bin").c_str(),
-                                                  DXGI_FORMAT_R16G16B16A16_FLOAT);
+                        dumpOrLog(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
+                                  _d3d12->InternalHeight(), L"dump_reduced_color.bin", kColorDump);
+                        dumpOrLog(_d3d12->ReducedDenoised(*slot), _d3d12->InternalWidth(),
+                                  _d3d12->InternalHeight(), L"dump_reduced_denoised.bin", kColorDump);
+                        dumpOrLog(_d3d12->HorizontalRes(*slot), width,
+                                  _d3d12->InternalHeight(), L"dump_horizontal.bin",
+                                  DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
-                    _d3d12->DumpTextureToFile(_d3d12->OutputColor(*slot), width, height,
-                                              (base / L"dump_output.bin").c_str(), kColorDump);
+                    dumpOrLog(_d3d12->OutputColor(*slot), width, height, L"dump_output.bin", kColorDump);
                 }
             }
         }
@@ -1403,7 +1496,9 @@ bool DlssnrContext::ProcessFrame(
         char line[384] = "";
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
-            g_timing.Push(gpuWaitMs, packMs, nvofMs, evalOnlyMs, unpackMs);
+            const double slotWaitMs = ms(tSlot0, tSlot1, qpcFreq);
+            const double lockWaitMs = ms(tLock0, tLock1, qpcFreq);
+            g_timing.Push(gpuWaitMs, packMs, nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
             static int statFrames = 0;
             if (++statFrames % 60 == 1) {
                 const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
@@ -1414,8 +1509,10 @@ bool DlssnrContext::ProcessFrame(
                 const double nvofEma = TimingWindow::Ema(g_timing.nvof, g_timing.count);
                 const double evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
                 const double unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
+                const double slotEma = TimingWindow::Ema(g_timing.slotW, g_timing.count);
+                const double lockEma = TimingWindow::Ema(g_timing.lockW, g_timing.count);
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f unpack=%.1f | res=%d%% of=%d %dx%d",
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f unpack=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f | res=%d%% of=%d %dx%d f=%d fps=%.0f",
                          gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
                          _nvof ? _nvof->LastGateWaitMs() : 0.0,
                          _nvof ? _nvof->LastCpyWaitMs() : 0.0,
@@ -1424,12 +1521,18 @@ bool DlssnrContext::ProcessFrame(
                          _nvof ? _nvof->GateExpired() : 0u,
                          _nvof ? _nvof->ResetCount() : 0u,
                          evalCpuEma, unpackEma,
+                         slotEma, g_timing.slotW[lastIdx],
+                         lockEma, g_timing.lockW[lastIdx],
                          std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
                          _curOfQuality,
-                         _width, _height);
+                         _width, _height,
+                         _lastFrameN.load(std::memory_order_relaxed),
+                         _d3d12->FrameRateWindow());
                 // nvof=ema/last;后缀 g/c/e = 门等待/前帧拷贝等待/引擎输出等待,
-                // s/x = 门超时跳帧/过期帧累计(临时探针,定位 seek 后持续掉帧,
-                // 与 NvofContext 内探针同期删除)。
+                // s/x/r = 门跳帧/过期帧/历史重置累计(探针保留:时序类问题的
+                // 第一手证据)。slot/lock = 槽池等待 / evaluate 互斥等待
+                // (ema/last);f = 本行前一帧的帧号(与 STATUS 行对齐用);
+                // fps = 1s 窗口帧入口计数,处理帧率 < 源帧率 = 宿主侧没来帧。
 
                 // stats via named shared memory (no disk IO; panel reads directly).
                 // Keys are the SK_* constants from panel_ipc.h, interpolated
@@ -1470,6 +1573,16 @@ void DlssnrContext::PublishDeadState(const char *state, const char *detail) noex
     if (_lastDeadState.exchange(code) == code) return;
     char safe[288];
     SanitizeJsonDetail(detail, safe, sizeof(safe));
+    // 探针:死亡状态边缘进 timing log(边缘触发 = 不刷屏)。此前 init
+    // 失败/帧早退的原因串只走 VS logMessage(GUI mpv 不透传)+ stats,
+    // timing log 完全空白 —— "为什么回退直通"只能靠猜。
+    {
+        char msg[384];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dead state=%s%s%.180s",
+                      state, safe[0] ? " detail=" : "", safe);
+        TimingLog(msg);
+        DbgLine(msg);
+    }
     char body[512];
     if (safe[0]) {
         std::snprintf(body, sizeof(body), "{\"%s\":\"%s\",\"%s\":\"%.200s\"}",
@@ -1481,6 +1594,14 @@ void DlssnrContext::PublishDeadState(const char *state, const char *detail) noex
 }
 
 void DlssnrContext::Shutdown() noexcept {
+    // 探针:Shutdown 只在停用路径运行(热上下文刻意泄漏,永不走到这)。
+    // 每次出现都是生命周期事件:parked 上下文排干 / 故障隔离 / 直通实例释放。
+    {
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: ngx shutdown (faulted=%d ready=%d)",
+                      NgxRuntimeGuard::IsFaulted() ? 1 : 0, _ready.load(std::memory_order_relaxed) ? 1 : 0);
+        TimingLog(msg);
+    }
     // NVOF 会话:不调用 nvOFDestroy(销毁后继续进程存活期的 GPU 工作
     // 会触发驱动访问违例,见 _retiredNvof 注释)—— 弃引用,随进程退出
     // 由 OS 回收。宿主重启才是真实的生命周期终点。
@@ -1521,13 +1642,27 @@ void DlssnrContext::Shutdown() noexcept {
         const NVSDK_NGX_Result r = SnippetShutdownSafely(&sehCode);
         // A final shutdown failure is equally unsafe to retry (upstream marks
         // this state non-recoverable) — latch the process.
-        if (sehCode || !NVSDK_NGX_SUCCEED(r)) NgxRuntimeGuard::MarkShutdownFailed();
+        if (sehCode || !NVSDK_NGX_SUCCEED(r)) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: snippet Shutdown1 FAILED (r=0x%x seh=0x%x); process latched",
+                          static_cast<unsigned>(r), static_cast<unsigned>(sehCode));
+            TimingLog(msg);
+            NgxRuntimeGuard::MarkShutdownFailed();
+        }
         _snippetInitialized = false;
     }
     if (_coreInitialized && _d3d12) {
         DWORD sehCode = 0;
         const NVSDK_NGX_Result r = CoreShutdownSafely(_d3d12->Device(), &sehCode);
-        if (sehCode || !NVSDK_NGX_SUCCEED(r)) NgxRuntimeGuard::MarkShutdownFailed();
+        if (sehCode || !NVSDK_NGX_SUCCEED(r)) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: core Shutdown1 FAILED (r=0x%x seh=0x%x); process latched",
+                          static_cast<unsigned>(r), static_cast<unsigned>(sehCode));
+            TimingLog(msg);
+            NgxRuntimeGuard::MarkShutdownFailed();
+        }
         _coreInitialized = false;
     }
     RestoreSnippetCallerHook(_hook);

@@ -144,6 +144,10 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             char msg[512];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", n, err);
             vsapi->logMessage(mtWarning, msg, core);
+            // 探针:首帧失败进 timing log(GUI mpv 完全看不到 logMessage;
+            // 此前 PackInput/BeginFrameRecording 等不自带留痕的失败路径在这
+            // 里是唯一记录,而记录通道本身不可见)。latch 保证不刷屏。
+            vsdlssnr::TimingStatusLine(msg);
         }
         // Failed frames fall back to a plain copy of the source content so the
         // output planes are never left uninitialized.
@@ -190,6 +194,13 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().width = d->width;
         Hot().height = d->height;
         Hot().valid = true;
+        // 探针:停放行 —— 与下一次 create 的 "hot rebind kept"/"re-init"
+        // 行配对,seek 生命周期序列(bridge stopped → freed → started →
+        // rebind)在 timing log 里闭环;mpv 在停放后退出也有尾行可查。
+        char msg[96];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: filter freed (hot parked %dx%d)",
+                      d->width, d->height);
+        vsdlssnr::TimingStatusLine(msg);
     }
     delete d;
 }
@@ -242,8 +253,21 @@ static void VS_CC DlssnrCreate(
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
     // the bridge poll skips the existing payload (history), so the panel's
     // parameters only came back after touching the panel again.
-    vsdlssnr::BridgeLoadIni(initial);
-    vsdlssnr::BridgeAdoptPanelPayload(initial);
+    const bool iniLoaded = vsdlssnr::BridgeLoadIni(initial);
+    const bool payloadAdopted = vsdlssnr::BridgeAdoptPanelPayload(initial);
+    // 探针:三层参数源(vpy 默认 → ini → 面板 payload)的最终裁决值。
+    // "参数没生效/拖进度条回去了"类问题(#37)一行定位:ini/payload 哪层
+    // 参与了、create-time 三元组最终是什么,一眼可查。
+    {
+        char msg[224];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: create params %dx%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d",
+                      d->width, d->height, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
+                      initial.preset, initial.inputResolutionPercent,
+                      initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
+                      initial.nvofFollowScaling ? 1 : 0);
+        vsdlssnr::TimingStatusLine(msg);
+    }
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
 
     int dllErr = 0;
@@ -296,6 +320,7 @@ static void VS_CC DlssnrCreate(
                 vsapi->logMessage(mtWarning,
                                   "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
                                   core);
+                vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
             }
             char msg[128];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr ready from hot context (%dx%d)", d->width, d->height);
@@ -306,6 +331,7 @@ static void VS_CC DlssnrCreate(
             char msg[512];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr hot rebind failed, re-initializing: %s", err);
             vsapi->logMessage(mtWarning, msg, core);
+            vsdlssnr::TimingStatusLine(msg); // GUI mpv 不透传 logMessage,失败必须进 timing log
             d->ngx.reset();
             d->d3d12.reset();
         }
@@ -335,6 +361,7 @@ static void VS_CC DlssnrCreate(
                 vsapi->logMessage(mtWarning,
                                   "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
                                   core);
+                vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
             }
             char msg[128];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
@@ -344,6 +371,7 @@ static void VS_CC DlssnrCreate(
             std::snprintf(msg, sizeof(msg),
                           "vs_dlssnr init failed, falling back to passthrough: %s", err);
             vsapi->logMessage(mtWarning, msg, core);
+            vsdlssnr::TimingStatusLine(msg); // GUI mpv 不透传 logMessage,失败必须进 timing log
             OutputDebugStringA("vs_dlssnr: init failed: ");
             OutputDebugStringA(err);
             OutputDebugStringA("\n");

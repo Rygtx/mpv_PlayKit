@@ -20,13 +20,6 @@ float Saturate(float v) noexcept {
     return v < 1.0f ? v : 1.0f;
 }
 
-// 临时探针(定位 DEVICE_HUNG 时序用,验证后删除)
-void DbgProbe(const char *what) noexcept {
-    fprintf(stderr, "[probe %llu] %s\n",
-            static_cast<unsigned long long>(GetTickCount64()), what);
-    fflush(stderr);
-}
-
 } // namespace
 
 D3D12Context::~D3D12Context() { Finalize(); }
@@ -187,6 +180,8 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
 }
 
 void D3D12Context::Finalize() noexcept {
+    // 探针:D3D12 上下文销毁只发生在 parked 上下文排干/非热路径释放。
+    if (_device) TimingStatusLine("DLSSNR STATUS: d3d12 context finalized");
     if (_queue && _fence) {
         // Best-effort drain so the GPU is idle before releasing command objects.
         const uint64_t v = _fenceValue.fetch_add(1) + 1;
@@ -280,8 +275,13 @@ bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_
             SetErr(err, errLen, E_FAIL, "SetEventOnCompletion failed");
             return false;
         }
+        LARGE_INTEGER w0{}, w1{}, wf{};
+        QueryPerformanceCounter(&w0);
         // 10s timeout: a device removal would never signal -> don't wait forever
-        if (WaitForSingleObject(event, 10000) != WAIT_OBJECT_0) {
+        const DWORD wr = WaitForSingleObject(event, 10000);
+        QueryPerformanceCounter(&w1);
+        QueryPerformanceFrequency(&wf);
+        if (wr != WAIT_OBJECT_0) {
             HRESULT rr = _device ? _device->GetDeviceRemovedReason() : E_FAIL;
             char buf[160];
             snprintf(buf, sizeof(buf),
@@ -304,6 +304,16 @@ bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_
             OutputDebugStringA("\n");
             SetErr(err, errLen, E_FAIL, buf);
             return false;
+        }
+        // 探针:恢复型 GPU 停顿(TDR 恢复/驱动内部同步/着色器首次编译)
+        // 不超时、不报错,此前完全不可见。>200ms 的"成功"等待同样是异常。
+        const double waitMs = static_cast<double>(w1.QuadPart - w0.QuadPart) * 1000.0 /
+                              static_cast<double>(wf.QuadPart);
+        if (waitMs > 200.0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "DLSSNR STATUS: fence wait slow=%.0fms value=%llu",
+                     waitMs, static_cast<unsigned long long>(value));
+            TimingStatusLine(buf);
         }
     }
     return true;
@@ -334,8 +344,22 @@ D3D12Context::PoolHold::PoolHold(D3D12Context &ctx) noexcept : _ctx(&ctx) {
     // the resources the holder is about to replace. Waiting for the drain
     // inside the same lock is safe — the frames still in flight never take
     // _poolMutex again (they already own their slot), they just release.
+    // 探针:排空等待 = recreate 的顿挫主体(#32 的"切档帧一次性顿挫")。
+    // 每次切预设/滑块一行,量化换挡停顿;若在无用户操作时出现 = 有东西在
+    // 反复触发重建。
+    LARGE_INTEGER t0{}, t1{}, tf{};
+    QueryPerformanceCounter(&t0);
     _lock = std::unique_lock<std::mutex>(_ctx->_poolMutex);
     _ctx->_poolCv.wait(_lock, [&ctx] { return ctx._freeCount == kSlotCount; });
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&tf);
+    const double waitMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                          static_cast<double>(tf.QuadPart);
+    if (waitMs > 20.0) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "DLSSNR STATUS: pool drain wait=%.0fms (recreate stall)", waitMs);
+        TimingStatusLine(buf);
+    }
 }
 
 D3D12Context::PoolHold::~PoolHold() noexcept {
@@ -390,7 +414,7 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
         return false;
     }
 
-    DbgProbe("frame-res: before clear");
+    if (ProbeEnabled()) TimingStatusLine("PROBE: d3d12 frame-res before clear"); // init 细分(DEVICE_HUNG 时序定位)
     {
         D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
         rtvDesc.NumDescriptors = 2;
@@ -434,13 +458,21 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
         }
     }
 
-    DbgProbe("frame-res: before slot loop");
+    if (ProbeEnabled()) TimingStatusLine("PROBE: d3d12 frame-res before slot loop");
     for (int i = 0; i < kSlotCount; ++i) {
-        DbgProbe("slot loop: begin");
+        if (ProbeEnabled()) {
+            char pb[48];
+            snprintf(pb, sizeof(pb), "PROBE: d3d12 slot %d begin", i);
+            TimingStatusLine(pb);
+        }
         if (!CreateSlotResources(_slots[i], err, errLen)) return false;
-        DbgProbe("slot loop: end");
+        if (ProbeEnabled()) {
+            char pb[48];
+            snprintf(pb, sizeof(pb), "PROBE: d3d12 slot %d done", i);
+            TimingStatusLine(pb);
+        }
     }
-    DbgProbe("frame-res: after slot loop");
+    if (ProbeEnabled()) TimingStatusLine("PROBE: d3d12 frame-res done");
     // Seed the free stack (LIFO) — the pool starts fully free. Without this,
     // the first DrainSlots (RebuildScaling during Initialize) would wait
     // forever for slots that were never handed out.
@@ -816,7 +848,22 @@ bool D3D12Context::SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence,
     // ExecuteCommandLists order — concurrent frame threads must not let a
     // later Signal (smaller value) land after an earlier one (fence values
     // must never regress).
+    // 探针:提交互斥等待(3 槽并发提交在此串行)。>50ms = 提交路径拥塞,
+    // 与 GPU 执行慢(gpu 段)分家。
+    LARGE_INTEGER s0{}, s1{}, sf{};
+    QueryPerformanceCounter(&s0);
     std::lock_guard<std::mutex> lock(_submitMutex);
+    QueryPerformanceCounter(&s1);
+    QueryPerformanceFrequency(&sf);
+    {
+        const double waitMs = static_cast<double>(s1.QuadPart - s0.QuadPart) * 1000.0 /
+                              static_cast<double>(sf.QuadPart);
+        if (waitMs > 50.0) {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "DLSSNR STATUS: submit mutex wait=%.0fms (slots contending)", waitMs);
+            TimingStatusLine(buf);
+        }
+    }
     // NVOF guidance:本槽 densify 依赖 NVOF execute 的 flow 输出 —— 队列级
     // 栅栏等待(顺序无关:常规顺序下该值已满足,零开销;乱序提交时它把本
     // 槽命令排到 NVOF 输出之后,防 GPU 端读-写竞争)。
