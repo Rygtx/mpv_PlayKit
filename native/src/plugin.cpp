@@ -235,6 +235,8 @@ static void VS_CC DlssnrCreate(
     ApplyFlagArg(in, vsapi, "scaling_enabled", initial.scalingEnabled);
     // NVOF 光流质量 0-5(0 = 零 guidance);>0 且驱动支持时启用真运动矢量
     ApplyIntArg(in, vsapi, "motion_vector_quality", initial.motionVectorQuality, kOfQualityMin, kOfQualityMax);
+    // 光流输入跟随内部降采样(scaling 启用时 NVOF 按内部尺寸计算)
+    ApplyFlagArg(in, vsapi, "nvof_follow_scaling", initial.nvofFollowScaling);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
@@ -397,7 +399,8 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "reflection_glow:float:opt;"
         "scaling_enabled:int:opt;"
         "input_resolution:int:opt;"
-        "motion_vector_quality:int:opt;",
+        "motion_vector_quality:int:opt;"
+        "nvof_follow_scaling:int:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);
 }

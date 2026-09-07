@@ -25,6 +25,7 @@ Scaling_Enabled = True
 Input_Resolution = 100
 Residual_Multiplier = 1.0
 Motion_Vector_Quality = 0
+Nvof_Follow_Scaling = False
 H_Max = 0
 ## <0-3> 整数, NR 预设档位
 ## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
@@ -73,6 +74,7 @@ else :
 		input_resolution = Input_Resolution,
 		residual_multiplier = Residual_Multiplier,
 		motion_vector_quality = Motion_Vector_Quality,
+		nvof_follow_scaling = int(Nvof_Follow_Scaling),
 	)
 	ret = core.resize.Bilinear(clip=rgb, format=clip.format.id, matrix_s="709")
 

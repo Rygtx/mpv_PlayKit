@@ -21,12 +21,13 @@ constexpr wchar_t PARAMS_EVENT[] = L"vs_dlssnr_panel_params_event"; // auto-rese
 constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";             // saved profile (written/read by both sides)
 constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive"; // filter-lifetime marker (bridge + panel watchdog)
 constexpr uint32_t PAYLOAD_SIZE = 512;
-// "DSSL5": v3 added the four residual fine-control floats; v4 drops the
+// "DSSL6": v3 added the four residual fine-control floats; v4 drops the
 // write-only resetRequest command field (a reset is just a payload full of
-// default values); v5 adds motionVectorQuality (NVOF 光流质量 0-5). The bump
-// keeps mixed-version panel/plugin pairs from decoding shifted offsets as
-// valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x354C5344u; // "DSSL5"
+// default values); v5 adds motionVectorQuality (NVOF 光流质量 0-5); v6 adds
+// nvofFollowScaling (光流输入跟随内部降采样)。The bump keeps mixed-version
+// panel/plugin pairs from decoding shifted offsets as valid payloads — panel
+// and plugin must be deployed as a pair.
+constexpr uint32_t PAYLOAD_MAGIC = 0x364C5344u; // "DSSL6"
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -52,7 +53,8 @@ struct PanelPayload {
     int32_t saveRequest;         // panel "保存设置" press (applied once per seq)
     int32_t logEnabled;          // perf log toggle state
     int32_t motionVectorQuality; // 0-5 (0 = 无光流)
-    uint32_t reserved[2];
+    int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
+    uint32_t reserved[1];
 };
 #pragma pack(pop)
 
@@ -80,6 +82,7 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.shadowStructureMultiplier = std::clamp(pl.shadowStructure, kResidualFineMin, kResidualFineMax);
     p.reflectionGlowMultiplier = std::clamp(pl.reflectionGlow, kResidualFineMin, kResidualFineMax);
     p.motionVectorQuality = std::clamp(pl.motionVectorQuality, kOfQualityMin, kOfQualityMax);
+    p.nvofFollowScaling = pl.nvofFollowScaling != 0;
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
@@ -108,6 +111,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.shadowStructure = p.shadowStructureMultiplier;
     pl.reflectionGlow = p.reflectionGlowMultiplier;
     pl.motionVectorQuality = p.motionVectorQuality;
+    pl.nvofFollowScaling = p.nvofFollowScaling ? 1 : 0;
     return pl;
 }
 

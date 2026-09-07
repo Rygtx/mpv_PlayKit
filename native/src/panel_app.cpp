@@ -91,6 +91,7 @@ constexpr struct { const char *key; const char *label; const char *tip;
 constexpr struct { const char *label; const char *tip; int DlssnrParams::*field; } kFlags[] = {
     { "自动蒙版",     "自动蒙版。模型自动识别区域并区别处理。", &DlssnrParams::useAutoMask },
     { "UI 文字修正", "UI 修正。降低对画面内文字/UI 元素的涂抹。", &DlssnrParams::uiCorrection },
+    { "光流跟随降采样", "光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。", &DlssnrParams::nvofFollowScaling },
 };
 // clang-format on
 

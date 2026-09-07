@@ -58,7 +58,7 @@ public:
     // 毫秒级),NGX feature 不动。quality == 0 时销毁会话回退零 guidance;
     // 会话建立失败时优雅降级(记档位防逐帧重试风暴)。内部自取 PoolHold:
     // 调用方必须尚未持有槽位,且不得已在 PoolHold 之中。
-    bool RebuildNvof(int quality, char *err, size_t errLen) noexcept;
+    bool RebuildNvof(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept;
     // 光流历史失效(seek = 新时间线)。热 Rebind 上调用;下一帧重新播种。
     void ResetNvofHistory() noexcept;
 

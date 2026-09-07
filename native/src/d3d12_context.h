@@ -63,6 +63,12 @@ struct FrameSlot {
 
     ComPtr<ID3D12Resource> upload;    // RGBA8 staging, persist-mapped
     void *uploadMapped = nullptr;
+    // 光流跟随降采样:NVOF 输入上传缓冲(会话输入尺寸,懒创建,同款
+    // persist-mapped;尺寸不匹配时由 PackNvofInput 重建)
+    ComPtr<ID3D12Resource> nvofUpload;
+    void *nvofMapped = nullptr;
+    UINT nvofPitch = 0;
+    UINT nvofW = 0, nvofH = 0;
     ComPtr<ID3D12Resource> inputColor;   // W×H RGBA8
     ComPtr<ID3D12Resource> outputColor;  // W×H RGBA8, UAV (NGX / composite write)
     ComPtr<ID3D12Resource> readback;     // RGBA8 readback buffer, persist-mapped
@@ -146,10 +152,12 @@ public:
     // densify(Magpie NVOF_Densify HLSL 原样):S10.5 网格 → 稠密运动 +
     // 置信度。在 NVOF 会话的 nvof CL 上执行(门内、execute 完成后),
     // 调用方负责 motion/confidence 的 UAV 态转移。gridSize/旗标来自
-    // NvofContext 会话。
+    // NvofContext 会话。motionScale = 流向量单位换算(会话输入像素 →
+    // 源像素;输入未降采样时为 1,1)。
     void RecordDensify(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                        uint32_t flowW, uint32_t flowH, uint32_t gridSize,
-                       bool hasForwardCost, bool hasBackward, bool hasBackwardCost) noexcept;
+                       bool hasForwardCost, bool hasBackward, bool hasBackwardCost,
+                       float motionScaleX, float motionScaleY) noexcept;
     // 缩放启用时的 guidance 降采样(Magpie DownsampleGuidance;深度输出
     // 在本宿主是死重 —— depth 恒为零纹理,NGX 直接消费静态零纹理)。
     void RecordGuidanceDownsample(FrameSlot &slot) noexcept;
@@ -173,6 +181,15 @@ public:
     // Per-slot frame path.
     bool PackInput(FrameSlot &slot, const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                    int width, int height, char *err, size_t errLen) noexcept;
+    // 光流输入跟随降采样:确保槽内 NVOF 输入上传缓冲匹配 dstW×dstH(懒创建,
+    // persist-mapped),并从 RGBS 源平面双线性降采样写入。**读 RGBS 而非
+    // upload 映射内存**:UPLOAD 堆是 write-combined,CPU 读它绕缓存
+    // (~100ns/次,实测 385k 像素双线性 ≈ 700ms);RGBS 是普通缓存内存。
+    // 槽被调用线程独占,懒创建不跨槽竞争;调用方在持有槽位时调用,且须先
+    // WaitCopyIdle(上帧自该缓冲的拷贝完成后才能覆写)。
+    bool PackNvofInput(FrameSlot &slot, const uint8_t *const *srcPlanes,
+                       const int64_t *srcStrides, int srcW, int srcH,
+                       int dstW, int dstH, char *err, size_t errLen) noexcept;
     bool BeginFrameRecording(FrameSlot &slot) noexcept;
     // 记录:input COMMON→COPY_DEST→拷贝→stateAfter
     bool RecordUploadCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept;

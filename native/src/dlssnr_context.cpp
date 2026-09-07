@@ -638,11 +638,17 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         _height = newHeight;
         // NVOF 会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildNvof
         // —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见 _retiredNvof
-        // 注释),失败降级零 guidance,不致命。
+        // 注释),失败降级零 guidance,不致命。会话输入尺寸遵循 follow 语义
+        // (scalingEnabled/resPercent 是本次重建的目标态,内部尺寸由参数
+        // 直推,不依赖尚未执行的 RebuildScaling)。
         if (_nvof && _curOfQuality > 0 && !_nvofFailed) {
+            const DlssnrParams sp = _shared->Snapshot();
+            const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled;
+            int iw = _width, ih = _height;
+            if (foll) InternalSize(_width, _height, resPercent, iw, ih);
             auto next = std::make_unique<NvofContext>();
             char nvofErr[160]{};
-            if (next->Initialize(*_d3d12, _width, _height, _curOfQuality,
+            if (next->Initialize(*_d3d12, iw, ih, _curOfQuality,
                                  nvofErr, sizeof(nvofErr))) {
                 _retiredNvof.push_back(std::move(_nvof));
                 _nvof = std::move(next);
@@ -722,18 +728,21 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     return true;
 }
 
-bool DlssnrContext::RebuildNvof(int quality, char *err, size_t errLen) noexcept {
-    // NVOF 会话重建(quality 变化)。只重建光流会话,NGX feature 不动。
+bool DlssnrContext::RebuildNvof(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept {
+    // NVOF 会话重建(quality 或会话输入尺寸变化;follow 模式下会话输入 =
+    // 内部尺寸,由调用方传入 dstW/dstH)。只重建光流会话,NGX feature 不动。
     // 内部自取 PoolHold(槽池封死满足 NvofContext 的调用约束)——因此
     // 绝不能在已持有 PoolHold 的路径上调用(RecreateFeature 的尺寸重建
     // 内联处理,不走这里)。调用方必须尚未持有槽位(ProcessFrame 在
     // AcquireSlot 之前消费本请求,与 ConsumeRebuild 同款)。
     //
     // _nvofMutex:fmParallel 下多个帧线程会同时看到同一档位变化并并发进入
-    // (实测并发重建互相踩踏挂死);锁内复查 _curOfQuality,后来者直接跳过。
+    // (实测并发重建互相踩踏挂死);锁内复查 _curOfQuality 与尺寸,后来者
+    // 直接跳过。
     std::lock_guard<std::mutex> switchLock(_nvofMutex);
     const int q = std::clamp(quality, kOfQualityMin, kOfQualityMax);
-    if (q == _curOfQuality && !_nvofFailed) return true;
+    if (q == _curOfQuality && !_nvofFailed && _nvof &&
+        _nvof->Width() == dstW && _nvof->Height() == dstH) return true;
     {
         D3D12Context::PoolHold pool(*_d3d12);
         if (q == 0) {
@@ -744,13 +753,13 @@ bool DlssnrContext::RebuildNvof(int quality, char *err, size_t errLen) noexcept 
             _curOfQuality = 0;
             TimingStatusLine("DLSSNR STATUS: nvof disabled (quality=0; session kept)");
         } else if (!_nvof || _nvofFailed ||
-                   _nvof->Quality() != q || _nvof->Width() != _width || _nvof->Height() != _height) {
+                   _nvof->Quality() != q || _nvof->Width() != dstW || _nvof->Height() != dstH) {
             // 先建新会话再弃旧(旧会话仅弃引用,不调用 nvOFDestroy —— 同上,
             // 销毁后继续 GPU 工作不可靠)。弃旧的 GPU 资源随 PoolHold 排空
             // 后不再被引用,纹理显存由驱动按引用回收(对象随进程生存)。
             auto next = std::make_unique<NvofContext>();
             char nvofErr[160]{};
-            if (next->Initialize(*_d3d12, _width, _height, q, nvofErr, sizeof(nvofErr))) {
+            if (next->Initialize(*_d3d12, dstW, dstH, q, nvofErr, sizeof(nvofErr))) {
                 if (_nvof) _retiredNvof.push_back(std::move(_nvof)); // 退役,不销毁
                 _nvof = std::move(next);
                 _nvofFailed = false;
@@ -769,7 +778,8 @@ bool DlssnrContext::RebuildNvof(int quality, char *err, size_t errLen) noexcept 
             }
         } else {
             // 复用保留的会话(q=0 期间停用):帧序门与历史都已在停用期冻结,
-            // 重置让下一帧重新播种,避免旧参考帧产生一次错误流。
+            // 重置让下一帧重新播种,避免旧参考帧产生一次错误流。停用期的
+            // 尺寸/档位变化由上方的条件分支兜住(尺寸不符走重建)。
             _nvof->ResetHistory();
             _nvofFailed = false;
             _curOfQuality = q;
@@ -778,7 +788,7 @@ bool DlssnrContext::RebuildNvof(int quality, char *err, size_t errLen) noexcept 
     if (_nvof && _nvof->Enabled()) {
         char msg[128];
         std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: nvof rebuilt quality=%d %dx%d",
-                      _curOfQuality, _width, _height);
+                      _curOfQuality, dstW, dstH);
         DbgLine(msg);
         TimingLog(msg);
     }
@@ -816,9 +826,16 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *er
         // 作废(下一帧播种),光流档位同步到新实例的参数快照;此前建立
         // 失败的会话在热复用时重试一次。
         ResetNvofHistory();
+        // 会话输入尺寸同步(follow = 开关 + scaling 状态;热路径下内部尺寸
+        // 未变,除非 ini/payload 同时带了 res% 变化 —— 那会走下方重建分支)。
+        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling();
+        const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
+        const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
         if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax);
-            ofq != _curOfQuality || (ofq > 0 && _nvofFailed)) {
-            RebuildNvof(ofq, err, errLen); // 失败仅降级零 guidance,热复用不受影响
+            ofq != _curOfQuality || (ofq > 0 && _nvof &&
+                (_nvof->Width() != nvW || _nvof->Height() != nvH)) ||
+            (ofq > 0 && _nvofFailed)) {
+            RebuildNvof(ofq, nvW, nvH, err, errLen); // 失败仅降级零 guidance,热复用不受影响
         }
         char msg[128];
         std::snprintf(msg, sizeof(msg),
@@ -831,10 +848,16 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *er
     const bool nvofOk = RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen,
                                         dimsChanged ? width : -1, dimsChanged ? height : -1);
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
-    // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。
+    // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。会话输
+    // 入尺寸同样在此对齐(follow 开关/res% 变化)。
     if (nvofOk) {
-        if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax); ofq != _curOfQuality) {
-            RebuildNvof(ofq, err, errLen);
+        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling();
+        const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
+        const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
+        if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax);
+            ofq != _curOfQuality || (ofq > 0 && _nvof &&
+                (_nvof->Width() != nvW || _nvof->Height() != nvH)) || (ofq > 0 && _nvofFailed)) {
+            RebuildNvof(ofq, nvW, nvH, err, errLen);
         }
     }
     return nvofOk;
@@ -885,11 +908,18 @@ bool DlssnrContext::ProcessFrame(
         }
     }
     const DlssnrParams frameParams = _shared->Snapshot();
-    // NVOF 档位同步(只重建光流会话,不动 NGX feature)。在 AcquireSlot
-    // 之前消费:RebuildNvof 要封池排空。失败只降级零 guidance,帧继续。
-    if (const int ofq = std::clamp(frameParams.motionVectorQuality, kOfQualityMin, kOfQualityMax); ofq != _curOfQuality) {
+    // NVOF 档位/会话输入尺寸同步(只重建光流会话,不动 NGX feature)。在
+    // AcquireSlot 之前消费:RebuildNvof 要封池排空。失败只降级零 guidance,
+    // 帧继续。会话输入尺寸 = follow(开关 + scaling 启用)? 内部尺寸 : 源
+    // 尺寸 —— ConsumeRebuild 已在上文跑过,内部尺寸此处是新鲜的。
+    const bool nvofFollow = frameParams.nvofFollowScaling != 0 && _d3d12->HasScaling();
+    const int nvDstW = nvofFollow ? _d3d12->InternalWidth() : width;
+    const int nvDstH = nvofFollow ? _d3d12->InternalHeight() : height;
+    if (const int ofq = std::clamp(frameParams.motionVectorQuality, kOfQualityMin, kOfQualityMax);
+        ofq != _curOfQuality ||
+        (ofq > 0 && _nvof && (_nvof->Width() != nvDstW || _nvof->Height() != nvDstH))) {
         char nvofErr[160]{};
-        RebuildNvof(ofq, nvofErr, sizeof(nvofErr));
+        RebuildNvof(ofq, nvDstW, nvDstH, nvofErr, sizeof(nvofErr));
     }
     const ResidualControls residual{
         std::clamp(frameParams.residualMultiplier, kResidualMultMin, kResidualMultMax),
@@ -950,27 +980,50 @@ bool DlssnrContext::ProcessFrame(
     double nvofMs = 0.0;
     if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
         const uint32_t gs = _nvof->GridSize();
-        const uint32_t flowW = (static_cast<uint32_t>(width) + gs - 1) / gs;
-        const uint32_t flowH = (static_cast<uint32_t>(height) + gs - 1) / gs;
+        // 流场网格随会话输入尺寸(follow 模式 = 内部尺寸);densify 的
+        // MotionScale 把流向量从会话输入像素单位换算回源像素单位。
+        const uint32_t nvW = static_cast<uint32_t>(_nvof->Width());
+        const uint32_t nvH = static_cast<uint32_t>(_nvof->Height());
+        const uint32_t flowW = (nvW + gs - 1) / gs;
+        const uint32_t flowH = (nvH + gs - 1) / gs;
+        const float msX = nvW != static_cast<uint32_t>(width)
+                              ? static_cast<float>(width) / static_cast<float>(nvW) : 1.0f;
+        const float msY = nvH != static_cast<uint32_t>(height)
+                              ? static_cast<float>(height) / static_cast<float>(nvH) : 1.0f;
         const bool hasBwd = _nvof->Bidirectional();
         const bool hasCost = _nvof->CostEnabled();
         NvofContext::PostExecuteFn post =
-            [this, &slot, flowW, flowH, gs, hasCost, hasBwd](ID3D12GraphicsCommandList *cl) {
+            [this, &slot, flowW, flowH, gs, hasCost, hasBwd, msX, msY](ID3D12GraphicsCommandList *cl) {
                 D3D12_RESOURCE_BARRIER g1[2]{
                     Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
                     Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
                 };
                 cl->ResourceBarrier(2, g1);
                 _d3d12->RecordDensify(*cl, *slot, flowW, flowH, gs,
-                                      hasCost, hasBwd, hasBwd && hasCost);
+                                      hasCost, hasBwd, hasBwd && hasCost, msX, msY);
                 D3D12_RESOURCE_BARRIER g2[2]{
                     Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                     Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 };
                 cl->ResourceBarrier(2, g2);
             };
+        // follow 模式:RGBS 源平面 CPU 双线性降采样到槽内 NVOF 输入缓冲
+        // (会话尺寸),nvof CL 照旧整块拷贝进注册纹理。尺寸一致(未开
+        // 跟随)时直接用 upload,零额外成本。覆写前先等上帧自该缓冲的
+        // 拷贝完成(栅栏在 StageFrame 内,而 CPU 写在这里)。
+        ID3D12Resource *nvofIn = slot->upload.Get();
+        UINT nvofPitch = static_cast<UINT>(slot->uploadPitch);
+        if (nvW != static_cast<uint32_t>(width) || nvH != static_cast<uint32_t>(height)) {
+            _nvof->WaitCopyIdle();
+            if (!_d3d12->PackNvofInput(*slot, srcPlanes, srcStrides, width, height,
+                                       static_cast<int>(nvW), static_cast<int>(nvH), err, errLen)) {
+                return false;
+            }
+            nvofIn = slot->nvofUpload.Get();
+            nvofPitch = slot->nvofPitch;
+        }
         const NvofContext::StageResult st =
-            _nvof->StageFrame(n, slot->upload.Get(), static_cast<UINT>(slot->uploadPitch), post);
+            _nvof->StageFrame(n, nvofIn, nvofPitch, post);
         nvofHistoryReset = st.historyReset;
         nvofMs = _nvof->LastStageMs();
         realMotion = st.waitFenceValue != 0;
