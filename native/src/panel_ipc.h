@@ -136,6 +136,9 @@ inline constexpr const char *SK_GPU_LAST = "gpu_last";
 inline constexpr const char *SK_GPU_EMA = "gpu_ema";
 inline constexpr const char *SK_PACK_EMA = "pack_ema";
 inline constexpr const char *SK_EVAL_CPU_EMA = "eval_cpu_ema";
+// NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
+// 时恒 0,面板零值段自动隐藏)。与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
+inline constexpr const char *SK_NVOF_EMA = "nvof_ema";
 inline constexpr const char *SK_UNPACK_EMA = "unpack_ema";
 inline constexpr const char *SK_INTERNAL_W = "internal_w";
 inline constexpr const char *SK_INTERNAL_H = "internal_h";

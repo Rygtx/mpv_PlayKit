@@ -90,7 +90,7 @@ struct AppState {
     char ofMode[28]{};       // SK_OF_MODE: off / zero / forward[+cost] / both[+cost] q<N> grid<G>
                              // 最长 "forward+cost q5 grid4" = 22+1,28 防截断(与插件 _ofModeBuf 同尺寸)
     double fps = 0.0;
-    float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f;
+    float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
     bool hasSegments = false;
     bool statsDirty = false; // LoadStats changed something on screen (redraw gate)
 };
@@ -317,6 +317,7 @@ void LoadStats() noexcept {
             g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_EMA, 0));
             g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_EMA, 0));
             g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_EMA, 0));
+            g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_NVOF_EMA, 0));
             g_app.hasSegments = g_app.segGpu > 0;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
             char gnPat[32];
@@ -336,7 +337,7 @@ void LoadStats() noexcept {
             // 分段,让状态行成为唯一内容。
             g_app.statsBig[0] = 0;
             g_app.statsRes[0] = 0;
-            g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = 0.0f;
+            g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = g_app.segNvof = 0.0f;
             g_app.hasSegments = false;
             g_app.fps = 0.0;
         }
@@ -349,7 +350,8 @@ void LoadStats() noexcept {
                        memcmp(before.ofMode, g_app.ofMode, sizeof(g_app.ofMode)) != 0 ||
                        before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
                        before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
-                       before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack;
+                       before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack ||
+                       before.segNvof != g_app.segNvof;
 }
 
 // ---------------------------------------------------------------------------
@@ -463,15 +465,19 @@ void DrawUi() noexcept {
     // 效果渲染用时(堆叠时间线,列宽 = 耗时占比)
     const bool timingsOpen = ImGui::CollapsingHeader("处理用时", ImGuiTreeNodeFlags_DefaultOpen);
     if (timingsOpen && g_app.hasSegments) {
-        const float total = g_app.segPack + g_app.segEval + g_app.segGpu + g_app.segUnpack;
+        // 分段 = 帧内执行顺序:nvof(光流等待)在 pack 之后、NGX 录制之前。
+        // of=0 时 nvof 恒 0,零值段由下方 <1e-3f 跳过,时间线退回四段。
+        const float total = g_app.segPack + g_app.segNvof + g_app.segEval + g_app.segGpu + g_app.segUnpack;
         if (total > 0.5f) {
             struct Seg { float v; ImU32 c; const char *name; };
-            const Seg segs[4]{
+            const Seg segs[5]{
                 { g_app.segPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
+                { g_app.segNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
                 { g_app.segEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
                 { g_app.segGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NGX+残差)" },
                 { g_app.segUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
+            constexpr int kSegCount = 5;
 
             ImGui::Spacing();
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
@@ -479,8 +485,8 @@ void DrawUi() noexcept {
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5, 5));
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
 
-            if (ImGui::BeginTable("timeline", 4)) {
-                for (int i = 0; i < 4; ++i) {
+            if (ImGui::BeginTable("timeline", kSegCount)) {
+                for (int i = 0; i < kSegCount; ++i) {
                     if (segs[i].v < 1e-3f) continue;
                     char colId[8];
                     snprintf(colId, sizeof(colId), "%d", i);
@@ -489,7 +495,7 @@ void DrawUi() noexcept {
                         segs[i].v / total);
                 }
                 ImGui::TableNextRow();
-                for (int i = 0; i < 4; ++i) {
+                for (int i = 0; i < kSegCount; ++i) {
                     if (segs[i].v < 1e-3f) continue;
                     ImGui::TableNextColumn();
                     ImGui::PushID(i);
@@ -526,8 +532,9 @@ void DrawUi() noexcept {
             // timings 列表:色点 ■ + 名称 + 右对齐时间
             if (ImGui::BeginTable("timings", 1, ImGuiTableFlags_PadOuterX)) {
                 ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoResize);
-                for (int si = 0; si < 4; ++si) {
+                for (int si = 0; si < kSegCount; ++si) {
                     const Seg &seg = segs[si];
+                    if (seg.v < 1e-3f) continue; // 零值段不列(of=0 的 nvof / 关缩放)
                     ImGui::PushID(si);
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();

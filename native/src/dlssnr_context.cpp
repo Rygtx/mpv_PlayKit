@@ -1604,12 +1604,13 @@ bool DlssnrContext::ProcessFrame(
             char body[512];
             snprintf(body, sizeof(body),
                      "{\"%s\":%.1f,\"%s\":%.1f,"
-                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
+                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
                      "\"%s\":\"%s\",\"%s\":\"%s\"}",
                      SK_GPU_LAST, gpuLast, SK_GPU_EMA, gpuEma,
                      SK_PACK_EMA, packEma, SK_EVAL_CPU_EMA, evalCpuEma, SK_UNPACK_EMA, unpackEma,
+                     SK_NVOF_EMA, nvofEma,
                      SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
                      SK_WIDTH, _width, SK_HEIGHT, _height,
                      SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
