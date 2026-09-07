@@ -93,8 +93,10 @@ constexpr struct { const char *key; const char *label; const char *tip;
 constexpr struct { const char *label; const char *tip; int DlssnrParams::*field; } kFlags[] = {
     { "自动蒙版",     "自动蒙版。模型自动识别区域并区别处理。", &DlssnrParams::useAutoMask },
     { "UI 文字修正", "UI 修正。降低对画面内文字/UI 元素的涂抹。", &DlssnrParams::uiCorrection },
-    { "光流跟随降采样", "光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。", &DlssnrParams::nvofFollowScaling },
 };
+// 光流跟随降采样不进 kFlags:语义属于光流引导组(依赖分辨率缩放,与
+// 光流质量相邻),且此前的 kFlags 区用硬编码行距,高 DPI 下复选框互相
+// 挤压 —— 归位后在 DrawUi 里与枚举行同节奏渲染。
 // clang-format on
 
 struct AppState {
@@ -112,7 +114,8 @@ struct AppState {
     char gpuName[128]{};
     char filterState[16]{};  // SK_FILTER_STATE: ok / nvof_zero / passthrough / ngx_faulted
     char stateDetail[160]{}; // SK_STATE_DETAIL: 死亡状态的原因串
-    char ofMode[20]{};       // SK_OF_MODE: off / zero / forward[+cost] / both[+cost]
+    char ofMode[28]{};       // SK_OF_MODE: off / zero / forward[+cost] / both[+cost] q<N> grid<G>
+                             // 最长 "forward+cost q5 grid4" = 22+1,28 防截断(与插件 _ofModeBuf 同尺寸)
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f;
     bool hasSegments = false;
@@ -592,7 +595,7 @@ void DrawUi() noexcept {
     // --- 内容 ---
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     ImGui::TextDisabled("参数改动在下一帧生效");
-    y += 24 * s;
+    y += ImGui::GetTextLineHeight() + 8 * s; // 行进用实测行高:硬编码 24*s 在高 DPI 下会被文字压线
     dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
     y += 14 * s;
 
@@ -613,6 +616,21 @@ void DrawUi() noexcept {
         int v = g_app.params.*(e.field);
         if (ImGui::Combo(("##" + std::string(e.key)).c_str(), &v, e.names, e.count)) {
             g_app.params.*(e.field) = v;
+            g_app.liveDirty = true;
+        }
+        y += rowH;
+    }
+
+    // 光流跟随降采样:与光流质量同组(依赖分辨率缩放),枚举行同节奏。
+    {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+        ImGui::TextUnformatted("光流跟随降采样");
+        if (ImGui::IsItemHovered())
+            ShowTip("光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。");
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+        bool v = g_app.params.nvofFollowScaling != 0;
+        if (ImGui::Checkbox("##nvof_follow_scaling", &v)) {
+            g_app.params.nvofFollowScaling = v ? 1 : 0;
             g_app.liveDirty = true;
         }
         y += rowH;
@@ -683,7 +701,7 @@ void DrawUi() noexcept {
             // textures every frame; push once on slider release instead.
             g_app.liveDirty = true;
         }
-        y += 38 * s;
+        y += rowH; // 原 38*s 硬编码:与 kFlags 同款高 DPI 重叠类问题
     }
 
     dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
@@ -697,7 +715,7 @@ void DrawUi() noexcept {
             g_app.liveDirty = true;
         }
         if (ImGui::IsItemHovered()) ShowTip(f.tip);
-        y += 26 * s;
+        y += rowH; // 原硬编码 26*s:高 DPI 下控件随字体长高,行距不跟 → 重叠
     }
 
     // 性能日志开关(经共享内存参数通道通知插件;状态持久化在 ini [panel] 节)
@@ -715,8 +733,8 @@ void DrawUi() noexcept {
             WritePayload(); // logEnabled included
             g_app.liveDirty = false;
         }
-        if (ImGui::IsItemHovered()) ShowTip("每 60 帧一行性能统计,追加到 mpv 同目录 dlssnr_timing.log。\n排查性能问题时把该文件一并附上。");
-        y += 28 * s;
+        if (ImGui::IsItemHovered()) ShowTip("每秒一行性能统计(与帧率无关),追加到 mpv 同目录 dlssnr_timing.log。\n排查性能问题时把该文件一并附上。");
+        y += rowH;
     }
 
     y += 8 * s;
@@ -1068,8 +1086,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
 
         // Throttled stats read (plugin publishes into the stats mapping every
-        // 60 frames); shared memory, zero disk IO
-        if (nowSec - g_app.lastStatsRead > 0.5) {
+        // frame); shared memory, zero disk IO. 100ms 读节流 + 100ms 空闲唤醒:
+        // 处理用时 ~10Hz 呼吸;空闲时无重绘,唤醒成本 = 一次 512B 映射读。
+        if (nowSec - g_app.lastStatsRead > 0.1) {
             g_app.lastStatsRead = nowSec;
             LoadStats();
         }
@@ -1093,8 +1112,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                 g_swap->Present(1, 0);
             }
         } else {
-            // sleep until input arrives or the next 0.5s stats tick comes due
-            MsgWaitForMultipleObjects(0, nullptr, FALSE, 500, QS_ALLINPUT);
+            // sleep until input arrives or the next 100ms stats tick comes due
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, 100, QS_ALLINPUT);
         }
     }
 
