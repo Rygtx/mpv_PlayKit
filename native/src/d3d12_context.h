@@ -161,10 +161,16 @@ public:
     // 调用方负责 motion/confidence 的 UAV 态转移。gridSize/旗标来自
     // NvofContext 会话。motionScale = 流向量单位换算(会话输入像素 →
     // 源像素;输入未降采样时为 1,1)。
+    // densify:网格流 → 稠密运动场。denseW/H = 稠密目标尺寸(= dispatch 范围,
+    // shader 的 SourceExtent);uavMotion/uavConfidence = 目标 UAV 描述符 ——
+    // 源尺寸管线写 12/13(slot.motion/confidence),follow 内部管线直接写
+    // 20/21(slot.reducedMotion/reducedConfidence,NGX 缩放消费纹理)。
     void RecordDensify(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                       uint32_t denseW, uint32_t denseH,
                        uint32_t flowW, uint32_t flowH, uint32_t gridSize,
                        bool hasForwardCost, bool hasBackward, bool hasBackwardCost,
-                       float motionScaleX, float motionScaleY) noexcept;
+                       float motionScaleX, float motionScaleY,
+                       UINT uavMotion, UINT uavConfidence) noexcept;
     // 缩放启用时的 guidance 降采样(Magpie DownsampleGuidance;深度输出
     // 在本宿主是死重 —— depth 恒为零纹理,NGX 直接消费静态零纹理)。
     void RecordGuidanceDownsample(FrameSlot &slot) noexcept;

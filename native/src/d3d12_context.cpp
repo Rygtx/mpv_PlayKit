@@ -1965,12 +1965,18 @@ bool D3D12Context::BindNvofResources(ID3D12Resource *flowFwd, ID3D12Resource *fl
 }
 
 void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                 uint32_t denseW, uint32_t denseH,
                                  uint32_t flowW, uint32_t flowH, uint32_t gridSize,
                                  bool hasForwardCost, bool hasBackward,
                                  bool hasBackwardCost,
-                                 float motionScaleX, float motionScaleY) noexcept {
+                                 float motionScaleX, float motionScaleY,
+                                 UINT uavMotion, UINT uavConfidence) noexcept {
     // 在 NVOF 会话的 nvof CL 上执行(门内、execute 完成后)。NGX evaluate
     // 可能重绑堆/根签名;槽列表上的其它 pass 仍各自先重绑(同款)。
+    // shader 的 SourceExtent 语义 = 稠密目标尺寸:流场网格均匀覆盖会话输入
+    // 范围,SourceExtent 即会话输入被线性映射到的目标域 —— 源尺寸管线(源,
+    // MotionScale=会话→源)与 follow 内部管线(内部,= 会话尺寸,
+    // MotionScale=(1,1))共用同一几何公式。
     ID3D12GraphicsCommandList *cl = &clRef;
 
     cl->SetComputeRootSignature(_rsDensify.Get());
@@ -1981,7 +1987,7 @@ void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
     const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
 
-    const UINT srcWH[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+    const UINT srcWH[2]{ static_cast<UINT>(denseW), static_cast<UINT>(denseH) };
     const UINT flowWH[2]{ flowW, flowH };
     cl->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
     cl->SetComputeRoot32BitConstants(0, 2, flowWH, 2);
@@ -1995,10 +2001,10 @@ void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
     cl->SetComputeRootDescriptorTable(2, gpu(15)); // t1 BackwardFlow
     cl->SetComputeRootDescriptorTable(3, gpu(16)); // t2 ForwardCost
     cl->SetComputeRootDescriptorTable(4, gpu(17)); // t3 BackwardCost
-    cl->SetComputeRootDescriptorTable(5, gpu(12)); // u0 DenseMotion(uavMotion)
-    cl->SetComputeRootDescriptorTable(6, gpu(13)); // u1 DenseConfidence(uavConfidence)
-    cl->Dispatch((static_cast<UINT>(_width) + 7) / 8,
-                 (static_cast<UINT>(_height) + 7) / 8, 1);
+    cl->SetComputeRootDescriptorTable(5, gpu(uavMotion));      // u0 DenseMotion
+    cl->SetComputeRootDescriptorTable(6, gpu(uavConfidence));  // u1 DenseConfidence
+    cl->Dispatch((static_cast<UINT>(denseW) + 7) / 8,
+                 (static_cast<UINT>(denseH) + 7) / 8, 1);
 }
 
 void D3D12Context::RecordGuidancePass(FrameSlot &slot, ID3D12PipelineState *pso,

@@ -1059,6 +1059,7 @@ bool DlssnrContext::ProcessFrame(
     // 而本帧 densify 未读”的窗口。publishZero/历史重置语义见 StageFrame。
     bool realMotion = false;      // 本帧有真光流(densify 录制 + PARAM_MVEC 指向它)
     bool nvofHistoryReset = false;
+    bool densifyInternal = false; // densify 直写 reducedMotion(follow 内部管线)
     double nvofMs = 0.0;
     int nvofInputIndex = -1;      // 本帧写入的 NVOF 输入 ping-pong 槽位(诊断 dump 用)
     if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
@@ -1075,18 +1076,37 @@ bool DlssnrContext::ProcessFrame(
                               ? static_cast<float>(height) / static_cast<float>(nvH) : 1.0f;
         const bool hasBwd = _nvof->Bidirectional();
         const bool hasCost = _nvof->CostEnabled();
+        // follow 内部管线(会话输入 = 内部尺寸 ≠ 源):densify 直接产出
+        // NGX 缩放消费纹理 reducedMotion/reducedConfidence,跳过“densify
+        // 到源尺寸 → guidance 降采样缩回内部”的放大-缩小 pass。流向量保持
+        // 会话像素单位 = 内部像素单位(NGX 契约 MVecScale=1),MotionScale
+        // 恒 (1,1)。
+        densifyInternal =
+            nvW != static_cast<uint32_t>(width) || nvH != static_cast<uint32_t>(height);
         NvofContext::PostExecuteFn post =
-            [this, &slot, flowW, flowH, gs, hasCost, hasBwd, msX, msY](ID3D12GraphicsCommandList *cl) {
+            [this, &slot, flowW, flowH, gs, hasCost, hasBwd, msX, msY, densifyInternal,
+             nvW, nvH, width, height](ID3D12GraphicsCommandList *cl) {
+                ID3D12Resource *dstMotion = densifyInternal ? slot->reducedMotion.Get()
+                                                            : slot->motion.Get();
+                ID3D12Resource *dstConf = densifyInternal ? slot->reducedConfidence.Get()
+                                                          : slot->confidence.Get();
                 D3D12_RESOURCE_BARRIER g1[2]{
-                    Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                    Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    Transition(dstMotion, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    Transition(dstConf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
                 };
                 cl->ResourceBarrier(2, g1);
-                _d3d12->RecordDensify(*cl, *slot, flowW, flowH, gs,
-                                      hasCost, hasBwd, hasBwd && hasCost, msX, msY);
+                _d3d12->RecordDensify(*cl, *slot,
+                                      densifyInternal ? nvW : static_cast<uint32_t>(width),
+                                      densifyInternal ? nvH : static_cast<uint32_t>(height),
+                                      flowW, flowH, gs,
+                                      hasCost, hasBwd, hasBwd && hasCost,
+                                      densifyInternal ? 1.0f : msX,
+                                      densifyInternal ? 1.0f : msY,
+                                      densifyInternal ? 20u : 12u,
+                                      densifyInternal ? 21u : 13u);
                 D3D12_RESOURCE_BARRIER g2[2]{
-                    Transition(slot->motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                    Transition(slot->confidence.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    Transition(dstMotion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    Transition(dstConf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 };
                 cl->ResourceBarrier(2, g2);
             };
@@ -1168,7 +1188,9 @@ bool DlssnrContext::ProcessFrame(
         // 经 postExecute 回调录制)—— 本槽列表只剩缩放启用时的 guidance
         // 降采样(读 nvofCL 转入 NSR 的 motion/confidence,同队列 FIFO
         // 保序)。OF 关闭/跳过时 motion/confidence 全程 COMMON 不动。
-        if (realMotion && scaling) {
+        // follow 内部管线 densify 已直写 reducedMotion(NSR),这里整个
+        // 跳过;motion/confidence(源尺寸)本帧全程 COMMON 不被触碰。
+        if (realMotion && scaling && !densifyInternal) {
             // 缩放启用:置信度加权降采样到内部尺寸(运动向量乘
             // MotionScale 换算到内部像素单位,Magpie 同款)。
             D3D12_RESOURCE_BARRIER g3[2]{
@@ -1340,18 +1362,28 @@ bool DlssnrContext::ProcessFrame(
         }
         // guidance 纹理归位 COMMON(仅 realMotion 帧动过:播种/失败帧的
         // 发布走静态零纹理,per-slot motion 全程 COMMON 不被触碰)。
+        // follow 内部管线只动过 reducedMotion/reducedConfidence —— 源尺寸
+        // 对全程 COMMON,对它做 NSR→COMMON 是非法屏障。
         if (realMotion) {
-            D3D12_RESOURCE_BARRIER gBack[2]{
-                TransitionFromTo(slot->motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                TransitionFromTo(slot->confidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-            };
-            cl->ResourceBarrier(2, gBack);
-            if (realMotion && scaling) {
+            if (densifyInternal) {
                 D3D12_RESOURCE_BARRIER gBackR[2]{
                     TransitionFromTo(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                     TransitionFromTo(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                 };
                 cl->ResourceBarrier(2, gBackR);
+            } else {
+                D3D12_RESOURCE_BARRIER gBack[2]{
+                    TransitionFromTo(slot->motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    TransitionFromTo(slot->confidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                };
+                cl->ResourceBarrier(2, gBack);
+                if (scaling) {
+                    D3D12_RESOURCE_BARRIER gBackR[2]{
+                        TransitionFromTo(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                        TransitionFromTo(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    };
+                    cl->ResourceBarrier(2, gBackR);
+                }
             }
         }
     }

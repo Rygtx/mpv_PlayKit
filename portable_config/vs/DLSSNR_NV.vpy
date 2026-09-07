@@ -22,9 +22,9 @@ Skin_Structure = -1
 Use_Auto_Mask = True
 UI_Correction = True
 Scaling_Enabled = True
-Input_Resolution = 100
+Input_Resolution = 50
 Residual_Multiplier = 1.0
-Motion_Vector_Quality = 0
+Motion_Vector_Quality = 5
 Nvof_Follow_Scaling = False
 H_Max = 0
 ## <0-3> 整数, NR 预设档位
