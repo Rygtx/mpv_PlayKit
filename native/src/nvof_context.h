@@ -50,6 +50,7 @@ public:
         uint64_t waitFenceValue = 0; // SubmitFrame 需等待的 done 栅栏值(0 = 无)
         bool publishZero = false;    // 本帧清零 per-slot motion/confidence
         bool historyReset = false;   // 本帧对 NGX 置 PARAM_RESET
+        int inputIndex = -1;         // 本帧写入的输入 ping-pong 槽位(dump 用)
     };
 
     NvofContext() = default;
@@ -77,6 +78,8 @@ public:
     ID3D12Resource *CostBackward() const noexcept {
         return _bidirectional && _costEnabled ? _cost[1].Get() : nullptr;
     }
+    // 注册输入纹理(ping-pong,诊断 dump 用;index 0/1)。
+    ID3D12Resource *InputTexture(int index) const noexcept { return _input[index].Get(); }
     // densify 的 cbuffer 旗标与 SubmitFrame 的栅栏等待目标。
     uint32_t GridSize() const noexcept { return _gridSize; }
     bool Bidirectional() const noexcept { return _bidirectional; }
@@ -100,9 +103,16 @@ public:
     // CPU 等输出栅栏 → postExecute 回调(门内、同一 nvof CL 上二次提交,
     // 调用方在此记录 densify/清零 —— 与 execute 的完成构成栅栏链)。
     // postExecute 为空(OF 停用帧)时跳过 densify,其余语义不变。
+    // postCopy 非空(follow 模式):拷贝段改为在本 nvof CL 上记录本会话
+    // 输入纹理 _input[cur] 的 COMMON→UAV→COMMON 屏障并调用回调记录 GPU
+    // 降采样 dispatch(#46 改 GPU,替代 CopyTextureRegion)—— copyFence
+    // 在 CL 完成后才 Signal,execute 的 inFence[0] 天然覆盖 dispatch。
+    // 回调签名 (cl, cur):cur 为本帧输入槽位(0/1,UAV 描述符 23/24)。
     using PostExecuteFn = std::function<void(ID3D12GraphicsCommandList *cl)>;
+    using PostCopyFn = std::function<void(ID3D12GraphicsCommandList *cl, int inputIndex)>;
     StageResult StageFrame(int frameIndex, ID3D12Resource *uploadBuffer,
-                           UINT uploadRowPitch, const PostExecuteFn &postExecute) noexcept;
+                           UINT uploadRowPitch, const PostExecuteFn &postExecute,
+                           const PostCopyFn &postCopy = PostCopyFn{}) noexcept;
 
     // 本帧 NVOF 拷贝的完成等待(early-return 路径释放槽位前调用,防宿主
     // 复用 upload 缓冲撕裂在途拷贝;正常路径已被 execute 栅栏覆盖,no-op)。

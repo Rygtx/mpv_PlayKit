@@ -61,15 +61,16 @@ struct FrameSlot {
     HANDLE fenceEvent = nullptr;      // dedicated event for this slot's fence wait
     uint64_t fenceValue = 0;          // fence value of this slot's last submission
 
-    ComPtr<ID3D12Resource> upload;    // RGBA8 staging, persist-mapped
+    ComPtr<ID3D12Resource> upload;    // BGRA8 staging, persist-mapped
     void *uploadMapped = nullptr;
-    // 光流跟随降采样:NVOF 输入上传缓冲(会话输入尺寸,懒创建,同款
-    // persist-mapped;尺寸不匹配时由 PackNvofInput 重建)
-    ComPtr<ID3D12Resource> nvofUpload;
-    void *nvofMapped = nullptr;
-    UINT nvofPitch = 0;
-    UINT nvofW = 0, nvofH = 0;
-    ComPtr<ID3D12Resource> inputColor;   // W×H RGBA8
+    // 光流 GPU 降采样源(#46):整帧 BGRA8 暂存纹理。nvof CL 先按
+    // PLACED_FOOTPRINT 把 upload 拷进来,降采样 dispatch 读它的
+    // Texture2D SRV。**不直接对 upload buffer 建 buffer SRV**:typed
+    // buffer SRV 在本机驱动(RTX 3080)上触发异步 DEVICE_HUNG(创建成功、
+    // 下一次驱动调用报 device removed,2026-09-07 实测;与 NULL 描述符
+    // 异步 TDR 同族,#41-②),Texture2D SRV 是全仓惯用形态。
+    ComPtr<ID3D12Resource> nvofSrcTex;
+    ComPtr<ID3D12Resource> inputColor;   // W×H BGRA8
     ComPtr<ID3D12Resource> outputColor;  // W×H RGBA8, UAV (NGX / composite write)
     ComPtr<ID3D12Resource> readback;     // RGBA8 readback buffer, persist-mapped
     void *readbackMapped = nullptr;
@@ -91,6 +92,9 @@ struct FrameSlot {
     // 14=srvFlowF 15=srvFlowB 16=srvCostF 17=srvCostB(NVOF 会话纹理,
     // BindNvofResources 填充)18=srvReducedMotion 19=srvReducedConfidence
     // 20=uavReducedMotion 21=uavReducedConfidence
+    // 22=srvNvofSrc(光流降采样源纹理,Texture2D SRV)23=uavNvofInput0
+    // 24=uavNvofInput1(NVOF 注册输入纹理的 UAV,BindNvofResources 填充;
+    // GPU 光流输入降采样直写)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 
     size_t uploadPitch = 0;
@@ -145,10 +149,13 @@ public:
     FrameSlot *AcquireSlot() noexcept;
     void ReleaseSlot(FrameSlot *slot) noexcept;
 
-    // NVOF flow/cost 纹理的 SRV 写入每个槽的描述符堆(14-17);资源为
-    // null 时写空描述符(densify 着色器按 cbuffer 旗标跳过读取)。
+    // NVOF flow/cost 纹理的 SRV 写入每个槽的描述符堆(14-17),注册输入
+    // 纹理的 UAV 写 23/24(GPU 光流输入降采样直写目标);资源为 null 时
+    // 写占位描述符(densify/降采样只在会话存活时被记录,占位永不被有效
+    // 读取;绝不写 NULL 描述符)。
     bool BindNvofResources(ID3D12Resource *flowFwd, ID3D12Resource *flowBwd,
-                           ID3D12Resource *costFwd, ID3D12Resource *costBwd) noexcept;
+                           ID3D12Resource *costFwd, ID3D12Resource *costBwd,
+                           ID3D12Resource *inputFwd, ID3D12Resource *inputBwd) noexcept;
     // densify(Magpie NVOF_Densify HLSL 原样):S10.5 网格 → 稠密运动 +
     // 置信度。在 NVOF 会话的 nvof CL 上执行(门内、execute 完成后),
     // 调用方负责 motion/confidence 的 UAV 态转移。gridSize/旗标来自
@@ -161,6 +168,15 @@ public:
     // 缩放启用时的 guidance 降采样(Magpie DownsampleGuidance;深度输出
     // 在本宿主是死重 —— depth 恒为零纹理,NGX 直接消费静态零纹理)。
     void RecordGuidanceDownsample(FrameSlot &slot) noexcept;
+    // 光流输入降采样(#46 改 GPU):先把本帧 upload 拷进 nvofSrcTex
+    // (整帧 BGRA8 暂存),再读其 Texture2D SRV(槽 22)双线性写 NVOF
+    // 注册输入纹理 inputIndex(0/1,UAV 23/24)。在 NVOF 会话 nvof CL
+    // 第一次提交上执行(替代 follow 分支的 CopyTextureRegion);调用方
+    // (NvofContext)负责注册纹理的 COMMON→UAV→COMMON 屏障。不直接读
+    // upload buffer —— typed buffer SRV 在本机驱动上异步 DEVICE_HUNG
+    // (见 FrameSlot 注释)。
+    void RecordNvofDownsample(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                              int dstW, int dstH, int inputIndex) noexcept;
 
     // RAII: drain the pool (wait until every slot is released) and hold the
     // pool mutex, so AcquireSlot cannot hand out a slot while the holder
@@ -181,15 +197,6 @@ public:
     // Per-slot frame path.
     bool PackInput(FrameSlot &slot, const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                    int width, int height, char *err, size_t errLen) noexcept;
-    // 光流输入跟随降采样:确保槽内 NVOF 输入上传缓冲匹配 dstW×dstH(懒创建,
-    // persist-mapped),并从 RGBS 源平面双线性降采样写入。**读 RGBS 而非
-    // upload 映射内存**:UPLOAD 堆是 write-combined,CPU 读它绕缓存
-    // (~100ns/次,实测 385k 像素双线性 ≈ 700ms);RGBS 是普通缓存内存。
-    // 槽被调用线程独占,懒创建不跨槽竞争;调用方在持有槽位时调用,且须先
-    // WaitCopyIdle(上帧自该缓冲的拷贝完成后才能覆写)。
-    bool PackNvofInput(FrameSlot &slot, const uint8_t *const *srcPlanes,
-                       const int64_t *srcStrides, int srcW, int srcH,
-                       int dstW, int dstH, char *err, size_t errLen) noexcept;
     bool BeginFrameRecording(FrameSlot &slot) noexcept;
     // 记录:input COMMON→COPY_DEST→拷贝→stateAfter
     bool RecordUploadCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept;
@@ -304,12 +311,16 @@ private:
     ComPtr<ID3D12PipelineState> _psoPrepare;
     ComPtr<ID3D12PipelineState> _psoHorizontal;
     ComPtr<ID3D12PipelineState> _psoVertical;
-    // NVOF guidance(PORTING #6):densify + guidance 降采样各用独立根签名
+    // NVOF guidance(清单 #6):densify + guidance 降采样各用独立根签名
     // (densify = 4 SRV + 2 UAV + 8 常量;降采样 = 2 SRV + 2 UAV + 12 常量)。
     ComPtr<ID3D12RootSignature> _rsDensify;
     ComPtr<ID3D12PipelineState> _psoDensify;
     ComPtr<ID3D12RootSignature> _rsGuidance;
     ComPtr<ID3D12PipelineState> _psoGuidanceDownsample;
+    // 光流输入降采样(#46 改 GPU):Buffer<uint> SRV 读本槽 upload,
+    // 双线性写 NVOF 注册输入纹理(1 SRV + 1 UAV + 6 常量)。
+    ComPtr<ID3D12RootSignature> _rsNvofDownsample;
+    ComPtr<ID3D12PipelineState> _psoNvofDownsample;
 
     // frame slot pool
     static constexpr int kSlotCount = 3;

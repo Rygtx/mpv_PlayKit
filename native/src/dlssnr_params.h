@@ -55,7 +55,8 @@ struct DlssnrParams {
     // 毫秒级),不动 NGX feature;非 NVIDIA/驱动缺 OF 时优雅回退零 guidance。
     int motionVectorQuality = 0;
     // NVOF 输入跟随降采样(0/1,live 参数):开启且 scaling 启用时,NVOF
-    // 会话按内部尺寸建立,输入从源尺寸 CPU 双线性降采样 —— 引擎成本
+    // 会话按内部尺寸建立,输入由 GPU compute 从本帧 upload 双线性降采样
+    // 直写注册纹理(nvof CL 第一次提交,替代整块拷贝)—— 引擎成本
     // ∝ 内部像素数(4K@45% ≈ 5×)。上游不做此优化(Magpie 的 provider
     // 服务帧生成消费者,运动精度敏感,见 NvidiaOpticalFlowProvider),
     // NR guidance 对粗运动容忍度高(DLSS RR 语义即内部分辨率 motion)。

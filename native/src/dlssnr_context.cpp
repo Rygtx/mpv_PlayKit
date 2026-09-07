@@ -492,6 +492,7 @@ bool DlssnrContext::Initialize(
             return fail(msg);
         }
         _coreInitialized = true;
+        if (ProbeEnabled()) TimingStatusLine("PROBE: ngx core ok"); // init 细分(DEVICE_HUNG 时序定位)
     }
 
     // 2) Allocate the parameter block from the core; the snippet receives the
@@ -570,6 +571,7 @@ bool DlssnrContext::Initialize(
     // 4) Frame resources incl. zero-guidance textures + residual scaling
     //    textures/compute at the internal resolution (skipped entirely when
     //    internal-resolution scaling is disabled)
+    if (ProbeEnabled()) TimingStatusLine("PROBE: pre frame-res"); // init 细分(DEVICE_HUNG 时序定位)
     if (!_d3d12->CreateFrameResources(_width, _height, err, errLen)) return failWithExistingErr();
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
@@ -1058,6 +1060,7 @@ bool DlssnrContext::ProcessFrame(
     bool realMotion = false;      // 本帧有真光流(densify 录制 + PARAM_MVEC 指向它)
     bool nvofHistoryReset = false;
     double nvofMs = 0.0;
+    int nvofInputIndex = -1;      // 本帧写入的 NVOF 输入 ping-pong 槽位(诊断 dump 用)
     if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
         const uint32_t gs = _nvof->GridSize();
         // 流场网格随会话输入尺寸(follow 模式 = 内部尺寸);densify 的
@@ -1087,26 +1090,28 @@ bool DlssnrContext::ProcessFrame(
                 };
                 cl->ResourceBarrier(2, g2);
             };
-        // follow 模式:RGBS 源平面 CPU 双线性降采样到槽内 NVOF 输入缓冲
-        // (会话尺寸),nvof CL 照旧整块拷贝进注册纹理。尺寸一致(未开
-        // 跟随)时直接用 upload,零额外成本。覆写前先等上帧自该缓冲的
-        // 拷贝完成(栅栏在 StageFrame 内,而 CPU 写在这里)。
-        ID3D12Resource *nvofIn = slot->upload.Get();
-        UINT nvofPitch = static_cast<UINT>(slot->uploadPitch);
+        // follow 模式(#46 改 GPU):NVOF 输入不再 CPU 逐像素打包,改为
+        // nvof CL 第一次提交上的降采样 dispatch —— 读本槽 upload 的 typed
+        // R32_UINT SRV,双线性直写注册输入纹理,替代整块 CopyTextureRegion
+        // (原 CPU 双线性 ~2-4ms@4K,且有 WC 内存读坑与 WaitCopyIdle 覆写
+        // 排空负担,一并移除)。尺寸一致(未开跟随)时照旧拷贝 upload,零
+        // 额外成本。slot.upload 仍被本帧 nvof CL 读取,early-return 撕裂
+        // 防护由下方 CopyDrainGuard 承担。
+        NvofContext::PostCopyFn postCopy;
         if (nvW != static_cast<uint32_t>(width) || nvH != static_cast<uint32_t>(height)) {
-            _nvof->WaitCopyIdle();
-            if (!_d3d12->PackNvofInput(*slot, srcPlanes, srcStrides, width, height,
-                                       static_cast<int>(nvW), static_cast<int>(nvH), err, errLen)) {
-                return false;
-            }
-            nvofIn = slot->nvofUpload.Get();
-            nvofPitch = slot->nvofPitch;
+            postCopy = [this, &slot, nvW, nvH](ID3D12GraphicsCommandList *cl, int inputIndex) {
+                _d3d12->RecordNvofDownsample(*cl, *slot,
+                                             static_cast<int>(nvW), static_cast<int>(nvH),
+                                             inputIndex);
+            };
         }
         const NvofContext::StageResult st =
-            _nvof->StageFrame(n, nvofIn, nvofPitch, post);
+            _nvof->StageFrame(n, slot->upload.Get(), static_cast<UINT>(slot->uploadPitch),
+                              post, postCopy);
         nvofHistoryReset = st.historyReset;
         nvofMs = _nvof->LastStageMs();
         realMotion = st.waitFenceValue != 0;
+        nvofInputIndex = st.inputIndex;
     }
     // 3 连败停用(会话内部闩锁)在帧线程侧只发现不重试,防风暴;
     // Rebind/换档时经 _nvofFailed 条目重试一次。
@@ -1425,8 +1430,13 @@ bool DlssnrContext::ProcessFrame(
                     else TimingStatusLine("DLSSNR STATUS: motion dump OK"); // 临时探针
                     if (_nvof && _nvof->FlowForward()) {
                         const uint32_t gs = _nvof->GridSize();
-                        const uint32_t fw = (static_cast<uint32_t>(width) + gs - 1) / gs;
-                        const uint32_t fh = (static_cast<uint32_t>(height) + gs - 1) / gs;
+                        // flow 网格按会话输入尺寸(follow 模式 = 内部尺寸,
+                        // 与 StageFrame 调用点的 flowW/H 同款公式),不是源
+                        // 尺寸 —— 曾按源宽算 dump 维度,与纹理不符。
+                        const uint32_t nw = static_cast<uint32_t>(_nvof->Width());
+                        const uint32_t nh = static_cast<uint32_t>(_nvof->Height());
+                        const uint32_t fw = (nw + gs - 1) / gs;
+                        const uint32_t fh = (nh + gs - 1) / gs;
                         const bool flowOk = _d3d12->DumpTextureToFile(
                             _nvof->FlowForward(), static_cast<int>(fw),
                             static_cast<int>(fh), (base / L"dump_flow.bin").c_str(),
@@ -1461,6 +1471,14 @@ bool DlssnrContext::ProcessFrame(
                         }
                     };
                     dumpOrLog(_d3d12->InputColor(*slot), width, height, L"dump_input.bin", kColorDump);
+                    // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):
+                    // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
+                    // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
+                    if (_nvof && nvofInputIndex >= 0) {
+                        dumpOrLog(_nvof->InputTexture(nvofInputIndex),
+                                  _nvof->Width(), _nvof->Height(),
+                                  L"dump_nvof_input.bin", kColorDump);
+                    }
                     if (scaling) {
                         dumpOrLog(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
                                   _d3d12->InternalHeight(), L"dump_reduced_color.bin", kColorDump);

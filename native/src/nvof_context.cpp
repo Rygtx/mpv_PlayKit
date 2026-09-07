@@ -413,9 +413,11 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         }
     }
 
-    // flow/cost SRV 写入每个槽的描述符堆(densify 在槽列表上执行)。
+    // flow/cost SRV + 注册输入纹理 UAV 写入每个槽的描述符堆(densify 在
+    // 槽列表上执行;GPU 光流输入降采样在 nvof CL 上直写输入纹理,#46)。
     if (!d3d12.BindNvofResources(FlowForward(), FlowBackward(),
-                                 CostForward(), CostBackward())) {
+                                 CostForward(), CostBackward(),
+                                 InputTexture(0), InputTexture(1))) {
         return fail("nvof: bind flow SRVs failed");
     }
 
@@ -455,7 +457,8 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
 NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                                                  ID3D12Resource *uploadBuffer,
                                                  UINT uploadRowPitch,
-                                                 const PostExecuteFn &postExecute) noexcept {
+                                                 const PostExecuteFn &postExecute,
+                                                 const PostCopyFn &postCopy) noexcept {
     StageResult result{};
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) {
         result.publishZero = true;
@@ -563,20 +566,38 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         copyOk = copyOk &&
                  SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
         if (copyOk) {
-            D3D12_TEXTURE_COPY_LOCATION src{};
-            src.pResource = uploadBuffer;
-            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            src.PlacedFootprint.Offset = 0;
-            src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-            src.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
-            src.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
-            src.PlacedFootprint.Footprint.Depth = 1;
-            src.PlacedFootprint.Footprint.RowPitch = uploadRowPitch;
-            D3D12_TEXTURE_COPY_LOCATION dst{};
-            dst.pResource = _input[cur].Get();
-            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-            dst.SubresourceIndex = 0;
-            _copyCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            if (postCopy) {
+                // GPU 光流输入降采样(#46 改 GPU):屏障 + 回调记录 dispatch,
+                // 替代 CopyTextureRegion。注册纹理归本会话所有,屏障在此做;
+                // copyFence 在 CL 完成后才 Signal,execute 的 inFence[0]
+                // (copyFence >= k_n)天然覆盖 dispatch 的完成。
+                D3D12_RESOURCE_BARRIER toUav[1]{
+                    Transition(_input[cur].Get(),
+                               D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                };
+                _copyCommandList->ResourceBarrier(1, toUav);
+                postCopy(_copyCommandList.Get(), cur);
+                D3D12_RESOURCE_BARRIER toCommon[1]{
+                    Transition(_input[cur].Get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+                };
+                _copyCommandList->ResourceBarrier(1, toCommon);
+            } else {
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = uploadBuffer;
+                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                src.PlacedFootprint.Offset = 0;
+                src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                src.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
+                src.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
+                src.PlacedFootprint.Footprint.Depth = 1;
+                src.PlacedFootprint.Footprint.RowPitch = uploadRowPitch;
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = _input[cur].Get();
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                dst.SubresourceIndex = 0;
+                _copyCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            }
             // 播种帧不录 densify/清零:发布走静态零纹理(MotionResource),
             // per-slot motion 保持 COMMON 不被触碰(状态机按 realMotion 归位)。
             copyOk = SUCCEEDED(_copyCommandList->Close());
@@ -732,6 +753,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         //   execute 成功 → 历史连续(下一帧可 execute);
         //   execute 失败 → 历史作废(失败分支已置 false);
         //   播种帧(拷贝成功)→ 历史已建立,下一帧可 execute。
+        if (copyOk) result.inputIndex = cur;
         _curInput = 1 - cur;
         if (seed && copyOk) _historyValid = true;
         _nextSeq = static_cast<int64_t>(frameIndex) + 1;
