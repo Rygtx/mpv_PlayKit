@@ -478,6 +478,13 @@ void DrawUi() noexcept {
                 { g_app.segUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
             constexpr int kSegCount = 5;
+            // 实际要画的段数(零值段跳过)。BeginTable 的列数必须与之相等:
+            // imgui 对本帧未 TableSetupColumn 的列按 SizingStretchSame 默认
+            // 权重 1.0 补齐,而可见段权重和恒为 1.0 —— 空列恰好占掉一半
+            // 宽度(of=0 时长条右侧大片空白)。
+            int visibleSegs = 0;
+            for (int i = 0; i < kSegCount; ++i)
+                if (segs[i].v >= 1e-3f) ++visibleSegs;
 
             ImGui::Spacing();
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
@@ -485,7 +492,7 @@ void DrawUi() noexcept {
             ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(5, 5));
             ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
 
-            if (ImGui::BeginTable("timeline", kSegCount)) {
+            if (ImGui::BeginTable("timeline", visibleSegs)) {
                 for (int i = 0; i < kSegCount; ++i) {
                     if (segs[i].v < 1e-3f) continue;
                     char colId[8];
