@@ -120,8 +120,10 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     const VSMap *props = vsapi->getFramePropertiesRO(src);
     // 源色彩元数据(仓内 props 读取首例):矩阵/范围驱动 YUV↔RGB 展开,
     // 缺失/未知回落 709 limited 并留痕(值变化才再 log,atomic 边沿去重)。
-    // VS _Matrix:1=BT.709,5(BT470BG)/6(SMPTE170M)=601 族;4(FCC)/
-    // 9(BT.2020)/0(GBR)等超出本滤镜(SDR 链)范围,按 709 处理 + log 可见。
+    // VS _Matrix:1=BT.709,5(BT470BG)/6(SMPTE170M)=601 族,4(XYZ)=601 近似
+    // (XYZ→RGB 本需色度适配矩阵,近似到 601 是 D65 录制内容的可用降级);
+    // 9(BT.2020)/0(GBR) 等超范围,按 709 处理 + log 可见(vpy 层已有
+    // HDR 直通守卫,到这里的多半是属性缺失的裸流)。
     int perr = 0;
     const int matrixProp = vsapi->mapGetInt(props, "_Matrix", 0, &perr);
     const bool matrixKnown = perr == 0;
@@ -129,7 +131,9 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     const int rangeProp = vsapi->mapGetInt(props, "_ColorRange", 0, &perr);
     const bool rangeKnown = perr == 0;
     vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
-    if (matrixKnown && (matrixProp == 5 || matrixProp == 6)) matrix = vsdlssnr::ColorMatrix::BT601;
+    if (matrixKnown && (matrixProp == 4 || matrixProp == 5 || matrixProp == 6)) {
+        matrix = vsdlssnr::ColorMatrix::BT601;
+    }
     vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
     if (rangeKnown && rangeProp == 0) range = vsdlssnr::ColorRange::Full;
     {

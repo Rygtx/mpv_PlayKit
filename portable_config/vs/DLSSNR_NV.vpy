@@ -56,10 +56,25 @@ H_Max = 0
 
 clip = video_in
 
+# HDR 守卫:BT.2020 矩阵(_Matrix=9)或 PQ/HLG 传输(_Transfer=16/18)的
+# 内容按 SDR 709 处理必错色 —— 直通。属性缺失(裸流)时无法判定,按 SDR
+# 处理(与旧行为一致)。
+def _is_hdr(c) :
+	try :
+		f = c.get_frame(0)
+		props = f.props
+		m = props.get("_Matrix")
+		t = props.get("_Transfer")
+		return (m is not None and int(m) == 9) or (t is not None and int(t) in (16, 18))
+	except Exception :
+		return False
+
 if H_Max and clip.height > H_Max :
 	ret = clip
+elif _is_hdr(clip) :
+	ret = clip
 elif clip.format.id not in (vs.YUV420P8, vs.YUV420P10) :
-	# 非 420P8/P10 (422/444/RGB/HDR 等) 直通: 滤镜只收这两种格式
+	# 非 420P8/P10 (422/444/RGB 等) 直通: 滤镜只收这两种格式
 	ret = clip
 else :
 	ret = core.dlssnr.Enhance(
