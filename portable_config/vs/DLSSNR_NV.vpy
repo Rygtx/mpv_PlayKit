@@ -1,11 +1,12 @@
 ### NVIDIA DLSSNR 同分辨率 AI 画质增强 <RTX N卡专用>
 ### 依赖_ vs-plugins\vs_dlssnr.dll (VapourSynth 插件, 自动加载)
-###       vs-plugins\ngx\nvngx_dlssnr.dll (模型文件, 310.9.0)
+###       vs-plugins\ngx\nvngx_dlssnr.dll (模型文件, 310.9.0, 取自 RenoDX)
 ###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
-### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18), 零 guidance 单帧模式
-###       处理为同分辨率 (非超分), SDR 色彩空间 (非 HDR)
+### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18)
+###       处理为同分辨率 (非超分); 默认零 guidance, 可选 NVOF 硬件光流引导 (0-5 档)
 ###       YUV 原生: 直接吃 YUV420P8/P10 吐同格式, 无 CPU 格式往返;
 ###       色彩矩阵/范围按源帧属性 (_Matrix/_ColorRange) 处理, 缺省 709 limited
+###       HDR (BT.2020/PQ/HLG) 与非 420P8/P10 内容自动直通 (正常播放, 不做增强)
 ### 调参_ 播放时托盘点击 DLSSNR 图标打开控制面板, 实时调节; 保存后下次自动生效
 
 import vapoursynth as vs

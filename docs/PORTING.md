@@ -2,8 +2,9 @@
 
 > 用途:记录 Magpie experimental → mpv 的迁移项清单与迁移结果。只记结论,不记过程。
 
-参考仓库:`F:\Project\Magpie`(experimental,HEAD 9824d758,2026-09-06 对齐)
+参考仓库:[SAOG0721/Magpie](https://github.com/SAOG0721/Magpie)(experimental,本地 `F:\Project\Magpie`,HEAD 9824d758,2026-09-06 对齐)
 宿主仓库:`F:\Project\mpv_PlayKit`(本仓库)· 部署:`D:\Portable\mpv-lazy`
+模型来源:`nvngx_dlssnr.dll`(DLSS SDK 310.9.0)取自 RenoDX 项目
 
 ---
 
