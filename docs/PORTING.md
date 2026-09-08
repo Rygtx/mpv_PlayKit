@@ -2,8 +2,8 @@
 
 > 用途:记录 Magpie experimental → mpv 的迁移项清单与迁移结果。只记结论,不记过程。
 
-参考仓库:[SAOG0721/Magpie](https://github.com/SAOG0721/Magpie)(experimental,本地 `F:\Project\Magpie`,HEAD 9824d758,2026-09-06 对齐)
-宿主仓库:`F:\Project\mpv_PlayKit`(本仓库)· 部署:`D:\Portable\mpv-lazy`
+参考仓库:[SAOG0721/Magpie](https://github.com/SAOG0721/Magpie)(experimental,HEAD 9824d758,2026-09-06 对齐)
+宿主仓库:本仓库 · 部署:mpv-lazy 发行包(任意安装位置,下称「部署根」)
 模型来源:`nvngx_dlssnr.dll`(DLSS SDK 310.9.0)取自 RenoDX 项目
 
 ---
@@ -27,7 +27,7 @@
 ### 部署布局
 
 ```
-D:\Portable\mpv-lazy\
+<部署根>\
 ├── vs-plugins\{vs_dlssnr.dll, dlssnr_panel.exe, ngx\nvngx_dlssnr.dll, dlssnr_ui.ini(保存后生成)}
 └── portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 *,45 行)}
 本仓库:portable_config\{vs\DLSSNR_NV.vpy, menu.conf, input_uosc.conf(键位 *,45 行)}

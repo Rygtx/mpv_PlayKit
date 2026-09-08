@@ -4,7 +4,16 @@ param([switch]$Clean)
 
 $ErrorActionPreference = "Stop"
 $native = Split-Path -Parent $PSScriptRoot
-$vsroot = "D:\Installed\Microsoft Visual Studio"
+# VS 安装位置自动发现(vswhere 随 VS/Build Tools 一起安装);可用 VSDLSSNR_VSROOT 覆盖
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsroot = if ($env:VSDLSSNR_VSROOT) {
+    $env:VSDLSSNR_VSROOT
+} elseif (Test-Path $vswhere) {
+    & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+} else {
+    $null
+}
+if (-not $vsroot) { throw "未找到 Visual Studio 安装;设 VSDLSSNR_VSROOT 指向 VS 安装目录,或安装带 C++ 工具链的 VS" }
 $vcvars = Join-Path $vsroot "VC\Auxiliary\Build\vcvarsall.bat"
 
 if (-not (Test-Path $vcvars)) { throw "vcvarsall.bat not found: $vcvars" }

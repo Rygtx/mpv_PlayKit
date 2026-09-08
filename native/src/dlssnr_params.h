@@ -1,6 +1,6 @@
 #pragma once
 // User-facing parameters, mapped 1:1 onto Magpie's DLSSNR_AI_Filter.hlsl surface
-// (see F:\Project\Magpie\src\Effects\DLSSNR\DLSSNR_AI_Filter.hlsl).
+// (see Magpie experimental src/Effects/DLSSNR/DLSSNR_AI_Filter.hlsl).
 
 // Documented parameter ranges — the single authority. Every std::clamp on
 // these params (vpy args, dlssnr_ui.ini values, panel payload, internal

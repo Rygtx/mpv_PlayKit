@@ -3,8 +3,9 @@ native/build/
 native/bin/
 # 第三方依赖: fetch-deps.ps1 可重建 (NGX SDK / VapourSynth 头), 不入库
 native/dependencies/
-# 本地诊断测试与产物 (python 脚本/exe/截图/日志)
+# 本地诊断测试与产物 (python 脚本/exe/截图/日志);可复用工具在 native/testkit/
 native/tests/
+__pycache__/
 # 本地路线图/进展文档, 不随仓库分发
 native/PORTING.md
 # 打包: 仓库内暂存的模型等大文件 (package.ps1 输入) 与 zip 输出
