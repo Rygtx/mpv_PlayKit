@@ -1523,11 +1523,11 @@ void ConvertYuvToBgra(uint3 tid : SV_DispatchThreadID) {
     const float nU = (codeU - CMid) * CScale;
     const float nV = (codeV - CMid) * CScale;
 
-    // 矩阵求逆(Kg = 1-Kr-Kb):R = Y + Cr·2(1-Kr),B = Y + Cb·2(1-Kb),
-    // G = (Y - Kr·R - Kb·B)/Kg。
+    // 矩阵求逆(Kg = 1-Kr-Kb):Cr 驱动 R、Cb 驱动 B,增益各配自己的
+    // (1-Kx) —— R = Y + Cr·2(1-Kr) = Y + 1.5748·Cr(709)。
     const float Kg = 1.0 - Kr - Kb;
-    const float r = nY + nV * 2.0 * (1.0 - Kb);
-    const float b = nY + nU * 2.0 * (1.0 - Kr);
+    const float r = nY + nV * 2.0 * (1.0 - Kr);
+    const float b = nY + nU * 2.0 * (1.0 - Kb);
     const float g = (nY - Kr * r - Kb * b) / Kg;
     OutputColor[tid.xy] = float4(saturate(r), saturate(g), saturate(b), 1.0);
 }
@@ -1559,12 +1559,19 @@ float LumaOf(float3 rgb) {
     return dot(rgb, float3(Kr, 1.0 - Kr - Kb, Kb));
 }
 
+// 色度写回:cb/cr ∈ [-0.5,0.5],必须先加半幅度偏移再 saturate —— saturate
+// 在前会把全部负色度钳成中性 128(绿/青/蓝内容去饱和,2026-09-08 实测;
+// 与 #30 负残差 UNORM clamp 同族的"负值先钳"坑)。
+float ChromaToCode(float c) {
+    return saturate(c * SpanOverCM + LoOverCM);
+}
+
 [numthreads(8, 8, 1)]
 void BgraToYuvLuma(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
     const float3 rgb = saturate(CompositeColor[tid.xy].xyz);
     const float nY = LumaOf(rgb);
-    OutputA[tid.xy] = saturate(nY) * SpanOverCM + LoOverCM;
+    OutputA[tid.xy] = saturate(nY * SpanOverCM + LoOverCM);
 }
 
 [numthreads(8, 8, 1)]
@@ -1583,8 +1590,8 @@ void BgraToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     // cb = (B-Y)·0.5/(1-Kb),cr = (R-Y)·0.5/(1-Kr)
     const float cb = (rgb.z - nY) * (0.5 / (1.0 - Kb));
     const float cr = (rgb.x - nY) * (0.5 / (1.0 - Kr));
-    OutputA[tid.xy] = saturate(cb) * SpanOverCM + LoOverCM;  // u0 → U 平面
-    OutputB[tid.xy] = saturate(cr) * SpanOverCM + LoOverCM;  // u1 → V 平面
+    OutputA[tid.xy] = ChromaToCode(cb);  // u0 → U 平面
+    OutputB[tid.xy] = ChromaToCode(cr);  // u1 → V 平面
 }
 )";
 
