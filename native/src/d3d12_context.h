@@ -53,6 +53,12 @@ struct ResidualControls {
     float reflectionGlow = 1.0f;
 };
 
+// YUV↔RGB 转换的色彩参数(props _Matrix/_ColorRange → root constants 的语义
+// 输入;具体系数/范围常量在记录函数里按 _depth 推导)。矩阵只支持 709/601,
+// HDR 传输函数不在本滤镜范围(SDR 链)。
+enum class ColorMatrix : int { BT709 = 0, BT601 = 1 };
+enum class ColorRange : int { Full = 0, Limited = 1 };
+
 // Per-frame-in-flight resources; acquired from the slot pool for the duration
 // of one getFrame call.
 struct FrameSlot {
@@ -61,19 +67,25 @@ struct FrameSlot {
     HANDLE fenceEvent = nullptr;      // dedicated event for this slot's fence wait
     uint64_t fenceValue = 0;          // fence value of this slot's last submission
 
-    ComPtr<ID3D12Resource> upload;    // BGRA8 staging, persist-mapped
-    void *uploadMapped = nullptr;
-    // 光流 GPU 降采样源(#46):整帧 BGRA8 暂存纹理。nvof CL 先按
-    // PLACED_FOOTPRINT 把 upload 拷进来,降采样 dispatch 读它的
-    // Texture2D SRV。**不直接对 upload buffer 建 buffer SRV**:typed
-    // buffer SRV 在本机驱动(RTX 3080)上触发异步 DEVICE_HUNG(创建成功、
-    // 下一次驱动调用报 device removed,2026-09-07 实测;与 NULL 描述符
-    // 异步 TDR 同族,#41-②),Texture2D SRV 是全仓惯用形态。
-    ComPtr<ID3D12Resource> nvofSrcTex;
-    ComPtr<ID3D12Resource> inputColor;   // W×H BGRA8
-    ComPtr<ID3D12Resource> outputColor;  // W×H RGBA8, UAV (NGX / composite write)
-    ComPtr<ID3D12Resource> readback;     // RGBA8 readback buffer, persist-mapped
-    void *readbackMapped = nullptr;
+    // YUV 原生管道:VS 帧(YUV420P8/P10 三平面)与 GPU 之间纯行拷贝。
+    // [0]=Y 全分辨率,[1]=U [2]=V 半分辨率;pitch 256 对齐,persist-mapped。
+    // **不直接对 upload buffer 建 buffer SRV**:typed buffer SRV 在本机驱动
+    // (RTX 3080)上触发异步 DEVICE_HUNG(创建成功、下一次驱动调用报 device
+    // removed,2026-09-07 实测;与 NULL 描述符异步 TDR 同族,#41-②)——
+    // GPU 侧消费一律经 yuvIn 纹理(Texture2D SRV,全仓惯用形态)。
+    ComPtr<ID3D12Resource> uploadYuv[3];
+    void *uploadYuvMapped[3] = {};
+    size_t uploadPitchYuv[3] = {};
+    ComPtr<ID3D12Resource> readbackYuv[3];
+    void *readbackYuvMapped[3] = {};
+    size_t readbackPitchYuv[3] = {};
+    // GPU 侧 YUV 纹理:In = upload 拷贝进来供 YUV→RGB 采样;Out = RGB→YUV
+    // dispatch 写出供 readback。格式 R8_UNORM(8bit)/R16_UNORM(10bit),
+    // 10bit 存储字 = VS P10 采样值(右对齐 0-1023,2026-09-08 实测)。
+    ComPtr<ID3D12Resource> yuvIn[3];
+    ComPtr<ID3D12Resource> yuvOut[3];
+    ComPtr<ID3D12Resource> inputColor;   // W×H BGRA8,UAV(YUV→RGB 转换直写)
+    ComPtr<ID3D12Resource> outputColor;  // W×H BGRA8, UAV (NGX / composite write)
     // residual scaling pipeline, sized by the current input_resolution
     ComPtr<ID3D12Resource> reducedColor;
     ComPtr<ID3D12Resource> reducedDenoised;
@@ -92,13 +104,14 @@ struct FrameSlot {
     // 14=srvFlowF 15=srvFlowB 16=srvCostF 17=srvCostB(NVOF 会话纹理,
     // BindNvofResources 填充)18=srvReducedMotion 19=srvReducedConfidence
     // 20=uavReducedMotion 21=uavReducedConfidence
-    // 22=srvNvofSrc(光流降采样源纹理,Texture2D SRV)23=uavNvofInput0
-    // 24=uavNvofInput1(NVOF 注册输入纹理的 UAV,BindNvofResources 填充;
-    // GPU 光流输入降采样直写)
+    // 22=srvOutput(outputColor 的 SRV,RGB→YUV 转换读;原 srvNvofSrc 随
+    // nvofSrcTex 删除让位——降采样直接采样槽 0 srvInput)
+    // 23=uavNvofInput0 24=uavNvofInput1(NVOF 注册输入纹理的 UAV,
+    // BindNvofResources 填充)
+    // 25=srvYuvIn0 26=srvYuvIn1 27=srvYuvIn2(YUV→RGB 转换采样)
+    // 28=uavYuvOut0 29=uavYuvOut1 30=uavYuvOut2(RGB→YUV 写出)
+    // 31=uavInput(inputColor 的 UAV,YUV→RGB 转换直写)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
-
-    size_t uploadPitch = 0;
-    size_t readbackPitch = 0;
 };
 
 class D3D12Context {
@@ -125,7 +138,9 @@ public:
     // should stop evaluating instead of stalling the full wait every frame.
     bool IsDeviceLost() const noexcept { return _deviceLost.load(std::memory_order_relaxed); }
 
-    bool CreateFrameResources(int width, int height, char *err, size_t errLen) noexcept;
+    // depth = YUV 位深(8/10)。同尺寸换深度必须走重建(hotMatch 侧拦截,
+    // 否则 R8 槽纹理遇 P10 打包 = 数据撕裂)。
+    bool CreateFrameResources(int width, int height, int depth, char *err, size_t errLen) noexcept;
 
     // diagnostics: dump a texture's raw rows to a file (VSDLSSNR_DUMP);
     // format must match the resource (CopyTextureRegion has no cross-family
@@ -174,13 +189,23 @@ public:
     // 缩放启用时的 guidance 降采样(Magpie DownsampleGuidance;深度输出
     // 在本宿主是死重 —— depth 恒为零纹理,NGX 直接消费静态零纹理)。
     void RecordGuidanceDownsample(FrameSlot &slot) noexcept;
-    // 光流输入降采样(#46 改 GPU):先把本帧 upload 拷进 nvofSrcTex
-    // (整帧 BGRA8 暂存),再读其 Texture2D SRV(槽 22)双线性写 NVOF
-    // 注册输入纹理 inputIndex(0/1,UAV 23/24)。在 NVOF 会话 nvof CL
-    // 第一次提交上执行(替代 follow 分支的 CopyTextureRegion);调用方
-    // (NvofContext)负责注册纹理的 COMMON→UAV→COMMON 屏障。不直接读
-    // upload buffer —— typed buffer SRV 在本机驱动上异步 DEVICE_HUNG
-    // (见 FrameSlot 注释)。
+    // YUV↔RGB GPU 转换(双站点:录在 nvof CL 或槽 CL,见 Plan 定稿)。
+    // **cl 由调用方显式给定** —— postCopy 回调拿到的是 nvof CL,槽 CL 路径
+    // 传 slot.commandList;录错列表 = 命令被对方 Reset 销毁(首测实锤:
+    // 转换被 Reset 吃掉,NVOF/NGX 全链吃零 → 黑帧)。
+    // ConvertInput:3×yuvUpload→yuvIn 拷贝(COPY_DEST→NSR)→ dispatch 采样
+    // Y/U/V 双线性上采色度、按矩阵/范围展开 → UAV 直写 inputColor →
+    // stateAfter(NSR=NGX 待读 / COMMON=skipEval);yuvIn 收尾归 COMMON。
+    // 纯录制,无失败路径(void)。
+    void RecordConvertInput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                            ColorMatrix matrix, ColorRange range,
+                            D3D12_RESOURCE_STATES stateAfter) noexcept;
+    void RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRange range,
+                         D3D12_RESOURCE_STATES outputStateBefore) noexcept;
+    // 光流输入降采样(#46/#48):YUV→RGB 转换已在同一 CL 上产出 inputColor
+    // (NSR),本 pass 直接采样槽 0 srvInput 双线性写 NVOF 注册输入纹理
+    // inputIndex(0/1,UAV 23/24)。调用方(NvofContext)负责注册纹理的
+    // COMMON→UAV→COMMON 屏障。
     void RecordNvofDownsample(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                               int dstW, int dstH, int inputIndex) noexcept;
 
@@ -201,17 +226,17 @@ public:
     };
 
     // Per-slot frame path.
+    // YUV 原生:VS 三平面 → uploadYuv[3] 纯行拷贝(无像素算术)。
     bool PackInput(FrameSlot &slot, const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                    int width, int height, char *err, size_t errLen) noexcept;
     bool BeginFrameRecording(FrameSlot &slot) noexcept;
-    // 记录:input COMMON→COPY_DEST→拷贝→stateAfter
-    bool RecordUploadCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept;
-    // 记录:output stateBefore→COPY_SOURCE→拷贝→COMMON
-    bool RecordReadbackCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateBefore, char *err, size_t errLen) noexcept;
+    // 记录:yuvOut ×3 UAV→COPY_SOURCE→拷贝→COMMON(在 RecordYuvOutput 之后,
+    // yuvOut 处于 UAV 态)
+    bool RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
                      char *err, size_t errLen) noexcept; // [可选栅栏等待] close+execute+signal
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
-    // GPU 完成后调用:readback buffer → RGBS 三平面(纯 CPU)
+    // GPU 完成后调用:readbackYuv[3] → VS 三平面(纯 CPU 行拷贝,色度半尺寸)
     bool UnpackOutput(FrameSlot &slot, uint8_t **dstPlanes, int64_t *dstStrides,
                       int width, int height, char *err, size_t errLen) noexcept;
 
@@ -229,6 +254,10 @@ public:
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
+    // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
+    ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
+    ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
+    int BitDepth() const noexcept { return _bitDepth; }
     ID3D12Resource *ReducedColor(FrameSlot &s) const noexcept { return s.reducedColor.Get(); }
     ID3D12Resource *ReducedDenoised(FrameSlot &s) const noexcept { return s.reducedDenoised.Get(); }
     ID3D12Resource *ControlledRes(FrameSlot &s) const noexcept { return s.controlledRes.Get(); }
@@ -251,7 +280,7 @@ public:
     ID3D12Resource *Depth() const noexcept { return _depth.Get(); }
 
 private:
-    bool CreateSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept;
+    bool CreateSlotResources(FrameSlot &slot, int depth, char *err, size_t errLen) noexcept;
     bool CreateScalingForSlot(FrameSlot &slot, int iw, int ih, char *err, size_t errLen) noexcept;
     void ClearScalingForSlot(FrameSlot &slot) noexcept;
     bool WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept;
@@ -304,6 +333,9 @@ private:
 
     int _width = 0;
     int _height = 0;
+    int _bitDepth = 0;  // YUV 位深(8/10;不叫 _depth —— 那是零 guidance 深度纹理)
+    int _chromaW = 0;   // 色度平面尺寸 = (w+1)>>1 / (h+1)>>1
+    int _chromaH = 0;
 
     // shared read-only resources
     ComPtr<ID3D12Resource> _motion; // resident NON_PIXEL_SHADER_RESOURCE
@@ -323,10 +355,20 @@ private:
     ComPtr<ID3D12PipelineState> _psoDensify;
     ComPtr<ID3D12RootSignature> _rsGuidance;
     ComPtr<ID3D12PipelineState> _psoGuidanceDownsample;
-    // 光流输入降采样(#46 改 GPU):Buffer<uint> SRV 读本槽 upload,
-    // 双线性写 NVOF 注册输入纹理(1 SRV + 1 UAV + 6 常量)。
+    // 光流输入降采样(#48):inputColor(NSR,槽 0 srvInput)双线性写 NVOF
+    // 注册输入纹理(1 SRV + 1 UAV + 5 常量)。
     ComPtr<ID3D12RootSignature> _rsNvofDownsample;
     ComPtr<ID3D12PipelineState> _psoNvofDownsample;
+    // YUV↔RGB 转换(YUV 原生化):深度/矩阵/范围全走 root constants,
+    // R8/R16_UNORM 的 Texture2D<float> 视图同构 —— 仅 3 个 PSO:
+    // convertIn(Y/U/V 3 SRV → inputColor 1 UAV,8 常量);
+    // convertOut luma/chroma(outputColor 1 SRV → yuvOut 2 UAV——luma 用
+    // u0、chroma 用 u0/u1,共享根签名,10 常量:系数 4 + 范围 4 + 尺寸 2)。
+    ComPtr<ID3D12RootSignature> _rsConvertIn;
+    ComPtr<ID3D12PipelineState> _psoConvertIn;
+    ComPtr<ID3D12RootSignature> _rsConvertOut;
+    ComPtr<ID3D12PipelineState> _psoConvertOutLuma;
+    ComPtr<ID3D12PipelineState> _psoConvertOutChroma;
 
     // frame slot pool
     static constexpr int kSlotCount = 3;

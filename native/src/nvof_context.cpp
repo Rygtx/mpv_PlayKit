@@ -455,10 +455,10 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
 // 等待(有界 10s),device 丢失时短路快速降级。
 
 NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
-                                                 ID3D12Resource *uploadBuffer,
-                                                 UINT uploadRowPitch,
+                                                 ID3D12Resource *srcTex,
                                                  const PostExecuteFn &postExecute,
-                                                 const PostCopyFn &postCopy) noexcept {
+                                                 const PostCopyFn &postCopy,
+                                                 bool inputWrittenByPostCopy) noexcept {
     StageResult result{};
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) {
         result.publishZero = true;
@@ -566,37 +566,48 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         copyOk = copyOk &&
                  SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
         if (copyOk) {
-            if (postCopy) {
-                // GPU 光流输入降采样(#46 改 GPU):屏障 + 回调记录 dispatch,
-                // 替代 CopyTextureRegion。注册纹理归本会话所有,屏障在此做;
-                // copyFence 在 CL 完成后才 Signal,execute 的 inFence[0]
-                // (copyFence >= k_n)天然覆盖 dispatch 的完成。
-                D3D12_RESOURCE_BARRIER toUav[1]{
-                    Transition(_input[cur].Get(),
-                               D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            // YUV 原生:postCopy 恒设 —— 回调在本 nvof CL 上记录 YUV→RGB
+            // 转换(yuvUpload→yuvIn 拷贝 + dispatch → inputColor);follow 时
+            // 回调内含 RecordNvofDownsample(直写 _input[cur])。注册纹理归
+            // 本会话所有,屏障在此做;copyFence 在 CL 完成后才 Signal,
+            // execute 的 inFence[0](copyFence >= k_n)天然覆盖转换与
+            // dispatch 的完成。
+            D3D12_RESOURCE_BARRIER toUav[1]{
+                Transition(_input[cur].Get(),
+                           D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            };
+            _copyCommandList->ResourceBarrier(1, toUav);
+            postCopy(_copyCommandList.Get(), cur);
+            D3D12_RESOURCE_BARRIER toCommon[1]{
+                Transition(_input[cur].Get(),
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+            };
+            _copyCommandList->ResourceBarrier(1, toCommon);
+            if (!inputWrittenByPostCopy) {
+                // 非 follow:回调只做了转换(srcTex=inputColor,NSR),把整帧
+                // 纹理拷进 _input[cur](目标 COMMON 靠隐式提升,与旧 buffer
+                // 拷贝同款;源 NSR→COPY_SOURCE→copy→回 NSR)。
+                D3D12_RESOURCE_BARRIER toSrc[1]{
+                    Transition(srcTex,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE),
                 };
-                _copyCommandList->ResourceBarrier(1, toUav);
-                postCopy(_copyCommandList.Get(), cur);
-                D3D12_RESOURCE_BARRIER toCommon[1]{
-                    Transition(_input[cur].Get(),
-                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+                _copyCommandList->ResourceBarrier(1, toSrc);
+                D3D12_TEXTURE_COPY_LOCATION csrc{};
+                csrc.pResource = srcTex;
+                csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                csrc.SubresourceIndex = 0;
+                D3D12_TEXTURE_COPY_LOCATION cdst{};
+                cdst.pResource = _input[cur].Get();
+                cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                cdst.SubresourceIndex = 0;
+                _copyCommandList->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
+                D3D12_RESOURCE_BARRIER backNsr[1]{
+                    Transition(srcTex,
+                               D3D12_RESOURCE_STATE_COPY_SOURCE,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 };
-                _copyCommandList->ResourceBarrier(1, toCommon);
-            } else {
-                D3D12_TEXTURE_COPY_LOCATION src{};
-                src.pResource = uploadBuffer;
-                src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                src.PlacedFootprint.Offset = 0;
-                src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                src.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
-                src.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
-                src.PlacedFootprint.Footprint.Depth = 1;
-                src.PlacedFootprint.Footprint.RowPitch = uploadRowPitch;
-                D3D12_TEXTURE_COPY_LOCATION dst{};
-                dst.pResource = _input[cur].Get();
-                dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                dst.SubresourceIndex = 0;
-                _copyCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                _copyCommandList->ResourceBarrier(1, backNsr);
             }
             // 播种帧不录 densify/清零:发布走静态零纹理(MotionResource),
             // per-slot motion 保持 COMMON 不被触碰(状态机按 realMotion 归位)。

@@ -8,8 +8,6 @@
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgidebug.h>
-#include <immintrin.h>
-#include <intrin.h>
 
 namespace vsdlssnr {
 
@@ -17,26 +15,38 @@ namespace {
 
 constexpr UINT DEVICE_VENDOR_NVIDIA = 0x10DE;
 
-float Saturate(float v) noexcept {
-    if (!(v > 0.0f)) return 0.0f;   // also catches NaN
-    return v < 1.0f ? v : 1.0f;
-}
+// YUV↔RGB 转换系数(按位深/矩阵/范围推导,root constants 下发)。全程
+// 归一域 [0,1](Y)/[-0.5,0.5](C);shader 端与 CPU 参考实现共用同一组
+// 公式。10-bit 的有限范围常量 = 8-bit ×4(16→64 等)。
+// containerMax = UNORM 容器满值(255/65535):round(UNORM读出×containerMax)
+// 精确还原整数采样字;sampleMax = 采样值域上限(255/1023)。
+struct YuvCoeffs {
+    float containerMax;
+    float sampleMax;
+    float yLo, ySpan;   // limited: 16/219(8bit) 64/876(10bit);full: 0/sampleMax
+    float cMid, cSpan;  // limited: 128/224 512/896;full: sampleMax/2
+    float kr, kb;       // 709: 0.2126/0.0722;601: 0.299/0.114
+};
 
-// AVX2 检测(结果缓存):PackInput/UnpackOutput 的向量路径门。缺 AVX 的
-// 机器走原标量路径 —— 两条路径必须逐位等价(舍入语义见各自的实现注释)。
-// VSDLSSNR_SCALAR=1 强制标量(向量/标量逐位等价性的 A/B 验收 + 诊断)。
-bool HasAvx2() noexcept {
-    static const bool ok = [] {
-        if (GetEnvironmentVariableA("VSDLSSNR_SCALAR", nullptr, 0) != 0) return false;
-        int regs[4];
-        __cpuid(regs, 1);
-        if (!(regs[2] & (1u << 27))) return false; // OSXSAVE
-        if (!(regs[2] & (1u << 28))) return false; // AVX
-        if ((_xgetbv(_XCR_XFEATURE_ENABLED_MASK) & 0x6) != 0x6) return false; // XMM+YMM
-        __cpuidex(regs, 7, 0);
-        return (regs[1] & (1u << 5)) != 0;         // AVX2
-    }();
-    return ok;
+YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept {
+    YuvCoeffs c{};
+    c.containerMax = depth > 8 ? 65535.0f : 255.0f;
+    c.sampleMax = depth > 8 ? 1023.0f : 255.0f;
+    const float shift = depth > 8 ? 4.0f : 1.0f;
+    if (range == ColorRange::Limited) {
+        c.yLo = 16.0f * shift;
+        c.ySpan = 219.0f * shift;
+        c.cMid = 128.0f * shift;
+        c.cSpan = 224.0f * shift;
+    } else {
+        c.yLo = 0.0f;
+        c.ySpan = c.sampleMax;
+        c.cMid = c.sampleMax * 0.5f;
+        c.cSpan = c.sampleMax * 0.5f;
+    }
+    c.kr = matrix == ColorMatrix::BT709 ? 0.2126f : 0.299f;
+    c.kb = matrix == ColorMatrix::BT709 ? 0.0722f : 0.114f;
+    return c;
 }
 
 } // namespace
@@ -217,10 +227,16 @@ void D3D12Context::Finalize() noexcept {
             CloseHandle(s.fenceEvent);
             s.fenceEvent = nullptr;
         }
-        s.uploadMapped = nullptr;
-        s.readbackMapped = nullptr;
-        s.upload.Reset();
-        s.readback.Reset();
+        for (int p = 0; p < 3; ++p) {
+            if (s.uploadYuv[p] && s.uploadYuvMapped[p]) s.uploadYuv[p]->Unmap(0, nullptr);
+            if (s.readbackYuv[p] && s.readbackYuvMapped[p]) s.readbackYuv[p]->Unmap(0, nullptr);
+            s.uploadYuvMapped[p] = nullptr;
+            s.readbackYuvMapped[p] = nullptr;
+            s.uploadYuv[p].Reset();
+            s.readbackYuv[p].Reset();
+            s.yuvIn[p].Reset();
+            s.yuvOut[p].Reset();
+        }
         s.inputColor.Reset();
         s.outputColor.Reset();
         s.reducedColor.Reset();
@@ -414,9 +430,12 @@ bool D3D12Context::CreateColorTexture(
     return true;
 }
 
-bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t errLen) noexcept {
+bool D3D12Context::CreateFrameResources(int width, int height, int depth, char *err, size_t errLen) noexcept {
     _width = width;
     _height = height;
+    _bitDepth = depth;
+    _chromaW = (width + 1) >> 1;
+    _chromaH = (height + 1) >> 1;
 
     // 零 guidance 纹理:R16G16_FLOAT motion + R32_FLOAT depth,内容清 0。
     // RTV clear 要求 ALLOW_RENDER_TARGET 标志。clear 后常驻
@@ -484,7 +503,7 @@ bool D3D12Context::CreateFrameResources(int width, int height, char *err, size_t
             snprintf(pb, sizeof(pb), "PROBE: d3d12 slot %d begin", i);
             TimingStatusLine(pb);
         }
-        if (!CreateSlotResources(_slots[i], err, errLen)) return false;
+        if (!CreateSlotResources(_slots[i], depth, err, errLen)) return false;
         if (ProbeEnabled()) {
             char pb[48];
             snprintf(pb, sizeof(pb), "PROBE: d3d12 slot %d done", i);
@@ -528,7 +547,7 @@ bool D3D12Context::CreateRawBuffer(UINT64 bytes, D3D12_HEAP_TYPE heapType,
     return true;
 }
 
-bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
+bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, size_t errLen) noexcept {
     // Re-entrant on the hot path (a resolution change reuses the warm
     // context): release the previous generation of slot resources first.
     // Safe because the caller holds a PoolHold — every slot is idle and its
@@ -537,15 +556,21 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
         CloseHandle(slot.fenceEvent);
         slot.fenceEvent = nullptr;
     }
-    if (slot.upload && slot.uploadMapped) slot.upload->Unmap(0, nullptr);
-    if (slot.readback && slot.readbackMapped) slot.readback->Unmap(0, nullptr);
-    slot.uploadMapped = nullptr;
-    slot.readbackMapped = nullptr;
+    // YUV 原生:三对 persist-mapped buffer(Y 全分辨率 + U/V 半分辨率)。
+    for (int i = 0; i < 3; ++i) {
+        if (slot.uploadYuv[i] && slot.uploadYuvMapped[i]) slot.uploadYuv[i]->Unmap(0, nullptr);
+        if (slot.readbackYuv[i] && slot.readbackYuvMapped[i]) slot.readbackYuv[i]->Unmap(0, nullptr);
+        slot.uploadYuvMapped[i] = nullptr;
+        slot.readbackYuvMapped[i] = nullptr;
+    }
     slot.commandList.Reset();
     slot.allocator.Reset();
-    slot.upload.Reset();
-    slot.readback.Reset();
-    slot.nvofSrcTex.Reset();
+    for (int i = 0; i < 3; ++i) {
+        slot.uploadYuv[i].Reset();
+        slot.readbackYuv[i].Reset();
+        slot.yuvIn[i].Reset();
+        slot.yuvOut[i].Reset();
+    }
     slot.inputColor.Reset();
     slot.outputColor.Reset();
     slot.reducedColor.Reset();
@@ -585,11 +610,12 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
     }
 
     // B8G8R8A8_UNORM(与 Magpie 渲染管线同款):NVOF 输入格式要求 BGRA8
-    // (ABGR8),NGX DLSSNR 的参考宿主也是 BGRA —— 逐像素字节序在
-    // PackInput/UnpackOutput 两端换位,逻辑颜色内容与旧 RGBA8 版逐位等价。
+    // (ABGR8),NGX DLSSNR 的参考宿主也是 BGRA。ALLOW_UNORDERED_ACCESS:
+    // YUV→RGB 转换 dispatch UAV 直写(NGX 对 UAV-flag 纹理做 SRV 读有
+    // reducedColor/motion 生产前科)。
     if (!CreateColorTexture(slot.inputColor.GetAddressOf(), width, height,
                             DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_NONE, err, errLen)) {
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }
     // NGX binds the output as a UAV; a D3D12-native resource requires
@@ -600,11 +626,25 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }
-    // 光流 GPU 降采样源(#46 改 GPU):整帧 BGRA8 暂存,见 FrameSlot 注释。
-    if (!CreateColorTexture(slot.nvofSrcTex.GetAddressOf(), width, height,
-                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_NONE, err, errLen)) {
-        return false;
+
+    // YUV 平面纹理:In = upload 拷入供转换采样;Out = RGB→YUV dispatch 写出
+    // 供回读。R8_UNORM(8bit)/R16_UNORM(10bit,存储字 = VS P10 采样值,
+    // 右对齐 0-1023 —— 2026-09-08 BlankClip 实测;UNORM 读出 word/65535,
+    // round(×65535) 精确还原整数采样值)。
+    const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+    for (int i = 0; i < 3; ++i) {
+        const int pw = i == 0 ? width : _chromaW;
+        const int ph = i == 0 ? height : _chromaH;
+        if (!CreateColorTexture(slot.yuvIn[i].GetAddressOf(), pw, ph,
+                                yuvFmt, D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_FLAG_NONE, err, errLen)) {
+            return false;
+        }
+        if (!CreateColorTexture(slot.yuvOut[i].GetAddressOf(), pw, ph,
+                                yuvFmt, D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+            return false;
+        }
     }
 
     // NVOF guidance 槽纹理:densify 写稠密运动(R16G16_FLOAT)+ 置信度
@@ -620,35 +660,36 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
         return false;
     }
 
-    // Upload staging:RGBA8 行距 256 对齐(persist-mapped once)
-    {
-        if (!CreateRawBuffer(static_cast<UINT64>(height) * width * 4, D3D12_HEAP_TYPE_UPLOAD,
+    // YUV upload/readback staging:每平面一条 buffer,行距 256 对齐,
+    // persist-mapped(纯行拷贝,无像素算术)。
+    const UINT planeBytes = _bitDepth > 8 ? 2 : 1;
+    for (int i = 0; i < 3; ++i) {
+        const int pw = i == 0 ? width : _chromaW;
+        const int ph = i == 0 ? height : _chromaH;
+        const UINT bytesPerRow = static_cast<UINT>(pw) * planeBytes;
+        if (!CreateRawBuffer(static_cast<UINT64>(ph) * bytesPerRow, D3D12_HEAP_TYPE_UPLOAD,
                              D3D12_RESOURCE_STATE_GENERIC_READ,
-                             slot.upload.GetAddressOf(), slot.uploadPitch,
-                             width * 4, err, errLen)) {
+                             slot.uploadYuv[i].GetAddressOf(), slot.uploadPitchYuv[i],
+                             bytesPerRow, err, errLen)) {
             return false;
         }
-        hr = slot.upload->Map(0, nullptr, &slot.uploadMapped);
+        hr = slot.uploadYuv[i]->Map(0, nullptr, &slot.uploadYuvMapped[i]);
         if (FAILED(hr)) {
-            SetErr(err, errLen, hr, "Map(upload) failed");
+            SetErr(err, errLen, hr, "Map(uploadYuv) failed");
             return false;
         }
-    }
-    {
         // READBACK heap only accepts buffers on this runtime (texture staging
         // on READBACK heap returns E_INVALIDARG), so copy via placed footprint
-        // into a readback buffer. Persist-mapped like the upload side: the
-        // per-frame Map/Unmap pair was pure driver-call overhead.
-        slot.readbackPitch = slot.uploadPitch; // same 256-aligned RGBA8 row size
-        if (!CreateRawBuffer(static_cast<UINT64>(height) * width * 4, D3D12_HEAP_TYPE_READBACK,
+        // into a readback buffer. Persist-mapped like the upload side.
+        if (!CreateRawBuffer(static_cast<UINT64>(ph) * bytesPerRow, D3D12_HEAP_TYPE_READBACK,
                              D3D12_RESOURCE_STATE_COPY_DEST,
-                             slot.readback.GetAddressOf(), slot.readbackPitch,
-                             width * 4, err, errLen)) {
+                             slot.readbackYuv[i].GetAddressOf(), slot.readbackPitchYuv[i],
+                             bytesPerRow, err, errLen)) {
             return false;
         }
-        hr = slot.readback->Map(0, nullptr, &slot.readbackMapped);
+        hr = slot.readbackYuv[i]->Map(0, nullptr, &slot.readbackYuvMapped[i]);
         if (FAILED(hr)) {
-            SetErr(err, errLen, hr, "Map(readback) failed");
+            SetErr(err, errLen, hr, "Map(readbackYuv) failed");
             return false;
         }
     }
@@ -657,7 +698,7 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
         // here, the residual pipeline descriptors on every scaling rebuild.
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 25;
+        heapDesc.NumDescriptors = 32;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -685,14 +726,21 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, char *err, size_t errLen
         _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(15));
         _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(16));
         _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(17));
-        // 22:光流降采样源纹理的 SRV(默认视图描述符,Texture2D 惯用形态
-        // —— buffer SRV 在本机驱动上异步 DEVICE_HUNG,见 FrameSlot 注释)。
-        _device->CreateShaderResourceView(slot.nvofSrcTex.Get(), nullptr, slotHandle(22));
+        // 22:outputColor 的 SRV(RGB→YUV 转换读;原 srvNvofSrc 随 nvofSrcTex
+        // 删除让位 —— 降采样直接采样槽 0 srvInput)。
+        _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(22));
         // 23/24:NVOF 注册输入纹理的 UAV 占位(outputColor 带 UAV flag,
         // 不 NULL);BindNvofResources 在会话建立时覆盖为真值。降采样只在
         // 会话存活时被记录,占位永不被有效写入。
         _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(23));
         _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(24));
+        // 25-27:yuvIn 的 SRV(YUV→RGB 转换采样);28-30:yuvOut 的 UAV
+        // (RGB→YUV 写出);31:inputColor 的 UAV(YUV→RGB 直写)。
+        for (int i = 0; i < 3; ++i) {
+            _device->CreateShaderResourceView(slot.yuvIn[i].Get(), nullptr, slotHandle(25 + i));
+            _device->CreateUnorderedAccessView(slot.yuvOut[i].Get(), nullptr, nullptr, slotHandle(28 + i));
+        }
+        _device->CreateUnorderedAccessView(slot.inputColor.Get(), nullptr, nullptr, slotHandle(31));
     }
     return true;
 }
@@ -705,44 +753,16 @@ bool D3D12Context::PackInput(
         SetErr(err, errLen, E_INVALIDARG, "PackInput: size mismatch");
         return false;
     }
-    const bool avx2 = HasAvx2();
-    // 常量提在行循环外;mul/add 分开各舍入一次 —— 禁用 FMA 合并(fmadd
-    // 只舍入一次,与标量 (v*255 舍入) + 0.5 (再舍入) 在边界值差 1 LSB)。
-    const __m256 k255 = _mm256_set1_ps(255.0f);
-    const __m256 kHalf = _mm256_set1_ps(0.5f);
-    const __m256 kOne = _mm256_set1_ps(1.0f);
-    const __m256 kZero = _mm256_setzero_ps();
-    auto *dstRow = static_cast<uint8_t *>(slot.uploadMapped);
-    for (int y = 0; y < height; ++y, dstRow += slot.uploadPitch) {
-        const float *rowR = reinterpret_cast<const float *>(srcPlanes[0] + srcStrides[0] * y);
-        const float *rowG = reinterpret_cast<const float *>(srcPlanes[1] + srcStrides[1] * y);
-        const float *rowB = reinterpret_cast<const float *>(srcPlanes[2] + srcStrides[2] * y);
-        uint32_t *dstPx = reinterpret_cast<uint32_t *>(dstRow);
-        int x = 0;
-        if (avx2) {
-            // 向量路径:与标量路径逐位等价。Saturate ≡ maxps(NaN/负值返回
-            // 第二操作数 0,标量 !(v>0)→0 同款) + minps 封顶 1;
-            // *255+0.5 截断 ≡ cvttps_epi32(向零截断,值域 0..255 无差异)。
-            for (; x + 8 <= width; x += 8) {
-                const __m256 vr = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(rowR + x), kZero), kOne);
-                const __m256 vg = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(rowG + x), kZero), kOne);
-                const __m256 vb = _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(rowB + x), kZero), kOne);
-                const __m256i ri = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(vr, k255), kHalf));
-                const __m256i gi = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(vg, k255), kHalf));
-                const __m256i bi = _mm256_cvttps_epi32(_mm256_add_ps(_mm256_mul_ps(vb, k255), kHalf));
-                // BGRA 字节序(byte0=B):NVOF 输入格式 + Magpie 管线同款。
-                const __m256i px = _mm256_or_si256(_mm256_set1_epi32((int)0xFF000000),
-                    _mm256_or_si256(_mm256_or_si256(_mm256_slli_epi32(ri, 16),
-                                                    _mm256_slli_epi32(gi, 8)), bi));
-                _mm256_storeu_si256(reinterpret_cast<__m256i *>(dstPx + x), px);
-            }
-        }
-        for (; x < width; ++x) {
-            const uint32_t r = static_cast<uint32_t>(Saturate(rowR[x]) * 255.0f + 0.5f);
-            const uint32_t g = static_cast<uint32_t>(Saturate(rowG[x]) * 255.0f + 0.5f);
-            const uint32_t b = static_cast<uint32_t>(Saturate(rowB[x]) * 255.0f + 0.5f);
-            // BGRA 字节序(byte0=B):NVOF 输入格式 + Magpie 管线同款。
-            dstPx[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+    // YUV 原生:纯行拷贝,零像素算术(YUV→RGB 在 GPU 转换 pass)。
+    // [0]=Y 全分辨率,[1]/[2]=U/V 半分辨率;行距 256 对齐,VS stride 对齐。
+    for (int p = 0; p < 3; ++p) {
+        const int pw = p == 0 ? width : _chromaW;
+        const int ph = p == 0 ? height : _chromaH;
+        const size_t rowBytes = static_cast<size_t>(pw) * (_bitDepth > 8 ? 2u : 1u);
+        const uint8_t *srcRow = srcPlanes[p];
+        uint8_t *dstRow = static_cast<uint8_t *>(slot.uploadYuvMapped[p]);
+        for (int y = 0; y < ph; ++y, srcRow += srcStrides[p], dstRow += slot.uploadPitchYuv[p]) {
+            memcpy(dstRow, srcRow, rowBytes);
         }
     }
     return true;
@@ -763,57 +783,121 @@ bool D3D12Context::BeginFrameRecording(FrameSlot &slot) noexcept {
     return SUCCEEDED(hr);
 }
 
-bool D3D12Context::RecordUploadCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateAfter, char *err, size_t errLen) noexcept {
-    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
-    D3D12_RESOURCE_BARRIER toCopyDest[1]{
-        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
+// cbuffer ConvertInParams(root constants,三处同步铁律:HLSL cbuffer /
+// Num32BitValues=10 / SetComputeRoot32BitConstants):
+// @0-1 uint2 DstExtent(inputColor 尺寸,dispatch 边界)
+// @2 containerMax @3 yLo @4 yScale(1/ySpan) @5 cMid @6 cScale(1/cSpan)
+// @7 kr @8 kb @9 pad
+void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                      ColorMatrix matrix, ColorRange range,
+                                      D3D12_RESOURCE_STATES stateAfter) noexcept {
+    // cl 由调用方给定(nvof CL 或槽 CL)—— 见头文件注释,录错列表 = 被销毁。
+    ID3D12GraphicsCommandList *cl = &clRef;
+    const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+    const int planeW[3]{ _width, _chromaW, _chromaW };
+    const int planeH[3]{ _height, _chromaH, _chromaH };
+
+    // 1) yuvUpload → yuvIn ×3(footprint,同格式)。
+    D3D12_RESOURCE_BARRIER toCopyDest[3];
+    for (int i = 0; i < 3; ++i) {
+        toCopyDest[i] = Transition(slot.yuvIn[i].Get(),
+                                   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    cl->ResourceBarrier(3, toCopyDest);
+    for (int i = 0; i < 3; ++i) {
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = slot.uploadYuv[i].Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Offset = 0;
+        src.PlacedFootprint.Footprint.Format = yuvFmt;
+        src.PlacedFootprint.Footprint.Width = static_cast<UINT>(planeW[i]);
+        src.PlacedFootprint.Footprint.Height = static_cast<UINT>(planeH[i]);
+        src.PlacedFootprint.Footprint.Depth = 1;
+        src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.uploadPitchYuv[i]);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = slot.yuvIn[i].Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+    D3D12_RESOURCE_BARRIER toNsr[3];
+    for (int i = 0; i < 3; ++i) {
+        toNsr[i] = Transition(slot.yuvIn[i].Get(),
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    cl->ResourceBarrier(3, toNsr);
+
+    // 2) 转换 dispatch:采样 Y/U/V(色度双线性上采)→ UAV 直写 inputColor。
+    D3D12_RESOURCE_BARRIER toUav[1]{
+        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
     };
-    cl->ResourceBarrier(1, toCopyDest);
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = slot.upload.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = 0;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
-    src.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.uploadPitch);
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = slot.inputColor.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = 0;
-    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    D3D12_RESOURCE_BARRIER toAfter[1]{
-        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, stateAfter),
+    cl->ResourceBarrier(1, toUav);
+    const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _bitDepth);
+    cl->SetComputeRootSignature(_rsConvertIn.Get());
+    cl->SetPipelineState(_psoConvertIn.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+    const float consts[8]{ cf.containerMax, cf.yLo, 1.0f / cf.ySpan, cf.cMid,
+                           1.0f / cf.cSpan, cf.kr, cf.kb, 0.0f };
+    cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+    cl->SetComputeRoot32BitConstants(0, 8, consts, 2);
+    cl->SetComputeRootDescriptorTable(1, gpu(25)); // t0 PlaneY
+    cl->SetComputeRootDescriptorTable(2, gpu(26)); // t1 PlaneU
+    cl->SetComputeRootDescriptorTable(3, gpu(27)); // t2 PlaneV
+    cl->SetComputeRootDescriptorTable(4, gpu(31)); // u0 inputColor
+    cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
+
+    // 3) inputColor → stateAfter(NSR=NGX 待读;COMMON=skipEval);
+    //    yuvIn 归位 COMMON(帧末全 COMMON 不变量,下一帧重新 COPY_DEST)。
+    D3D12_RESOURCE_BARRIER outBar[1]{
+        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, stateAfter),
     };
-    cl->ResourceBarrier(1, toAfter);
-    return true;
+    cl->ResourceBarrier(1, outBar);
+    D3D12_RESOURCE_BARRIER inBack[3];
+    for (int i = 0; i < 3; ++i) {
+        inBack[i] = Transition(slot.yuvIn[i].Get(),
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
+    cl->ResourceBarrier(3, inBack);
 }
 
-bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, D3D12_RESOURCE_STATES stateBefore, char *err, size_t errLen) noexcept {
+bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    // RecordYuvOutput 之后调用:yuvOut 处于 UAV 态 → COPY_SOURCE → 拷贝
+    // → COMMON。三平面各自 footprint(格式同资源,跨格式 = 静默 E_INVALIDARG)。
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
-    D3D12_RESOURCE_BARRIER toCopySrc[1]{
-        Transition(slot.outputColor.Get(), stateBefore, D3D12_RESOURCE_STATE_COPY_SOURCE),
-    };
-    cl->ResourceBarrier(1, toCopySrc);
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = slot.outputColor.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = slot.readback.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint.Offset = 0;
-    dst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
-    dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
-    dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.readbackPitch);
-    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    D3D12_RESOURCE_BARRIER backToCommon[1]{
-        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-    };
-    cl->ResourceBarrier(1, backToCommon);
+    const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+    const int planeW[3]{ _width, _chromaW, _chromaW };
+    const int planeH[3]{ _height, _chromaH, _chromaH };
+    for (int i = 0; i < 3; ++i) {
+        D3D12_RESOURCE_BARRIER toCopySrc[1]{
+            Transition(slot.yuvOut[i].Get(),
+                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        };
+        cl->ResourceBarrier(1, toCopySrc);
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = slot.yuvOut[i].Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = slot.readbackYuv[i].Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint.Offset = 0;
+        dst.PlacedFootprint.Footprint.Format = yuvFmt;
+        dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(planeW[i]);
+        dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(planeH[i]);
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.readbackPitchYuv[i]);
+        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER backToCommon[1]{
+            Transition(slot.yuvOut[i].Get(),
+                       D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+        };
+        cl->ResourceBarrier(1, backToCommon);
+    }
     return true;
 }
 
@@ -870,36 +954,18 @@ bool D3D12Context::UnpackOutput(
         return false;
     }
 
-    // The readback buffer is persist-mapped at creation (mirrors the upload
-    // side): the per-frame Map/Unmap pair only bought two driver calls.
-    const size_t pitch = slot.readbackPitch;
-    const auto *srcRow = static_cast<const uint8_t *>(slot.readbackMapped);
-    // 标量公式是乘常数 (1/255.0f)(编译期折叠),向量路径用同一常数 ——
-    // cvtdq2ps 对 0..255 整数精确,float 乘法逐位等价。禁用除法改写。
-    const __m256 kRecip = _mm256_set1_ps(1.0f / 255.0f);
-    for (int y = 0; y < height; ++y, srcRow += pitch) {
-        const uint8_t *row = srcRow;
-        float *rowR = reinterpret_cast<float *>(dstPlanes[0] + dstStrides[0] * y);
-        float *rowG = reinterpret_cast<float *>(dstPlanes[1] + dstStrides[1] * y);
-        float *rowB = reinterpret_cast<float *>(dstPlanes[2] + dstStrides[2] * y);
-        int x = 0;
-        if (HasAvx2()) {
-            // 向量路径:与标量路径逐位等价(与 PackInput 的写入换位成对)。
-            for (; x + 8 <= width; x += 8) {
-                const __m256i px = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row + x * 4));
-                const __m256i bI = _mm256_and_si256(px, _mm256_set1_epi32(0xFF));
-                const __m256i gI = _mm256_srli_epi32(_mm256_and_si256(px, _mm256_set1_epi32(0xFF00)), 8);
-                const __m256i rI = _mm256_srli_epi32(_mm256_and_si256(px, _mm256_set1_epi32(0xFF0000)), 16);
-                _mm256_storeu_ps(rowB + x, _mm256_mul_ps(_mm256_cvtepi32_ps(bI), kRecip));
-                _mm256_storeu_ps(rowG + x, _mm256_mul_ps(_mm256_cvtepi32_ps(gI), kRecip));
-                _mm256_storeu_ps(rowR + x, _mm256_mul_ps(_mm256_cvtepi32_ps(rI), kRecip));
-            }
-        }
-        for (; x < width; ++x) {
-            // BGRA 字节序(byte0=B):与 PackInput 的写入换位成对。
-            rowB[x] = row[x * 4 + 0] * (1.0f / 255.0f);
-            rowG[x] = row[x * 4 + 1] * (1.0f / 255.0f);
-            rowR[x] = row[x * 4 + 2] * (1.0f / 255.0f);
+    // YUV 原生:RGB→YUV 已在 GPU 完成,这里纯行拷贝回 VS 平面。
+    // 10bit:yuvOut(R16_UNORM)存储字 = round(n*65535) = 10-bit 采样值
+    // (shader 侧 w=n*1023/65535 精确缩放,见 BGRA_TO_YUV_HLSL),与 VS
+    // P10 word 逐位一致 —— 所以是纯拷贝。
+    for (int p = 0; p < 3; ++p) {
+        const int pw = p == 0 ? width : _chromaW;
+        const int ph = p == 0 ? height : _chromaH;
+        const size_t rowBytes = static_cast<size_t>(pw) * (_bitDepth > 8 ? 2u : 1u);
+        const uint8_t *srcRow = static_cast<const uint8_t *>(slot.readbackYuvMapped[p]);
+        uint8_t *dstRow = dstPlanes[p];
+        for (int y = 0; y < ph; ++y, srcRow += slot.readbackPitchYuv[p], dstRow += dstStrides[p]) {
+            memcpy(dstRow, srcRow, rowBytes);
         }
     }
     return true;
@@ -1354,17 +1420,16 @@ void DownsampleGuidance(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
-// 光流输入 GPU 降采样(#46 改 GPU):nvof CL 先把本帧 upload 拷进
-// nvofSrcTex(GPU 本地整帧 BGRA8 暂存),本 shader 读它的 Texture2D SRV
-// 双线性写到 NVOF 注册输入纹理。不直接读 upload buffer:typed buffer
-// SRV 在本机驱动上异步 DEVICE_HUNG(见 FrameSlot 注释)。核公式与被删除
-// 的 CPU PackNvofInput 逐式一致(f=(d+0.5)*s-0.5、(int) 截断、clamp、
-// +1 邻域取 min);差异仅在量化顺序 —— CPU 对 RGBS 浮点 lerp 后一次性
+// 光流输入 GPU 降采样(#46/#48):YUV→RGB 转换(同 CL 先行)已产出
+// inputColor(NSR),本 shader 读它的 Texture2D SRV 双线性写到 NVOF 注册
+// 输入纹理。核公式与被删除的 CPU PackNvofInput 逐式一致(f=(d+0.5)*s-0.5、
+// (int) 截断、clamp、+1 邻域取 min);差异仅在量化顺序 —— CPU 对 RGBS 浮点
+// lerp 后一次性
 // 量化,GPU 对 PackInput 已量化的 0-255 值 lerp,权重和为 1 的线性映射
 // 下两端差 ≤1 LSB,对光流输入(低频信号)无影响。仅缩窄方向
 // (dstW<=srcW)使用,f 恒 >= 0。
 constexpr char NVOF_DOWNSAMPLE_HLSL[] = R"(
-Texture2D<float4> SourceColor : register(t0);  // BGRA8 UNORM: x=B y=G z=R w=A
+Texture2D<float4> SourceColor : register(t0);  // BGRA8:SRV 返回逻辑 RGBA(通道无关于本 shader)
 RWTexture2D<float4> DestColor : register(u0);
 
 cbuffer NvofDownsampleParams : register(b0) {
@@ -1407,13 +1472,133 @@ void NvofDownsample(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// YUV→RGB(YUV 原生化):采样 Y/U/V 平面(色度双线性上采),按位深恢复
+// 整数采样字、按范围展开,矩阵求逆得 RGB,UAV 直写 inputColor。深度/矩阵/
+// 范围全在 root constants(C0/C1,由 YuvCoeffsFor 按 _bitDepth 推导)——
+// R8/R16_UNORM 的 Texture2D<float> SRV 同构,单 PSO 通吃两深度。
+// BGRA typed SRV 返回逻辑 RGBA(.xyz=R,G,B,Magpie r5 TODO §2.1 同款约定;
+// 数值验收的 python 参考会当场抓 R/B 换位)。
+constexpr char YUV_TO_BGRA_HLSL[] = R"(
+Texture2D<float> PlaneY : register(t0);
+Texture2D<float> PlaneU : register(t1);
+Texture2D<float> PlaneV : register(t2);
+RWTexture2D<float4> OutputColor : register(u0);
+
+cbuffer ConvertInParams : register(b0) {
+    uint2 DstExtent;      // inputColor 尺寸(dispatch 边界)
+    float ContainerMax;   // 255 / 65535
+    float YLo;            // limited 16/64;full 0
+    float YScale;         // 1/219, 1/876, 1/255, 1/1023
+    float CMid;           // limited 128/512;full sampleMax/2
+    float CScale;         // 1/224, 1/896, 2/sampleMax
+    float Kr;             // 0.2126(709) / 0.299(601)
+    float Kb;             // 0.0722(709) / 0.114(601)
+    float Pad0;
+};
+
+[numthreads(8, 8, 1)]
+void ConvertYuvToBgra(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    // round(UNORM × containerMax) 精确还原整数采样字(8/10 位同构)。
+    const float codeY = round(PlaneY[tid.xy].x * ContainerMax);
+    const float nY = (codeY - YLo) * YScale;
+
+    // 色度半分辨率 → 双线性上采(与原 zimg Bilinear 对齐;siting (0,0.5))。
+    const int2 cExtent = (DstExtent + 1) >> 1;
+    const float2 fc = (tid.xy + 0.5) * 0.5 - 0.5;
+    const int2 c0 = int2(floor(fc));
+    const float2 wf = fc - c0;
+    const int2 s0 = clamp(c0, int2(0, 0), cExtent - 1);
+    const int2 s1 = clamp(c0 + 1, int2(0, 0), cExtent - 1);
+    const float w00 = (1.0 - wf.x) * (1.0 - wf.y), w10 = wf.x * (1.0 - wf.y);
+    const float w01 = (1.0 - wf.x) * wf.y, w11 = wf.x * wf.y;
+    const float codeU = round(PlaneU[s0].x * ContainerMax) * w00
+                      + round(PlaneU[int2(s1.x, s0.y)].x * ContainerMax) * w10
+                      + round(PlaneU[int2(s0.x, s1.y)].x * ContainerMax) * w01
+                      + round(PlaneU[s1].x * ContainerMax) * w11;
+    const float codeV = round(PlaneV[s0].x * ContainerMax) * w00
+                      + round(PlaneV[int2(s1.x, s0.y)].x * ContainerMax) * w10
+                      + round(PlaneV[int2(s0.x, s1.y)].x * ContainerMax) * w01
+                      + round(PlaneV[s1].x * ContainerMax) * w11;
+    const float nU = (codeU - CMid) * CScale;
+    const float nV = (codeV - CMid) * CScale;
+
+    // 矩阵求逆(Kg = 1-Kr-Kb):R = Y + Cr·2(1-Kr),B = Y + Cb·2(1-Kb),
+    // G = (Y - Kr·R - Kb·B)/Kg。
+    const float Kg = 1.0 - Kr - Kb;
+    const float r = nY + nV * 2.0 * (1.0 - Kb);
+    const float b = nY + nU * 2.0 * (1.0 - Kr);
+    const float g = (nY - Kr * r - Kb * b) / Kg;
+    OutputColor[tid.xy] = float4(saturate(r), saturate(g), saturate(b), 1.0);
+}
+)";
+
+// RGB→YUV(YUV 原生化):outputColor(SRV,逻辑 RGBA)→ luma 全分辨率 +
+// chroma 半分辨率 2×2 box 两个入口。归一域 → 整数采样字 → 写 w =
+// code/containerMax;UNORM 存储回读 = round(w×containerMax) = code,与
+// VS 平面字(P8 byte / P10 word)逐位一致 → CPU 解包纯行拷贝。深度由
+// LoOverCM/SpanOverCM 折叠(= yLo/CM 等,YuvCoeffsFor 推导)。
+constexpr char BGRA_TO_YUV_HLSL[] = R"(
+Texture2D<float4> CompositeColor : register(t0);  // BGRA8:SRV 返回逻辑 RGBA
+RWTexture2D<float> OutputA : register(u0);  // luma dispatch 绑 yuvOut[0](Y)
+RWTexture2D<float> OutputB : register(u1);  // chroma dispatch 绑 yuvOut[1](U)/[2](V)
+
+cbuffer ConvertOutParams : register(b0) {
+    uint2 DstExtent;      // luma: W,H;chroma: cw,ch(dispatch 边界)
+    uint2 SourceExtent;   // 全分辨率尺寸(chroma 2×2 块 clamp)
+    float Kr;
+    float Kb;
+    float LoOverCM;       // luma: yLo/CM;chroma: cMid/CM
+    float SpanOverCM;     // luma: ySpan/CM;chroma: cSpan/CM
+    float Pad0;
+    float Pad1;
+    float Pad2;
+};
+
+float LumaOf(float3 rgb) {
+    return dot(rgb, float3(Kr, 1.0 - Kr - Kb, Kb));
+}
+
+[numthreads(8, 8, 1)]
+void BgraToYuvLuma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float3 rgb = saturate(CompositeColor[tid.xy].xyz);
+    const float nY = LumaOf(rgb);
+    OutputA[tid.xy] = saturate(nY) * SpanOverCM + LoOverCM;
+}
+
+[numthreads(8, 8, 1)]
+void BgraToYuvChroma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    // 2×2 box 平均:全程仿射,先平均后转换与逐点转换等价。
+    const int2 base = tid.xy * 2;
+    const int2 x1 = min(base + int2(1, 0), SourceExtent - 1);
+    const int2 y1 = min(base + int2(0, 1), SourceExtent - 1);
+    const int2 x1y1 = min(base + int2(1, 1), SourceExtent - 1);
+    const float3 rgb = saturate(0.25 * (CompositeColor[base].xyz
+                                      + CompositeColor[x1].xyz
+                                      + CompositeColor[y1].xyz
+                                      + CompositeColor[x1y1].xyz));
+    const float nY = LumaOf(rgb);
+    // cb = (B-Y)·0.5/(1-Kb),cr = (R-Y)·0.5/(1-Kr)
+    const float cb = (rgb.z - nY) * (0.5 / (1.0 - Kb));
+    const float cr = (rgb.x - nY) * (0.5 / (1.0 - Kr));
+    OutputA[tid.xy] = saturate(cb) * SpanOverCM + LoOverCM;  // u0 → U 平面
+    OutputB[tid.xy] = saturate(cr) * SpanOverCM + LoOverCM;  // u1 → V 平面
+}
+)";
+
 } // namespace
 
 bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
                                      const wchar_t *path, DXGI_FORMAT format) noexcept {
-    // RGBA8 (4 B/px) covers the color dumps; the horizontal residual is now
-    // R16G16B16A16_FLOAT (8 B/px) since the residual needs a signed range.
-    const UINT bpp = format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+    // 4 B/px covers the BGRA color dumps; the horizontal residual is
+    // R16G16B16A16_FLOAT (8 B/px, signed range); R8/R16_UNORM (1/2 B/px)
+    // are the YUV planes (YUV 原生化 dump 验收用)。
+    UINT bpp = 4u;
+    if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) bpp = 8u;
+    else if (format == DXGI_FORMAT_R16_UNORM) bpp = 2u;
+    else if (format == DXGI_FORMAT_R8_UNORM) bpp = 1u;
     size_t pitch = 0;
     ComPtr<ID3D12Resource> buffer;
     char ignore[96];
@@ -1681,8 +1866,8 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             return false;
         }
     }
-    // 光流输入 GPU 降采样(#46 改 GPU):b0 5 常量 + t0 单表(nvofSrcTex
-    // 的 Texture2D SRV)+ u0 单表(NVOF 注册输入纹理 UAV)。t0/u0 各自
+    // 光流输入 GPU 降采样(#46/#48):b0 5 常量 + t0 单表(inputColor 的
+    // Texture2D SRV,槽 0)+ u0 单表(NVOF 注册输入纹理 UAV)。t0/u0 各自
     // 独立表参数 —— 同表重叠 range 禁忌见 densify 块注释。
     if (ProbeEnabled()) TimingStatusLine("PROBE: pso base ok");
     {
@@ -1740,6 +1925,137 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             return false;
         }
         if (ProbeEnabled()) TimingStatusLine("PROBE: pso nvofds done");
+    }
+    // YUV↔RGB 转换(YUV 原生化):convertIn = t0/t1/t2 三张 SRV 表(Y/U/V)
+    // + u0 一张 UAV 表(inputColor)+ b0 10 常量;convertOut = t0 一张 SRV 表
+    // (outputColor)+ u0/u1 两张 UAV 表(Y/U,V)+ b0 12 常量。深度/矩阵/
+    // 范围全在常量里(R8/R16_UNORM 的 float 视图同构)—— 每 shader 单 PSO。
+    {
+        D3D12_DESCRIPTOR_RANGE srvRanges[3]{};
+        for (UINT i = 0; i < 3; ++i) {
+            srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            srvRanges[i].NumDescriptors = 1;
+            srvRanges[i].BaseShaderRegister = i;
+            srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
+        }
+        D3D12_DESCRIPTOR_RANGE uavRange{};
+        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRange.NumDescriptors = 1;
+        uavRange.BaseShaderRegister = 0;
+        uavRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_ROOT_PARAMETER params[5]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.ShaderRegister = 0;
+        params[0].Constants.Num32BitValues = 10; // extent(2)+C0(4)+C1(4)-1pad
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        for (UINT i = 0; i < 3; ++i) {
+            params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
+            params[1 + i].DescriptorTable.pDescriptorRanges = &srvRanges[i];
+            params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[4].DescriptorTable.NumDescriptorRanges = 1;
+        params[4].DescriptorTable.pDescriptorRanges = &uavRange;
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+        rsDesc.NumParameters = 5;
+        rsDesc.pParameters = params;
+        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ComPtr<ID3DBlob> rsBlob, rsErr;
+        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(convert in) failed");
+            return false;
+        }
+        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsConvertIn.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateRootSignature(convert in) failed");
+            return false;
+        }
+        ComPtr<ID3DBlob> code, csErr;
+        if (FAILED(D3DCompile(YUV_TO_BGRA_HLSL, strlen(YUV_TO_BGRA_HLSL),
+                              nullptr, nullptr, nullptr, "ConvertYuvToBgra", "cs_5_0",
+                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(convert in) failed");
+            return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+        psoDesc.pRootSignature = _rsConvertIn.Get();
+        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
+        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoConvertIn.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert in) failed");
+            return false;
+        }
+    }
+    {
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_DESCRIPTOR_RANGE uavRanges[2]{};
+        for (UINT i = 0; i < 2; ++i) {
+            uavRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            uavRanges[i].NumDescriptors = 1;
+            uavRanges[i].BaseShaderRegister = i;
+            uavRanges[i].OffsetInDescriptorsFromTableStart = 0;
+        }
+        D3D12_ROOT_PARAMETER params[4]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.ShaderRegister = 0;
+        params[0].Constants.Num32BitValues = 12; // extent(2)+srcExtent(2)+系数(4)+pad(4)
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 1;
+        params[1].DescriptorTable.pDescriptorRanges = &srvRange;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable.NumDescriptorRanges = 1;
+        params[2].DescriptorTable.pDescriptorRanges = &uavRanges[0];
+        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[3].DescriptorTable.NumDescriptorRanges = 1;
+        params[3].DescriptorTable.pDescriptorRanges = &uavRanges[1];
+        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+        rsDesc.NumParameters = 4;
+        rsDesc.pParameters = params;
+        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ComPtr<ID3DBlob> rsBlob, rsErr;
+        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(convert out) failed");
+            return false;
+        }
+        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsConvertOut.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateRootSignature(convert out) failed");
+            return false;
+        }
+        struct OutCso { const char *entry; ID3D12PipelineState **pso; };
+        const OutCso outCsos[]{
+            { "BgraToYuvLuma", _psoConvertOutLuma.GetAddressOf() },
+            { "BgraToYuvChroma", _psoConvertOutChroma.GetAddressOf() },
+        };
+        for (const auto &cso : outCsos) {
+            ComPtr<ID3DBlob> code, csErr;
+            if (FAILED(D3DCompile(BGRA_TO_YUV_HLSL, strlen(BGRA_TO_YUV_HLSL),
+                                  nullptr, nullptr, nullptr, cso.entry, "cs_5_0",
+                                  0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
+                SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(convert out) failed");
+                return false;
+            }
+            D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+            psoDesc.pRootSignature = _rsConvertOut.Get();
+            psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
+            if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(cso.pso)))) {
+                SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert out) failed");
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -2051,43 +2367,14 @@ void D3D12Context::RecordGuidanceDownsample(FrameSlot &slot) noexcept {
 
 void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
                                         int dstW, int dstH, int inputIndex) noexcept {
-    // 光流输入 GPU 降采样(#46 改 GPU):在 NVOF 会话 nvof CL 第一次提交
-    // 上执行,替代 follow 分支的 CopyTextureRegion。注册纹理的
-    // COMMON→UAV→COMMON 屏障由调用方(NvofContext)负责 —— 纹理归会话
+    // 光流输入 GPU 降采样(#46/#48):在 NVOF 会话 nvof CL 第一次提交上
+    // 执行,替代 follow 分支的 CopyTextureRegion。inputColor 由同 CL 上
+    // 先行的 RecordConvertInput 产出(已是 NSR,直读,无屏障);注册纹理
+    // 的 COMMON→UAV→COMMON 屏障由调用方(NvofContext)负责 —— 纹理归会话
     // 所有;copyFence 在 CL 完成后才 Signal,execute 的 inFence[0] 天然
     // 覆盖本 dispatch。NGX evaluate 可能重绑堆/根签名,与其它 pass 同款
     // 先重绑。
     ID3D12GraphicsCommandList *cl = &clRef;
-
-    // 1) upload → nvofSrcTex(PLACED_FOOTPRINT,BGRA8,行距 256 对齐)。
-    // buffer 不能直接当 SRV 读(本机驱动异步 DEVICE_HUNG,见 FrameSlot
-    // 注释),先落一张 GPU 本地纹理 —— 拷贝形态与 RecordUploadCopy 同款。
-    D3D12_RESOURCE_BARRIER toCopyDest[1]{
-        Transition(slot.nvofSrcTex.Get(),
-                   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST),
-    };
-    cl->ResourceBarrier(1, toCopyDest);
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = slot.upload.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Offset = 0;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    src.PlacedFootprint.Footprint.Width = static_cast<UINT>(_width);
-    src.PlacedFootprint.Footprint.Height = static_cast<UINT>(_height);
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.uploadPitch);
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = slot.nvofSrcTex.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = 0;
-    cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    D3D12_RESOURCE_BARRIER toNsr[1]{
-        Transition(slot.nvofSrcTex.Get(),
-                   D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-    };
-    cl->ResourceBarrier(1, toNsr);
-
-    // 2) 降采样 dispatch(nvofSrcTex SRV → 注册输入纹理 UAV)。
     cl->SetComputeRootSignature(_rsNvofDownsample.Get());
     cl->SetPipelineState(_psoNvofDownsample.Get());
     ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
@@ -2105,17 +2392,78 @@ void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameS
     cl->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
     cl->SetComputeRoot32BitConstants(0, 1, pad, 4);
 
-    cl->SetComputeRootDescriptorTable(1, gpu(22));              // t0 SourceColor(nvofSrcTex)
+    cl->SetComputeRootDescriptorTable(1, gpu(0));               // t0 inputColor(NSR)
     cl->SetComputeRootDescriptorTable(2, gpu(23 + inputIndex)); // u0 NvofInput[cur]
     cl->Dispatch((static_cast<UINT>(dstW) + 7) / 8,
                  (static_cast<UINT>(dstH) + 7) / 8, 1);
+}
 
-    // 3) 源纹理归位 COMMON(帧末全资源归位不变量)。
-    D3D12_RESOURCE_BARRIER toCommon[1]{
-        Transition(slot.nvofSrcTex.Get(),
+void D3D12Context::RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRange range,
+                                   D3D12_RESOURCE_STATES outputStateBefore) noexcept {
+    // RGB→YUV(YUV 原生化):outputColor(stateBefore=UAV 正常 / COMMON
+    // skipEval)→ NSR → luma + chroma 两个 dispatch 写 yuvOut(留 UAV 交
+    // RecordReadbackCopy)→ outputColor 归 COMMON。constant 的 Lo/Span 按
+    // 平面语义填充(luma 用 yLo/ySpan,chroma 用 cMid/cSpan)。
+    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+    const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _bitDepth);
+    D3D12_RESOURCE_BARRIER toNsr[1]{
+        Transition(slot.outputColor.Get(), outputStateBefore,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+    };
+    cl->ResourceBarrier(1, toNsr);
+    D3D12_RESOURCE_BARRIER toUav[3];
+    for (int i = 0; i < 3; ++i) {
+        toUav[i] = Transition(slot.yuvOut[i].Get(),
+                              D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    cl->ResourceBarrier(3, toUav);
+
+    cl->SetComputeRootSignature(_rsConvertOut.Get());
+    cl->SetPipelineState(_psoConvertOutLuma.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+
+    // luma:extent=W,H,Lo/Span = yLo/ySpan(÷CM 由调用侧折进常量)。
+    {
+        const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+        const UINT srcExtent[2]{ extent[0], extent[1] };
+        const float consts[8]{ cf.kr, cf.kb,
+                               cf.yLo / cf.containerMax, cf.ySpan / cf.containerMax,
+                               0.0f, 0.0f, 0.0f, 0.0f };
+        cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+        cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+        cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+        cl->SetComputeRootDescriptorTable(1, gpu(22)); // t0 outputColor SRV
+        cl->SetComputeRootDescriptorTable(2, gpu(28)); // u0 yuvOut[0](Y)
+        cl->SetComputeRootDescriptorTable(3, gpu(29)); // u1 绑定但本 pass 不写
+        cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
+    }
+    // chroma:extent=cw,ch,Lo/Span = cMid/cSpan;2×2 box 平均。u0=U,u1=V。
+    cl->SetPipelineState(_psoConvertOutChroma.Get());
+    {
+        const UINT extent[2]{ static_cast<UINT>(_chromaW), static_cast<UINT>(_chromaH) };
+        const UINT srcExtent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+        const float consts[8]{ cf.kr, cf.kb,
+                               cf.cMid / cf.containerMax, cf.cSpan / cf.containerMax,
+                               0.0f, 0.0f, 0.0f, 0.0f };
+        cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+        cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+        cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+        cl->SetComputeRootDescriptorTable(1, gpu(22)); // t0 outputColor SRV
+        cl->SetComputeRootDescriptorTable(2, gpu(29)); // u0 yuvOut[1](U)
+        cl->SetComputeRootDescriptorTable(3, gpu(30)); // u1 yuvOut[2](V)
+        cl->Dispatch((static_cast<UINT>(_chromaW) + 7) / 8, (static_cast<UINT>(_chromaH) + 7) / 8, 1);
+    }
+
+    // outputColor 归位 COMMON(yuvOut 留 UAV,由 RecordReadbackCopy 收尾)。
+    D3D12_RESOURCE_BARRIER back[1]{
+        Transition(slot.outputColor.Get(),
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
-    cl->ResourceBarrier(1, toCommon);
+    cl->ResourceBarrier(1, back);
 }
 
 } // namespace vsdlssnr

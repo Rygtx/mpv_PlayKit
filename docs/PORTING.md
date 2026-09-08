@@ -14,7 +14,7 @@
 - 形态:VapourSynth API4 原生插件(纯 D3D12、零 guidance 单帧、同分辨率、单次提交管线);NGX Feature 18 经静态 core + snippet 直连 + IAT hook 伪装,Magpie 调用链完整移植。
 - 参数:preset/style/intensity/local_tone/local_structure/skin_structure/use_auto_mask/ui_correction 全部暴露且可实时生效(preset 为创建参数,切换走热重建);residual_multiplier + 残差精调 4 项(residual_saturation/residual_lightness/shadow_structure/reflection_glow,r1-r10 新增)实时生效;intensity/local_tone/local_structure 范围已随上游 r2-fix1 收紧为 0-1。
 - 性能(RTX 3080,稳态):720p 18.0ms / 55.7fps;1080p 32.9ms / 30.4fps。首帧 init ~1s。
-- 验证:smoke 数值、150 帧零泄漏、mpv 端到端、10bit 链路(vpy 内 YUV↔RGB matrix_in_s=709);2026-09-06 4-pass 对齐后 smoke/IPC 契约/生命周期/泄漏复验通过(validate_v066.py:确定性、等宽残差通道、新参数生效、clamp 收紧全过)。
+- 验证:smoke 数值、150 帧零泄漏、mpv 端到端;YUV 原生化(2026-09-08)后滤镜直收 YUV420P8/P10、CPU 零像素转换,数值验收 check_yuv_convert.py(两段转换 ≤1 LSB);2026-09-06 4-pass 对齐后 smoke/IPC 契约/生命周期/泄漏复验通过。
 
 ### 独立控制面板(dlssnr_panel.exe,已完成)
 

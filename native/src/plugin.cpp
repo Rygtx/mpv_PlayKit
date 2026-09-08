@@ -72,6 +72,7 @@ struct FilterData {
     bool initOk = false;
     int width = 0;
     int height = 0;
+    int depth = 0; // YUV 位深(8/10);同尺寸换深度必须走冷重建(hotMatch 拦截)
     // Failure-log latch: a wedged context fails every frame at frame rate —
     // log the first failure only, re-arm on the next success.
     std::atomic<bool> failureLogged{ false };
@@ -93,6 +94,7 @@ struct HotContext {
     std::wstring ngxDllPath;
     int width = 0;
     int height = 0;
+    int depth = 0;
     bool valid = false;
 };
 HotContext &Hot() {
@@ -114,6 +116,36 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     if (activationReason != arAllFramesReady) return nullptr;
 
     const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+
+    const VSMap *props = vsapi->getFramePropertiesRO(src);
+    // 源色彩元数据(仓内 props 读取首例):矩阵/范围驱动 YUV↔RGB 展开,
+    // 缺失/未知回落 709 limited 并留痕(值变化才再 log,atomic 边沿去重)。
+    // VS _Matrix:1=BT.709,5(BT470BG)/6(SMPTE170M)=601 族;4(FCC)/
+    // 9(BT.2020)/0(GBR)等超出本滤镜(SDR 链)范围,按 709 处理 + log 可见。
+    int perr = 0;
+    const int matrixProp = vsapi->mapGetInt(props, "_Matrix", 0, &perr);
+    const bool matrixKnown = perr == 0;
+    perr = 0;
+    const int rangeProp = vsapi->mapGetInt(props, "_ColorRange", 0, &perr);
+    const bool rangeKnown = perr == 0;
+    vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
+    if (matrixKnown && (matrixProp == 5 || matrixProp == 6)) matrix = vsdlssnr::ColorMatrix::BT601;
+    vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
+    if (rangeKnown && rangeProp == 0) range = vsdlssnr::ColorRange::Full;
+    {
+        const int sig = (matrixKnown ? matrixProp : -1) * 16 + (rangeKnown ? rangeProp : -2);
+        static std::atomic<int> lastSig{ INT_MIN };
+        if (lastSig.exchange(sig, std::memory_order_relaxed) != sig) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: frame props matrix=%s(%d) range=%s(%d) -> %s/%s",
+                          matrixKnown ? "yes" : "missing", matrixProp,
+                          rangeKnown ? "yes" : "missing", rangeProp,
+                          matrix == vsdlssnr::ColorMatrix::BT709 ? "709" : "601",
+                          range == vsdlssnr::ColorRange::Limited ? "limited" : "full");
+            vsdlssnr::TimingStatusLine(msg);
+        }
+    }
 
     if (!d->initOk) return src; // passthrough on any setup failure; the frame
                                 // reference is handed off to the caller
@@ -138,7 +170,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     // NGX history-reset policy (frame-gap heuristic) lives in DlssnrContext;
     // only the frame index is forwarded here.
     if (!d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
-                              d->width, d->height, n, err, sizeof(err),
+                              d->width, d->height, n, matrix, range, err, sizeof(err),
                               timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0)) {
         if (!d->failureLogged.exchange(true)) {
             char msg[512];
@@ -150,13 +182,15 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             vsdlssnr::TimingStatusLine(msg);
         }
         // Failed frames fall back to a plain copy of the source content so the
-        // output planes are never left uninitialized.
+        // output planes are never left uninitialized. YUV420:色度半尺寸。
+        const int bpp = fi->bytesPerSample;
+        const int cw = (d->width + 1) >> 1, ch = (d->height + 1) >> 1;
         vsh::bitblt(dstPlanes[0], dstStrides[0], srcPlanes[0], srcStrides[0],
-                    static_cast<size_t>(d->width) * 4, d->height);
+                    static_cast<size_t>(d->width) * bpp, d->height);
         vsh::bitblt(dstPlanes[1], dstStrides[1], srcPlanes[1], srcStrides[1],
-                    static_cast<size_t>(d->width) * 4, d->height);
+                    static_cast<size_t>(cw) * bpp, ch);
         vsh::bitblt(dstPlanes[2], dstStrides[2], srcPlanes[2], srcStrides[2],
-                    static_cast<size_t>(d->width) * 4, d->height);
+                    static_cast<size_t>(cw) * bpp, ch);
     } else {
         d->failureLogged.store(false);
     }
@@ -193,13 +227,14 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().ngxDllPath = std::move(d->ngxDllPath);
         Hot().width = d->width;
         Hot().height = d->height;
+        Hot().depth = d->depth;
         Hot().valid = true;
         // 探针:停放行 —— 与下一次 create 的 "hot rebind kept"/"re-init"
         // 行配对,seek 生命周期序列(bridge stopped → freed → started →
         // rebind)在 timing log 里闭环;mpv 在停放后退出也有尾行可查。
         char msg[96];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: filter freed (hot parked %dx%d)",
-                      d->width, d->height);
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: filter freed (hot parked %dx%dd%d)",
+                      d->width, d->height, d->depth);
         vsdlssnr::TimingStatusLine(msg);
     }
     delete d;
@@ -214,10 +249,16 @@ static void VS_CC DlssnrCreate(
     }
     const VSVideoInfo *vi = vsapi->getVideoInfo(node);
 
-    if (!vsh::isConstantVideoFormat(vi) ||
-        vi->format.colorFamily != cfRGB || vi->format.sampleType != stFloat ||
-        vi->format.bitsPerSample != 32 || vi->format.numPlanes != 3) {
-        vsapi->mapSetError(out, "dlssnr.Enhance: clip must be RGBS (RGB float32, constant format)");
+    // YUV 原生(全切 RGBS):仅 YUV420P8/P10,输出同格式。其它格式由 vpy
+    // 直通守卫(防不支持格式打断播放)。
+    const bool is420P8 = vi->format.colorFamily == cfYUV && vi->format.sampleType == stInteger &&
+                         vi->format.bitsPerSample == 8 && vi->format.subSamplingW == 1 &&
+                         vi->format.subSamplingH == 1;
+    const bool is420P10 = vi->format.colorFamily == cfYUV && vi->format.sampleType == stInteger &&
+                          vi->format.bitsPerSample == 10 && vi->format.subSamplingW == 1 &&
+                          vi->format.subSamplingH == 1;
+    if (!vsh::isConstantVideoFormat(vi) || (!is420P8 && !is420P10)) {
+        vsapi->mapSetError(out, "dlssnr.Enhance: clip must be YUV420P8 or YUV420P10 (constant format)");
         vsapi->freeNode(node);
         return;
     }
@@ -226,6 +267,7 @@ static void VS_CC DlssnrCreate(
     d->node = node;
     d->width = vi->width;
     d->height = vi->height;
+    d->depth = vi->format.bitsPerSample;
 
     DlssnrParams initial{}; // member initializers are the default authority
     ApplyIntArg(in, vsapi, "preset", initial.preset, kPresetMin, kPresetMax);
@@ -261,8 +303,8 @@ static void VS_CC DlssnrCreate(
     {
         char msg[224];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d",
-                      d->width, d->height, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d",
+                      d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.nvofFollowScaling ? 1 : 0);
@@ -307,13 +349,17 @@ static void VS_CC DlssnrCreate(
     // snippet DLL forces the cold path. Failure keeps the passthrough
     // fallback semantics below.
     char err[256]{};
-    const bool hotMatch = Hot().valid && Hot().ngxDllPath == d->ngxDllPath;
+    // depth 参与 hotMatch:同尺寸换深度(P8↔P10)走冷重建 —— 热上下文的
+    // 槽纹理按旧位深建,R8 纹理遇 P10 打包 = 数据撕裂(#40-① 同族)。
+    const bool hotMatch = Hot().valid && Hot().ngxDllPath == d->ngxDllPath &&
+                          Hot().width == d->width && Hot().height == d->height &&
+                          Hot().depth == d->depth;
     if (hotMatch) {
         d->d3d12 = std::move(Hot().d3d12);
         d->ngx = std::move(Hot().ngx);
         Hot().valid = false;
         Hot().ngxDllPath.clear();
-        if (d->ngx->Rebind(d->params.get(), d->width, d->height, err, sizeof(err))) {
+        if (d->ngx->Rebind(d->params.get(), d->width, d->height, d->depth, err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
             if (!vsdlssnr::BridgeStart(d->params.get())) {
@@ -354,7 +400,7 @@ static void VS_CC DlssnrCreate(
         d->ngx = std::make_unique<vsdlssnr::DlssnrContext>();
         if (d->d3d12->Initialize(err, sizeof(err)) &&
             d->ngx->Initialize(*d->d3d12, d->ngxDllPath.c_str(),
-                               d->width, d->height, d->params.get(), err, sizeof(err))) {
+                               d->width, d->height, d->depth, d->params.get(), err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
             if (!vsdlssnr::BridgeStart(d->params.get())) {

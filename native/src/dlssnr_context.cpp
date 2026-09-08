@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <share.h> // _SH_DENYNO(timing log 显式共享读)
 
 namespace vsdlssnr {
 
@@ -174,7 +175,11 @@ void TimingLog(const char *line) noexcept {
                    std::filesystem::path(dir).parent_path().c_str());
     }
     if (!g_timingLogFile) {
-        if (_wfopen_s(&g_timingLogFile, g_timingLogPath, L"a") != 0 || !g_timingLogFile) {
+        // 显式 DENYNO 共享(_wfopen_s 的共享语义不可靠:实测同进程 python
+        // 读被拒 PermissionError)—— 常驻句柄必须允许外部读者(timing log
+        // 的全部价值就在跨进程可读)。
+        g_timingLogFile = _wfsopen(g_timingLogPath, L"a", _SH_DENYNO);
+        if (!g_timingLogFile) {
             // 探针:日志自身打不开(磁盘满/文件被锁)只报一次 —— 否则每行
             // 静默丢失,"日志里怎么没有"无从查起。
             static bool warnedOpen = false;
@@ -438,7 +443,7 @@ bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHisto
 
 bool DlssnrContext::Initialize(
     D3D12Context &d3d12, const wchar_t *ngxDllPath,
-    int width, int height, SharedParams *shared,
+    int width, int height, int depth, SharedParams *shared,
     char *err, size_t errLen) noexcept {
     auto fail = [&](const char *what) {
         if (err && errLen) std::snprintf(err, errLen, "%s", what);
@@ -458,6 +463,7 @@ bool DlssnrContext::Initialize(
     _d3d12 = &d3d12;
     _width = width;
     _height = height;
+    _depth = depth;
     _shared = shared;
 
     // Application data path = snippet directory (mirrors Magpie using its exe dir;
@@ -572,7 +578,7 @@ bool DlssnrContext::Initialize(
     //    textures/compute at the internal resolution (skipped entirely when
     //    internal-resolution scaling is disabled)
     if (ProbeEnabled()) TimingStatusLine("PROBE: pre frame-res"); // init 细分(DEVICE_HUNG 时序定位)
-    if (!_d3d12->CreateFrameResources(_width, _height, err, errLen)) return failWithExistingErr();
+    if (!_d3d12->CreateFrameResources(_width, _height, _depth, err, errLen)) return failWithExistingErr();
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
         int iw = _width, ih = _height;
@@ -665,8 +671,8 @@ bool DlssnrContext::Initialize(
         _curScaling = p.scalingEnabled;
         char msg[288];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: Feature=18 created=true path=signed-snippet %dx%d disabled=false gpu=%.60s",
-                      _width, _height, _gpuNameUtf8);
+                      "DLSSNR STATUS: Feature=18 created=true path=signed-snippet %dx%dd%d disabled=false gpu=%.60s",
+                      _width, _height, _depth, _gpuNameUtf8);
         DbgLine(msg);
         // Rebind/RecreateFeature already log through TimingLog; log the cold
         // path too so the three lifecycle outcomes are distinguishable in
@@ -677,7 +683,7 @@ bool DlssnrContext::Initialize(
 }
 
 bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
-                                    int newWidth, int newHeight) noexcept {
+                                    int newWidth, int newHeight, int newDepth) noexcept {
     if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
         return false;
@@ -698,14 +704,16 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // A video-size change replaces every slot's frame resources first —
     // outside CtlMutex because the guidance clear inside takes it itself.
     // All GPU work is complete (slots are only released after WaitFrame).
-    const bool resize = newWidth > 0 && (newWidth != _width || newHeight != _height);
-    if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, err, errLen)) {
+    const bool resize = newWidth > 0 &&
+                        (newWidth != _width || newHeight != _height || newDepth != _depth);
+    if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, newDepth, err, errLen)) {
         _ready.store(false, std::memory_order_release);
         return false;
     }
     if (resize) {
         _width = newWidth;
         _height = newHeight;
+        _depth = newDepth;
         // NVOF 会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildNvof
         // —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见 _retiredNvof
         // 注释),失败降级零 guidance,不致命。会话输入尺寸遵循 follow 语义
@@ -788,9 +796,9 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     }
     char msg[160];
     snprintf(msg, sizeof(msg),
-             "DLSSNR STATUS: preset=%d res=%d%% scaling=%d internal=%dx%d feature recreated%s frame=%d",
+             "DLSSNR STATUS: preset=%d res=%d%% scaling=%d internal=%dx%d d=%d feature recreated%s frame=%d",
              preset, scalingEnabled ? resPercent : 100, scalingEnabled,
-             _d3d12->InternalWidth(), _d3d12->InternalHeight(),
+             _d3d12->InternalWidth(), _d3d12->InternalHeight(), _depth,
              resize ? " (size changed)" : "", _lastFrameN.load(std::memory_order_relaxed));
     DbgLine(msg);
     TimingLog(msg);
@@ -873,7 +881,8 @@ void DlssnrContext::ResetNvofHistory() noexcept {
     if (_nvof) _nvof->ResetHistory();
 }
 
-bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *err, size_t errLen) noexcept {
+bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int depth,
+                           char *err, size_t errLen) noexcept {
     if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "Rebind: context not ready");
         return false;
@@ -892,7 +901,7 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *er
     cur.preset = _curPreset;
     cur.inputResolutionPercent = _curRes;
     cur.scalingEnabled = _curScaling;
-    const bool dimsChanged = width != _width || height != _height;
+    const bool dimsChanged = width != _width || height != _height || depth != _depth;
     if (!dimsChanged && !CreateParamsChanged(p, cur)) {
         // 热复用:NGX feature 保持,但 seek 是新时间线 —— 光流历史必须
         // 作废(下一帧播种),光流档位同步到新实例的参数快照;此前建立
@@ -911,15 +920,16 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, char *er
         }
         char msg[160];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%d internal=%dx%d)",
+                      "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%dd%d internal=%dx%d)",
                       _curPreset, _curScaling ? _curRes : 100, _curScaling, _curOfQuality,
-                      _width, _height, _d3d12->InternalWidth(), _d3d12->InternalHeight());
+                      _width, _height, _depth, _d3d12->InternalWidth(), _d3d12->InternalHeight());
         DbgLine(msg);
         TimingLog(msg);
         return true;
     }
     const bool nvofOk = RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen,
-                                        dimsChanged ? width : -1, dimsChanged ? height : -1);
+                                        dimsChanged ? width : -1, dimsChanged ? height : -1,
+                                        dimsChanged ? depth : -1);
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
     // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。会话输
     // 入尺寸同样在此对齐(follow 开关/res% 变化)。
@@ -940,6 +950,7 @@ bool DlssnrContext::ProcessFrame(
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
     uint8_t **dstPlanes, int64_t *dstStrides,
     int width, int height, int n,
+    ColorMatrix matrix, ColorRange range,
     char *err, size_t errLen,
     char *timingOut, size_t timingLen) noexcept {
     // Faulted latch: every NGX entry returns instantly, so bail before
@@ -1110,24 +1121,25 @@ bool DlssnrContext::ProcessFrame(
                 };
                 cl->ResourceBarrier(2, g2);
             };
-        // follow 模式(#46 改 GPU):NVOF 输入不再 CPU 逐像素打包,改为
-        // nvof CL 第一次提交上的降采样 dispatch —— 读本槽 upload 的 typed
-        // R32_UINT SRV,双线性直写注册输入纹理,替代整块 CopyTextureRegion
-        // (原 CPU 双线性 ~2-4ms@4K,且有 WC 内存读坑与 WaitCopyIdle 覆写
-        // 排空负担,一并移除)。尺寸一致(未开跟随)时照旧拷贝 upload,零
-        // 额外成本。slot.upload 仍被本帧 nvof CL 读取,early-return 撕裂
-        // 防护由下方 CopyDrainGuard 承担。
-        NvofContext::PostCopyFn postCopy;
-        if (nvW != static_cast<uint32_t>(width) || nvH != static_cast<uint32_t>(height)) {
-            postCopy = [this, &slot, nvW, nvH](ID3D12GraphicsCommandList *cl, int inputIndex) {
-                _d3d12->RecordNvofDownsample(*cl, *slot,
-                                             static_cast<int>(nvW), static_cast<int>(nvH),
-                                             inputIndex);
+        // YUV 原生:postCopy 恒设 —— 回调在 nvof CL 第一次提交上记录
+        // YUV→RGB 转换(yuvUpload→yuvIn 拷贝 + dispatch → inputColor NSR),
+        // follow(densifyInternal)时追加 RecordNvofDownsample 直写注册输入
+        // 纹理;非 follow 由 StageFrame 随后做 inputColor→_input[cur] 纹理
+        // 拷贝。原 CPU 双线性(~2-4ms@4K)与 WC 内存读坑、WaitCopyIdle 覆写
+        // 排空负担一并成为历史;CopyDrainGuard 仍守护 early-return 撕裂
+        // (yuvUpload 是 per-slot 资源,nvof CL 在读它)。
+        NvofContext::PostCopyFn postCopy =
+            [this, &slot, nvW, nvH, densifyInternal, matrix, range](ID3D12GraphicsCommandList *cl, int inputIndex) {
+                _d3d12->RecordConvertInput(*cl, *slot, matrix, range,
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (densifyInternal) {
+                    _d3d12->RecordNvofDownsample(*cl, *slot,
+                                                 static_cast<int>(nvW), static_cast<int>(nvH),
+                                                 inputIndex);
+                }
             };
-        }
         const NvofContext::StageResult st =
-            _nvof->StageFrame(n, slot->upload.Get(), static_cast<UINT>(slot->uploadPitch),
-                              post, postCopy);
+            _nvof->StageFrame(n, _d3d12->InputColor(*slot), post, postCopy, densifyInternal);
         nvofHistoryReset = st.historyReset;
         nvofMs = _nvof->LastStageMs();
         realMotion = st.waitFenceValue != 0;
@@ -1154,15 +1166,18 @@ bool DlssnrContext::ProcessFrame(
     }
     // NOTE: D3D12 timestamp queries crash NGX snippet evaluate (SEH) when on the same command list - do not re-enable (verified 2026-09-05)
 
-    // Upload copy runs on both paths (the diagnostic pipe-cost measurement
-    // must include it; skipping it left InputColor holding the previous
-    // frame and polluted the recorded segments). The copy lands directly in
-    // the next consumer's state: NSR for the evaluate paths, COMMON for the
-    // diagnostic copy (which reads it as COPY_SOURCE next) — no COMMON detour.
     const D3D12_RESOURCE_STATES uploadPost = skipEval
                                                  ? D3D12_RESOURCE_STATE_COMMON
                                                  : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (!_d3d12->RecordUploadCopy(*slot, uploadPost, err, errLen)) return false;
+    // Upload/convert: NVOF active 时转换已在 nvof CL 完成(inputIndex>=0);
+    // 其余路径(OF 关/skipEval/nvofFailed/迟到帧)在槽 CL 补做,落点语义
+    // 与旧 RecordUploadCopy 相同——NSR 供 evaluate,COMMON 供诊断拷贝。
+    // The conversion lands directly in the next consumer's state: NSR for
+    // the evaluate paths, COMMON for the diagnostic copy — no COMMON detour.
+    const bool convertedOnNvof = nvofInputIndex >= 0; // 迟到帧/失败帧 = -1(见 nvof_context.h 迟到帧契约)
+    if (!convertedOnNvof) {
+        _d3d12->RecordConvertInput(*slot->commandList.Get(), *slot, matrix, range, uploadPost);
+    }
 
     if (skipEval) {
         // Diagnostic path: route input straight to output for pipe-cost measurement
@@ -1388,11 +1403,13 @@ bool DlssnrContext::ProcessFrame(
         }
     }
 
-    // OutputColor arrives in UAV (evaluate/vertical write) or COMMON (the
-    // diagnostic copy); the readback parks it back in COMMON either way.
-    if (!_d3d12->RecordReadbackCopy(*slot, skipEval ? D3D12_RESOURCE_STATE_COMMON
-                                                    : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                    err, errLen)) {
+    // RGB→YUV(两分支汇合处):outputColor 到达时 = UAV(evaluate/垂直
+    // 合成写)或 COMMON(诊断拷贝),RecordYuvOutput 统一 NSR 化后转换、
+    // 收尾归 COMMON;yuvOut 留 UAV 交 readback。
+    _d3d12->RecordYuvOutput(*slot, matrix, range,
+                            skipEval ? D3D12_RESOURCE_STATE_COMMON
+                                     : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    if (!_d3d12->RecordReadbackCopy(*slot, err, errLen)) {
         return false;
     }
     // NOTE: timestamp disabled, see note above
@@ -1503,6 +1520,20 @@ bool DlssnrContext::ProcessFrame(
                         }
                     };
                     dumpOrLog(_d3d12->InputColor(*slot), width, height, L"dump_input.bin", kColorDump);
+                    // YUV 输入平面(YUV→RGB 转换验收:python 参考按矩阵/范围
+                    // 重算 BGRA8 与 dump_input 对比 ≤1-2 LSB)。
+                    {
+                        const DXGI_FORMAT yuvDumpIn = _d3d12->BitDepth() > 8
+                                                          ? DXGI_FORMAT_R16_UNORM
+                                                          : DXGI_FORMAT_R8_UNORM;
+                        const int cw = (width + 1) >> 1, ch = (height + 1) >> 1;
+                        const int pw[3]{ width, cw, cw };
+                        const int ph[3]{ height, ch, ch };
+                        const wchar_t *names[3]{ L"dump_yuvin_y.bin", L"dump_yuvin_u.bin", L"dump_yuvin_v.bin" };
+                        for (int i = 0; i < 3; ++i) {
+                            dumpOrLog(_d3d12->YuvInPlane(*slot, i), pw[i], ph[i], names[i], yuvDumpIn);
+                        }
+                    }
                     // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):
                     // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
                     // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
@@ -1521,6 +1552,20 @@ bool DlssnrContext::ProcessFrame(
                                   DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
                     dumpOrLog(_d3d12->OutputColor(*slot), width, height, L"dump_output.bin", kColorDump);
+                    // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
+                    // Y/U/V 与 dump 对比,≤1-2 LSB;P10 = 右对齐 word)。
+                    {
+                        const DXGI_FORMAT yuvDump = _d3d12->BitDepth() > 8
+                                                        ? DXGI_FORMAT_R16_UNORM
+                                                        : DXGI_FORMAT_R8_UNORM;
+                        const int cw = (width + 1) >> 1, ch = (height + 1) >> 1;
+                        const int pw[3]{ width, cw, cw };
+                        const int ph[3]{ height, ch, ch };
+                        const wchar_t *names[3]{ L"dump_y_plane.bin", L"dump_u_plane.bin", L"dump_v_plane.bin" };
+                        for (int i = 0; i < 3; ++i) {
+                            dumpOrLog(_d3d12->YuvOutPlane(*slot, i), pw[i], ph[i], names[i], yuvDump);
+                        }
+                    }
                 }
             }
         }

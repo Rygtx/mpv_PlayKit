@@ -4,6 +4,8 @@
 ###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
 ### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18), 零 guidance 单帧模式
 ###       处理为同分辨率 (非超分), SDR 色彩空间 (非 HDR)
+###       YUV 原生: 直接吃 YUV420P8/P10 吐同格式, 无 CPU 格式往返;
+###       色彩矩阵/范围按源帧属性 (_Matrix/_ColorRange) 处理, 缺省 709 limited
 ### 调参_ 播放时托盘点击 DLSSNR 图标打开控制面板, 实时调节; 保存后下次自动生效
 
 import vapoursynth as vs
@@ -22,9 +24,9 @@ Skin_Structure = -1
 Use_Auto_Mask = True
 UI_Correction = True
 Scaling_Enabled = True
-Input_Resolution = 50
+Input_Resolution = 100
 Residual_Multiplier = 1.0
-Motion_Vector_Quality = 5
+Motion_Vector_Quality = 0
 Nvof_Follow_Scaling = False
 H_Max = 0
 ## <0-3> 整数, NR 预设档位
@@ -56,12 +58,12 @@ clip = video_in
 
 if H_Max and clip.height > H_Max :
 	ret = clip
-elif clip.format.color_family != vs.YUV :
+elif clip.format.id not in (vs.YUV420P8, vs.YUV420P10) :
+	# 非 420P8/P10 (422/444/RGB/HDR 等) 直通: 滤镜只收这两种格式
 	ret = clip
 else :
-	rgb = core.resize.Bilinear(clip=clip, format=vs.RGBS, matrix_in_s="709")
-	rgb = core.dlssnr.Enhance(
-		rgb,
+	ret = core.dlssnr.Enhance(
+		clip,
 		preset = Preset,
 		style = Style,
 		intensity = Intensity,
@@ -76,6 +78,5 @@ else :
 		motion_vector_quality = Motion_Vector_Quality,
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
 	)
-	ret = core.resize.Bilinear(clip=rgb, format=clip.format.id, matrix_s="709")
 
 ret.set_output()

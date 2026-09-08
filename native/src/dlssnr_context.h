@@ -36,27 +36,28 @@ public:
     DlssnrContext &operator=(const DlssnrContext &) = delete;
 
     bool Initialize(D3D12Context &d3d12, const wchar_t *ngxDllPath,
-                    int width, int height, SharedParams *shared,
+                    int width, int height, int depth, SharedParams *shared,
                     char *err, size_t errLen) noexcept;
     void Shutdown() noexcept;
 
     // Hot-context rebind: attach this kept-warm context (device, NGX feature,
     // slot pool all alive) to a new filter instance's SharedParams — including
-    // one for a different video size (frame resources + feature rebuild under
-    // the pool seal; only a changed snippet DLL forces a full re-init at the
-    // caller). The feature is rebuilt only when a create-time parameter
-    // (preset / input_resolution / scaling_enabled) or the size actually
-    // differs; otherwise it is free. Returns false (and leaves _ready false)
-    // when the rebuild fails; the caller then falls back to a full Initialize.
-    bool Rebind(SharedParams *shared, int width, int height, char *err, size_t errLen) noexcept;
+    // one for a different video size or bit depth (frame resources + feature
+    // rebuild under the pool seal; only a changed snippet DLL forces a full
+    // re-init at the caller). The feature is rebuilt only when a create-time
+    // parameter (preset / input_resolution / scaling_enabled) or the
+    // size/depth actually differs; otherwise it is free. Returns false (and
+    // leaves _ready false) when the rebuild fails; the caller then falls back
+    // to a full Initialize.
+    bool Rebind(SharedParams *shared, int width, int height, int depth, char *err, size_t errLen) noexcept;
 
     // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
     // on panel change the frame thread rebuilds the feature (and scaling
     // textures for resolution changes; disabled = residual pipeline dropped).
-    // newWidth/newHeight >= 0 additionally rebuilds the per-slot frame
-    // resources for that size (used by Rebind across resolutions).
+    // newWidth/newHeight/depth >= 0 additionally rebuild the per-slot frame
+    // resources for that geometry (used by Rebind across resolutions/depth).
     bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
-                         int newWidth = -1, int newHeight = -1) noexcept;
+                         int newWidth = -1, int newHeight = -1, int newDepth = -1) noexcept;
 
     // NVOF 会话重建(quality 变化)。只重建光流会话(PoolHold 内,
     // 毫秒级),NGX feature 不动。quality == 0 时销毁会话回退零 guidance;
@@ -66,13 +67,16 @@ public:
     // 光流历史失效(seek = 新时间线)。热 Rebind 上调用;下一帧重新播种。
     void ResetNvofHistory() noexcept;
 
-    // RGBS float32 三平面进 → 处理 → RGBS float32 三平面出(同分辨率)
+    // YUV420P8/P10 三平面进 → 处理 → 同格式三平面出(同分辨率)。
+    // matrix/range 来自源帧属性(props _Matrix/_ColorRange,plugin.cpp 读;
+    // 缺省 709 limited)—— YUV↔RGB GPU 转换按此展开/压缩。
     // n is the frame index; discontinuity detection (NGX history reset) is
     // owned here, not by the glue layer. timingOut 非 NULL 时写入分段耗时
     // (毫秒,逗号分隔:pack,submit+gpu,unpack)
     bool ProcessFrame(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                       uint8_t **dstPlanes, int64_t *dstStrides,
                       int width, int height, int n,
+                      ColorMatrix matrix, ColorRange range,
                       char *err, size_t errLen,
                       char *timingOut = nullptr, size_t timingLen = 0) noexcept;
 
@@ -138,6 +142,7 @@ private:
     wchar_t _appDataPath[MAX_PATH]{};
     int _width = 0;
     int _height = 0;
+    int _depth = 0; // YUV 位深(8/10;CreateFrameResources/resize 判据/日志)
     // Adapter description in UTF-8, filled once in Initialize and reused by
     // the periodic stats publish (GetDesc per stats tick is wasted work).
     char _gpuNameUtf8[160] = "UNAVAILABLE";

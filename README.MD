@@ -11,6 +11,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 **vs_dlssnr** — 把 Magpie 的 DLSSNR(NVIDIA DLSS SDK 310.9.0 的 AI 视频增强,NGX Feature 18)移植为 VapourSynth API4 原生插件接入 mpv:
 
 - 纯 D3D12 实现,零 guidance 单帧模式(不需要运动矢量 / 深度)
+- **YUV 原生**:直接处理 YUV420P8/P10、输出同格式,CPU 侧零像素转换(纯行拷贝);色彩矩阵/范围按源帧属性(_Matrix/_ColorRange,709/601 + limited/full)处理,缺省 709 limited
 - 同分辨率处理(非超分),SDR 色彩空间(非 HDR)
 - 静态 NGX core + snippet 直连 + IAT hook,完整复刻 Magpie 调用链
 - 残差管线:内部推理分辨率 25–100% 可调,Catmull-Rom 残差重建回源分辨率

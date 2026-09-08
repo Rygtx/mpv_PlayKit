@@ -98,21 +98,26 @@ public:
         _gateCv.notify_all();
     }
 
-    // 帧路径:PackInput 之后(槽 upload 已含本帧 BGRA8)、SubmitFrame 之前,
-    // 在帧线程上调用。帧序门 → 拷贝 CL 提交 → (历史有效时) execute →
-    // CPU 等输出栅栏 → postExecute 回调(门内、同一 nvof CL 上二次提交,
-    // 调用方在此记录 densify/清零 —— 与 execute 的完成构成栅栏链)。
-    // postExecute 为空(OF 停用帧)时跳过 densify,其余语义不变。
-    // postCopy 非空(follow 模式):拷贝段改为在本 nvof CL 上记录本会话
-    // 输入纹理 _input[cur] 的 COMMON→UAV→COMMON 屏障并调用回调记录 GPU
-    // 降采样 dispatch(#46 改 GPU,替代 CopyTextureRegion)—— copyFence
-    // 在 CL 完成后才 Signal,execute 的 inFence[0] 天然覆盖 dispatch。
+    // 帧路径:PackInput 之后、SubmitFrame 之前,在帧线程上调用。帧序门 →
+    // 拷贝 CL 提交 → (历史有效时) execute → CPU 等输出栅栏 → postExecute
+    // 回调(门内、同一 nvof CL 上二次提交,调用方在此记录 densify/清零 ——
+    // 与 execute 的完成构成栅栏链)。postExecute 为空(OF 停用帧)时跳过
+    // densify,其余语义不变。
+    // YUV 原生:postCopy 恒设,回调在本 nvof CL 上记录 YUV→RGB 转换
+    // (yuvUpload→yuvIn 拷贝 + dispatch → inputColor);inputWrittenByPostCopy
+    // = follow(回调内含 RecordNvofDownsample,直接写 _input[cur])时为
+    // true;非 follow 为 false —— 此时回调只做转换,本函数随后把 srcTex
+    // (inputColor,NSR)整帧纹理拷贝进 _input[cur](NSR→COPY_SOURCE→copy→
+    // 回 NSR;目标 COMMON 靠隐式提升,与旧 buffer 拷贝同款)。
+    // **迟到帧契约**:帧序门对迟到/过期帧提前 return、不提交任何 CL,
+    // inputIndex 保持 -1 —— 调用方据此在槽 CL 上补做转换
+    // (convertedOnNvof = inputIndex >= 0)。copyOk=false 同样 -1。
     // 回调签名 (cl, cur):cur 为本帧输入槽位(0/1,UAV 描述符 23/24)。
     using PostExecuteFn = std::function<void(ID3D12GraphicsCommandList *cl)>;
     using PostCopyFn = std::function<void(ID3D12GraphicsCommandList *cl, int inputIndex)>;
-    StageResult StageFrame(int frameIndex, ID3D12Resource *uploadBuffer,
-                           UINT uploadRowPitch, const PostExecuteFn &postExecute,
-                           const PostCopyFn &postCopy = PostCopyFn{}) noexcept;
+    StageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
+                           const PostExecuteFn &postExecute,
+                           const PostCopyFn &postCopy, bool inputWrittenByPostCopy) noexcept;
 
     // 本帧 NVOF 拷贝的完成等待(early-return 路径释放槽位前调用,防宿主
     // 复用 upload 缓冲撕裂在途拷贝;正常路径已被 execute 栅栏覆盖,no-op)。
