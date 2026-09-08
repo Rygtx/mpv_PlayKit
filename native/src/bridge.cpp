@@ -289,7 +289,10 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
 
 // Silently start the independent panel exe (single-instance guarded there).
 // Called on filter load so the tray icon appears without user action.
+// VSDLSSNR_NO_PANEL=1 跳过(无头/CI/数值验收场景:面板启动即发布 payload,
+// 经 BridgeAdoptPanelPayload 覆盖 vpy 参数,哈希类测试必须无面板运行)。
 void LaunchPanelSilently() noexcept {
+    if (GetEnvironmentVariableA("VSDLSSNR_NO_PANEL", nullptr, 0) != 0) return;
     wchar_t dir[MAX_PATH], exePath[MAX_PATH];
     if (!GetSelfDir(dir, MAX_PATH)) return;
     if (wcslen(dir) + 1 + wcslen(PANEL_EXE) >= MAX_PATH) return;
