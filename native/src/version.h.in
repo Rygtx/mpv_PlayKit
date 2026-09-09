@@ -1,0 +1,7 @@
+// 版本号 = configure 当天日期, 对齐 package.ps1 打包版本 vYYYY.MM.DD
+// (本文件生成于 build/version.h,勿手改;与上游 Magpie 的 0.6.6 无关,
+// 上游对齐版本只出现在 docs/PORTING.md 的对齐记录里)
+#define VER_FILEVERSION        @PANEL_FILEVERSION@
+#define VER_FILEVERSION_STR    "@PANEL_VERSION_STR@\0"
+#define VER_PRODUCTVERSION     @PANEL_FILEVERSION@
+#define VER_PRODUCTVERSION_STR "@PANEL_VERSION_STR@\0"

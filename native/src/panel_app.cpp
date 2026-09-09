@@ -8,6 +8,8 @@
 #include "dlssnr_ini.h"
 #include "fonts.h"
 
+#include "resource.h"
+
 using namespace vsdlssnr;
 
 #include <imgui.h>
@@ -1026,7 +1028,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
     wc.lpszClassName = WINDOW_CLASS;
-    wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    // 自家图标(资源 IDI_PANEL_ICON):托盘、任务栏与资源管理器共用。
+    // hIcon 取 256px 母版由系统按需缩小(高 DPI 任务栏/Alt-Tab 不糊);
+    // hIconSm 取 16px(标题栏)。
+    wc.hIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(IDI_PANEL_ICON),
+                                             IMAGE_ICON, 256, 256, LR_SHARED));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(IDI_PANEL_ICON),
+                                               IMAGE_ICON, 16, 16, LR_SHARED));
     RegisterClassExW(&wc);
 
     wchar_t base[MAX_PATH];
@@ -1090,13 +1098,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     RebuildFontDpi(g_app.dpi);
 
     // Tray icon
+    // 托盘图标用 16px 变体(系统 DPI 缩放时由 Shell 按需缩放资源内其他尺寸);
+    // 程序生命周期内常驻,句柄不销毁(LR_SHARED 归属进程,无需显式清理)。
     ZeroMemory(&g_nid, sizeof(g_nid));
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd = g_hwnd;
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_APP_TRAYICON;
-    g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    {
+        const UINT dpi = GetDpiForWindow(g_hwnd);
+        const int traySize = MulDiv(16, static_cast<int>(dpi), 96); // 系统托盘标准 16px@96dpi
+        g_nid.hIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(IDI_PANEL_ICON),
+                                                    IMAGE_ICON, traySize, traySize, LR_SHARED));
+    }
     wcscpy_s(g_nid.szTip, TRAY_TIP);
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
