@@ -244,7 +244,7 @@ bool JsonGetString(const char *body, const char *key, char *out, size_t outLen) 
     return true;
 }
 
-// Read the plugin's periodic stats from named shared memory (zero disk IO).
+// Read the plugin's per-frame stats from named shared memory (zero disk IO).
 // Mapping absent = no live filter: clear the stats line. The mapping object
 // dies with the plugin process, so re-open each refresh (no stale handles).
 void LoadStats() noexcept {
@@ -262,7 +262,7 @@ void LoadStats() noexcept {
     }
     // Seq-gated snapshot (protocol mirrors PublishStatsJson): a copy whose
     // counter moved mid-read, or a write still in progress (seq 0), is
-    // discarded — the next 0.5s refresh repaints it.
+    // discarded — the next 100ms refresh repaints it.
     const StatsPayload *view =
         static_cast<const StatsPayload *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
     StatsPayload st{};
@@ -315,11 +315,13 @@ void LoadStats() noexcept {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d(原生)", w, h);
             }
-            g_app.segPack = static_cast<float>(JsonGetFloat(body, SK_PACK_EMA, 0));
-            g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_EMA, 0));
-            g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_EMA, 0));
-            g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_EMA, 0));
-            g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_NVOF_EMA, 0));
+            // 五段读每帧 last 值(与 NGX 延迟同语义):EMA 稳态冻结,
+            // last 随帧呼吸(见 panel_ipc.h SK_*_LAST 注释)。
+            g_app.segPack = static_cast<float>(JsonGetFloat(body, SK_PACK_LAST, 0));
+            g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
+            g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_LAST, 0));
+            g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_LAST, 0));
+            g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_NVOF_LAST, 0));
             g_app.hasSegments = g_app.segGpu > 0;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
             char gnPat[32];

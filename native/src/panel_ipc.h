@@ -2,7 +2,7 @@
 // Shared IPC layout between dlssnr_panel.exe (writer) and vs_dlssnr.dll
 // (reader). Two named file mappings, both 512 bytes:
 //   "vs_dlssnr_panel_params" - panel pushes parameter edits (seq-gated)
-//   "vs_dlssnr_stats"        - plugin pushes perf stats (60-frame cadence)
+//   "vs_dlssnr_stats"        - plugin pushes perf stats (per-frame cadence)
 // Also hosts the cross-process contract names and the single authority for
 // the PanelPayload <-> DlssnrParams field mapping.
 
@@ -133,13 +133,15 @@ static_assert(sizeof(StatsPayload) == PAYLOAD_SIZE, "stats payload must fit the 
 // format strings (dlssnr_context.cpp / d3d12_context.cpp) interpolate exactly
 // these; the panel reader is constant-driven.
 inline constexpr const char *SK_GPU_LAST = "gpu_last";
-inline constexpr const char *SK_GPU_EMA = "gpu_ema";
-inline constexpr const char *SK_PACK_EMA = "pack_ema";
-inline constexpr const char *SK_EVAL_CPU_EMA = "eval_cpu_ema";
+// 五段用时走每帧 last(与 gpu_last 同语义):EMA 是 120 帧滚动平均,稳态
+// 播放时逐帧变化 <0.1ms,面板"处理用时"会冻结成"停几秒 + 突跳"的观感;
+// last 随帧呼吸。perf 日志行仍用 EMA(诊断要看趋势,不受影响)。
+inline constexpr const char *SK_PACK_LAST = "pack_last";
+inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
 // NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
 // 时恒 0,面板零值段自动隐藏)。与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
-inline constexpr const char *SK_NVOF_EMA = "nvof_ema";
-inline constexpr const char *SK_UNPACK_EMA = "unpack_ema";
+inline constexpr const char *SK_NVOF_LAST = "nvof_last";
+inline constexpr const char *SK_UNPACK_LAST = "unpack_last";
 inline constexpr const char *SK_INTERNAL_W = "internal_w";
 inline constexpr const char *SK_INTERNAL_H = "internal_h";
 inline constexpr const char *SK_WIDTH = "width";
@@ -190,8 +192,8 @@ inline void PublishWithSeq(volatile uint32_t *seq, uint32_t newSeq, WriteBody &&
 // process; readers map read-only per refresh). Replacing the mapping handle
 // per write would leak one handle per publish.
 inline bool PublishStatsJson(const char *json) noexcept {
-    // Every publisher (the 60-frame stats tick under the plugin's timing
-    // mutex, the GPU-hang path in WaitFenceValue, Initialize) serializes
+    // Every publisher (the per-frame stats publish in ProcessFrame, the
+    // GPU-hang path in WaitFenceValue, Initialize) serializes
     // here: two writers must never interleave the invalidate/body/publish
     // sequence, or the reader accepts a torn body with a valid seq.
     static std::mutex publishLock;

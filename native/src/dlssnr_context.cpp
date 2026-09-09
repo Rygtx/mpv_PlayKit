@@ -620,10 +620,10 @@ bool DlssnrContext::Initialize(
 
     // Publish the render GPU's name so the panel shows it before the first
     // frame lands (queried once from the adapter the device was created on;
-    // the periodic stats tick reuses the cached string). Body also carries the
-    // initial filter state + actual NVOF mode: a failed NVOF init (zero
+    // the per-frame stats publish reuses the cached string). Body also carries
+    // the initial filter state + actual NVOF mode: a failed NVOF init (zero
     // guidance) is a degradation, and the panel must not wait for the first
-    // stats tick to learn it.
+    // stats publish to learn it.
     {
         DXGI_ADAPTER_DESC desc{};
         if (_d3d12->Adapter() && SUCCEEDED(_d3d12->Adapter()->GetDesc(&desc))) {
@@ -1584,13 +1584,18 @@ bool DlssnrContext::ProcessFrame(
         // see NOTE above); the submit+wait wall clock stands in for it.
         const double gpuWaitMs = ms(t2, t3, qpcFreq);
         const double unpackMs = ms(t3, t4, qpcFreq);
-        // Magpie-style periodic stats (every 60 frames) into dlssnr_timing.log.
-        // TimingLog takes g_timingMutex itself — format the line under the
-        // lock, log outside of it, or this thread self-deadlocks on frame 1
-        // and burns one slot forever.
+        // Magpie-style perf log line into dlssnr_timing.log (time-gated ≥1s,
+        // see perfDue below). TimingLog takes g_timingMutex itself — format
+        // the line under the lock, log outside of it, or this thread
+        // self-deadlocks on frame 1 and burns one slot forever.
         char line[384] = "";
+        // 五段 last(每帧值,面板"处理用时"数据源)+ EMA(perf 日志行专用)。
+        // pack/nvof/eval_cpu/unpack 的 last 就是本帧裸值(与日志对齐);gpuLast
+        // 取窗口内最近样本。EMA 同锁内算,fmParallel 并发安全。
         double gpuLast = 0.0, gpuEma = 0.0, packEma = 0.0, nvofEma = 0.0,
                evalCpuEma = 0.0, unpackEma = 0.0;
+        const double packLast = packMs, nvofLast = nvofMs,
+                     evalCpuLast = evalOnlyMs, unpackLast = unpackMs;
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
             const double slotWaitMs = ms(tSlot0, tSlot1, qpcFreq);
@@ -1640,22 +1645,21 @@ bool DlssnrContext::ProcessFrame(
                 // fps = 1s 窗口帧入口计数,处理帧率 < 源帧率 = 宿主侧没来帧。
             }
         }
-        // stats 每帧发布(EMA 是滚动窗口读数,每帧重算 ~600 flops + 512B
-        // 共享内存写,开销可忽略):面板"处理用时"随帧呼吸,不再按日志
-        // 节流跳变。perf 行(磁盘 IO)按时间门 ≥1s 一行(与帧率无关)。
-        // Snapshot/FrameRateWindow 在锁外取(各自持独立互斥,勿在
-        // g_timingMutex 内叠锁)。
+        // stats 每帧发布(五段 last + 512B 共享内存写,开销可忽略):面板
+        // "处理用时"随帧呼吸,不再按日志节流跳变。perf 行(磁盘 IO)按时间
+        // 门 ≥1s 一行(与帧率无关)。Snapshot/FrameRateWindow 在锁外取
+        // (各自持独立互斥,勿在 g_timingMutex 内叠锁)。
         {
             char body[512];
             snprintf(body, sizeof(body),
                      "{\"%s\":%.1f,\"%s\":%.1f,"
-                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
+                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
                      "\"%s\":\"%s\",\"%s\":\"%s\"}",
-                     SK_GPU_LAST, gpuLast, SK_GPU_EMA, gpuEma,
-                     SK_PACK_EMA, packEma, SK_EVAL_CPU_EMA, evalCpuEma, SK_UNPACK_EMA, unpackEma,
-                     SK_NVOF_EMA, nvofEma,
+                     SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
+                     SK_EVAL_CPU_LAST, evalCpuLast, SK_UNPACK_LAST, unpackLast,
+                     SK_NVOF_LAST, nvofLast,
                      SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
                      SK_WIDTH, _width, SK_HEIGHT, _height,
                      SK_SCALING, _d3d12->HasScaling() ? 1 : 0,

@@ -7,7 +7,7 @@ panel_ipc.h 是唯一权威;本文件是测试用的字节级镜像 —— 改�
 
 通道:
   - 参数通道 PARAMS_MAPPING(面板写 -> 插件 40ms 轮询,seq 门控)
-  - stats 通道 STATS_MAPPING(插件写 JSON -> 面板 0.5s 读)
+  - stats 通道 STATS_MAPPING(插件写 JSON -> 面板 0.1s 读,每帧发布)
   - ALIVE_EVENT:滤镜生命周期标记(面板 watchdog 据此自动退出)
 """
 import ctypes

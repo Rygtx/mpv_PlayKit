@@ -144,7 +144,7 @@ private:
     int _height = 0;
     int _depth = 0; // YUV 位深(8/10;CreateFrameResources/resize 判据/日志)
     // Adapter description in UTF-8, filled once in Initialize and reused by
-    // the periodic stats publish (GetDesc per stats tick is wasted work).
+    // every per-frame stats publish (GetDesc per frame is wasted work).
     char _gpuNameUtf8[160] = "UNAVAILABLE";
     bool _coreInitialized = false;
     bool _snippetInitialized = false;
