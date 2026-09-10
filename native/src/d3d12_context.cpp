@@ -430,12 +430,14 @@ bool D3D12Context::CreateColorTexture(
     return true;
 }
 
-bool D3D12Context::CreateFrameResources(int width, int height, int depth, char *err, size_t errLen) noexcept {
+bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool fg,
+                                        char *err, size_t errLen) noexcept {
     _width = width;
     _height = height;
     _bitDepth = depth;
     _chromaW = (width + 1) >> 1;
     _chromaH = (height + 1) >> 1;
+    _fgSlots = fg;
 
     // 零 guidance 纹理:R16G16_FLOAT motion + R32_FLOAT depth,内容清 0。
     // RTV clear 要求 ALLOW_RENDER_TARGET 标志。clear 后常驻
@@ -560,14 +562,17 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     for (int i = 0; i < 3; ++i) {
         if (slot.uploadYuv[i] && slot.uploadYuvMapped[i]) slot.uploadYuv[i]->Unmap(0, nullptr);
         if (slot.readbackYuv[i] && slot.readbackYuvMapped[i]) slot.readbackYuv[i]->Unmap(0, nullptr);
+        if (slot.readbackFg[i] && slot.readbackFgMapped[i]) slot.readbackFg[i]->Unmap(0, nullptr);
         slot.uploadYuvMapped[i] = nullptr;
         slot.readbackYuvMapped[i] = nullptr;
+        slot.readbackFgMapped[i] = nullptr;
     }
     slot.commandList.Reset();
     slot.allocator.Reset();
     for (int i = 0; i < 3; ++i) {
         slot.uploadYuv[i].Reset();
         slot.readbackYuv[i].Reset();
+        slot.readbackFg[i].Reset();
         slot.yuvIn[i].Reset();
         slot.yuvOut[i].Reset();
     }
@@ -581,6 +586,7 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     slot.confidence.Reset();
     slot.reducedMotion.Reset();
     slot.reducedConfidence.Reset();
+    slot.fgInterp.Reset();
     slot.srvUavHeap.Reset();
 
     const int width = _width;
@@ -693,12 +699,19 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
             return false;
         }
     }
+    // FG 槽纹理/回读缓冲必须在描述符块之前创建:槽 32/33 的视图以
+    // fgInterp 为目标 —— 纹理不存在时 CreateShaderResourceView(nullptr)
+    // = NULL 描述符,本机驱动异步 TDR(见 14-17 注释;2026-09-11 fg 路径
+    // 首测实锤,失败在下一个 CreateCommittedResource 才浮出)。
+    if (_fgSlots && !CreateFgSlotResources(slot, err, errLen)) return false;
     {
         // slot-local shader-visible descriptor heap; input/output descriptors
         // here, the residual pipeline descriptors on every scaling rebuild.
+        // 34 = 0..31 原有 + 32/33(FG 插值输出的 SRV/UAV;堆空间常备,
+        // 非 FG 槽写占位视图)。
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 32;
+        heapDesc.NumDescriptors = 34;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -741,6 +754,44 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
             _device->CreateUnorderedAccessView(slot.yuvOut[i].Get(), nullptr, nullptr, slotHandle(28 + i));
         }
         _device->CreateUnorderedAccessView(slot.inputColor.Get(), nullptr, nullptr, slotHandle(31));
+        // 32/33:FG 插值输出的 SRV/UAV(fgInterp 已在上面创建 —— 顺序是
+        // 硬约束,见描述符块前的 NULL 描述符 TDR 注释)。非 FG 槽 =
+        // outputColor 占位视图(占位永不被有效读取:FG 第二遍转换仅在
+        // _fg && realMotion 帧被记录)。
+        if (_fgSlots) {
+            _device->CreateShaderResourceView(slot.fgInterp.Get(), nullptr, slotHandle(32));
+            _device->CreateUnorderedAccessView(slot.fgInterp.Get(), nullptr, nullptr, slotHandle(33));
+        } else {
+            _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(32));
+            _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(33));
+        }
+    }
+    return true;
+}
+
+// DLSS FG 槽资源(仅 _fgSlots):插值输出纹理 + 第二组回读缓冲。
+bool D3D12Context::CreateFgSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    if (!CreateColorTexture(slot.fgInterp.GetAddressOf(), _width, _height,
+                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
+    const UINT planeBytes = _bitDepth > 8 ? 2 : 1;
+    for (int i = 0; i < 3; ++i) {
+        const int pw = i == 0 ? _width : _chromaW;
+        const int ph = i == 0 ? _height : _chromaH;
+        const UINT bytesPerRow = static_cast<UINT>(pw) * planeBytes;
+        if (!CreateRawBuffer(static_cast<UINT64>(ph) * bytesPerRow, D3D12_HEAP_TYPE_READBACK,
+                             D3D12_RESOURCE_STATE_COPY_DEST,
+                             slot.readbackFg[i].GetAddressOf(), slot.readbackPitchFg[i],
+                             bytesPerRow, err, errLen)) {
+            return false;
+        }
+        const HRESULT hr = slot.readbackFg[i]->Map(0, nullptr, &slot.readbackFgMapped[i]);
+        if (FAILED(hr)) {
+            SetErr(err, errLen, hr, "Map(readbackFg) failed");
+            return false;
+        }
     }
     return true;
 }
@@ -865,14 +916,19 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
     cl->ResourceBarrier(3, inBack);
 }
 
-bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen) noexcept {
+bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen,
+                                      bool fgTarget) noexcept {
     // RecordYuvOutput 之后调用:yuvOut 处于 UAV 态 → COPY_SOURCE → 拷贝
     // → COMMON。三平面各自 footprint(格式同资源,跨格式 = 静默 E_INVALIDARG)。
+    // fgTarget = 拷入 FG 第二组回读缓冲(同一条 CL 上两次转换+两次回读,
+    // 目标缓冲必须不同)。
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
     const int planeW[3]{ _width, _chromaW, _chromaW };
     const int planeH[3]{ _height, _chromaH, _chromaH };
     for (int i = 0; i < 3; ++i) {
+        ID3D12Resource *dstBuf = fgTarget ? slot.readbackFg[i].Get() : slot.readbackYuv[i].Get();
+        const size_t dstPitch = fgTarget ? slot.readbackPitchFg[i] : slot.readbackPitchYuv[i];
         D3D12_RESOURCE_BARRIER toCopySrc[1]{
             Transition(slot.yuvOut[i].Get(),
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -883,14 +939,14 @@ bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen)
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src.SubresourceIndex = 0;
         D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource = slot.readbackYuv[i].Get();
+        dst.pResource = dstBuf;
         dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dst.PlacedFootprint.Offset = 0;
         dst.PlacedFootprint.Footprint.Format = yuvFmt;
         dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(planeW[i]);
         dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(planeH[i]);
         dst.PlacedFootprint.Footprint.Depth = 1;
-        dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(slot.readbackPitchYuv[i]);
+        dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(dstPitch);
         cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         D3D12_RESOURCE_BARRIER backToCommon[1]{
             Transition(slot.yuvOut[i].Get(),
@@ -948,7 +1004,8 @@ bool D3D12Context::WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept
 bool D3D12Context::UnpackOutput(
     FrameSlot &slot,
     uint8_t **dstPlanes, int64_t *dstStrides,
-    int width, int height, char *err, size_t errLen) noexcept {
+    int width, int height, char *err, size_t errLen,
+    bool fgSource) noexcept {
     if (width != _width || height != _height) {
         SetErr(err, errLen, E_INVALIDARG, "UnpackOutput: size mismatch");
         return false;
@@ -958,13 +1015,16 @@ bool D3D12Context::UnpackOutput(
     // 10bit:yuvOut(R16_UNORM)存储字 = round(n*65535) = 10-bit 采样值
     // (shader 侧 w=n*1023/65535 精确缩放,见 BGRA_TO_YUV_HLSL),与 VS
     // P10 word 逐位一致 —— 所以是纯拷贝。
+    // fgSource = 读 FG 第二组回读缓冲(插值帧)。
     for (int p = 0; p < 3; ++p) {
         const int pw = p == 0 ? width : _chromaW;
         const int ph = p == 0 ? height : _chromaH;
         const size_t rowBytes = static_cast<size_t>(pw) * (_bitDepth > 8 ? 2u : 1u);
-        const uint8_t *srcRow = static_cast<const uint8_t *>(slot.readbackYuvMapped[p]);
+        const uint8_t *srcRow = static_cast<const uint8_t *>(
+            fgSource ? slot.readbackFgMapped[p] : slot.readbackYuvMapped[p]);
+        const size_t srcPitch = fgSource ? slot.readbackPitchFg[p] : slot.readbackPitchYuv[p];
         uint8_t *dstRow = dstPlanes[p];
-        for (int y = 0; y < ph; ++y, srcRow += slot.readbackPitchYuv[p], dstRow += dstStrides[p]) {
+        for (int y = 0; y < ph; ++y, srcRow += srcPitch, dstRow += dstStrides[p]) {
             memcpy(dstRow, srcRow, rowBytes);
         }
     }
@@ -2406,18 +2466,27 @@ void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameS
 }
 
 void D3D12Context::RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRange range,
-                                   D3D12_RESOURCE_STATES outputStateBefore) noexcept {
-    // RGB→YUV(YUV 原生化):outputColor(stateBefore=UAV 正常 / COMMON
-    // skipEval)→ NSR → luma + chroma 两个 dispatch 写 yuvOut(留 UAV 交
-    // RecordReadbackCopy)→ outputColor 归 COMMON。constant 的 Lo/Span 按
+                                   D3D12_RESOURCE_STATES outputStateBefore,
+                                   ID3D12Resource *srcColor, UINT srcSrvIndex) noexcept {
+    // RGB→YUV(YUV 原生化):srcColor(缺省 outputColor;FG 路径传
+    // fgInterp)stateBefore(UAV 正常 / COMMON skipEval / NSR=FG 后)→ NSR
+    // → luma + chroma 两个 dispatch 写 yuvOut(留 UAV 交
+    // RecordReadbackCopy)→ srcColor 归 COMMON。constant 的 Lo/Span 按
     // 平面语义填充(luma 用 yLo/ySpan,chroma 用 cMid/cSpan)。
+    if (!srcColor) {
+        srcColor = slot.outputColor.Get();
+        srcSrvIndex = kSrvOutputColor;
+    }
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _bitDepth);
-    D3D12_RESOURCE_BARRIER toNsr[1]{
-        Transition(slot.outputColor.Get(), outputStateBefore,
-                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-    };
-    cl->ResourceBarrier(1, toNsr);
+    // FG 路径传 NSR(Evaluate 已消费 backbuffer):同态迁移不录屏障。
+    if (outputStateBefore != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER toNsr[1]{
+            Transition(srcColor, outputStateBefore,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        cl->ResourceBarrier(1, toNsr);
+    }
     D3D12_RESOURCE_BARRIER toUav[3];
     for (int i = 0; i < 3; ++i) {
         toUav[i] = Transition(slot.yuvOut[i].Get(),
@@ -2443,7 +2512,7 @@ void D3D12Context::RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRan
         cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
         cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
         cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-        cl->SetComputeRootDescriptorTable(1, gpu(22)); // t0 outputColor SRV
+        cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
         cl->SetComputeRootDescriptorTable(2, gpu(28)); // u0 yuvOut[0](Y)
         cl->SetComputeRootDescriptorTable(3, gpu(29)); // u1 绑定但本 pass 不写
         cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
@@ -2459,15 +2528,15 @@ void D3D12Context::RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRan
         cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
         cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
         cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-        cl->SetComputeRootDescriptorTable(1, gpu(22)); // t0 outputColor SRV
+        cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
         cl->SetComputeRootDescriptorTable(2, gpu(29)); // u0 yuvOut[1](U)
         cl->SetComputeRootDescriptorTable(3, gpu(30)); // u1 yuvOut[2](V)
         cl->Dispatch((static_cast<UINT>(_chromaW) + 7) / 8, (static_cast<UINT>(_chromaH) + 7) / 8, 1);
     }
 
-    // outputColor 归位 COMMON(yuvOut 留 UAV,由 RecordReadbackCopy 收尾)。
+    // 色源归位 COMMON(yuvOut 留 UAV,由 RecordReadbackCopy 收尾)。
     D3D12_RESOURCE_BARRIER back[1]{
-        Transition(slot.outputColor.Get(),
+        Transition(srcColor,
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
     cl->ResourceBarrier(1, back);

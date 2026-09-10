@@ -91,6 +91,7 @@ struct AppState {
     char stateDetail[160]{}; // SK_STATE_DETAIL: 死亡状态的原因串
     char ofMode[28]{};       // SK_OF_MODE: off / zero / forward[+cost] / both[+cost] q<N> grid<G>
                              // 最长 "forward+cost q5 grid4" = 22+1,28 防截断(与插件 _ofModeBuf 同尺寸)
+    char fgState[16]{};      // SK_FG: on / dup / off / unavailable
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
     bool hasSegments = false;
@@ -252,12 +253,13 @@ void LoadStats() noexcept {
     if (!m) {
         g_app.statsDirty = g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0 ||
                            g_app.filterState[0] != 0 || g_app.stateDetail[0] != 0 ||
-                           g_app.ofMode[0] != 0;
+                           g_app.ofMode[0] != 0 || g_app.fgState[0] != 0;
         g_app.statsBig[0] = 0;
         g_app.statsRes[0] = 0;
         g_app.filterState[0] = 0;
         g_app.stateDetail[0] = 0;
         g_app.ofMode[0] = 0;
+        g_app.fgState[0] = 0;
         return;
     }
     // Seq-gated snapshot (protocol mirrors PublishStatsJson): a copy whose
@@ -285,6 +287,8 @@ void LoadStats() noexcept {
         g_app.stateDetail[0] = 0;
     if (!JsonGetString(body, SK_OF_MODE, g_app.ofMode, sizeof(g_app.ofMode)))
         g_app.ofMode[0] = 0;
+    if (!JsonGetString(body, SK_FG, g_app.fgState, sizeof(g_app.fgState)))
+        g_app.fgState[0] = 0;
     if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
         // The hang payload has no gpu_last, so the gate below would keep
         // showing frozen pre-hang stats forever; surface it — with the
@@ -298,6 +302,7 @@ void LoadStats() noexcept {
         g_app.filterState[0] = 0;
         g_app.stateDetail[0] = 0;
         g_app.ofMode[0] = 0;
+        g_app.fgState[0] = 0;
     } else {
         const double gpuLast = JsonGetFloat(body, SK_GPU_LAST, -1);
         if (gpuLast >= 0) {
@@ -352,6 +357,7 @@ void LoadStats() noexcept {
                        memcmp(before.filterState, g_app.filterState, sizeof(g_app.filterState)) != 0 ||
                        memcmp(before.stateDetail, g_app.stateDetail, sizeof(g_app.stateDetail)) != 0 ||
                        memcmp(before.ofMode, g_app.ofMode, sizeof(g_app.ofMode)) != 0 ||
+                       memcmp(before.fgState, g_app.fgState, sizeof(g_app.fgState)) != 0 ||
                        before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
                        before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
                        before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack ||
@@ -462,6 +468,15 @@ void DrawUi() noexcept {
         // 时在这里暴露;档位关闭(off)不显示。
         if (g_app.ofMode[0] && std::strcmp(g_app.ofMode, "off") != 0) {
             ImGui::TextDisabled("光流模式: %s", g_app.ofMode);
+        }
+        // DLSS FG 状态:on=插值中;dup=复制帧(复位/零光流/开关暂关/降级);
+        // off=本会话未激活;unavailable=代理初始化失败回退 1:1。
+        if (g_app.fgState[0] && std::strcmp(g_app.fgState, "off") != 0) {
+            const char *desc = std::strcmp(g_app.fgState, "on") == 0 ? "插值中"
+                             : std::strcmp(g_app.fgState, "dup") == 0 ? "复制帧"
+                             : std::strcmp(g_app.fgState, "unavailable") == 0 ? "不可用(1:1)"
+                             : g_app.fgState;
+            ImGui::TextDisabled("帧生成: %s", desc);
         }
     }
     ImGui::Spacing();
@@ -671,12 +686,31 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("光流跟随降采样");
     if (ImGui::IsItemHovered())
-        ShowTip("光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。");
+        ShowTip("光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。\n帧生成激活时此开关被忽略(帧生成要求源尺寸运动场)。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         bool v = g_app.params.nvofFollowScaling != 0;
         if (ImGui::Checkbox("##nvof_follow_scaling", &v)) {
             g_app.params.nvofFollowScaling = v ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
+    // DLSS 帧生成(整行)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("帧生成");
+    if (ImGui::IsItemHovered())
+        ShowTip("DLSS 帧生成(挂降噪之后):输出帧率 x2,插值帧由 DLSS FG 模型合成。\n"
+                "依赖 vs-plugins\\ngx\\version.dll(dlssg_for_sm86 代理,用户自备部署);\n"
+                "初始化失败自动回退 1:1 输出,降噪不受影响。\n"
+                "开启需要重启播放生效(帧率在滤镜创建时声明);会话内开关即时生效\n"
+                "(关 = 插值帧改为复制真实帧,帧数不变)。建议配合光流质量 > 0 使用。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        bool v = g_app.params.fgEnabled != 0;
+        if (ImGui::Checkbox("##fg_enabled", &v)) {
+            g_app.params.fgEnabled = v ? 1 : 0;
             g_app.liveDirty = true;
         }
     }

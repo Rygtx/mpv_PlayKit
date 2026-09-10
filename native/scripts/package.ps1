@@ -19,9 +19,16 @@ $Version = $Version.TrimStart("v")
 $binDll   = Join-Path $native "bin\vs_dlssnr.dll"
 $binPanel = Join-Path $native "bin\dlssnr_panel.exe"
 $model    = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"
+$fgDll    = Join-Path $native "vendor\ngx\version.dll"
+$fgIni    = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
 if (-not (Test-Path $binDll))   { throw "缺少编译产物: $binDll (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $binPanel)) { throw "缺少编译产物: $binPanel (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $model))    { throw "缺少模型文件: $model (把 nvngx_dlssnr.dll 复制到 native\vendor\ngx\)" }
+# DLSS 帧生成代理为可选件: 缺失时打包照常, 滤镜侧优雅回退 1:1 输出 (vpy fg_enabled 失效)
+$fgPack = (Test-Path $fgDll) -and (Test-Path $fgIni)
+if (-not $fgPack) {
+    Write-Warning "缺少帧生成代理 (version.dll / dlssg_sm86.ini, dlssg_for_sm86): 打包将不含帧生成, 滤镜自动回退 1:1"
+}
 
 $dist  = Join-Path $native "dist"
 $stage = Join-Path $dist "stage"
@@ -38,6 +45,10 @@ Get-ChildItem (Join-Path $stage "portable_config\_cache") -Recurse -File -ErrorA
 Copy-Item $binDll   (Join-Path $stage "vs-plugins")
 Copy-Item $binPanel (Join-Path $stage "vs-plugins")
 Copy-Item $model    (Join-Path $stage "vs-plugins\ngx")
+if ($fgPack) {
+    Copy-Item $fgDll (Join-Path $stage "vs-plugins\ngx")
+    Copy-Item $fgIni (Join-Path $stage "vs-plugins\ngx")
+}
 
 # --- 安装说明 ---
 $readme = Join-Path $stage "安装说明.txt"
@@ -52,6 +63,11 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   vs-plugins\vs_dlssnr.dll            VapourSynth 插件 (Magpie DLSSNR 移植, NGX Feature 18)
   vs-plugins\dlssnr_panel.exe         ImGui 独立调参面板 (运行时实时调参)
   vs-plugins\ngx\nvngx_dlssnr.dll     DLSSNR 模型 (NVIDIA DLSS SDK 310.9.0)
+$(if ($fgPack) {
+"  vs-plugins\ngx\version.dll          DLSS 帧生成代理 (dlssg_for_sm86 原生实现, 自签名)
+  vs-plugins\ngx\dlssg_sm86.ini       帧生成代理配置 (Router=SM86 / KernelImage=PTX)
+"
+})
 
 安装 (已有 mpv-lazy, 建议与打包基线同版或更新)
   1. 备份你的 portable_config\ (若有个人修改)
@@ -66,6 +82,13 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   首帧初始化约 1 秒 (模型加载), 属正常现象
   双击 vs-plugins\dlssnr_panel.exe 可在播放时实时调参, "保存为默认值"写入 dlssnr_ui.ini
   删除 vs-plugins\dlssnr_ui.ini 可恢复脚本默认参数
+$(if ($fgPack) {
+"帧生成 (可选)
+  vs\DLSSNR_NV.vpy 中 Fg_Enabled = True 开启: 输出帧率 x2 (插值帧挂降噪之后),
+  依赖 vs-plugins\ngx\version.dll (dlssg_for_sm86, RTX 30/20 系解锁 DLSS FG);
+  初始化失败自动回退 1:1, 降噪不受影响; 建议配合面板光流质量 >= 2 使用
+"
+})
 
 要求: RTX 显卡
 本包不含 mpv.exe 与 VapourSynth 运行时, 请使用官方 mpv-lazy 发行包

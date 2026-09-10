@@ -23,6 +23,7 @@ endif ()
 add_library(vs_dlssnr SHARED
     src/plugin.cpp
     src/dlssnr_context.cpp
+    src/dlssfg_context.cpp
     src/nvof_context.cpp
     src/iat_hook.cpp
     src/d3d12_context.cpp

@@ -61,7 +61,17 @@ struct DlssnrParams {
     // 服务帧生成消费者,运动精度敏感,见 NvidiaOpticalFlowProvider),
     // NR guidance 对粗运动容忍度高(DLSS RR 语义即内部分辨率 motion)。
     // scaling 关闭时本开关无效。
+    // 注意 FG(DLSS FG)激活时本开关被忽略:FG 的 MVecs 契约要求与
+    // backbuffer 同尺寸的稠密运动场,必须按源尺寸建 NVOF 会话。
     int nvofFollowScaling = 0;
+    // DLSS 帧生成(0/1)。语义分两层:
+    //   create-time —— 非零且 FG 上下文初始化成功时,滤镜输出帧率 ×2
+    //   (vi.fps 翻倍,奇数索引输出插值帧);初始化失败优雅回退 1:1。
+    //   live —— 会话内 FG 激活时,面板切 0 = 立即停 eval 改为复制真实帧
+    //   (帧数不变);切回 1 恢复 eval。创建时未激活的会话,面板开关在
+    //   下次播放(seek 重建滤镜)才生效。
+    // FG 路径要求挂 DLSSNR 之后:FG 的 backbuffer = NR 输出。
+    int fgEnabled = 0;
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence

@@ -442,7 +442,7 @@ bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHisto
 // ---- Lifecycle ----
 
 bool DlssnrContext::Initialize(
-    D3D12Context &d3d12, const wchar_t *ngxDllPath,
+    D3D12Context &d3d12, const wchar_t *ngxDllPath, const wchar_t *fgDllPath,
     int width, int height, int depth, SharedParams *shared,
     char *err, size_t errLen) noexcept {
     auto fail = [&](const char *what) {
@@ -578,12 +578,45 @@ bool DlssnrContext::Initialize(
     //    textures/compute at the internal resolution (skipped entirely when
     //    internal-resolution scaling is disabled)
     if (ProbeEnabled()) TimingStatusLine("PROBE: pre frame-res"); // init 细分(DEVICE_HUNG 时序定位)
-    if (!_d3d12->CreateFrameResources(_width, _height, _depth, err, errLen)) return failWithExistingErr();
+    // FG 请求 = 创建时参数快照的 fgEnabled(桥接 ini/payload 采纳已在此前
+    // 完成);sticky —— 尺寸重建(RecreateFeature)沿用本旗标,面板运行中
+    // 改变只影响逐帧 eval 门,不重建槽资源。
+    _fgRequested = _shared->Snapshot().fgEnabled != 0 && fgDllPath && fgDllPath[0];
+    if (!_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested, err, errLen)) return failWithExistingErr();
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
         int iw = _width, ih = _height;
         InternalSize(_width, _height, pct, iw, ih);
         if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) return failWithExistingErr();
+    }
+
+    // 4a) DLSS FG 会话(挂 NR 之后;先于 NVOF 建立,使光流 follow 的会话
+    // 输入尺寸决策能感知 FG)。失败优雅降级:滤镜回退 1:1 输出(不翻倍
+    // 帧率),NR 不受影响 —— FG 的 SEH 走本地闩锁,不进全局 NgxRuntimeGuard。
+    if (_fgRequested) {
+        DWORD sehCode = 0;
+        const NVSDK_NGX_Result pr = CoreAllocateParametersSafely(&_fgParams, &sehCode);
+        if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
+            _fg = std::make_unique<DlssfgContext>();
+            char fgErr[256]{};
+            if (!_fg->Initialize(*_d3d12, fgDllPath, _appDataPath, _fgParams,
+                                 _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                 fgErr, sizeof(fgErr))) {
+                char msg[352];
+                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg init failed (%s); 1:1 output",
+                              fgErr);
+                DbgLine(msg);
+                TimingStatusLine(msg);
+                _fg.reset();
+                // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
+                // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
+                _fgParams = nullptr;
+                _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
+            }
+        } else {
+            TimingStatusLine("DLSSNR STATUS: dlssfg core parameter block FAILED; 1:1 output");
+            _fgRequested = false;
+        }
     }
 
     // 4b) NVOF 光流会话(PORTING #6):quality > 0 时建立;失败优雅回退零
@@ -706,7 +739,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // All GPU work is complete (slots are only released after WaitFrame).
     const bool resize = newWidth > 0 &&
                         (newWidth != _width || newHeight != _height || newDepth != _depth);
-    if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, newDepth, err, errLen)) {
+    if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, newDepth, _fgRequested, err, errLen)) {
         _ready.store(false, std::memory_order_release);
         return false;
     }
@@ -714,6 +747,19 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         _width = newWidth;
         _height = newHeight;
         _depth = newDepth;
+        // FG feature 随尺寸重建(proxy Release + CreateFeature;失败 = FG
+        // 闩停,降级复制帧,NR 不受影响)。历史在重建时作废。
+        if (_fg && _fg->Enabled()) {
+            char fgErr[192]{};
+            if (!_fg->Rebuild(_width, _height, DXGI_FORMAT_B8G8R8A8_UNORM, fgErr, sizeof(fgErr))) {
+                char msg[288];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: dlssfg rebuild failed (%s); FG off (dup)",
+                              fgErr);
+                DbgLine(msg);
+                TimingStatusLine(msg);
+            }
+        }
         // NVOF 会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildNvof
         // —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见 _retiredNvof
         // 注释),失败降级零 guidance,不致命。会话输入尺寸遵循 follow 语义
@@ -721,7 +767,8 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         // 直推,不依赖尚未执行的 RebuildScaling)。
         if (_nvof && _curOfQuality > 0 && !_nvofFailed) {
             const DlssnrParams sp = _shared->Snapshot();
-            const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled;
+            // FG 激活时 MVecs 契约要求源尺寸稠密运动 —— follow 被忽略。
+            const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled && !(_fg && _fg->Enabled());
             int iw = _width, ih = _height;
             if (foll) InternalSize(_width, _height, resPercent, iw, ih);
             auto next = std::make_unique<NvofContext>();
@@ -876,9 +923,11 @@ bool DlssnrContext::RebuildNvof(int quality, int dstW, int dstH, char *err, size
 }
 
 void DlssnrContext::ResetNvofHistory() noexcept {
-    // seek = 新时间线:流历史作废,下一帧重新播种(清零发布 + NGX PARAM_RESET)。
-    // 会话本身保留(热上下文跨 seek 存活)。
+    // seek = 新时间线:流历史作废,下一帧重新播种(清零发布 + NGX PARAM_RESET;
+    // FG 下一帧 eval 带 DLSSG.Reset,该帧插值输出降级复制)。会话本身保留
+    // (热上下文跨 seek 存活)。
     if (_nvof) _nvof->ResetHistory();
+    if (_fg) _fg->ResetHistory();
 }
 
 bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int depth,
@@ -905,11 +954,14 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     if (!dimsChanged && !CreateParamsChanged(p, cur)) {
         // 热复用:NGX feature 保持,但 seek 是新时间线 —— 光流历史必须
         // 作废(下一帧播种),光流档位同步到新实例的参数快照;此前建立
-        // 失败的会话在热复用时重试一次。
+        // 失败的会话在热复用时重试一次。FG 同理(下一帧 eval 带 Reset,
+        // 该帧插值输出降级复制)。
         ResetNvofHistory();
-        // 会话输入尺寸同步(follow = 开关 + scaling 状态;热路径下内部尺寸
-        // 未变,除非 ini/payload 同时带了 res% 变化 —— 那会走下方重建分支)。
-        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling();
+        // 会话输入尺寸同步(follow = 开关 + scaling 状态 + FG 未激活;热路
+        // 径下内部尺寸未变,除非 ini/payload 同时带了 res% 变化 —— 那会走
+        // 下方重建分支)。
+        const bool fgHot = _fg && _fg->Enabled();
+        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgHot;
         const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
         const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
         if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax);
@@ -934,7 +986,8 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。会话输
     // 入尺寸同样在此对齐(follow 开关/res% 变化)。
     if (nvofOk) {
-        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling();
+        const bool fgHot = _fg && _fg->Enabled();
+        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgHot;
         const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
         const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
         if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax);
@@ -949,10 +1002,12 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
 bool DlssnrContext::ProcessFrame(
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
     uint8_t **dstPlanes, int64_t *dstStrides,
+    uint8_t **fgDstPlanes, int64_t *fgDstStrides, bool &fgEvaluated,
     int width, int height, int n,
     ColorMatrix matrix, ColorRange range,
     char *err, size_t errLen,
     char *timingOut, size_t timingLen) noexcept {
+    fgEvaluated = false;
     // Faulted latch: every NGX entry returns instantly, so bail before
     // paying AcquireSlot + the full-frame CPU pack for a frame that can
     // never succeed.
@@ -996,9 +1051,12 @@ bool DlssnrContext::ProcessFrame(
     const DlssnrParams frameParams = _shared->Snapshot();
     // NVOF 档位/会话输入尺寸同步(只重建光流会话,不动 NGX feature)。在
     // AcquireSlot 之前消费:RebuildNvof 要封池排空。失败只降级零 guidance,
-    // 帧继续。会话输入尺寸 = follow(开关 + scaling 启用)? 内部尺寸 : 源
-    // 尺寸 —— ConsumeRebuild 已在上文跑过,内部尺寸此处是新鲜的。
-    const bool nvofFollow = frameParams.nvofFollowScaling != 0 && _d3d12->HasScaling();
+    // 帧继续。会话输入尺寸 = follow(开关 + scaling 启用 + FG 未激活)?
+    // 内部尺寸 : 源尺寸 —— FG 的 MVecs 契约要求与 backbuffer 同尺寸稠密
+    // 运动场,FG 激活时 follow 被强制忽略。ConsumeRebuild 已在上文跑过,
+    // 内部尺寸此处是新鲜的。
+    const bool fgGateLive = _fg && _fg->Enabled() && frameParams.fgEnabled;
+    const bool nvofFollow = frameParams.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgGateLive;
     const int nvDstW = nvofFollow ? _d3d12->InternalWidth() : width;
     const int nvDstH = nvofFollow ? _d3d12->InternalHeight() : height;
     if (const int ofq = std::clamp(frameParams.motionVectorQuality, kOfQualityMin, kOfQualityMax);
@@ -1073,6 +1131,12 @@ bool DlssnrContext::ProcessFrame(
     bool densifyInternal = false; // densify 直写 reducedMotion(follow 内部管线)
     double nvofMs = 0.0;
     int nvofInputIndex = -1;      // 本帧写入的 NVOF 输入 ping-pong 槽位(诊断 dump 用)
+    // DLSS FG:本帧是否真插值(eval 成功且回读落位);false = 插值输出为
+    // 真实帧复制(复位/零光流/面板关/eval 降级)。函数级作用域 —— YUV 双
+    // 转换与统计段都要读。fgRan = 本帧向 proxy 提交过 eval(含播种):
+    // outputColor 已在 NSR,真实帧转换以 NSR 为 stateBefore。
+    bool fgEvaluatedLocal = false;
+    bool fgRan = false;
     if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
         const uint32_t gs = _nvof->GridSize();
         // 流场网格随会话输入尺寸(follow 模式 = 内部尺寸);densify 的
@@ -1375,6 +1439,65 @@ bool DlssnrContext::ProcessFrame(
             };
             cl->ResourceBarrier(1, back);
         }
+
+        // ---- DLSS FG 段(挂 NR 之后):backbuffer = NR 输出(outputColor),
+        // MVecs = 源尺寸稠密运动(slot.motion —— FG 激活时 follow 已被忽略,
+        // 会话必为源尺寸),Depth = 静态零纹理。proxy 契约:输入 NSR / 输出
+        // UAV;CUDA 互操作工作与槽队列 FIFO 保序,插值输出就绪由本槽
+        // WaitFrame 覆盖(与 NVOF densify 同款论证)。仅真光流且非复位帧
+        // 消费输出;复位/零光流/eval 失败帧的插值输出 = 真实帧复制(无运动
+        // 信息可插,重复帧优于垃圾插值)。
+        // fgRan = 本帧向 proxy 提交了 eval(含播种 eval):outputColor 已被
+        // 置 NSR。fgEvaluatedLocal = fgRan 且非播种 —— 播种 eval(会话首帧/
+        // seek 后)带 DLSSG.Reset=1,输出不可信,只建历史不发布。
+        if (fgGateLive && !skipEval && realMotion && !nvofHistoryReset &&
+            fgDstPlanes && _d3d12->FgSlots() && slot->fgInterp) {
+            const bool fgResetEval = _fg->NeedsReset();
+            D3D12_RESOURCE_BARRIER fgBar[2]{
+                TransitionFromTo(_d3d12->OutputColor(*slot),
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                Transition(slot->fgInterp.Get(),
+                           D3D12_RESOURCE_STATE_COMMON,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            };
+            cl->ResourceBarrier(2, fgBar);
+            char fgErr[160]{};
+            if (_fg->Evaluate(cl, _d3d12->OutputColor(*slot), slot->motion.Get(),
+                              _d3d12->Depth(), slot->fgInterp.Get(), width, height,
+                              false, fgErr, sizeof(fgErr))) {
+                fgRan = true;
+                fgEvaluatedLocal = !fgResetEval;
+                if (fgResetEval) {
+                    // 播种帧:插值输出不消费,fgInterp 归 COMMON;outputColor
+                    // 留 NSR 进真实帧转换(与 fgRan 路径同款)。
+                    D3D12_RESOURCE_BARRIER fgSeed[1]{
+                        Transition(slot->fgInterp.Get(),
+                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                   D3D12_RESOURCE_STATE_COMMON),
+                    };
+                    cl->ResourceBarrier(1, fgSeed);
+                }
+            } else {
+                // eval 失败(会话已被闩停):补回屏障,恢复 outputColor
+                // UAV / fgInterp COMMON 的帧末不变量,本帧降级复制。
+                D3D12_RESOURCE_BARRIER fgUndo[2]{
+                    TransitionFromTo(_d3d12->OutputColor(*slot),
+                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    Transition(slot->fgInterp.Get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COMMON),
+                };
+                cl->ResourceBarrier(2, fgUndo);
+                // 失败必须进 timing log(dlssfg 内部已留痕;此处补帧号锚点)。
+                char msg[224];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: dlssfg frame %d degraded to dup: %.150s",
+                              n, fgErr);
+                TimingStatusLine(msg);
+            }
+        }
         // guidance 纹理归位 COMMON(仅 realMotion 帧动过:播种/失败帧的
         // 发布走静态零纹理,per-slot motion 全程 COMMON 不被触碰)。
         // follow 内部管线只动过 reducedMotion/reducedConfidence —— 源尺寸
@@ -1404,13 +1527,25 @@ bool DlssnrContext::ProcessFrame(
     }
 
     // RGB→YUV(两分支汇合处):outputColor 到达时 = UAV(evaluate/垂直
-    // 合成写)或 COMMON(诊断拷贝),RecordYuvOutput 统一 NSR 化后转换、
-    // 收尾归 COMMON;yuvOut 留 UAV 交 readback。
+    // 合成写)/ COMMON(诊断拷贝)/ NSR(FG eval 已消费 backbuffer),
+    // RecordYuvOutput 统一 NSR 化后转换、收尾归 COMMON;yuvOut 留 UAV 交
+    // readback。
     _d3d12->RecordYuvOutput(*slot, matrix, range,
                             skipEval ? D3D12_RESOURCE_STATE_COMMON
-                                     : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                                     : (fgRan ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                              : D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     if (!_d3d12->RecordReadbackCopy(*slot, err, errLen)) {
         return false;
+    }
+    // FG 插值帧:第二遍 RGB→YUV(fgInterp UAV→NSR→COMMON)+ 独立回读缓冲
+    // —— 同一条 CL 上先后两对转换/回读,真实帧回读不被覆写。
+    if (fgEvaluatedLocal) {
+        _d3d12->RecordYuvOutput(*slot, matrix, range,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                slot->fgInterp.Get(), D3D12Context::kSrvFgInterp);
+        if (!_d3d12->RecordReadbackCopy(*slot, err, errLen, true)) {
+            return false;
+        }
     }
     // NOTE: timestamp disabled, see note above
     // NVOF flow 已在 StageFrame 里 CPU 等待完成(execute 后的输出栅栏),
@@ -1437,6 +1572,15 @@ bool DlssnrContext::ProcessFrame(
     if (ProbeEnabled()) TimingStatusLine("PROBE: waited"); // 临时探针(VSDLSSNR_PROBE=1)
     QueryPerformanceCounter(&t3);
     const bool rb = _d3d12->UnpackOutput(*slot, dstPlanes, dstStrides, width, height, err, errLen);
+    // FG 插值帧回读(独立缓冲;eval 成功才有内容)。失败按整体失败处理:
+    // 调用方会对两份输出都做源帧复制降级。
+    if (rb && fgEvaluatedLocal && fgDstPlanes) {
+        if (!_d3d12->UnpackOutput(*slot, fgDstPlanes, fgDstStrides, width, height,
+                                  err, errLen, true)) {
+            return false;
+        }
+    }
+    fgEvaluated = rb && fgEvaluatedLocal;
     {
         // concurrent frame threads: dump at most once, no interleaved writes;
         // the mutex is only taken when a dump is actually pending (the old
@@ -1552,6 +1696,12 @@ bool DlssnrContext::ProcessFrame(
                                   DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
                     dumpOrLog(_d3d12->OutputColor(*slot), width, height, L"dump_output.bin", kColorDump);
+                    // FG 插值输出(仅 eval 过的帧有内容;首帧必为播种,等
+                    // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。
+                    if (fgRan) {
+                        dumpOrLog(_d3d12->FgInterp(*slot), width, height,
+                                  L"dump_fg_interp.bin", kColorDump);
+                    }
                     // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
                     // Y/U/V 与 dump 对比,≤1-2 LSB;P10 = 右对齐 word)。
                     {
@@ -1651,12 +1801,18 @@ bool DlssnrContext::ProcessFrame(
         // (各自持独立互斥,勿在 g_timingMutex 内叠锁)。
         {
             char body[512];
+            // FG 状态:on = 本帧真插值;dup = 复制真实帧(复位/零光流/面板
+            // 关/降级);off = 本会话未激活;unavailable = proxy 初始化或
+            // eval 失败闩停(帧率仍 ×2,内容为复制帧)。
+            const char *fgState = !_fg ? "off"
+                : (!_fg->Enabled() ? "unavailable"
+                                   : (fgEvaluatedLocal ? "on" : "dup"));
             snprintf(body, sizeof(body),
                      "{\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
-                     "\"%s\":\"%s\",\"%s\":\"%s\"}",
+                     "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\"}",
                      SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
                      SK_EVAL_CPU_LAST, evalCpuLast, SK_UNPACK_LAST, unpackLast,
                      SK_NVOF_LAST, nvofLast,
@@ -1665,7 +1821,8 @@ bool DlssnrContext::ProcessFrame(
                      SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
                      SK_FPS, _d3d12->FrameRateWindow(), SK_GPU_NAME, _gpuNameUtf8,
                      SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
-                     SK_OF_MODE, OfModeString());
+                     SK_OF_MODE, OfModeString(),
+                     SK_FG, fgState);
             PublishStatsJson(body);
         }
         if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)
@@ -1722,6 +1879,14 @@ void DlssnrContext::Shutdown() noexcept {
         _nvof.release();
         _curOfQuality = 0;
         _nvofFailed = false;
+    }
+    // FG:proxy 模块进程级钉住(永不 FreeLibrary),feature 弃引用随进程
+    // 回收;参数块在 core 存活期销毁(与 _parameters 同序,Shutdown1 之前)。
+    _fg.release(); // 析构不触碰 proxy(见 dlssfg_context 析构注释)
+    if (_fgParams) {
+        DWORD sehCode = 0;
+        CoreDestroyParametersSafely(_fgParams, &sehCode);
+        _fgParams = nullptr;
     }
     // A faulted latch refuses further SDK entry (Invoke returns the fallback
     // with *sehCode == 0): skip shutdown entirely and keep the faulted modules

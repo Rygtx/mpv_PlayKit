@@ -6,6 +6,7 @@
 // 或 NVOF 真运动矢量(PORTING #6,NvofContext),由 motionVectorQuality 切换。
 
 #include "d3d12_context.h"
+#include "dlssfg_context.h"
 #include "dlssnr_params.h"
 #include "iat_hook.h"
 #include "nvof_context.h"
@@ -36,6 +37,7 @@ public:
     DlssnrContext &operator=(const DlssnrContext &) = delete;
 
     bool Initialize(D3D12Context &d3d12, const wchar_t *ngxDllPath,
+                    const wchar_t *fgDllPath,
                     int width, int height, int depth, SharedParams *shared,
                     char *err, size_t errLen) noexcept;
     void Shutdown() noexcept;
@@ -73,12 +75,23 @@ public:
     // n is the frame index; discontinuity detection (NGX history reset) is
     // owned here, not by the glue layer. timingOut 非 NULL 时写入分段耗时
     // (毫秒,逗号分隔:pack,submit+gpu,unpack)
+    // FG 双输出(fgDstPlanes 非 NULL = 创建时 FG 激活,输出帧率 ×2):
+    // fgDst* 收插值帧(经 DLSSG eval 或真实帧复制),fgEvaluated 告知调用
+    // 方本帧是否真插值(false = 复制语义,调用方无须再处理 —— 双输出都在
+    // 本函数内完成回读/复制)。
     bool ProcessFrame(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                       uint8_t **dstPlanes, int64_t *dstStrides,
+                      uint8_t **fgDstPlanes, int64_t *fgDstStrides, bool &fgEvaluated,
                       int width, int height, int n,
                       ColorMatrix matrix, ColorRange range,
                       char *err, size_t errLen,
                       char *timingOut = nullptr, size_t timingLen = 0) noexcept;
+
+    // FG 会话是否激活(创建时 fgEnabled 且 proxy 初始化成功且槽资源在)。
+    // 决定滤镜输出帧率是否 ×2(插件 create 侧)。
+    bool FgActive() const noexcept {
+        return _fg && _fg->Enabled();
+    }
 
 private:
     // ---- SEH wrappers (Magpie style; every NGX call is wrapped) ----
@@ -168,6 +181,13 @@ private:
     int _curOfQuality = 0;
     bool _nvofFailed = false;
     std::mutex _nvofMutex;
+    // DLSS FG(挂 NR 之后):创建时 fgEnabled → 建 proxy 会话 + FG 槽资源
+    // (_fgRequested 参与 CreateFrameResources 旗标,sticky);初始化失败 =
+    // _fg 空,滤镜优雅回退 1:1 输出。面板 fgEnabled 为 live 语义(会话内
+    // 关 = 复制真实帧;未激活会话内开 = 下次播放生效)。
+    std::unique_ptr<DlssfgContext> _fg;
+    NVSDK_NGX_Parameter *_fgParams = nullptr; // FG 专用核心参数块(core 拥有)
+    bool _fgRequested = false;
     // fmParallel: several frame threads call EvaluateFeature concurrently.
     // The feature and the parameter block are singletons, so evaluate
     // (parameter setup + snippet call) is serialized; GPU-side dispatches

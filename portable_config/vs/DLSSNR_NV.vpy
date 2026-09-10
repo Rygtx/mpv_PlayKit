@@ -1,9 +1,12 @@
 ### NVIDIA DLSSNR 同分辨率 AI 画质增强 <RTX N卡专用>
 ### 依赖_ vs-plugins\vs_dlssnr.dll (VapourSynth 插件, 自动加载)
 ###       vs-plugins\ngx\nvngx_dlssnr.dll (模型文件, 310.9.0, 取自 RenoDX)
+###       vs-plugins\ngx\version.dll (DLSS FG 原生代理, dlssg_for_sm86; 帧生成可选, 用户自备)
 ###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
 ### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18)
 ###       处理为同分辨率 (非超分); 默认零 guidance, 可选 NVOF 硬件光流引导 (0-5 档)
+###       DLSS 帧生成 (可选): 挂降噪之后, 输出帧率 x2 (插值帧由 DLSS FG 模型合成);
+###       需要光流引导 (Motion_Vector_Quality > 0) 才有意义, 否则插值帧 = 复制真实帧
 ###       YUV 原生: 直接吃 YUV420P8/P10 吐同格式, 无 CPU 格式往返;
 ###       色彩矩阵/范围按源帧属性 (_Matrix/_ColorRange) 处理, 缺省 709 limited
 ###       HDR (BT.2020/PQ/HLG) 与非 420P8/P10 内容自动直通 (正常播放, 不做增强)
@@ -29,6 +32,7 @@ Input_Resolution = 100
 Residual_Multiplier = 1.0
 Motion_Vector_Quality = 0
 Nvof_Follow_Scaling = False
+Fg_Enabled = False
 H_Max = 0
 ## <0-3> 整数, NR 预设档位
 ## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
@@ -50,6 +54,15 @@ H_Max = 0
 ##          0 = 无 (零 guidance); 1-5 用硬件光流减轻运动场景的时域伪影
 ##          需要 NVIDIA Turing+; 不支持时自动回退零 guidance
 ##          播放中可在面板实时切换 (只重建光流会话, 毫秒级)
+##          帧生成开启时建议 >= 2 (Balanced): 光流是插值帧的运动来源
+## <True|False> 光流输入跟随内部降采样 (默认 False); 帧生成激活时被忽略
+## <True|False> DLSS 帧生成 (默认 False)
+##          挂降噪之后: 输出帧率 x2 (24fps 源 → 48fps 输出), 插值帧由
+##          DLSS FG 模型合成; 依赖 ngx\version.dll (dlssg_for_sm86),
+##          初始化失败自动回退 1:1, 降噪不受影响
+##          面板开关: 会话内关 = 插值帧改复制真实帧 (帧数不变);
+##          未激活会话内开 = 下次播放生效
+##          显示端建议刷新率 >= 输出帧率 (24fps 源 x2 = 48fps < 60Hz OK)
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
 
@@ -93,6 +106,7 @@ else :
 		residual_multiplier = Residual_Multiplier,
 		motion_vector_quality = Motion_Vector_Quality,
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
+		fg_enabled = int(Fg_Enabled),
 	)
 
 ret.set_output()

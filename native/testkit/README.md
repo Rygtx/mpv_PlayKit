@@ -64,6 +64,7 @@
 | `verify_stats_keys.py` | stats JSON 键位:filter_state / of_mode / 必败路径上报 |
 | `test_lifecycle.py` | 滤镜加载自动拉起面板;杀 mpv 后面板 watchdog 自退 |
 | `test_res_crash.py` | 内部分辨率逐档下发,mpv 存活 + recreate 真实发生(空心测试防线) |
+| `test_fg_fallback.py` | DLSS 帧生成降级:fg_enabled=1 且 proxy(version.dll)缺失 -> 优雅回退 1:1,输出帧数/格式不变 |
 
 `panel_ipc.py` 是 `native/src/panel_ipc.h` 的 python 字节级镜像
 (92 字节 packed struct + 自检 assert)。**改头文件必须同步这里**——

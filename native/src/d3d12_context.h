@@ -97,6 +97,14 @@ struct FrameSlot {
     ComPtr<ID3D12Resource> confidence;    // W×H R8_UNORM,UAV
     ComPtr<ID3D12Resource> reducedMotion;     // internalW×internalH R16G16_FLOAT
     ComPtr<ID3D12Resource> reducedConfidence; // internalW×internalH R8_UNORM
+    // DLSS FG(仅 _fgSlots 建立时分配):FG 插值输出(BGRA8,UAV —— DLSSG
+    // 契约:输出为 UAV;NSR 化后走 RGB→YUV 第二遍转换)。
+    ComPtr<ID3D12Resource> fgInterp;      // W×H BGRA8,UAV
+    // FG 插值帧的独立回读缓冲(与真实帧的 readbackYuv 并存:同一条 CL 上
+    // 先后两次转换+回读,真实帧回读不能被插值帧覆写)。
+    ComPtr<ID3D12Resource> readbackFg[3];
+    void *readbackFgMapped[3] = {};
+    size_t readbackPitchFg[3] = {};
     // slot-local shader-visible heap: 0=srvInput 1=srvReducedColor
     // 2=srvReducedDenoised 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised
     // 6=uavHorizontal 7=uavOutput 8=srvControlled 9=uavControlled
@@ -111,6 +119,8 @@ struct FrameSlot {
     // 25=srvYuvIn0 26=srvYuvIn1 27=srvYuvIn2(YUV→RGB 转换采样)
     // 28=uavYuvOut0 29=uavYuvOut1 30=uavYuvOut2(RGB→YUV 写出)
     // 31=uavInput(inputColor 的 UAV,YUV→RGB 转换直写)
+    // 32=srvFgInterp 33=uavFgInterp(FG 插值输出;非 FG 槽 = outputColor
+    // 占位视图 —— 绝不写 NULL 描述符,见 14-17 注释)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 };
 
@@ -140,7 +150,12 @@ public:
 
     // depth = YUV 位深(8/10)。同尺寸换深度必须走重建(hotMatch 侧拦截,
     // 否则 R8 槽纹理遇 P10 打包 = 数据撕裂)。
-    bool CreateFrameResources(int width, int height, int depth, char *err, size_t errLen) noexcept;
+    // fg = 建 DLSS FG 槽资源(插值输出纹理 + 第二组回读缓冲)。create-time
+    // 语义:FG 激活与否决定帧资源形态,变化走 PoolHold 全量重建(同 Rebind
+    // 尺寸变化路径),不做逐槽懒补。
+    bool CreateFrameResources(int width, int height, int depth, bool fg,
+                              char *err, size_t errLen) noexcept;
+    bool FgSlots() const noexcept { return _fgSlots; }
 
     // diagnostics: dump a texture's raw rows to a file (VSDLSSNR_DUMP);
     // format must match the resource (CopyTextureRegion has no cross-family
@@ -201,7 +216,9 @@ public:
                             ColorMatrix matrix, ColorRange range,
                             D3D12_RESOURCE_STATES stateAfter) noexcept;
     void RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRange range,
-                         D3D12_RESOURCE_STATES outputStateBefore) noexcept;
+                         D3D12_RESOURCE_STATES outputStateBefore,
+                         ID3D12Resource *srcColor = nullptr,
+                         UINT srcSrvIndex = kSrvOutputColor) noexcept;
     // 光流输入降采样(#46/#48):YUV→RGB 转换已在同一 CL 上产出 inputColor
     // (NSR),本 pass 直接采样槽 0 srvInput 双线性写 NVOF 注册输入纹理
     // inputIndex(0/1,UAV 23/24)。调用方(NvofContext)负责注册纹理的
@@ -231,14 +248,18 @@ public:
                    int width, int height, char *err, size_t errLen) noexcept;
     bool BeginFrameRecording(FrameSlot &slot) noexcept;
     // 记录:yuvOut ×3 UAV→COPY_SOURCE→拷贝→COMMON(在 RecordYuvOutput 之后,
-    // yuvOut 处于 UAV 态)
-    bool RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen) noexcept;
+    // yuvOut 处于 UAV 态)。fgTarget = 拷入 FG 第二组回读缓冲(插值帧);
+    // 同一条 CL 上两次转换+两次回读共用 yuvOut,目标缓冲必须不同。
+    bool RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen,
+                            bool fgTarget = false) noexcept;
     bool SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
                      char *err, size_t errLen) noexcept; // [可选栅栏等待] close+execute+signal
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
-    // GPU 完成后调用:readbackYuv[3] → VS 三平面(纯 CPU 行拷贝,色度半尺寸)
+    // GPU 完成后调用:回读缓冲 → VS 三平面(纯 CPU 行拷贝,色度半尺寸)。
+    // fgSource = 读 FG 第二组缓冲(插值帧)。
     bool UnpackOutput(FrameSlot &slot, uint8_t **dstPlanes, int64_t *dstStrides,
-                      int width, int height, char *err, size_t errLen) noexcept;
+                      int width, int height, char *err, size_t errLen,
+                      bool fgSource = false) noexcept;
 
     // 五段残差 compute 路径的命令记录(在该槽已 BeginFrameRecording 的列表上)。
     // 降采样两段可分离(Lanczos2),horizontalRes 复用为降采样 FP16 中间纹理
@@ -254,6 +275,10 @@ public:
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
+    ID3D12Resource *FgInterp(FrameSlot &s) const noexcept { return s.fgInterp.Get(); }
+    // 描述符堆槽位(RecordYuvOutput / FG 转换共用)。
+    static constexpr UINT kSrvOutputColor = 22; // outputColor 的 SRV
+    static constexpr UINT kSrvFgInterp = 32;    // fgInterp 的 SRV(FG 槽)
     // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
@@ -283,6 +308,8 @@ private:
     bool CreateSlotResources(FrameSlot &slot, int depth, char *err, size_t errLen) noexcept;
     bool CreateScalingForSlot(FrameSlot &slot, int iw, int ih, char *err, size_t errLen) noexcept;
     void ClearScalingForSlot(FrameSlot &slot) noexcept;
+    // FG 槽纹理/回读缓冲/描述符(仅 _fgSlots);CreateSlotResources 尾部调用。
+    bool CreateFgSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept;
     // Shared body of the three raw buffer creations (upload / readback /
     // diagnostics dump): heap type, initial state and the 256-aligned pitch
@@ -381,6 +408,7 @@ private:
     int _internalWidth = 0;
     int _internalHeight = 0;
     bool _scalingReady = false;
+    bool _fgSlots = false; // 槽池当前含 FG 资源(CreateFrameResources 的 fg 旗标)
     std::mutex _tickMutex;
     static constexpr int kTickRingCap = 1024; // 1s 窗的容量上限(超出按 1024fps 封顶)
     double _tickRing[kTickRingCap] = {};
