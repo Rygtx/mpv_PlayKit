@@ -98,6 +98,21 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 
 调参参考:100% 开缩放 ≈ 关闭缩放(multiplier = 1 时等价);降档位省不了多少帧耗(NGX 固定成本主导),主要影响高频细节,1080p 内容建议 50–75%,25% 仅极端省电场景;4K 源建议配合 `Input_Resolution = 50`。4K 全分辨率(res=100%)推理约 200ms/帧,物理性上限,非卡顿。
 
+## 功能依赖(不能单独开启的功能)
+
+| 功能 | 依赖 | 不满足时 |
+|---|---|---|
+| 光流引导 1–5 档 | RTX Turing+ 显卡 | 自动回退零 guidance,不挡其他功能 |
+| 光流跟随降采样 | `Scaling_Enabled = True`;**帧生成激活时被强制忽略**(帧生成要求源尺寸运动场) | 开关无效,光流按源尺寸计算 |
+| `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | 无意义(关闭缩放按源尺寸直接处理) |
+| 帧生成 `Fg_Enabled` | ① **光流质量 ≥ 1**(零 guidance 无真运动场)② `ngx\` 内对应运行时(官方 `nvngx_dlssg.dll` 或代理 `version.dll`) | 零 guidance 下插值帧全部退化为复制真实帧(等于白开);运行时缺失/拒载自动回退 1:1,降噪不受影响 |
+| 帧生成改档/开关自动重载 | mpv.conf `input-ipc-server`(本包发行配置已默认开启) | 关/降档退化为会话内复制真实帧;升档需手动 seek |
+| `Fg_Route` 钉档(非自动) | 对应运行时存在(SM86/SM75 → `version.dll`;官方档 → `nvngx_dlssg.dll`) | 官方档被架构门禁拒载**不回落**,补帧直接关 |
+| 只关降噪 `NR_Enabled = False` | 无(帧生成/光流可独立工作) | 与帧生成**同时**全关 → 整个滤镜零初始化零开销,其余参数全部无效 |
+| DLSSNR 滤镜整体 | RTX 显卡(Tensor Core)+ `ngx\nvngx_dlssnr.dll` 模型 + YUV420 8/10bit SDR 源 | 缺任一自动直通(正常播放不增强) |
+| 面板统计/状态区 | 滤镜已加载 | 面板可单独运行改参并保存 ini(下次加载生效),统计区空白 |
+| 菜单/`*` 键 DLSSNR 开关 | `input_uosc.conf`(uosc 菜单)与 `menu.conf`(mpv 右键菜单)两处各有一份绑定 | 自定义键位需两处同步修改 |
+
 ## 性能参考(实测,RTX 3080)
 
 - 1080p:插件内部 ≈16.5ms/帧(≈60fps 能力;YUV 原生化后 pack 0.2 + NGX 推理 + GPU 光流 + unpack 0.3,CPU 侧每帧像素转换为零)

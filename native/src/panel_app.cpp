@@ -58,10 +58,10 @@ inline constexpr float kCloseBtnPad = 10.0f;
 // 引用 dlssnr_params.h 的常量(文档注释里的 0-1 等只是给用户看的)。
 constexpr struct { const char *key; const char *label; const char *tip;
                    float lo, hi; float DlssnrParams::*field; } kFineSliders[] = {
-    { "residual_saturation", "残差饱和度", "对 DLSSNR 造成的饱和度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualSaturation },
-    { "residual_lightness",  "残差亮度",   "对 DLSSNR 造成的明度变化的倍率(0-2,默认 1)。\n1=保持其变化;2=放大;0=移除。相对语义,非绝对调色。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualLightness },
-    { "shadow_structure",    "阴影结构",   "残差中变暗(负)分量的倍率(0-2,默认 1)。\n调低可减轻暗部噪点被放大,调高增强暗部结构重建。", kResidualFineMin, kResidualFineMax, &DlssnrParams::shadowStructureMultiplier },
-    { "reflection_glow",     "反射辉光",   "残差中变亮(正)分量的倍率(0-2,默认 1)。\n调低可抑制高光泛光,调高增强高光/辉光表现。", kResidualFineMin, kResidualFineMax, &DlssnrParams::reflectionGlowMultiplier },
+    { "residual_saturation", "残差饱和度", "对 DLSSNR 引起的饱和度变化的倍率(0-2,默认 1):\n1=保持,2=放大,0=移除。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualSaturation },
+    { "residual_lightness",  "残差亮度",   "对 DLSSNR 引起的明度变化的倍率(0-2,默认 1):\n1=保持,2=放大,0=移除。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualLightness },
+    { "shadow_structure",    "阴影结构",   "残差中变暗分量的倍率(0-2,默认 1):\n调低减轻暗部噪点,调高增强暗部结构。", kResidualFineMin, kResidualFineMax, &DlssnrParams::shadowStructureMultiplier },
+    { "reflection_glow",     "反射辉光",   "残差中变亮分量的倍率(0-2,默认 1):\n调低抑制高光泛光,调高增强辉光。", kResidualFineMin, kResidualFineMax, &DlssnrParams::reflectionGlowMultiplier },
 };
 constexpr const char *kPresetNames[] = { "0(默认)", "1(预设 #1)", "2(预设 #2)", "3(预设 #3)" };
 constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
@@ -765,11 +765,8 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("降噪增强");
     if (ImGui::IsItemHovered())
-        ShowTip("DLSSNR 降噪总开关:关闭 = 跳过降噪推理输出源帧(补帧/光流\n"
-                "照常工作,不受影响)。已激活的会话内切换立即生效;\n"
-                "降噪与帧生成都关时,整个滤镜零初始化零开销,重开由面板自动\n"
-                "触发 mpv 原地重载(热上下文保留,秒回;需 mpv.conf 启用\n"
-                "input-ipc-server,未启用时需手动 seek)。面板开关优先于 vpy 的 NR_Enabled。");
+        ShowTip("降噪总开关。关闭 = 跳过降噪,补帧/光流照常;与帧生成都关时滤镜零开销。\n"
+                "重开自动触发 mpv 重载(需 IPC,未启用时手动 seek)。面板优先于 vpy。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         bool v = g_app.params.nrEnabled != 0;
@@ -797,7 +794,8 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("光流质量");
     if (ImGui::IsItemHovered())
-        ShowTip("NVIDIA 光流(真运动矢量)引导档位:无=零 guidance(旧行为),\n其余档位用硬件光流减轻运动场景的时域伪影。需要 NVIDIA Turing+;\n不支持时自动回退零 guidance。切换只重建光流会话(毫秒级,不停顿)。");
+        ShowTip("NVIDIA 光流引导,减轻运动场景的时域伪影;档位越高越精确也越耗时。\n"
+                "需 RTX Turing+,不支持时自动回退\"无\"。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
     {
@@ -813,7 +811,7 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("光流跟随降采样");
     if (ImGui::IsItemHovered())
-        ShowTip("光流输入按内部降采样尺寸计算(需开启分辨率缩放)。大幅降低光流引擎占用,运动精度略降;过载档位的闪烁会明显减轻。\n帧生成激活时此开关被忽略(帧生成要求源尺寸运动场)。");
+        ShowTip("光流按内部缩放尺寸计算,省光流开销、精度略降(需先开分辨率缩放)。\n帧生成激活时忽略。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         bool v = g_app.params.nvofFollowScaling != 0;
@@ -828,13 +826,9 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("帧生成");
     if (ImGui::IsItemHovered())
-        ShowTip("DLSS 帧生成(挂降噪之后):每源帧产出 M 帧,插值帧由 DLSS FG 模型合成,\n"
-                "落在相邻两真实帧之间(前一真实帧之后、当前真实帧之前)。\n"
-                "依赖 vs-plugins\\ngx\\version.dll(dlssg_for_sm86 代理,用户自备部署);\n"
-                "初始化失败自动回退 1:1,降噪不受影响。建议配合光流质量 > 0 使用。\n"
-                "输出帧数/节奏随创建档位定格,档位/开关变化由面板自动触发 mpv 原地\n"
-                "重载(需 mpv.conf 启用 input-ipc-server;未启用时关/降档退化为\n"
-                "会话内复制真实帧,升档需手动 seek)。");
+        ShowTip("DLSS 补帧,输出帧率 ×2–×4,插值帧落在相邻真实帧之间。\n"
+                "需光流质量 > 0(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
+                "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         // 单一控件:关(=0)/2x/3x/4x,同步 fgEnabled + fgMultiplier 两键。
@@ -862,11 +856,9 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("FG 路由");
     if (ImGui::IsItemHovered())
-        ShowTip("DLSS 帧生成路由:自动 = 官方可用(RTX 40/50)走官方签名运行时,\n"
-                "否则经 dlssg_for_sm86 代理(回落路由 SM86;RTX 20 系请选 SM75)。\n"
-                "SM86/SM75 = 固定走代理并写入 vs-plugins\\ngx\\dlssg_sm86.ini;\n"
-                "官方 NGX = 固定官方档(30/20 系被架构门禁拒载 → 补帧关,不回落)。\n"
-                "进程级,切换后重启 mpv 生效。");
+        ShowTip("帧生成后端:自动 = 官方优先(RTX 40/50),回落代理(30 系)。\n"
+                "SM86/SM75 = 固定走代理;官方 NGX = 固定官方档(拒载不回落)。\n"
+                "进程级,重启 mpv 生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         const int items = 4;
@@ -897,14 +889,14 @@ void DrawUi() noexcept {
 
     // 残差乘数(整行)
     fullSlider("residual_multiplier", "残差乘数",
-               "残差合成权重(1-2,默认 1)。\n配合内部分辨率缩放,控制重建细节的增强倍数。",
+               "重建细节的增强倍率(1-2,默认 1),配合分辨率缩放使用。",
                &DlssnrParams::residualMultiplier, kResidualMultMin, kResidualMultMax);
 
     // 分辨率缩放(整行:开关 + 百分比滑杆)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("分辨率缩放");
     if (ImGui::IsItemHovered())
-        ShowTip("启用 NGX 内部分辨率缩放(源尺寸 × 百分比推理,Catmull-Rom 残差重建回源)。\n关闭后流程上彻底跳过缩放管线,按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
+        ShowTip("按百分比分辨率推理再重建回源,降耗省帧;关闭则按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         bool scalingOn = g_app.params.scalingEnabled != 0;
@@ -952,7 +944,7 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     const bool advanced = ImGui::CollapsingHeader("残差精调(高级)");
     if (ImGui::IsItemHovered())
-        ShowTip("饱和度 / 亮度 / 阴影结构 / 反射辉光。\n相对语义微调(1=保持 DLSSNR 的变化),默认全部中性,一般无需调整。");
+        ShowTip("残差微调:1 = 保持 DLSSNR 的变化,默认全部中性,一般无需调整。");
     if (advanced != g_app.advancedOpen) {
         g_app.advancedOpen = advanced;
         wchar_t base[MAX_PATH], path[MAX_PATH];
@@ -998,7 +990,7 @@ void DrawUi() noexcept {
             WritePayload(); // logEnabled included
             g_app.liveDirty = false;
         }
-        if (ImGui::IsItemHovered()) ShowTip("每秒一行性能统计(与帧率无关),追加到 mpv 同目录 dlssnr_timing.log。\n排查性能问题时把该文件一并附上。");
+        if (ImGui::IsItemHovered()) ShowTip("每秒追加一行性能统计到 mpv 同目录 dlssnr_timing.log;排查性能问题时附上该文件。");
     }
     y += rowH;
 

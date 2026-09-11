@@ -98,6 +98,21 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 
 Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 1); lowering levels does not save much frame time (NGX fixed cost dominates) and mainly affects high-frequency detail — 50–75% is recommended for 1080p content, 25% only for extreme power-saving scenarios; for 4K sources pair with `Input_Resolution = 50`. 4K full-resolution (res=100%) inference is about 200ms/frame — a physical ceiling, not stuttering.
 
+## Feature dependencies (what cannot be enabled standalone)
+
+| Feature | Depends on | When unmet |
+|---|---|---|
+| Optical-flow guidance levels 1–5 | RTX Turing+ GPU | Auto-falls back to zero guidance; nothing else is blocked |
+| Optical-flow follow scaling | `Scaling_Enabled = True`; **force-ignored while frame generation is active** (FG requires a source-sized motion field) | Switch has no effect; optical flow runs at source size |
+| `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | Meaningless (processing happens at source size when scaling is off) |
+| Frame generation `Fg_Enabled` | ① **Motion_Vector_Quality ≥ 1** (zero guidance has no real motion field) ② a matching runtime under `ngx\` (official `nvngx_dlssg.dll` or proxy `version.dll`) | With zero guidance every interpolated frame degrades to a duplicated real frame (switching it on accomplishes nothing); missing/rejected runtime falls back to 1:1, denoise unaffected |
+| FG multiplier/switch auto-reload | mpv.conf `input-ipc-server` (enabled by default in the shipped config) | Off/down-grade degrades to in-session real-frame duplication; up-grade needs a manual seek |
+| `Fg_Route` pinned (non-auto) | The matching runtime must exist (SM86/SM75 → `version.dll`; official → `nvngx_dlssg.dll`) | Official route rejected by the architecture gate does **not** fall back — FG simply turns off |
+| NR only off (`NR_Enabled = False`) | None (frame generation / optical flow work independently) | With frame generation **also** off → the whole filter initializes nothing at zero cost and every other parameter is moot |
+| DLSSNR filter as a whole | RTX GPU (Tensor Core) + `ngx\nvngx_dlssnr.dll` model + YUV420 8/10-bit SDR source | Any missing → automatic passthrough (normal playback, no enhancement) |
+| Panel stats/status area | Filter loaded | The panel can run alone to tweak and save the ini (applied on next load); stats area stays blank |
+| Menu / `*` key DLSSNR toggle | Bound in both `input_uosc.conf` (uosc menu) and `menu.conf` (mpv context menu) | Custom key bindings must be updated in both places |
+
 ## Performance reference (measured, RTX 3080)
 
 - 1080p: plugin-internal ≈16.5ms/frame (≈60fps capability; after YUV nativization: pack 0.2 + NGX inference + GPU optical flow + unpack 0.3, zero per-frame pixel conversion on the CPU side)
