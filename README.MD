@@ -46,7 +46,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `vs-plugins\vs_dlssnr.dll` | VapourSynth API4 插件(mpv-lazy 会自动加载) |
 | `vs-plugins\dlssnr_panel.exe` | ImGui 独立调参面板(可选,滤镜加载时自动拉起) |
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR 模型(必须位于 `ngx\` 子目录,插件按此相对路径寻找;取自 RenoDX 项目) |
-| `vs-plugins\ngx\nvngx_dlssg.dll` | DLSS 官方帧生成运行时(NVIDIA 签名,RTX 40/50 系插帧自动选用) |
+| `vs-plugins\ngx\nvngx_dlssg.dll` | DLSS 官方帧生成运行时(NVIDIA 签名,RTX 40/50 系;面板"FG 后端"可选) |
 | `vs-plugins\ngx\version.dll` | DLSS 帧生成 proxy(dlssg_for_sm86,RTX 30/20 系;自签名) |
 | `vs-plugins\ngx\dlssg_sm86.ini` | 帧生成 proxy 配置(Router 由面板"FG 路由"选项自动写入) |
 | `portable_config\vs\DLSSNR_NV.vpy` | 滤镜脚本(参数见下表) |
@@ -113,7 +113,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 两个 AI 功能对显卡的要求不同:
 
 - **DLSSNR 降噪**:NVIDIA NGX 官方特性,需 Tensor Core,RTX 全系(Turing+)在官方支持范围内,非 RTX 不可用
-- **DLSS 插帧(帧生成)**:双后端自动分流 —— RTX 40/50 系走**官方 NGX 分支**(Magpie 同款:官方签名 `nvngx_dlssg.dll` 经共享 NGX core 加载 + NVOF 自产运动矢量,插件按驱动能力自动选用,无 proxy 无自签);RTX 30/20 系官方拒载,走 [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) 破解 proxy(自带推理资源与 PTX,面板"FG 路由"可选 SM86/SM75)
+- **DLSS 插帧(帧生成)**:双后端 —— RTX 40/50 系走**官方 NGX 分支**(Magpie 同款:官方签名 `nvngx_dlssg.dll` 经共享 NGX core 加载 + NVOF 自产运动矢量,无 proxy 无自签);RTX 30/20 系官方拒载,走 [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) 破解 proxy(自带推理资源与 PTX,面板"FG 路由"可选 SM86/SM75)。后端选择在面板"FG 后端"完成:默认**自动**(官方优先,不可用回落 proxy),也可显式固定官方 NGX 或 proxy 档 —— 显式档失败直接 1:1,不跨后端回退(下个 seek 生效)
 
 | 显卡 | 架构 | DLSSNR 降噪 | DLSS 插帧 |
 |---|---|---|---|
@@ -126,7 +126,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 图例:✅ 已实测可用 · 🟡 理论上支持(未实测) · ❌ 不可用
 
 > - NVOF 硬件光流引导(RTX Turing+)全系原生支持;不支持或非 N 卡时自动回退零 guidance,不挡功能
-> - 官方 NGX 分支要求 `nvngx_dlssg.dll`(NVIDIA 签名,发行包已含)与模型 DLL 同目录;3080 实测确认其被架构门禁正常拒载后自动回落 proxy,不影响 30/20 系
+> - 官方 NGX 分支要求 `nvngx_dlssg.dll`(NVIDIA 签名,发行包已含)与模型 DLL 同目录;3080 实测确认其被架构门禁正常拒载(自动档随后回落 proxy,不影响 30/20 系),面板"FG 后端"显式固定官方档可跳过该双探
 > - RTX 30/20 系的 DLSS 插帧属于破解路径:proxy 不加载原厂 `nvngx_dlssg.dll`
 > - 实测基线为 RTX 3080;其余档位为理论推断,欢迎反馈实测结果
 

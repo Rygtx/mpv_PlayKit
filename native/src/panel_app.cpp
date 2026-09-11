@@ -732,16 +732,40 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-    // FG 路由(整行;进程级,重启 mpv 生效)
+    // FG 后端(整行;下个 seek 生效;显式档失败不跨后端回退)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("FG 后端");
+    if (ImGui::IsItemHovered())
+        ShowTip("DLSS 帧生成后端:自动 = 驱动报告 DLSSG 能力(RTX 40/50)时走官方\n"
+                "签名 nvngx_dlssg.dll,否则经 dlssg_for_sm86 代理(RTX 30/20 唯一路径)。\n"
+                "显式选官方/代理后不再跨后端回退:选错档初始化失败 = FG 关,输出 1:1;\n"
+                "改动在下个 seek 生效,无需重启 mpv。仅官方 NGX 档 30/20 系会被拒载。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        const int items = 3;
+        const char *labels[items] = { "自动 (官方优先)", "官方 NGX (RTX 40/50)", "代理 (RTX 30/20)" };
+        int sel = std::clamp(g_app.params.fgBackend, kFgBackendMin, kFgBackendMax);
+        ImGui::SetNextItemWidth(150 * s);
+        if (ImGui::Combo("##fg_backend", &sel, labels, items)) {
+            g_app.params.fgBackend = sel;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
+    // FG 路由(整行;进程级,重启 mpv 生效;仅官方后端下无效)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("FG 路由");
     if (ImGui::IsItemHovered())
         ShowTip("dlssg_for_sm86 代理的 GPU 架构路由:SM86 = RTX 30 系(Ampere),\n"
                 "SM75 = RTX 20 系(Turing;上游物理 Turing 验证仍有限)。\n"
                 "插件自动把路由写入 vs-plugins\\ngx\\dlssg_sm86.ini,无需手动改文件;\n"
-                "代理模块进程内常驻,切换后需重启 mpv 生效。");
+                "代理模块进程内常驻,切换后需重启 mpv 生效;仅官方 NGX 后端下无效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
+        const bool routerIdle =
+            std::clamp(g_app.params.fgBackend, kFgBackendMin, kFgBackendMax) == 1;
+        if (routerIdle) ImGui::BeginDisabled();
         const int items = 2;
         const char *labels[items] = { "SM86 (RTX 30 系)", "SM75 (RTX 20 系)" };
         int sel = std::clamp(g_app.params.fgRouter, kFgRouterMin, kFgRouterMax);
@@ -750,6 +774,7 @@ void DrawUi() noexcept {
             g_app.params.fgRouter = sel;
             g_app.liveDirty = true;
         }
+        if (routerIdle) ImGui::EndDisabled();
     }
     y += rowH;
 

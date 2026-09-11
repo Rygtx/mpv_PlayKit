@@ -600,20 +600,25 @@ bool DlssnrContext::Initialize(
     // 输入尺寸决策能感知 FG)。失败优雅降级:滤镜回退 1:1 输出(不翻倍
     // 帧率),NR 不受影响 —— FG 的 SEH 走本地闩锁,不进全局 NgxRuntimeGuard。
     if (_fgRequested) {
-        // 官方 NGX 分支优先(PORTING #8):官方签名 nvngx_dlssg.dll 与模型
+        // FG 后端选择(0=自动:官方优先、不可用回落 proxy;1=仅官方 NGX;
+        // 2=仅 proxy)。显式档失败不跨后端回退 —— 免去自动档在能力外硬件
+        // 上每次创建的官方双探开销(3080 实测:先 capability 拒载才落
+        // proxy),选错档 = FG 关,输出 1:1。
+        const int fgBackend =
+            std::clamp(_shared->Snapshot().fgBackend, kFgBackendMin, kFgBackendMax);
+        // 官方 NGX 分支(PORTING #8):官方签名 nvngx_dlssg.dll 与模型
         // DLL 同目录(ngx\)部署且驱动报告 FG 能力(RTX 40/50)时,经共享
         // NGX core 走官方签名链 —— 免自签 proxy 与杀软误报面,cubin 由
         // NVIDIA 预编译(SM89/SM120,无 PTX JIT)。参数块 = GetCapability
-        // (官方 DLSSG 的 Magpie 同款 create/eval 块)。不可用时回落
+        // (官方 DLSSG 的 Magpie 同款 create/eval 块)。自动档不可用时回落
         // dlssg_for_sm86 proxy —— RTX 30/20 官方拒载(FrameGeneration
         // .Available=0),proxy 是该区间唯一路径。
         wchar_t officialDll[MAX_PATH]{};
         {
-            std::error_code ec;
             const std::filesystem::path p =
                 std::filesystem::path(ngxDllPath).parent_path() / L"nvngx_dlssg.dll";
             const std::wstring ws = p.wstring();
-            if (!ec && ws.size() < MAX_PATH) {
+            if (ws.size() < MAX_PATH) {
                 const DWORD attr = GetFileAttributesW(ws.c_str());
                 if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
                     std::memcpy(officialDll, ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
@@ -621,7 +626,7 @@ bool DlssnrContext::Initialize(
             }
         }
         bool fgUp = false;
-        if (officialDll[0]) {
+        if (fgBackend != 2 && officialDll[0]) {
             DWORD sehCode = 0;
             const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
             if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
@@ -635,8 +640,9 @@ bool DlssnrContext::Initialize(
                 } else {
                     char msg[352];
                     std::snprintf(msg, sizeof(msg),
-                                  "DLSSNR STATUS: dlssfg official init failed (%s); trying proxy",
-                                  fgErr);
+                                  "DLSSNR STATUS: dlssfg official init failed (%s); %s",
+                                  fgErr,
+                                  fgBackend == 1 ? "FG off (backend pinned)" : "trying proxy");
                     DbgLine(msg);
                     TimingStatusLine(msg);
                     _fg.reset();
@@ -645,10 +651,12 @@ bool DlssnrContext::Initialize(
                     _fgParams = nullptr;
                 }
             } else {
-                TimingStatusLine("DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
+                TimingStatusLine(fgBackend == 1
+                                     ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (backend pinned)"
+                                     : "DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
             }
         }
-        if (!fgUp && fgDllPath && fgDllPath[0]) {
+        if (!fgUp && fgBackend != 1 && fgDllPath && fgDllPath[0]) {
             DWORD sehCode = 0;
             const NVSDK_NGX_Result pr = CoreAllocateParametersSafely(&_fgParams, &sehCode);
             if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
@@ -673,6 +681,15 @@ bool DlssnrContext::Initialize(
             }
         }
         if (!fgUp) {
+            // 显式档连尝试都没发生(部署缺失)时,失败原因没有其它出口,
+            // 这里补一行;各尝试路径自身失败已有带因状态行。
+            if (fgBackend == 1 && !officialDll[0]) {
+                TimingStatusLine(
+                    "DLSSNR STATUS: dlssfg backend pinned official but nvngx_dlssg.dll missing; 1:1 output");
+            } else if (fgBackend == 2 && !(fgDllPath && fgDllPath[0])) {
+                TimingStatusLine(
+                    "DLSSNR STATUS: dlssfg backend pinned proxy but version.dll missing; 1:1 output");
+            }
             _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
         }
     }

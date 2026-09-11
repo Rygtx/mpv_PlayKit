@@ -27,10 +27,11 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // nvofFollowScaling (光流输入跟随内部降采样); v7 adds fgEnabled (DLSS 帧生成,
 // 占用原 reserved[0] —— 布局不变,老面板写 0 = 关); v8 adds fgMultiplier
 // (插帧倍数 2-4,live,源帧边界生效 —— 结构体增长,新旧混跑按 magic 拒读);
-// v9 adds fgRouter (FG 路由 0=SM86/1=SM75,进程级,重启 mpv 生效)。
+// v9 adds fgRouter (FG 路由 0=SM86/1=SM75,进程级,重启 mpv 生效); v10 adds
+// fgBackend (FG 后端 0=自动/1=官方 NGX/2=代理,下个 seek 生效)。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x394C5344u; // "DSSL9"
+constexpr uint32_t PAYLOAD_MAGIC = 0x414C5344u; // "DSLA" (v10, 版本位走 hex:9 之后是 A)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -60,6 +61,7 @@ struct PanelPayload {
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
     int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,源帧边界生效)
     int32_t fgRouter;            // 0/1 FG 路由(v9;0=SM86,1=SM75,重启 mpv 生效)
+    int32_t fgBackend;           // 0/1/2 FG 后端(v10;0=自动,1=官方 NGX,2=代理,下个 seek 生效)
 };
 #pragma pack(pop)
 
@@ -100,6 +102,10 @@ inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     // Router 不进 LoadLiveParams:proxy 模块进程内钉住,live 改动无运行时
     // 效果;只在滤镜创建(下个 seek)与 proxy INI 同步时消费,重启后全面生效。
     p.fgRouter = std::clamp(pl.fgRouter, kFgRouterMin, kFgRouterMax);
+    // Backend 同样不进 LoadLiveParams:后端选择发生在冷初始化。与 Router
+    // 不同的是它参与 hotMatch(plugin.cpp),面板改动会在下个 seek 触发冷
+    // 重建并当场生效 —— 无需重启 mpv。
+    p.fgBackend = std::clamp(pl.fgBackend, kFgBackendMin, kFgBackendMax);
 }
 
 // Parameter fields only; the caller fills seq/generation/save/reset/log.
@@ -126,6 +132,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.fgEnabled = p.fgEnabled ? 1 : 0;
     pl.fgMultiplier = std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax);
     pl.fgRouter = std::clamp(p.fgRouter, kFgRouterMin, kFgRouterMax);
+    pl.fgBackend = std::clamp(p.fgBackend, kFgBackendMin, kFgBackendMax);
     return pl;
 }
 

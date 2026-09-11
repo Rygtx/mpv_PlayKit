@@ -46,7 +46,7 @@ For general mpv tweaks from upstream (configuration guides, mpv-lazy usage, etc.
 | `vs-plugins\vs_dlssnr.dll` | VapourSynth API4 plugin (loaded automatically by mpv-lazy) |
 | `vs-plugins\dlssnr_panel.exe` | Standalone ImGui tuning panel (optional, launched automatically when the filter loads) |
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR model (must reside in the `ngx\` subdirectory; the plugin resolves it by this relative path; taken from the RenoDX project) |
-| `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, auto-selected for RTX 40/50) |
+| `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, RTX 40/50; selectable via "FG backend") |
 | `vs-plugins\ngx\version.dll` | DLSS frame-generation proxy (dlssg_for_sm86, RTX 30/20; self-signed) |
 | `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy config (Router written automatically by the panel's "FG route" option) |
 | `portable_config\vs\DLSSNR_NV.vpy` | Filter script (parameters in the table below) |
@@ -113,7 +113,7 @@ Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 
 The two AI features have different GPU requirements:
 
 - **DLSSNR denoise**: an official NVIDIA NGX feature, requires Tensor Core; all RTX cards (Turing+) are within the officially supported range, non-RTX unavailable
-- **DLSS frame generation**: dual backends dispatched automatically — RTX 40/50 use the **official NGX branch** (Magpie-style: the NVIDIA-signed `nvngx_dlssg.dll` loaded through the shared NGX core + NVOF-generated motion vectors, selected automatically by driver capability, no proxy, no self-signing); RTX 30/20 are refused by the official path and go through the [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) unofficial proxy (its own inference resources and PTX; the panel's "FG route" offers SM86/SM75)
+- **DLSS frame generation**: dual backends — RTX 40/50 use the **official NGX branch** (Magpie-style: the NVIDIA-signed `nvngx_dlssg.dll` loaded through the shared NGX core + NVOF-generated motion vectors, no proxy, no self-signing); RTX 30/20 are refused by the official path and go through the [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) unofficial proxy (its own inference resources and PTX; the panel's "FG route" offers SM86/SM75). Backend selection lives in the panel's "FG backend" option: the default **Auto** (official first, proxy fallback) can be pinned to official NGX or proxy — a pinned backend that fails falls straight to 1:1 with no cross-backend fallback (takes effect on the next seek)
 
 | GPU | Architecture | DLSSNR denoise | DLSS frame gen |
 |---|---|---|---|
@@ -126,7 +126,7 @@ The two AI features have different GPU requirements:
 Legend: ✅ verified · 🟡 theoretical (untested) · ❌ unavailable
 
 > - NVOF hardware optical-flow guidance (RTX Turing+) is natively supported across the line; on unsupported or non-NVIDIA cards it automatically falls back to zero guidance without blocking the feature
-> - The official NGX branch requires `nvngx_dlssg.dll` (NVIDIA-signed, included in the release package) next to the model DLL; RTX 3080 testing confirmed it is cleanly rejected by the architecture gate and the proxy takes over — RTX 30/20 are unaffected
+> - The official NGX branch requires `nvngx_dlssg.dll` (NVIDIA-signed, included in the release package) next to the model DLL; RTX 3080 testing confirmed it is cleanly rejected by the architecture gate (Auto mode then falls back to the proxy, so RTX 30/20 are unaffected), and pinning "FG backend" to official NGX skips that double probe
 > - DLSS frame generation on RTX 30/20 is an unofficial path: the proxy does not load the stock `nvngx_dlssg.dll`
 > - The verified baseline is the RTX 3080; other tiers are theoretical inferences — real-world test feedback is welcome
 

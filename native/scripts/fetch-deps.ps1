@@ -1,4 +1,4 @@
-# 从公开源落地 native/ 依赖:NGX SDK(官方 NVIDIA/DLSS 仓库)+ VapourSynth R73 头
+﻿# 从公开源落地 native/ 依赖:NGX SDK(官方 NVIDIA/DLSS 仓库)+ VapourSynth R73 头
 # 用法: powershell -File scripts\fetch-deps.ps1
 $ErrorActionPreference = "Stop"
 

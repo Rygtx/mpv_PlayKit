@@ -27,6 +27,12 @@ inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
 // LoadLibrary 前把该值自动写入 proxy 同目录 dlssg_sm86.ini 的 Router 键
 // (plugin.cpp SyncProxyRouterIni),用户不接触 INI 文件。
 inline constexpr int kFgRouterMin = 0, kFgRouterMax = 1;
+// DLSS 帧生成后端(0=自动:官方优先、不可用回落 proxy;1=仅官方 NGX;2=仅
+// proxy)。显式档失败不跨后端回退(选错档 = FG 关,输出 1:1),免去自动档
+// 在能力外硬件上每次创建的官方双探开销(3080 实测:先 capability 拒载才
+// 落 proxy)。改动在下个 seek 生效:fgBackend 参与 plugin.cpp hotMatch,
+// 变化触发冷重建重选后端(与 fgEnabled 同节奏)。
+inline constexpr int kFgBackendMin = 0, kFgBackendMax = 2;
 
 struct DlssnrParams {
     // NGX "DLSSNR.Hint.Render.Preset" 0-3
@@ -89,6 +95,9 @@ struct DlssnrParams {
     // DLSS 帧生成路由(0=SM86 RTX 30 系,1=SM75 RTX 20 系;进程级,重启
     // mpv 生效):见 kFgRouterMin 注释 —— 面板选项,插件自动同步 proxy INI。
     int fgRouter = 0;
+    // DLSS 帧生成后端(0=自动 官方优先回落 proxy,1=仅官方 NGX RTX 40/50,
+    // 2=仅 proxy RTX 30/20;下个 seek 生效):见 kFgBackendMin 注释。
+    int fgBackend = 0;
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence
