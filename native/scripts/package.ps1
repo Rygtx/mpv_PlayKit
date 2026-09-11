@@ -1,4 +1,4 @@
-﻿# 打包 mpv_PlayKit DLSSNR 完整发行包: dlssnr 分支 portable_config 全目录 + vs_dlssnr 插件三件套
+# 打包 mpv_PlayKit DLSSNR 完整发行包: dlssnr 分支 portable_config 全目录 + vs_dlssnr 插件三件套
 # 全部输入取自仓库树内, 无本机绝对路径
 # 用法: pwsh -File scripts\package.ps1 [-Version 2026.09.07]  (必须在 dlssnr 分支上运行)
 # 产物: dist\mpv_PlayKit-dlssnr-v<版本>-full.zip
@@ -65,7 +65,7 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   vs-plugins\ngx\nvngx_dlssnr.dll     DLSSNR 模型 (NVIDIA DLSS SDK 310.9.0)
 $(if ($fgPack) {
 "  vs-plugins\ngx\version.dll          DLSS 帧生成代理 (dlssg_for_sm86 原生实现, 自签名)
-  vs-plugins\ngx\dlssg_sm86.ini       帧生成代理配置 (Router=SM86 / KernelImage=PTX)
+  vs-plugins\ngx\dlssg_sm86.ini       帧生成代理配置 (Router 由面板 FG 路由选项自动写入)
 "
 })
 
@@ -86,6 +86,7 @@ $(if ($fgPack) {
 "帧生成 (可选)
   vs\DLSSNR_NV.vpy 中 Fg_Enabled = True 开启: 输出帧率 x2 (插值帧挂降噪之后),
   依赖 vs-plugins\ngx\version.dll (dlssg_for_sm86, RTX 30/20 系解锁 DLSS FG);
+  GPU 路由在面板 ""FG 路由"" 选项切换 (默认 SM86, RTX 20 系选 SM75, 重启 mpv 生效);
   初始化失败自动回退 1:1, 降噪不受影响; 建议配合面板光流质量 >= 2 使用
 "
 })

@@ -21,6 +21,12 @@ inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
 // live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
 // 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
 inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
+// DLSS 帧生成 GPU 架构路由(0=SM86 Ampere/RTX 30 系,1=SM75 Turing/RTX 20 系)。
+// 进程级参数:proxy 模块(dlssg_for_sm86 version.dll)进程内钉住、永不卸载,
+// 改动只影响下次 proxy 加载 —— 面板提示"重启 mpv 生效"。插件在 proxy
+// LoadLibrary 前把该值自动写入 proxy 同目录 dlssg_sm86.ini 的 Router 键
+// (plugin.cpp SyncProxyRouterIni),用户不接触 INI 文件。
+inline constexpr int kFgRouterMin = 0, kFgRouterMax = 1;
 
 struct DlssnrParams {
     // NGX "DLSSNR.Hint.Render.Preset" 0-3
@@ -80,6 +86,9 @@ struct DlssnrParams {
     // 插值),输出帧时长 = 源时长/M。源帧边界生效(当前源帧按触及时的 M
     // 走完),无重建/重启。fgEnabled=0 时忽略。
     int fgMultiplier = 2;
+    // DLSS 帧生成路由(0=SM86 RTX 30 系,1=SM75 RTX 20 系;进程级,重启
+    // mpv 生效):见 kFgRouterMin 注释 —— 面板选项,插件自动同步 proxy INI。
+    int fgRouter = 0;
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence

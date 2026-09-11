@@ -732,6 +732,27 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
+    // FG 路由(整行;进程级,重启 mpv 生效)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("FG 路由");
+    if (ImGui::IsItemHovered())
+        ShowTip("dlssg_for_sm86 代理的 GPU 架构路由:SM86 = RTX 30 系(Ampere),\n"
+                "SM75 = RTX 20 系(Turing;上游物理 Turing 验证仍有限)。\n"
+                "插件自动把路由写入 vs-plugins\\ngx\\dlssg_sm86.ini,无需手动改文件;\n"
+                "代理模块进程内常驻,切换后需重启 mpv 生效。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        const int items = 2;
+        const char *labels[items] = { "SM86 (RTX 30 系)", "SM75 (RTX 20 系)" };
+        int sel = std::clamp(g_app.params.fgRouter, kFgRouterMin, kFgRouterMax);
+        ImGui::SetNextItemWidth(150 * s);
+        if (ImGui::Combo("##fg_router", &sel, labels, items)) {
+            g_app.params.fgRouter = sel;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
     // (强度 | 局部色调)
     pairLabel(0, "强度", "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。");
     pairSlider("intensity", &DlssnrParams::intensity, kStrengthMin, kStrengthMax, 0);

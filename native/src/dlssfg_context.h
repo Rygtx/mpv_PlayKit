@@ -7,8 +7,8 @@
 //      NgxRuntimeGuard:FG 崩溃只降级本功能(复制真实帧),绝不连带杀 NR。
 //   2. 参数契约 —— 只设 proxy 声明的消费面(DLSSG.Backbuffer/MVecs/Depth/
 //      OutputInterpolated/Reset/MultiFrame*/MvecScale*/ClipToPrevClip/
-//      PrevClipToClip/DepthInverted);多余键(BackbufferFrameID 等)对
-//      忽略未知键的实现无害,对按官方契约实现的消费者是正确输入。
+//      PrevClipToClip/DepthInverted/CmdQueue);多余键(BackbufferFrameID 等)
+//      对忽略未知键的实现无害,对按官方契约实现的消费者是正确输入。
 // 时序契约(README:输入 NSR / 输出 UAV,提交与同步归调用方):proxy 的
 // CUDA 互操作工作以 DLSSG.CmdQueue/D3D12 互操作语义与槽队列保序,插值
 // 输出的就绪由本槽 SubmitFrame→WaitFrame 的栅栏覆盖(与 NVOF densify 同

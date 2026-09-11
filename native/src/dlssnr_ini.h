@@ -47,6 +47,7 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeInt(L"nvof_follow_scaling", p.nvofFollowScaling ? 1 : 0);
     writeInt(L"fg_enabled", p.fgEnabled ? 1 : 0);
     writeInt(L"fg_multiplier", std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax));
+    writeInt(L"fg_router", std::clamp(p.fgRouter, kFgRouterMin, kFgRouterMax));
     writeInt(L"saved", 1);
     return ok;
 }
@@ -90,6 +91,7 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.nvofFollowScaling = readInt(L"nvof_follow_scaling", p.nvofFollowScaling) != 0;
     p.fgEnabled = readInt(L"fg_enabled", p.fgEnabled) != 0;
     p.fgMultiplier = std::clamp(readInt(L"fg_multiplier", p.fgMultiplier), kFgMultMin, kFgMultMax);
+    p.fgRouter = std::clamp(readInt(L"fg_router", p.fgRouter), kFgRouterMin, kFgRouterMax);
     return true;
 }
 

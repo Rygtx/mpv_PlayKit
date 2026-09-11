@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -55,6 +56,78 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
     int err = 0;
     const long long v = vsapi->mapGetInt(in, key, 0, &err);
     if (!err) field = v != 0;
+}
+
+// ---------------------------------------------------------------------------
+// FG proxy INI 同步:Router 面板选项的落点。dlssg_for_sm86 从 proxy DLL 同
+// 目录读 dlssg_sm86.ini(五键,见其 docs/NATIVE_INI.md);mpv_PlayKit 拥有
+// 该文件的 Router 键 —— 面板改路由后这里在 proxy 加载前自动重写,用户不
+// 接触 INI。文件 Router 已是目标值时不动(保留用户自行添加的 [Diagnostics]
+// 等排查段);其余键写上游 0.2.4 默认值。时机:每次滤镜创建、proxy
+// LoadLibrary 之前 —— 冷路径当场生效;proxy 模块进程内钉住,已加载会话的
+// 改动按面板提示重启 mpv 后生效。
+// ---------------------------------------------------------------------------
+void SyncProxyRouterIni(const std::wstring &fgDllPath, int fgRouter) noexcept {
+    std::error_code ec;
+    const std::filesystem::path proxyDll(fgDllPath);
+    if (fgDllPath.empty() || !std::filesystem::exists(proxyDll, ec)) {
+        return; // proxy 未部署:FG 本就不可用,不产生孤儿 INI
+    }
+    const char *router = fgRouter == 1 ? "SM75" : "SM86";
+    const std::filesystem::path iniPath = proxyDll.parent_path() / "dlssg_sm86.ini";
+
+    // 已含目标 Router 行 -> 不写。只认行首(允许空白)的 Router 键:上游
+    // 注释 "; SM86 for Ampere ..." 无 Router 前缀,天然跳过。
+    {
+        std::ifstream in(iniPath);
+        std::string line;
+        while (std::getline(in, line)) {
+            const size_t s = line.find_first_not_of(" \t");
+            if (s == std::string::npos || line.compare(s, 6, "Router") != 0) continue;
+            if (line.size() > s + 6 && line[s + 6] != '=' && line[s + 6] != ' ' &&
+                line[s + 6] != '\t') {
+                continue; // RouterX 之类的近似键,不是本键
+            }
+            const size_t eq = line.find('=', s + 6);
+            if (eq == std::string::npos) break;
+            const size_t v = line.find_first_not_of(" \t", eq + 1);
+            if (v != std::string::npos && line.compare(v, 4, router) == 0) {
+                return; // 已是目标值
+            }
+            break; // Router 键存在但值不同 -> 整文件重写
+        }
+    }
+
+    static const char *kIniFmt =
+        "; Native proxy config maintained by mpv_PlayKit (FG Router panel option).\n"
+        "; Other keys mirror dlssg_for_sm86 0.2.4 defaults; restart mpv after switching.\n"
+        "[Compatibility]\n"
+        "; SM86 for Ampere (RTX 30); SM75 for Turing (RTX 20) with KernelImage=PTX.\n"
+        "Router=%s\n"
+        "; PTX uses driver JIT. Cubin requires an exact GPU/Router match.\n"
+        "KernelImage=PTX\n"
+        "; 0 = exact output (default); 1 = optional approximate sampling, SM86 only.\n"
+        "HardwareBilinear=0\n"
+        "\n"
+        "[FrameGeneration]\n"
+        "; Capability limit: 1=2X, 2=3X, 3=4X. The filter requests the actual multiplier.\n"
+        "MaxGeneratedFrames=3\n"
+        "\n"
+        "[Logging]\n"
+        "; 0=off, 1=errors, 2=diagnostics, 3=verbose.\n"
+        "Level=1\n";
+    char content[768];
+    std::snprintf(content, sizeof(content), kIniFmt, router);
+    std::ofstream out(iniPath, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        vsdlssnr::TimingStatusLine(
+            "DLSSNR STATUS: fg proxy ini sync FAILED (write); Router stays as on disk");
+        return;
+    }
+    out << content;
+    char msg[128];
+    std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: fg proxy ini synced Router=%s", router);
+    vsdlssnr::TimingStatusLine(msg);
 }
 
 struct FilterData {
@@ -517,6 +590,8 @@ static void VS_CC DlssnrCreate(
     ApplyFlagArg(in, vsapi, "fg_enabled", initial.fgEnabled);
     // 插帧倍数 2-4(live 参数,源帧边界生效;创建值定 vi.fps 元数据)
     ApplyIntArg(in, vsapi, "fg_multiplier", initial.fgMultiplier, kFgMultMin, kFgMultMax);
+    // FG 路由 0=SM86/1=SM75(进程级,重启生效;proxy INI 由插件自动同步)
+    ApplyIntArg(in, vsapi, "fg_router", initial.fgRouter, kFgRouterMin, kFgRouterMax);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
@@ -530,12 +605,12 @@ static void VS_CC DlssnrCreate(
     {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d router=%d",
                       d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.nvofFollowScaling ? 1 : 0, initial.fgEnabled ? 1 : 0,
-                      initial.fgMultiplier);
+                      initial.fgMultiplier, initial.fgRouter);
         vsdlssnr::TimingStatusLine(msg);
     }
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
@@ -593,6 +668,10 @@ static void VS_CC DlssnrCreate(
             }
         }
     }
+
+    // FG 路由面板选项落点:proxy LoadLibrary 之前同步其同目录 INI(冷路径
+    // 当场生效;模块已钉住的会话按面板提示重启后生效)。
+    SyncProxyRouterIni(d->fgDllPath, initial.fgRouter);
 
     // Eager init: the D3D12/NGX bring-up costs ~1s (165MB snippet DLL load +
     // CreateFeature + first-evaluate warm-up). Doing it here — script
@@ -756,6 +835,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "nvof_follow_scaling:int:opt;"
         "fg_enabled:int:opt;"
         "fg_multiplier:int:opt;"
+        "fg_router:int:opt;"
         "fg_dll:data:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);

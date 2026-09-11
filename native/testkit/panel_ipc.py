@@ -14,7 +14,7 @@ import ctypes
 import struct
 
 PAYLOAD_SIZE = 512
-PAYLOAD_MAGIC = 0x384C5344  # "DSSL8"
+PAYLOAD_MAGIC = 0x394C5344  # "DSSL9"
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
@@ -24,10 +24,10 @@ ALIVE_EVENT = "vs_dlssnr_bridge_alive"
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
 # localStructure,skinStructure | 3i useAutoMask,uiCorrection,inputResolution |
 # 5f residualMultiplier,residualSaturation,residualLightness,shadowStructure,
-# reflectionGlow | 7i scalingEnabled,saveRequest,logEnabled,motionVectorQuality,
-# nvofFollowScaling,fgEnabled,fgMultiplier
-_STRUCT = struct.Struct("<3I2i4f3i5f7i")
-assert _STRUCT.size == 96, "PanelPayload 布局与 panel_ipc.h 不一致"
+# reflectionGlow | 8i scalingEnabled,saveRequest,logEnabled,motionVectorQuality,
+# nvofFollowScaling,fgEnabled,fgMultiplier,fgRouter
+_STRUCT = struct.Struct("<3I2i4f3i5f8i")
+assert _STRUCT.size == 100, "PanelPayload 布局与 panel_ipc.h 不一致"
 
 DEFAULTS = dict(
     preset=0, style=0,
@@ -37,7 +37,7 @@ DEFAULTS = dict(
     shadowStructure=1.0, reflectionGlow=1.0,
     scalingEnabled=1, saveRequest=0, logEnabled=1,
     motionVectorQuality=0, nvofFollowScaling=0,
-    fgEnabled=0, fgMultiplier=2,
+    fgEnabled=0, fgMultiplier=2, fgRouter=0,
 )
 
 _FIELDS = ("magic", "seq", "generation", "preset", "style",
@@ -46,7 +46,8 @@ _FIELDS = ("magic", "seq", "generation", "preset", "style",
            "residualMultiplier", "residualSaturation", "residualLightness",
            "shadowStructure", "reflectionGlow",
            "scalingEnabled", "saveRequest", "logEnabled",
-           "motionVectorQuality", "nvofFollowScaling", "fgEnabled", "fgMultiplier")
+           "motionVectorQuality", "nvofFollowScaling", "fgEnabled", "fgMultiplier",
+           "fgRouter")
 
 PAGE_READWRITE = 0x04
 FILE_MAP_READ = 0x0004
@@ -81,7 +82,7 @@ class ParamsChannel:
             vals["residualLightness"], vals["shadowStructure"], vals["reflectionGlow"],
             vals["scalingEnabled"], vals["saveRequest"], vals["logEnabled"],
             vals["motionVectorQuality"], vals["nvofFollowScaling"],
-            vals["fgEnabled"], vals["fgMultiplier"])
+            vals["fgEnabled"], vals["fgMultiplier"], vals["fgRouter"])
         ctypes.memmove(ctypes.c_void_p(self._view), data, len(data))
 
     def read(self):

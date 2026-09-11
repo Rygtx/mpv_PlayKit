@@ -19,6 +19,18 @@ constexpr unsigned long long DLSSFG_PROXY_APPLICATION_ID = 0x0876232Dull;
 
 constexpr NVSDK_NGX_Feature FEATURE_DLSSG = NVSDK_NGX_Feature_FrameGeneration; // 11
 
+// proxy 自有键(来自 0.2.4 二进制字符串表,官方 nvsdk_ngx_defs_dlssg.h 无宏;
+// MultiFrameCountMax 除外,官方头有)。能力三键是 proxy 在 Init 后写入参数块
+// 的查询结果,读不到 = 旧版 proxy,fail-open 保持原行为。
+constexpr char KFG_KEY_AVAILABLE[] = "?DLSSG.Available";
+constexpr char KFG_KEY_NEEDS_UPDATED_DRIVER[] = "DLSSG.NeedsUpdatedDriver";
+constexpr char KFG_KEY_FEATURE_INIT_RESULT[] = "DLSSG.FeatureInitResult";
+// 调用方 D3D12 队列:proxy 的 CUDA 互操作与可选 GPU 计时([Diagnostics]
+// Performance=1)以它为锚(二进制明文 "Performance tracing requires
+// DLSSG.CmdQueue")。传槽 CL 的执行队列 → 同队列 FIFO 保序(见
+// dlssfg_context.h 时序契约);不传时 proxy 自管,诊断计时不可用。
+constexpr char KFG_KEY_CMD_QUEUE[] = "DLSSG.CmdQueue";
+
 // 官方 create 资源旗标(Magpie DLSSFrameGenerator.cpp:513-518 原样):
 // 声明永不提供的可选输入,省 VRAM。proxy 未读该键时无害。
 constexpr unsigned int DLSSG_NEVER_PROVIDED_FLAGS =
@@ -170,6 +182,35 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
         }
     }
 
+    // 能力预检(fail-open):proxy 在 Init_Ext 后写入参数块的能力键。读到
+    // Available=0 / NeedsUpdatedDriver=1 时带因降级(比 CreateFeature 失败
+    // 更早、原因更准);键不存在 = 旧版 proxy,保持原路径继续。
+    {
+        unsigned int available = 1, needsDriver = 0, maxGen = 0;
+        const bool haveCap =
+            _params->Get(KFG_KEY_AVAILABLE, &available) == NVSDK_NGX_Result_Success;
+        const bool haveDriver =
+            _params->Get(KFG_KEY_NEEDS_UPDATED_DRIVER, &needsDriver) == NVSDK_NGX_Result_Success;
+        const bool haveMaxGen =
+            _params->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maxGen) ==
+            NVSDK_NGX_Result_Success;
+        if (haveCap && !available) {
+            return fail("proxy reports DLSSG unavailable (?DLSSG.Available=0)");
+        }
+        if (haveDriver && needsDriver) {
+            return fail("proxy reports driver update required (NeedsUpdatedDriver=1)");
+        }
+        if (haveCap || haveDriver || haveMaxGen) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: dlssfg capability available=%d driver=%d maxGen=%u",
+                          haveCap ? static_cast<int>(available) : -1,
+                          haveDriver ? static_cast<int>(needsDriver) : -1,
+                          haveMaxGen ? maxGen : 0u);
+            TimingStatusLine(msg);
+        }
+    }
+
     _width = width;
     _height = height;
     if (!CreateFeatureOnCtl(width, height, backbufferFormat, err, errLen)) {
@@ -207,6 +248,10 @@ bool DlssfgContext::CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbu
     _params->Set(NVSDK_NGX_DLSSG_Parameter_InternalHeight, static_cast<unsigned int>(height));
     _params->Set(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_ResourceNeverProvided_Flags, DLSSG_NEVER_PROVIDED_FLAGS);
+    // 调用方队列(代理自有键):CUDA 互操作与 GPU 计时诊断的锚;与槽 CL
+    // 同队列 → FIFO 保序。Set 与 Eval 的其余键同款普通调用(参数块 vtable
+    // 属 NGX core,与 proxy 故障隔离无关)。
+    _params->Set(KFG_KEY_CMD_QUEUE, static_cast<void *>(_d3d12->Queue()));
 
     char sehErr[160]{};
     bool ok = SehCall([&] {
@@ -220,8 +265,17 @@ bool DlssfgContext::CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbu
     }
     if (!ok) {
         if (err && errLen) {
-            std::snprintf(err, errLen, "dlssfg: CreateFeature failed%s%s",
-                          sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "");
+            // 官方 DLSS 同款:CreateFeature 失败后从同一参数块读 snippet 的
+            // 精确初始化结果码(proxy 自有键;读不到 = 旧版 proxy,原样)。
+            unsigned int initResult = 0;
+            const bool haveResult =
+                _params->Get(KFG_KEY_FEATURE_INIT_RESULT, &initResult) == NVSDK_NGX_Result_Success;
+            char resultTag[40]{};
+            if (haveResult) {
+                std::snprintf(resultTag, sizeof(resultTag), " (FeatureInitResult 0x%X)", initResult);
+            }
+            std::snprintf(err, errLen, "dlssfg: CreateFeature failed%s%s%s",
+                          sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "", resultTag);
         }
         TimingStatusLine("DLSSNR STATUS: dlssfg CreateFeature failed; FG off (1:1 output)");
         return false;

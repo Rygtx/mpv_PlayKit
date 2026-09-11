@@ -34,6 +34,7 @@ Motion_Vector_Quality = 0
 Nvof_Follow_Scaling = False
 Fg_Enabled = False
 Fg_Multiplier = 2
+Fg_Router = 0
 H_Max = 0
 ## <0-3> 整数, NR 预设档位
 ## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
@@ -66,6 +67,9 @@ H_Max = 0
 ##          显示端建议刷新率 >= 输出帧率
 ##          面板开关: 会话内关 = 插值帧改复制真实帧 (帧数不变);
 ##          未激活会话内开 = 下次播放生效
+## <0-1> 整数, FG 路由 (默认 0): 0 = SM86 (RTX 30 系), 1 = SM75 (RTX 20 系)
+##          插件自动把路由写入 ngx\dlssg_sm86.ini (无需手动改文件);
+##          代理模块进程内常驻, 切换后重启 mpv 生效; 面板保存的设置优先
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
 
@@ -111,6 +115,7 @@ else :
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
 		fg_enabled = int(Fg_Enabled),
 		fg_multiplier = Fg_Multiplier,
+		fg_router = int(Fg_Router),
 	)
 
 ret.set_output()
