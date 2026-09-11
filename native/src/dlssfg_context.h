@@ -1,14 +1,24 @@
 #pragma once
-// DLSS 帧生成上下文 —— 经 dlssg_for_sm86 的原生 proxy(version.dll)驱动
-// NGX DLSSG(Feature 11)eval 契约。与 NR snippet 同款集成形态:
-// LoadLibrary(用户自备 DLL,进程级钉住)→ Init_Ext → 核心参数块 CreateFeature
-// → 槽命令列表上 EvaluateFeature。区别于 NR 的两点:
-//   1. 故障隔离 —— proxy 的 SEH 走本类本地闩锁(_faulted),不上抛全局
+// DLSS 帧生成上下文 —— 双后端驱动 NGX DLSSG(Feature 11)eval 契约:
+//   Proxy      — dlssg_for_sm86 原生 proxy(version.dll),RTX 30/20 唯一路径
+//                (官方 DLSSG 在 Ampere/Turing 拒载)。LoadLibrary(用户自备
+//                DLL,进程级钉住)→ Init_Ext → 核心参数块 CreateFeature →
+//                槽命令列表上 EvaluateFeature。
+//   OfficialNgx — 官方签名 nvngx_dlssg.dll 经共享 NGX core 解析加载(RTX
+//                40/50,PORTING #8;Magpie DLSSFrameGenerator 同款):无
+//                proxy、无自签,SM89/SM120 cubin 由 NVIDIA 预编译。调用方
+//                以 GetCapabilityParameters 块传入,_params 必须来自
+//                NVSDK_NGX_D3D12_GetCapabilityParameters(官方 DLSSG 的
+//                create/eval 块);能力键 FrameGeneration.Available 在本类
+//                Initialize 内预检,不可用即失败由调用方回落 proxy。
+// 与 NR snippet 同款集成形态;区别于 NR 的两点:
+//   1. 故障隔离 —— FG 的 SEH 走本类本地闩锁(_faulted),不上抛全局
 //      NgxRuntimeGuard:FG 崩溃只降级本功能(复制真实帧),绝不连带杀 NR。
-//   2. 参数契约 —— 只设 proxy 声明的消费面(DLSSG.Backbuffer/MVecs/Depth/
+//   2. 参数契约 —— 设 proxy 声明的消费面(DLSSG.Backbuffer/MVecs/Depth/
 //      OutputInterpolated/Reset/MultiFrame*/MvecScale*/ClipToPrevClip/
-//      PrevClipToClip/DepthInverted/CmdQueue);多余键(BackbufferFrameID 等)
-//      对忽略未知键的实现无害,对按官方契约实现的消费者是正确输入。
+//      PrevClipToClip/DepthInverted/CmdQueue)+ 官方 eval 契约补全(Magpie
+//      optionalParams:五矩阵恒等/相机单位基座/jitter 0/可选资源 null;
+//      proxy 忽略未知键无害,官方 DLSSG 依赖这些键)。
 // 时序契约(README:输入 NSR / 输出 UAV,提交与同步归调用方):proxy 的
 // CUDA 互操作工作以 DLSSG.CmdQueue/D3D12 互操作语义与槽队列保序,插值
 // 输出的就绪由本槽 SubmitFrame→WaitFrame 的栅栏覆盖(与 NVOF densify 同
@@ -24,19 +34,25 @@ namespace vsdlssnr {
 
 class DlssfgContext {
 public:
+    // FG 后端(见文件头说明)。Proxy = dlssg_for_sm86;OfficialNgx = 官方
+    // 签名 snippet 经共享 NGX core(调用方传 capability 块)。
+    enum class FgBackend { Proxy, OfficialNgx };
+
     DlssfgContext() = default;
     ~DlssfgContext();
     DlssfgContext(const DlssfgContext &) = delete;
     DlssfgContext &operator=(const DlssfgContext &) = delete;
 
-    // 加载 proxy 模块(进程级缓存,路径变化才重载;永不 FreeLibrary ——
-    // 与 nvofapi64.dll 同哲学)→ Init_Ext → ctl 路径 CreateFeature。
-    // params 为 NGX core 分配的专用参数块(自描述对象,proxy 经 vtable
-    // 读取;调用方拥有并负责销毁)。内部自取 CtlMutex;调用方不得持有
-    // 槽位(PoolHold 语义同 RecreateFeature)。
+    // OfficialNgx:加载免除外的一切照旧(模块加载跳过,函数指针指向静态
+    // SDK;dllPath 仅作部署指纹日志)。Proxy:dllPath 为 version.dll,进程级
+    // 缓存,路径变化才重载;永不 FreeLibrary —— 与 nvofapi64.dll 同哲学)。
+    // params 为 NGX core 参数块(proxy 传 AllocateParameters 块,官方传
+    // GetCapabilityParameters 块;调用方拥有并负责销毁)。内部自取
+    // CtlMutex;调用方不得持有槽位(PoolHold 语义同 RecreateFeature)。
     bool Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
                     const wchar_t *appDataPath, NVSDK_NGX_Parameter *params,
                     int width, int height, DXGI_FORMAT backbufferFormat,
+                    FgBackend backend,
                     char *err, size_t errLen) noexcept;
 
     // 尺寸变化重建 feature(旧 handle 经 ReleaseFeature 退役;Release 失败
@@ -53,6 +69,11 @@ public:
     bool NeedsReset() noexcept;
 
     bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
+
+    // 面板/日志用后端名("official ngx" / "proxy")。
+    const char *BackendName() const noexcept {
+        return _backend == FgBackend::OfficialNgx ? "official ngx" : "proxy";
+    }
 
     // 每处理帧每插值槽一次(fmParallel 并发由内部互斥串行;GPU dispatch 仍
     // 随各槽命令列表重叠)。multiplier = 本源帧倍数 M(2-4),slotIndex =
@@ -90,10 +111,11 @@ private:
     D3D12Context *_d3d12 = nullptr;
     NVSDK_NGX_Parameter *_params = nullptr; // 借用;core 拥有
     NVSDK_NGX_Handle *_feature = nullptr;
-    InitExtFn _initExt = nullptr;
+    InitExtFn _initExt = nullptr;       // 仅 Proxy 使用(OfficialNgx 为 null)
     CreateFeatureFn _createFeature = nullptr;
     EvaluateFeatureFn _evaluateFeature = nullptr;
     ReleaseFeatureFn _releaseFeature = nullptr;
+    FgBackend _backend = FgBackend::Proxy;
 
     std::mutex _mutex;            // eval + history + 计数器串行(fmParallel)
     std::atomic<bool> _ready{false};

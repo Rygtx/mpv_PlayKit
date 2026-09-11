@@ -313,6 +313,12 @@ NVSDK_NGX_Result DlssnrContext::CoreAllocateParametersSafely(NVSDK_NGX_Parameter
     }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
+NVSDK_NGX_Result DlssnrContext::CoreGetCapabilityParametersSafely(NVSDK_NGX_Parameter **out, DWORD *sehCode) noexcept {
+    return NgxRuntimeGuard::Invoke([&] {
+        return NVSDK_NGX_D3D12_GetCapabilityParameters(out);
+    }, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
+}
+
 NVSDK_NGX_Result DlssnrContext::CoreDestroyParametersSafely(NVSDK_NGX_Parameter *p, DWORD *sehCode) noexcept {
     return NgxRuntimeGuard::Invoke([&] {
         return NVSDK_NGX_D3D12_DestroyParameters(p);
@@ -581,7 +587,7 @@ bool DlssnrContext::Initialize(
     // FG 请求 = 创建时参数快照的 fgEnabled(桥接 ini/payload 采纳已在此前
     // 完成);sticky —— 尺寸重建(RecreateFeature)沿用本旗标,面板运行中
     // 改变只影响逐帧 eval 门,不重建槽资源。
-    _fgRequested = _shared->Snapshot().fgEnabled != 0 && fgDllPath && fgDllPath[0];
+    _fgRequested = _shared->Snapshot().fgEnabled != 0;
     if (!_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested, err, errLen)) return failWithExistingErr();
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
@@ -594,28 +600,80 @@ bool DlssnrContext::Initialize(
     // 输入尺寸决策能感知 FG)。失败优雅降级:滤镜回退 1:1 输出(不翻倍
     // 帧率),NR 不受影响 —— FG 的 SEH 走本地闩锁,不进全局 NgxRuntimeGuard。
     if (_fgRequested) {
-        DWORD sehCode = 0;
-        const NVSDK_NGX_Result pr = CoreAllocateParametersSafely(&_fgParams, &sehCode);
-        if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
-            _fg = std::make_unique<DlssfgContext>();
-            char fgErr[256]{};
-            if (!_fg->Initialize(*_d3d12, fgDllPath, _appDataPath, _fgParams,
-                                 _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
-                                 fgErr, sizeof(fgErr))) {
-                char msg[352];
-                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg init failed (%s); 1:1 output",
-                              fgErr);
-                DbgLine(msg);
-                TimingStatusLine(msg);
-                _fg.reset();
-                // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
-                // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
-                _fgParams = nullptr;
-                _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
+        // 官方 NGX 分支优先(PORTING #8):官方签名 nvngx_dlssg.dll 与模型
+        // DLL 同目录(ngx\)部署且驱动报告 FG 能力(RTX 40/50)时,经共享
+        // NGX core 走官方签名链 —— 免自签 proxy 与杀软误报面,cubin 由
+        // NVIDIA 预编译(SM89/SM120,无 PTX JIT)。参数块 = GetCapability
+        // (官方 DLSSG 的 Magpie 同款 create/eval 块)。不可用时回落
+        // dlssg_for_sm86 proxy —— RTX 30/20 官方拒载(FrameGeneration
+        // .Available=0),proxy 是该区间唯一路径。
+        wchar_t officialDll[MAX_PATH]{};
+        {
+            std::error_code ec;
+            const std::filesystem::path p =
+                std::filesystem::path(ngxDllPath).parent_path() / L"nvngx_dlssg.dll";
+            const std::wstring ws = p.wstring();
+            if (!ec && ws.size() < MAX_PATH) {
+                const DWORD attr = GetFileAttributesW(ws.c_str());
+                if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    std::memcpy(officialDll, ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
+                }
             }
-        } else {
-            TimingStatusLine("DLSSNR STATUS: dlssfg core parameter block FAILED; 1:1 output");
-            _fgRequested = false;
+        }
+        bool fgUp = false;
+        if (officialDll[0]) {
+            DWORD sehCode = 0;
+            const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
+            if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
+                _fg = std::make_unique<DlssfgContext>();
+                char fgErr[256]{};
+                if (_fg->Initialize(*_d3d12, officialDll, _appDataPath, _fgParams,
+                                    _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    DlssfgContext::FgBackend::OfficialNgx,
+                                    fgErr, sizeof(fgErr))) {
+                    fgUp = true;
+                } else {
+                    char msg[352];
+                    std::snprintf(msg, sizeof(msg),
+                                  "DLSSNR STATUS: dlssfg official init failed (%s); trying proxy",
+                                  fgErr);
+                    DbgLine(msg);
+                    TimingStatusLine(msg);
+                    _fg.reset();
+                    // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
+                    // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
+                    _fgParams = nullptr;
+                }
+            } else {
+                TimingStatusLine("DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
+            }
+        }
+        if (!fgUp && fgDllPath && fgDllPath[0]) {
+            DWORD sehCode = 0;
+            const NVSDK_NGX_Result pr = CoreAllocateParametersSafely(&_fgParams, &sehCode);
+            if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
+                _fg = std::make_unique<DlssfgContext>();
+                char fgErr[256]{};
+                if (_fg->Initialize(*_d3d12, fgDllPath, _appDataPath, _fgParams,
+                                    _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    DlssfgContext::FgBackend::Proxy,
+                                    fgErr, sizeof(fgErr))) {
+                    fgUp = true;
+                } else {
+                    char msg[352];
+                    std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg init failed (%s); 1:1 output",
+                                  fgErr);
+                    DbgLine(msg);
+                    TimingStatusLine(msg);
+                    _fg.reset();
+                    _fgParams = nullptr;
+                }
+            } else {
+                TimingStatusLine("DLSSNR STATUS: dlssfg core parameter block FAILED; 1:1 output");
+            }
+        }
+        if (!fgUp) {
+            _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
         }
     }
 

@@ -16,19 +16,20 @@ if (-not $PSBoundParameters.ContainsKey("Version")) {
 }
 $Version = $Version.TrimStart("v")
 
-$binDll   = Join-Path $native "bin\vs_dlssnr.dll"
-$binPanel = Join-Path $native "bin\dlssnr_panel.exe"
-$model    = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"
-$fgDll    = Join-Path $native "vendor\ngx\version.dll"
-$fgIni    = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
-if (-not (Test-Path $binDll))   { throw "缺少编译产物: $binDll (先运行 scripts\build.ps1)" }
-if (-not (Test-Path $binPanel)) { throw "缺少编译产物: $binPanel (先运行 scripts\build.ps1)" }
-if (-not (Test-Path $model))    { throw "缺少模型文件: $model (把 nvngx_dlssnr.dll 复制到 native\vendor\ngx\)" }
-# DLSS 帧生成代理为可选件: 缺失时打包照常, 滤镜侧优雅回退 1:1 输出 (vpy fg_enabled 失效)
-$fgPack = (Test-Path $fgDll) -and (Test-Path $fgIni)
-if (-not $fgPack) {
-    Write-Warning "缺少帧生成代理 (version.dll / dlssg_sm86.ini, dlssg_for_sm86): 打包将不含帧生成, 滤镜自动回退 1:1"
-}
+$binDll     = Join-Path $native "bin\vs_dlssnr.dll"
+$binPanel   = Join-Path $native "bin\dlssnr_panel.exe"
+$model      = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"
+$fgDll      = Join-Path $native "vendor\ngx\version.dll"
+$fgIni      = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
+$fgOfficial = Join-Path $native "vendor\ngx\nvngx_dlssg.dll"
+# 全部文件必须齐备(fetch-deps.ps1 自动落地官方 runtime 与 NVOF/NGX 依赖;
+# 模型与 proxy 为手工/vendor 部署)。缺任一件 = 打包失败,杜绝残缺发行包。
+if (-not (Test-Path $binDll))     { throw "缺少编译产物: $binDll (先运行 scripts\build.ps1)" }
+if (-not (Test-Path $binPanel))   { throw "缺少编译产物: $binPanel (先运行 scripts\build.ps1)" }
+if (-not (Test-Path $model))      { throw "缺少模型文件: $model (把 nvngx_dlssnr.dll 复制到 native\vendor\ngx\)" }
+if (-not (Test-Path $fgDll))      { throw "缺少帧生成代理: $fgDll (dlssg_for_sm86 的 version.dll 放入 native\vendor\ngx\)" }
+if (-not (Test-Path $fgIni))      { throw "缺少帧生成代理配置: $fgIni (dlssg_sm86.ini 放入 native\vendor\ngx\)" }
+if (-not (Test-Path $fgOfficial)) { throw "缺少官方帧生成运行时: $fgOfficial (先运行 scripts\fetch-deps.ps1 自动下载)" }
 
 $dist  = Join-Path $native "dist"
 $stage = Join-Path $dist "stage"
@@ -41,14 +42,13 @@ Copy-Item (Join-Path $repo "portable_config") (Join-Path $stage "portable_config
 # 运行时缓存目录只保留空骨架
 Get-ChildItem (Join-Path $stage "portable_config\_cache") -Recurse -File -ErrorAction SilentlyContinue | Remove-Item -Force -Confirm:$false
 
-# --- 插件/面板/模型, 对齐插件内推导的 <插件目录>\ngx\ 相对布局 ---
-Copy-Item $binDll   (Join-Path $stage "vs-plugins")
-Copy-Item $binPanel (Join-Path $stage "vs-plugins")
-Copy-Item $model    (Join-Path $stage "vs-plugins\ngx")
-if ($fgPack) {
-    Copy-Item $fgDll (Join-Path $stage "vs-plugins\ngx")
-    Copy-Item $fgIni (Join-Path $stage "vs-plugins\ngx")
-}
+# --- 插件/面板/模型/帧生成全件, 对齐插件内推导的 <插件目录>\ngx\ 相对布局 ---
+Copy-Item $binDll     (Join-Path $stage "vs-plugins")
+Copy-Item $binPanel   (Join-Path $stage "vs-plugins")
+Copy-Item $model      (Join-Path $stage "vs-plugins\ngx")
+Copy-Item $fgDll      (Join-Path $stage "vs-plugins\ngx")
+Copy-Item $fgIni      (Join-Path $stage "vs-plugins\ngx")
+Copy-Item $fgOfficial (Join-Path $stage "vs-plugins\ngx")
 
 # --- 安装说明 ---
 $readme = Join-Path $stage "安装说明.txt"
@@ -63,11 +63,9 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   vs-plugins\vs_dlssnr.dll            VapourSynth 插件 (Magpie DLSSNR 移植, NGX Feature 18)
   vs-plugins\dlssnr_panel.exe         ImGui 独立调参面板 (运行时实时调参)
   vs-plugins\ngx\nvngx_dlssnr.dll     DLSSNR 模型 (NVIDIA DLSS SDK 310.9.0)
-$(if ($fgPack) {
-"  vs-plugins\ngx\version.dll          DLSS 帧生成代理 (dlssg_for_sm86 原生实现, 自签名)
+  vs-plugins\ngx\version.dll          DLSS 帧生成代理 (dlssg_for_sm86 原生实现, 自签名, RTX 30/20 系)
   vs-plugins\ngx\dlssg_sm86.ini       帧生成代理配置 (Router 由面板 FG 路由选项自动写入)
-"
-})
+  vs-plugins\ngx\nvngx_dlssg.dll      DLSS 官方帧生成运行时 (NVIDIA 签名, RTX 40/50 系优先路径)
 
 安装 (已有 mpv-lazy, 建议与打包基线同版或更新)
   1. 备份你的 portable_config\ (若有个人修改)
@@ -82,14 +80,11 @@ $(if ($fgPack) {
   首帧初始化约 1 秒 (模型加载), 属正常现象
   双击 vs-plugins\dlssnr_panel.exe 可在播放时实时调参, "保存为默认值"写入 dlssnr_ui.ini
   删除 vs-plugins\dlssnr_ui.ini 可恢复脚本默认参数
-$(if ($fgPack) {
-"帧生成 (可选)
-  vs\DLSSNR_NV.vpy 中 Fg_Enabled = True 开启: 输出帧率 x2 (插值帧挂降噪之后),
-  依赖 vs-plugins\ngx\version.dll (dlssg_for_sm86, RTX 30/20 系解锁 DLSS FG);
-  GPU 路由在面板 ""FG 路由"" 选项切换 (默认 SM86, RTX 20 系选 SM75, 重启 mpv 生效);
+帧生成 (可选)
+  vs\DLSSNR_NV.vpy 中 Fg_Enabled = True 开启: 输出帧率 x2-x4 (插值帧挂降噪之后)。
+  RTX 40/50 系: 经官方运行时 nvngx_dlssg.dll (NVIDIA 签名, 插件按驱动能力自动选用, 无需 proxy);
+  RTX 30/20 系: 经 dlssg_for_sm86 代理 version.dll (面板 ""FG 路由"" 切换, 默认 SM86, RTX 20 系选 SM75, 重启 mpv 生效)。
   初始化失败自动回退 1:1, 降噪不受影响; 建议配合面板光流质量 >= 2 使用
-"
-})
 
 要求: RTX 显卡
 本包不含 mpv.exe 与 VapourSynth 运行时, 请使用官方 mpv-lazy 发行包

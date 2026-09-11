@@ -1,4 +1,4 @@
-﻿# 从公开源落地 native/ 依赖:NGX SDK(官方 NVIDIA/DLSS 仓库)+ VapourSynth R73 头
+# 从公开源落地 native/ 依赖:NGX SDK(官方 NVIDIA/DLSS 仓库)+ VapourSynth R73 头
 # 用法: powershell -File scripts\fetch-deps.ps1
 $ErrorActionPreference = "Stop"
 
@@ -32,6 +32,21 @@ foreach ($h in $ngxHeaders) {
 
 # --- NGX static core lib (layout mirrors Magpie BuildOptions.props DLSSSdkDir) ---
 Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" (Join-Path $ngxLib "nvsdk_ngx_s.lib")
+
+# --- Official signed NGX FG runtime (PORTING #8 官方帧生成后端) ---
+# 落到 vendor\ngx\ 与模型 DLL 同目录,打包脚本按存在与否选装;插件只在驱动
+# 报告 DLSSG 能力(RTX 40/50)时经共享 NGX core 加载,否则回落 dlssg_for_sm86
+# proxy。尺寸门槛:HTML 错误页 / LFS 指针文件能通过非空检查,必须拦下。
+$fgOfficial = Join-Path $root "vendor\ngx\nvngx_dlssg.dll"
+if (-not (Test-Path $fgOfficial)) {
+    New-Item -ItemType Directory -Force (Split-Path -Parent $fgOfficial) | Out-Null
+    $tmp = "$fgOfficial.download"
+    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/rel/nvngx_dlssg.dll" $tmp
+    $len = (Get-Item $tmp).Length
+    if ($len -lt 1MB) { Remove-Item $tmp -Force; throw "nvngx_dlssg.dll size sanity failed ($len bytes)" }
+    Move-Item $tmp $fgOfficial -Force
+    Write-Host "official DLSSG runtime: $fgOfficial ($len bytes)"
+}
 
 # --- VapourSynth R73 headers (runtime is R73 / API4, see mpv-lazy Lib\site-packages\vapoursynth-73.dist-info) ---
 foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
