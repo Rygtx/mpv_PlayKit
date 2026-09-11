@@ -217,7 +217,7 @@ public:
     // 转换被 Reset 吃掉,NVOF/NGX 全链吃零 → 黑帧)。
     // ConvertInput:3×yuvUpload→yuvIn 拷贝(COPY_DEST→NSR)→ dispatch 采样
     // Y/U/V 双线性上采色度、按矩阵/范围展开 → UAV 直写 inputColor →
-    // stateAfter(NSR=NGX 待读 / COMMON=skipEval);yuvIn 收尾归 COMMON。
+    // stateAfter(NSR=NGX 待读 / COMMON=直通拷贝);yuvIn 收尾归 COMMON。
     // 纯录制,无失败路径(void)。
     void RecordConvertInput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                             ColorMatrix matrix, ColorRange range,

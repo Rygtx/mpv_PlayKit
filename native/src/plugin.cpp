@@ -182,6 +182,10 @@ struct FilterData {
     // Failure-log latch: a wedged context fails every frame at frame rate —
     // log the first failure only, re-arm on the next success.
     std::atomic<bool> failureLogged{ false };
+    // NR 总开关 stats 发布边沿(-1 = 未发布):开关翻转时向面板发一次
+    // filter_state 状态行(live 关 = 直通原因;live 开但未初始化 = 提示
+    // 需要 seek)。开着且已初始化时不发布 —— 常规逐帧 stats 接管。
+    std::atomic<int> nrPubState{ -1 };
 
     // ---- DLSS FG 多帧输出 ----
     // fgActive = 创建时 FG 激活(proxy 初始化成功):每源帧产出 M 帧
@@ -358,6 +362,26 @@ static const VSFrame *VS_CC DlssnrGetFrame(
 
     static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
 
+    // NR 总开关 live 门(shared_lock 快照,fmParallel 并发安全)。FG 激活
+    // 的会话:NR 关由 ProcessFrame 内部门控(跳过降噪评估,补帧/光流照常
+    // —— 输出仍是增强管线的产物),不走此直通。开关边沿向面板发一次状态
+    // (见 nrPubState 注释)。
+    const bool nrLive = d->params->Snapshot().nrEnabled != 0;
+    const int nrPub = nrLive ? 1 : 0;
+    if (d->nrPubState.exchange(nrPub) != nrPub) {
+        char body[224];
+        if (!nrLive && !d->fgActive) {
+            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR off (panel)\"}",
+                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
+        } else if (nrLive && !d->initOk) {
+            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR on; seek to initialize\"}",
+                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
+        } else {
+            body[0] = '\0'; // 已初始化 / FG 仍在跑:常规逐帧 stats 接管,无需发布
+        }
+        if (body[0]) vsdlssnr::PublishStatsJson(body);
+    }
+
     if (d->fgActive) {
         const intptr_t fd = reinterpret_cast<intptr_t>(*frameData);
         const int k = static_cast<int>(fd >> 4);
@@ -374,9 +398,12 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         const VSFrame *src = vsapi->getFrameFilter(k, d->node, frameCtx);
         const int m = d->fgM; // 本源帧倍数(arInitial 时定格)
         if (!d->initOk) {
-            // passthrough on any setup failure;FG 输出计数仍是 M(帧率
-            // 已 ×M):源帧复制入缓存,各槽交一个新引用。
+            // passthrough on setup failure(防御:fgActive 恒蕴含 initOk;
+            // NR 关不在此列 —— ProcessFrame 内部门控跳过降噪评估,补帧以
+            // 直通帧为 backbuffer 照常插值)。FG 输出计数仍是 M(帧率已
+            // ×M):源帧单次复制入缓存,各槽交新引用,时长按 1/M 摊分。
             VSFrame *dup = vsapi->copyFrame(src, core);
+            ScaleOutputDuration(dup, vsapi, m);
             d->fgCacheK = k;
             d->fgCacheM = m;
             for (int i = 0; i < kFgMultMax; ++i) {
@@ -469,7 +496,11 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             ScaleOutputDuration(i == 0 ? out : genFrame[i - 1], vsapi, m);
         }
         for (int i = 0; i < kFgMultMax; ++i) {
-            if (d->fgCache[i]) vsapi->freeFrame(d->fgCache[i]);
+            if (d->fgCache[i]) {
+                vsapi->freeFrame(d->fgCache[i]);
+                d->fgCache[i] = nullptr; // 置空:live 下调 m 后高位槽不再回填,
+                                         // 残留旧指针会被下一次填充/Free 双重释放
+            }
         }
         d->fgCacheK = k;
         d->fgCacheM = m;
@@ -485,7 +516,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
 
     // ---- 非 FG 路径(1:1,与旧管线一致) ----
     const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
-    if (!d->initOk) return src; // passthrough;引用移交调用方
+    if (!d->initOk || !nrLive) return src; // passthrough(NR 关 = 原帧零拷贝);引用移交调用方
 
     const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
     VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
@@ -596,6 +627,9 @@ static void VS_CC DlssnrCreate(
     d->depth = vi->format.bitsPerSample;
 
     DlssnrParams initial{}; // member initializers are the default authority
+    // NR 总开关(0/1):0 = 跳过 D3D12/NGX 全部初始化,滤镜纯直通零开销,
+    // FG 一并不可用;面板开关(live)与 ini/vpy 均可控制。
+    ApplyFlagArg(in, vsapi, "nr_enabled", initial.nrEnabled);
     ApplyIntArg(in, vsapi, "preset", initial.preset, kPresetMin, kPresetMax);
     ApplyIntArg(in, vsapi, "style", initial.style, kStyleMin, kStyleMax);
     ApplyFloatArg(in, vsapi, "intensity", initial.intensity, kStrengthMin, kStrengthMax);
@@ -639,9 +673,9 @@ static void VS_CC DlssnrCreate(
     {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d router=%d backend=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d router=%d backend=%d",
                       d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
-                      initial.preset, initial.inputResolutionPercent,
+                      initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.nvofFollowScaling ? 1 : 0, initial.fgEnabled ? 1 : 0,
                       initial.fgMultiplier, initial.fgRouter, initial.fgBackend);
@@ -675,6 +709,10 @@ static void VS_CC DlssnrCreate(
             }
         }
     }
+
+    // NR+FG 皆关时也照常同步 Router INI(重开时即最新值);热/冷初始化
+    // 由下方各守卫跳过 —— 零设备、零显存、零 GPU。仅 NR 关而 FG 开:
+    // 初始化照常,降噪评估在 ProcessFrame 内部跳过。
 
     // FG proxy DLL(dlssg_for_sm86 的 version.dll;用户自备部署,与模型
     // DLL 同目录约定)。默认 <plugin dir>/ngx/version.dll。
@@ -723,7 +761,10 @@ static void VS_CC DlssnrCreate(
     // FG 状态(开关 + 后端 + 代理路径)同样参与:槽资源形态(FG 纹理有无)
     // 与后端选择(官方 NGX vs proxy)随之变化,必须冷重建 —— 面板切后端
     // 因此在下个 seek 当场生效,无需重启 mpv。
-    const bool hotMatch = Hot().valid && Hot().ngxDllPath == d->ngxDllPath &&
+    // NR+FG 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开秒回);
+    // 仅 NR 关而 FG 开仍需热复用(设备与上下文都在用)。
+    const bool hotMatch = (initial.nrEnabled || initial.fgEnabled) && Hot().valid &&
+                          Hot().ngxDllPath == d->ngxDllPath &&
                           Hot().width == d->width && Hot().height == d->height &&
                           Hot().depth == d->depth &&
                           Hot().fgEnabled == (initial.fgEnabled != 0) &&
@@ -757,7 +798,7 @@ static void VS_CC DlssnrCreate(
             d->d3d12.reset();
         }
     }
-    if (!d->initOk && !d->d3d12) {
+    if ((initial.nrEnabled || initial.fgEnabled) && !d->initOk && !d->d3d12) {
         // Any parked context left over (different snippet DLL) must be torn
         // down BEFORE a cold init: the IAT hook and the NGX core are
         // process-global singletons. A second full Initialize could never
@@ -806,6 +847,25 @@ static void VS_CC DlssnrCreate(
             vsdlssnr::PublishStatsJson(body);
         }
     }
+    if (!initial.nrEnabled && !initial.fgEnabled) {
+        // NR + FG 皆关:热/冷初始化全部跳过 —— 零设备、零显存、零 GPU,
+        // 滤镜纯直通(getFrame 原帧交还)。仅 NR 关而 FG 开时不走此分支:
+        // 初始化照常(补帧/光流需要设备与 NVOF),降噪评估由 ProcessFrame
+        // 内部门控跳过。桥接照常启动:面板仍被拉起并可实时控制 —— 已激活
+        // 会话 live 重开立即恢复;创建即全关的实例重开需下个 seek(停泊热
+        // 上下文原样保留,同参数重开走秒回的热复用)。
+        char body[192];
+        std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR+FG disabled (panel/vpy)\"}",
+                      vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
+        vsdlssnr::PublishStatsJson(body);
+        if (!vsdlssnr::BridgeStart(d->params.get())) {
+            vsapi->logMessage(mtWarning,
+                              "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
+                              core);
+            vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
+        }
+        vsdlssnr::TimingStatusLine("DLSSNR STATUS: NR+FG disabled; passthrough (zero GPU)");
+    }
 
     // FG 多帧输出判定(两条初始化路径汇合):会话激活 = 每源帧产出 M 帧
     // (输出帧时长 = 源时长/M,mpv 逐帧认 _DurationNum/_DurationDen);
@@ -853,6 +913,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "Enhance",
         "clip:vnode;"
         "ngx_dll:data:opt;"
+        "nr_enabled:int:opt;"
         "preset:int:opt;"
         "style:int:opt;"
         "intensity:float:opt;"

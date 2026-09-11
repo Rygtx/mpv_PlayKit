@@ -2481,7 +2481,7 @@ void D3D12Context::RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRan
                                    D3D12_RESOURCE_STATES outputStateBefore,
                                    ID3D12Resource *srcColor, UINT srcSrvIndex) noexcept {
     // RGB→YUV(YUV 原生化):srcColor(缺省 outputColor;FG 路径传
-    // fgInterp)stateBefore(UAV 正常 / COMMON skipEval / NSR=FG 后)→ NSR
+    // fgInterp)stateBefore(UAV 正常/直通拷贝 / NSR=FG 后)→ NSR
     // → luma + chroma 两个 dispatch 写 yuvOut(留 UAV 交
     // RecordReadbackCopy)→ srcColor 归 COMMON。constant 的 Lo/Span 按
     // 平面语义填充(luma 用 yLo/ySpan,chroma 用 cMid/cSpan)。

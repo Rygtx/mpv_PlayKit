@@ -35,6 +35,14 @@ inline constexpr int kFgRouterMin = 0, kFgRouterMax = 1;
 inline constexpr int kFgBackendMin = 0, kFgBackendMax = 2;
 
 struct DlssnrParams {
+    // NR 总开关(0/1,默认 1)—— 只关降噪,不影响补帧/光流:
+    //   create-time —— 与 fgEnabled 皆关时跳过 D3D12/NGX 全部初始化(零
+    //     设备/零显存/零 GPU),滤镜纯直通;FG 开时初始化照常(补帧需要
+    //     设备与 NVOF),仅降噪评估被跳过(模型驻留显存,即时重开)。
+    //   live —— 会话已激活时面板切换立即生效:关 = 跳过 NGX 降噪评估,
+    //     Input→Output 直拷,补帧以直通帧为 backbuffer 照常插值(输出
+    //     计数与 _Duration 时长契约不变);开 = 立即恢复评估。
+    int nrEnabled = 1;
     // NGX "DLSSNR.Hint.Render.Preset" 0-3
     // 上游 v0.5.7 P8 引入、r2-fix1 取消暴露(fixed-0);移植端保留为扩展功能。
     int preset = 0;

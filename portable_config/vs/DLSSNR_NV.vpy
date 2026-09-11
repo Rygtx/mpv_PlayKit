@@ -19,6 +19,7 @@ from vapoursynth import core
 # 用户选项 #
 ############
 
+NR_Enabled = True
 Preset = 0
 Style = 0
 Intensity = 1.0
@@ -37,6 +38,10 @@ Fg_Multiplier = 2
 Fg_Router = 0
 Fg_Backend = 0
 H_Max = 0
+## <True|False> 降噪总开关 (默认 True): False = 跳过降噪推理输出源帧,
+##          补帧/光流照常工作不受影响; 降噪与帧生成都关时整个滤镜
+##          零初始化零开销 (重开需下个 seek); 已激活会话内面板切换
+##          立即生效; 面板 "降噪增强" 开关同步此值, 面板保存的设置优先
 ## <0-3> 整数, NR 预设档位
 ## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
 ## <0-1> 浮点, 强度 (默认 1.0)
@@ -105,6 +110,7 @@ elif clip.format.id not in (vs.YUV420P8, vs.YUV420P10) :
 else :
 	ret = core.dlssnr.Enhance(
 		clip,
+		nr_enabled = int(NR_Enabled),
 		preset = Preset,
 		style = Style,
 		intensity = Intensity,

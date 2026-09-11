@@ -28,10 +28,11 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // 占用原 reserved[0] —— 布局不变,老面板写 0 = 关); v8 adds fgMultiplier
 // (插帧倍数 2-4,live,源帧边界生效 —— 结构体增长,新旧混跑按 magic 拒读);
 // v9 adds fgRouter (FG 路由 0=SM86/1=SM75,进程级,重启 mpv 生效); v10 adds
-// fgBackend (FG 后端 0=自动/1=官方 NGX/2=代理,下个 seek 生效)。
+// fgBackend (FG 后端 0=自动/1=官方 NGX/2=代理,下个 seek 生效); v11 adds
+// nrEnabled (NR 总开关 0/1,默认 1;0 = 跳过降噪推理,补帧/光流不受影响)。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x414C5344u; // "DSLA" (v10, 版本位走 hex:9 之后是 A)
+constexpr uint32_t PAYLOAD_MAGIC = 0x424C5344u; // "DSLB" (v11, 版本位走 hex:9 之后是 A/B)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -62,6 +63,7 @@ struct PanelPayload {
     int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,源帧边界生效)
     int32_t fgRouter;            // 0/1 FG 路由(v9;0=SM86,1=SM75,重启 mpv 生效)
     int32_t fgBackend;           // 0/1/2 FG 后端(v10;0=自动,1=官方 NGX,2=代理,下个 seek 生效)
+    int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
 };
 #pragma pack(pop)
 
@@ -76,6 +78,7 @@ static_assert(sizeof(PanelPayload) <= PAYLOAD_SIZE, "payload must fit the mappin
 // ConsumeRebuild alone, never write them behind its back.
 // ---------------------------------------------------------------------------
 inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
+    p.nrEnabled = pl.nrEnabled != 0;
     p.style = std::clamp(pl.style, kStyleMin, kStyleMax);
     p.intensity = std::clamp(pl.intensity, kStrengthMin, kStrengthMax);
     p.localToneStrength = std::clamp(pl.localTone, kStrengthMin, kStrengthMax);
@@ -95,6 +98,7 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
+    p.nrEnabled = pl.nrEnabled != 0;
     p.preset = std::clamp(pl.preset, kPresetMin, kPresetMax);
     p.inputResolutionPercent = std::clamp(pl.inputResolution, kResPctMin, kResPctMax);
     p.scalingEnabled = pl.scalingEnabled != 0;
@@ -111,6 +115,7 @@ inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
 // Parameter fields only; the caller fills seq/generation/save/reset/log.
 inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     PanelPayload pl{};
+    pl.nrEnabled = p.nrEnabled ? 1 : 0;
     pl.magic = PAYLOAD_MAGIC;
     pl.preset = p.preset;
     pl.style = p.style;

@@ -1172,6 +1172,10 @@ bool DlssnrContext::ProcessFrame(
     // Diagnostic: VSDLSSNR_SKIP_EVAL=1 measures the pipe without NGX evaluate
     static const bool skipEval = GetEnvironmentVariableA("VSDLSSNR_SKIP_EVAL", nullptr, 0) != 0;
     static const bool dumpEnabled = GetEnvironmentVariableA("VSDLSSNR_DUMP", nullptr, 0) != 0;
+    // NR 总开关(live,shared_lock 快照):关 = 跳过 NGX 降噪评估(Input→Output
+    // 直拷),NVOF/补帧照常 —— 补帧以直通帧为 backbuffer 继续插值。与诊断
+    // 的 skipEval 互不相同:skipEval 连 NVOF/补帧一起跳(测管线底价)。
+    const bool nrOff = _shared->Snapshot().nrEnabled == 0;
     // fmParallel: VS feeds several frames concurrently, each on its own slot
     // (command list, staging, textures). The queue serializes the GPU work in
     // submit order, so slots overlap CPU pack/unpack with other slots' GPU
@@ -1312,7 +1316,7 @@ bool DlssnrContext::ProcessFrame(
     }
     // NOTE: D3D12 timestamp queries crash NGX snippet evaluate (SEH) when on the same command list - do not re-enable (verified 2026-09-05)
 
-    const D3D12_RESOURCE_STATES uploadPost = skipEval
+    const D3D12_RESOURCE_STATES uploadPost = (skipEval || nrOff)
                                                  ? D3D12_RESOURCE_STATE_COMMON
                                                  : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     // Upload/convert: NVOF active 时转换已在 nvof CL 完成(inputIndex>=0);
@@ -1325,27 +1329,40 @@ bool DlssnrContext::ProcessFrame(
         _d3d12->RecordConvertInput(*slot->commandList.Get(), *slot, matrix, range, uploadPost);
     }
 
-    if (skipEval) {
-        // Diagnostic path: route input straight to output for pipe-cost measurement
-        auto *cl = slot->commandList.Get();
+    // 槽 CL 与输出状态契约:直通拷贝(skipEval/nrOff)与 eval 路径帧末都把
+    // OutputColor 停在 UAV —— 下方 FG 段的 UAV→NSR 屏障与真实帧转换的
+    // stateBefore 在三条路径(skipEval / nrOff / eval)上完全一致。
+    auto *cl = slot->commandList.Get();
+    const bool scaling = _d3d12->HasScaling();
+    // guidance 降采样是否本帧执行(eval + 缩放 + 源尺寸运动场);NR 关时
+    // 跳过(eval 不消费运动场降采样),reduced 纹理保持 COMMON,帧末归位
+    // 相应跳过。
+    const bool guidanceDown = realMotion && scaling && !densifyInternal && !nrOff;
+    if (skipEval || nrOff) {
+        // 直通拷贝:Input → Output(不经 NGX 降噪)。skipEval = 诊断(测管线
+        // 底价,NVOF/补帧整体跳过);nrOff = 面板关降噪(NVOF/补帧照常,
+        // 补帧以直通帧为 backbuffer)。输入状态:nvof CL 转换落 NSR
+        // (convertedOnNvof)/ 槽 CL 补转换落 COMMON,拷贝后统一归 COMMON。
         D3D12_RESOURCE_BARRIER bar[2]{
-            TransitionTo(_d3d12->InputColor(*slot), D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(_d3d12->InputColor(*slot),
+                       convertedOnNvof ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                       : D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_COPY_SOURCE),
             TransitionTo(_d3d12->OutputColor(*slot), D3D12_RESOURCE_STATE_COPY_DEST),
         };
         cl->ResourceBarrier(2, bar);
         cl->CopyResource(_d3d12->OutputColor(*slot), _d3d12->InputColor(*slot));
-        for (auto &b : bar) {
-            D3D12_RESOURCE_STATES tmp = b.Transition.StateBefore;
-            b.Transition.StateBefore = b.Transition.StateAfter;
-            b.Transition.StateAfter = tmp;
-        }
-        cl->ResourceBarrier(2, bar);
+        D3D12_RESOURCE_BARRIER back[2]{
+            Transition(_d3d12->InputColor(*slot),
+                       D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+            Transition(_d3d12->OutputColor(*slot),
+                       D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        };
+        cl->ResourceBarrier(2, back);
         // t2 与正常路径 eval 后同位:此分支不赋值的话 gpuWaitMs = ms(t2=0, t3)
         // = 开机以来毫秒,面板/perf 日志的 gpu 段被巨值吞没。
         QueryPerformanceCounter(&t2);
     } else {
-        auto *cl = slot->commandList.Get();
-        const bool scaling = _d3d12->HasScaling();
 
         // ---- NVOF guidance 段(PORTING #6)----
         // densify/清零已挪进 NVOF 会话的 nvof CL(门内、execute 完成后,
@@ -1354,7 +1371,7 @@ bool DlssnrContext::ProcessFrame(
         // 保序)。OF 关闭/跳过时 motion/confidence 全程 COMMON 不动。
         // follow 内部管线 densify 已直写 reducedMotion(NSR),这里整个
         // 跳过;motion/confidence(源尺寸)本帧全程 COMMON 不被触碰。
-        if (realMotion && scaling && !densifyInternal) {
+        if (guidanceDown) {
             // 缩放启用:置信度加权降采样到内部尺寸(运动向量乘
             // MotionScale 换算到内部像素单位,Magpie 同款)。
             D3D12_RESOURCE_BARRIER g3[2]{
@@ -1524,139 +1541,137 @@ bool DlssnrContext::ProcessFrame(
             };
             cl->ResourceBarrier(1, back);
         }
+    }
 
-        // ---- DLSS FG 段(挂 NR 之后):backbuffer = NR 输出(outputColor),
-        // MVecs = 源尺寸稠密运动(slot.motion —— FG 激活时 follow 已被忽略,
-        // 会话必为源尺寸),Depth = 静态零纹理。proxy 契约:输入 NSR / 输出
-        // UAV;CUDA 互操作工作与槽队列 FIFO 保序,插值输出就绪由本槽
-        // WaitFrame 覆盖(与 NVOF densify 同款论证)。倍数 M:同一条 CL 上
-        // 按序 eval 插值槽 1..M-1(proxy 契约 "MFG indices must be evaluated
-        // in order starting at 1"),每槽紧随 RGB→YUV 转换 + 独立回读
-        // (fgInterp 单纹理逐槽复用 —— 转换/回读后 yuvOut 归位、fgInterp 归
-        // COMMON,下一槽重新起步)。播种帧(会话首帧/seek 后)只提交首个
-        // eval(带 DLSSG.Reset=1,只建历史,输出不消费);零光流帧整块跳过
-        // —— 无运动信息可插,插值槽一律真实帧复制。
-        // fgRan = 本帧向 proxy 提交过 eval(含播种):outputColor 已被置
-        // NSR,真实帧转换以 NSR 为 stateBefore。
-        if (fgM > 0 && !skipEval && realMotion && !nvofHistoryReset) {
-            const bool fgResetEval = _fg->NeedsReset();
-            D3D12_RESOURCE_BARRIER fgBar[1]{
-                TransitionFromTo(_d3d12->OutputColor(*slot),
-                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+    // ---- DLSS FG 段(挂 NR 之后;eval 与直通拷贝两路汇合):backbuffer =
+    // NR 输出(outputColor;NR 关 = 直通帧),MVecs = 源尺寸稠密运动
+    // (slot.motion —— FG 激活时 follow 已被忽略,会话必为源尺寸),Depth =
+    // 静态零纹理。proxy 契约:输入 NSR / 输出 UAV;CUDA 互操作工作与槽
+    // 队列 FIFO 保序,插值输出就绪由本槽 WaitFrame 覆盖(与 NVOF densify
+    // 同款论证)。倍数 M:同一条 CL 上按序 eval 插值槽 1..M-1(proxy 契约
+    // "MFG indices must be evaluated in order starting at 1"),每槽紧随
+    // RGB→YUV 转换 + 独立回读(fgInterp 单纹理逐槽复用 —— 转换/回读后
+    // yuvOut 归位、fgInterp 归 COMMON,下一槽重新起步)。播种帧(会话首帧
+    // /seek 后)只提交首个 eval(带 DLSSG.Reset=1,只建历史,输出不消费);
+    // 零光流帧整块跳过 —— 无运动信息可插,插值槽一律真实帧复制。
+    // fgRan = 本帧向 proxy 提交过 eval(含播种):outputColor 已被置 NSR,
+    // 真实帧转换以 NSR 为 stateBefore。
+    if (fgM > 0 && !skipEval && realMotion && !nvofHistoryReset) {
+        const bool fgResetEval = _fg->NeedsReset();
+        D3D12_RESOURCE_BARRIER fgBar[1]{
+            TransitionFromTo(_d3d12->OutputColor(*slot),
+                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        cl->ResourceBarrier(1, fgBar);
+        char fgErr[160]{};
+        for (int g = 0; g < fgM - 1; ++g) {
+            if (fgResetEval && g > 0) break; // 播种帧只建历史,不产插值
+            D3D12_RESOURCE_BARRIER toUav[1]{
+                Transition(slot->fgInterp.Get(),
+                           D3D12_RESOURCE_STATE_COMMON,
+                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
-            cl->ResourceBarrier(1, fgBar);
-            char fgErr[160]{};
-            for (int g = 0; g < fgM - 1; ++g) {
-                if (fgResetEval && g > 0) break; // 播种帧只建历史,不产插值
-                D3D12_RESOURCE_BARRIER toUav[1]{
-                    Transition(slot->fgInterp.Get(),
-                               D3D12_RESOURCE_STATE_COMMON,
-                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                };
-                cl->ResourceBarrier(1, toUav);
-                if (_fg->Evaluate(cl, _d3d12->OutputColor(*slot), slot->motion.Get(),
-                                  _d3d12->Depth(), slot->fgInterp.Get(), width, height,
-                                  fgM, g + 1, false, fgErr, sizeof(fgErr))) {
-                    fgRan = true;
-                    if (fgResetEval) {
-                        // 播种帧:插值输出不消费,fgInterp 归 COMMON。
-                        D3D12_RESOURCE_BARRIER fgSeed[1]{
-                            Transition(slot->fgInterp.Get(),
-                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                       D3D12_RESOURCE_STATE_COMMON),
-                        };
-                        cl->ResourceBarrier(1, fgSeed);
-                        break;
-                    }
-                    // 有效插值:fgInterp UAV→NSR 进转换,转换收尾归 COMMON;
-                    // 回读落第 g 组缓冲(各槽独立,真实帧回读不被覆写)。
-                    D3D12_RESOURCE_BARRIER toNsr[1]{
-                        Transition(slot->fgInterp.Get(),
-                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-                    };
-                    cl->ResourceBarrier(1, toNsr);
-                    _d3d12->RecordYuvOutput(*slot, matrix, range,
-                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                            slot->fgInterp.Get(), D3D12Context::kSrvFgInterp);
-                    if (!_d3d12->RecordReadbackCopy(*slot, err, errLen, g)) {
-                        return false;
-                    }
-                    if (fgGenOk) fgGenOk[g] = true;
-                    ++fgEvaluatedCount;
-                } else {
-                    // eval 失败(会话已被闩停):fgInterp 回 COMMON,本帧全部
-                    // 插值槽降级复制;outputColor 按是否提交过 eval 回补屏障。
-                    D3D12_RESOURCE_BARRIER undo[1]{
+            cl->ResourceBarrier(1, toUav);
+            if (_fg->Evaluate(cl, _d3d12->OutputColor(*slot), slot->motion.Get(),
+                              _d3d12->Depth(), slot->fgInterp.Get(), width, height,
+                              fgM, g + 1, false, fgErr, sizeof(fgErr))) {
+                fgRan = true;
+                if (fgResetEval) {
+                    // 播种帧:插值输出不消费,fgInterp 归 COMMON。
+                    D3D12_RESOURCE_BARRIER fgSeed[1]{
                         Transition(slot->fgInterp.Get(),
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                    D3D12_RESOURCE_STATE_COMMON),
                     };
-                    cl->ResourceBarrier(1, undo);
-                    // 失败必须进 timing log(dlssfg 内部已留痕;此处补帧号锚点)。
-                    char msg[224];
-                    std::snprintf(msg, sizeof(msg),
-                                  "DLSSNR STATUS: dlssfg frame %d slot %d degraded to dup: %.140s",
-                                  n, g + 1, fgErr);
-                    TimingStatusLine(msg);
+                    cl->ResourceBarrier(1, fgSeed);
                     break;
                 }
-            }
-            if (!fgRan) {
-                // 全部槽失败(首次 eval 即败):outputColor 回补 UAV,恢复
-                // 帧末不变量(fgRan=false 时真实帧转换以 UAV 为 stateBefore)。
-                D3D12_RESOURCE_BARRIER fgUndo[1]{
-                    TransitionFromTo(_d3d12->OutputColor(*slot),
-                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                // 有效插值:fgInterp UAV→NSR 进转换,转换收尾归 COMMON;
+                // 回读落第 g 组缓冲(各槽独立,真实帧回读不被覆写)。
+                D3D12_RESOURCE_BARRIER toNsr[1]{
+                    Transition(slot->fgInterp.Get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 };
-                cl->ResourceBarrier(1, fgUndo);
+                cl->ResourceBarrier(1, toNsr);
+                _d3d12->RecordYuvOutput(*slot, matrix, range,
+                                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                        slot->fgInterp.Get(), D3D12Context::kSrvFgInterp);
+                if (!_d3d12->RecordReadbackCopy(*slot, err, errLen, g)) {
+                    return false;
+                }
+                if (fgGenOk) fgGenOk[g] = true;
+                ++fgEvaluatedCount;
+            } else {
+                // eval 失败(会话已被闩停):fgInterp 回 COMMON,本帧全部
+                // 插值槽降级复制;outputColor 按是否提交过 eval 回补屏障。
+                D3D12_RESOURCE_BARRIER undo[1]{
+                    Transition(slot->fgInterp.Get(),
+                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                               D3D12_RESOURCE_STATE_COMMON),
+                };
+                cl->ResourceBarrier(1, undo);
+                // 失败必须进 timing log(dlssfg 内部已留痕;此处补帧号锚点)。
+                char msg[224];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: dlssfg frame %d slot %d degraded to dup: %.140s",
+                              n, g + 1, fgErr);
+                TimingStatusLine(msg);
+                break;
             }
-        } else if (_fg && _fg->Enabled()) {
-            // 门关帧(面板关/诊断跳过/播种/零光流)不向 proxy 提交 eval:
-            // 其内部 backbuffer 历史滞留在跳过前 —— 置位重置让恢复帧重新
-            // 播种(播种帧插值输出照常降级复制),否则"关→开"/播种后的
-            // 首个 eval 用陈旧历史插出鬼影。逐帧置位无害(布尔位;会话
-            // 已死时 Enabled() 为 false 不进此分支)。
-            _fg->ResetHistory();
         }
-        // guidance 纹理归位 COMMON(仅 realMotion 帧动过:播种/失败帧的
-        // 发布走静态零纹理,per-slot motion 全程 COMMON 不被触碰)。
-        // follow 内部管线只动过 reducedMotion/reducedConfidence —— 源尺寸
-        // 对全程 COMMON,对它做 NSR→COMMON 是非法屏障。
-        if (realMotion) {
-            if (densifyInternal) {
+        if (!fgRan) {
+            // 全部槽失败(首次 eval 即败):outputColor 回补 UAV,恢复
+            // 帧末不变量(fgRan=false 时真实帧转换以 UAV 为 stateBefore)。
+            D3D12_RESOURCE_BARRIER fgUndo[1]{
+                TransitionFromTo(_d3d12->OutputColor(*slot),
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            };
+            cl->ResourceBarrier(1, fgUndo);
+        }
+    } else if (_fg && _fg->Enabled()) {
+        // 门关帧(面板关/诊断跳过/播种/零光流)不向 proxy 提交 eval:
+        // 其内部 backbuffer 历史滞留在跳过前 —— 置位重置让恢复帧重新
+        // 播种(播种帧插值输出照常降级复制),否则"关→开"/播种后的
+        // 首个 eval 用陈旧历史插出鬼影。逐帧置位无害(布尔位;会话
+        // 已死时 Enabled() 为 false 不进此分支)。
+        _fg->ResetHistory();
+    }
+    // guidance 纹理归位 COMMON(仅 realMotion 帧动过:播种/失败帧的
+    // 发布走静态零纹理,per-slot motion 全程 COMMON 不被触碰)。
+    // follow 内部管线只动过 reducedMotion/reducedConfidence —— 源尺寸
+    // 对全程 COMMON,对它做 NSR→COMMON 是非法屏障。
+    if (realMotion) {
+        if (densifyInternal) {
+            D3D12_RESOURCE_BARRIER gBackR[2]{
+                TransitionFromTo(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            };
+            cl->ResourceBarrier(2, gBackR);
+        } else {
+            D3D12_RESOURCE_BARRIER gBack[2]{
+                TransitionFromTo(slot->motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                TransitionFromTo(slot->confidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+            };
+            cl->ResourceBarrier(2, gBack);
+            if (guidanceDown) {
                 D3D12_RESOURCE_BARRIER gBackR[2]{
                     TransitionFromTo(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                     TransitionFromTo(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
                 };
                 cl->ResourceBarrier(2, gBackR);
-            } else {
-                D3D12_RESOURCE_BARRIER gBack[2]{
-                    TransitionFromTo(slot->motion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                    TransitionFromTo(slot->confidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                };
-                cl->ResourceBarrier(2, gBack);
-                if (scaling) {
-                    D3D12_RESOURCE_BARRIER gBackR[2]{
-                        TransitionFromTo(slot->reducedMotion.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                        TransitionFromTo(slot->reducedConfidence.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
-                    };
-                    cl->ResourceBarrier(2, gBackR);
-                }
             }
         }
     }
 
-    // RGB→YUV(两分支汇合处):outputColor 到达时 = UAV(evaluate/垂直
-    // 合成写)/ COMMON(诊断拷贝)/ NSR(FG eval 已消费 backbuffer),
-    // RecordYuvOutput 统一 NSR 化后转换、收尾归 COMMON;yuvOut 留 UAV 交
-    // readback。
+    // RGB→YUV(三路汇合处):outputColor 到达时 = UAV(evaluate/垂直合成
+    // 写 / 直通拷贝写)/ NSR(FG eval 已消费 backbuffer),RecordYuvOutput
+    // 统一 NSR 化后转换、收尾归 COMMON;yuvOut 留 UAV 交 readback。
     _d3d12->RecordYuvOutput(*slot, matrix, range,
-                            skipEval ? D3D12_RESOURCE_STATE_COMMON
-                                     : (fgRan ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                              : D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+                            fgRan ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                  : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     if (!_d3d12->RecordReadbackCopy(*slot, err, errLen)) {
         return false;
     }

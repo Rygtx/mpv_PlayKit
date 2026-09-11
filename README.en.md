@@ -77,6 +77,7 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 
 | Parameter | Range | Default | Description |
 |---|---|---|---|
+| `NR_Enabled` | True/False | True | NR master switch; False = skip the denoise inference and pass source frames through while **frame generation / optical flow keep working untouched**; with both NR and FG off the whole filter initializes nothing at zero cost; panel toggles apply immediately within an activated session |
 | `Preset` | 0–3 | 0 | NR preset level (create-time parameter; switching triggers hot rebuild) |
 | `Style` | 0–2 | 0 | Style level (0 default / 1 natural / 2 cinematic) |
 | `Intensity` | 0–1 | 1.0 | Intensity |
@@ -90,6 +91,10 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 | `Residual_Multiplier` | 1.0–2.0 | 1.0 | Residual multiplier, compensating detail together with internal resolution scaling |
 | `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA optical-flow guidance level (0 = zero guidance; 1–5 use hardware optical flow to reduce motion-scene temporal artifacts; higher is more accurate but slower) |
 | `Nvof_Follow_Scaling` | True/False | False | Optical-flow input follows internal downsampling (requires Scaling_Enabled; greatly reduces optical-flow engine load at a slight motion-accuracy cost) |
+| `Fg_Enabled` | True/False | False | DLSS frame generation (chained after denoise, output fps ×2–×4; requires `ngx\version.dll`, falls back to 1:1 on init failure) |
+| `Fg_Multiplier` | 2–4 | 2 | Interpolation multiplier (live via panel, applied at source-frame boundaries; 24fps ×3 = 72fps) |
+| `Fg_Router` | 0–1 | 0 | Proxy GPU architecture route (0 = SM86/RTX 30, 1 = SM75/RTX 20; mpv restart required after switching) |
+| `Fg_Backend` | 0–2 | 0 | FG backend (0 = auto, official first with proxy fallback; 1 = official NGX only, RTX 40/50; 2 = proxy only. A pinned backend never falls back across backends; takes effect on the next seek) |
 | `H_Max` | integer | 0 | Output height cap (sources above it skip processing; 0 = unlimited) |
 
 Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 1); lowering levels does not save much frame time (NGX fixed cost dominates) and mainly affects high-frequency detail — 50–75% is recommended for 1080p content, 25% only for extreme power-saving scenarios; for 4K sources pair with `Input_Resolution = 50`. 4K full-resolution (res=100%) inference is about 200ms/frame — a physical ceiling, not stuttering.

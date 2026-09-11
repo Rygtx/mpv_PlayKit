@@ -666,6 +666,24 @@ void DrawUi() noexcept {
         y += rowH;
     };
 
+    // 降噪增强总开关(整行;live 即时,只关降噪不影响补帧/光流)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("降噪增强");
+    if (ImGui::IsItemHovered())
+        ShowTip("DLSSNR 降噪总开关:关闭 = 跳过降噪推理输出源帧(补帧/光流\n"
+                "照常工作,不受影响)。已激活的会话内切换立即生效;\n"
+                "降噪与帧生成都关时,整个滤镜零初始化零开销(重开需下个 seek,\n"
+                "热上下文保留,同参数重开秒回)。面板开关优先于 vpy 的 NR_Enabled。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        bool v = g_app.params.nrEnabled != 0;
+        if (ImGui::Checkbox("##nr_enabled", &v)) {
+            g_app.params.nrEnabled = v ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
     // (预设 | 风格)
     pairLabel(0, "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。");
     pairCombo("preset", &DlssnrParams::preset, 4, kPresetNames, 0);

@@ -28,6 +28,7 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     auto writeX100 = [&](const wchar_t *key, float v) {
         writeInt(key, static_cast<int>(std::lround(v * 100.0f)));
     };
+    writeInt(L"nr_enabled", p.nrEnabled ? 1 : 0);
     writeInt(L"preset", p.preset);
     writeInt(L"style", p.style);
     writeX100(L"intensity_x100", p.intensity);
@@ -70,6 +71,7 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
         return std::clamp(
             static_cast<float>(readInt(key, static_cast<int>(def * 100))) / 100.0f, lo, hi);
     };
+    p.nrEnabled = readInt(L"nr_enabled", p.nrEnabled) != 0;
     p.preset = std::clamp(readInt(L"preset", p.preset), kPresetMin, kPresetMax);
     p.style = std::clamp(readInt(L"style", p.style), kStyleMin, kStyleMax);
     p.intensity = readX100(L"intensity_x100", p.intensity, kStrengthMin, kStrengthMax);
