@@ -95,6 +95,7 @@ struct AppState {
     int fgMult = 0;          // SK_FG_MULT: 当前插帧倍数(未激活 = 0)
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
+    float segFg = 0.0f;
     bool hasSegments = false;
     bool statsDirty = false; // LoadStats changed something on screen (redraw gate)
 };
@@ -322,13 +323,14 @@ void LoadStats() noexcept {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d(原生)", w, h);
             }
-            // 五段读每帧 last 值(与 NGX 延迟同语义):EMA 稳态冻结,
+            // 六段读每帧 last 值(与 NGX 延迟同语义):EMA 稳态冻结,
             // last 随帧呼吸(见 panel_ipc.h SK_*_LAST 注释)。
             g_app.segPack = static_cast<float>(JsonGetFloat(body, SK_PACK_LAST, 0));
             g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
             g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_LAST, 0));
             g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_LAST, 0));
             g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_NVOF_LAST, 0));
+            g_app.segFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
             g_app.hasSegments = g_app.segGpu > 0;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
             char gnPat[32];
@@ -349,6 +351,7 @@ void LoadStats() noexcept {
             g_app.statsBig[0] = 0;
             g_app.statsRes[0] = 0;
             g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = g_app.segNvof = 0.0f;
+            g_app.segFg = 0.0f;
             g_app.hasSegments = false;
             g_app.fps = 0.0;
         }
@@ -363,7 +366,7 @@ void LoadStats() noexcept {
                        before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
                        before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
                        before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack ||
-                       before.segNvof != g_app.segNvof;
+                       before.segNvof != g_app.segNvof || before.segFg != g_app.segFg;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,17 +496,19 @@ void DrawUi() noexcept {
     if (timingsOpen && g_app.hasSegments) {
         // 分段 = 帧内执行顺序:nvof(光流等待)在 pack 之后、NGX 录制之前。
         // of=0 时 nvof 恒 0,零值段由下方 <1e-3f 跳过,时间线退回四段。
-        const float total = g_app.segPack + g_app.segNvof + g_app.segEval + g_app.segGpu + g_app.segUnpack;
+        const float total = g_app.segPack + g_app.segNvof + g_app.segEval +
+                            g_app.segFg + g_app.segGpu + g_app.segUnpack;
         if (total > 0.5f) {
             struct Seg { float v; ImU32 c; const char *name; };
-            const Seg segs[5]{
+            const Seg segs[6]{
                 { g_app.segPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
                 { g_app.segNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
                 { g_app.segEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
+                { g_app.segFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧)" },
                 { g_app.segGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NGX+残差)" },
                 { g_app.segUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
-            constexpr int kSegCount = 5;
+            constexpr int kSegCount = 6;
             // 实际要画的段数(零值段跳过)。BeginTable 的列数必须与之相等:
             // imgui 对本帧未 TableSetupColumn 的列按 SizingStretchSame 默认
             // 权重 1.0 补齐,而可见段权重和恒为 1.0 —— 空列恰好占掉一半
@@ -750,49 +755,26 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-    // FG 后端(整行;下个 seek 生效;显式档失败不跨后端回退)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("FG 后端");
-    if (ImGui::IsItemHovered())
-        ShowTip("DLSS 帧生成后端:自动 = 驱动报告 DLSSG 能力(RTX 40/50)时走官方\n"
-                "签名 nvngx_dlssg.dll,否则经 dlssg_for_sm86 代理(RTX 30/20 唯一路径)。\n"
-                "显式选官方/代理后不再跨后端回退:选错档初始化失败 = FG 关,输出 1:1;\n"
-                "改动在下个 seek 生效,无需重启 mpv。仅官方 NGX 档 30/20 系会被拒载。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    {
-        const int items = 3;
-        const char *labels[items] = { "自动 (官方优先)", "官方 NGX (RTX 40/50)", "代理 (RTX 30/20)" };
-        int sel = std::clamp(g_app.params.fgBackend, kFgBackendMin, kFgBackendMax);
-        ImGui::SetNextItemWidth(150 * s);
-        if (ImGui::Combo("##fg_backend", &sel, labels, items)) {
-            g_app.params.fgBackend = sel;
-            g_app.liveDirty = true;
-        }
-    }
-    y += rowH;
-
-    // FG 路由(整行;进程级,重启 mpv 生效;仅官方后端下无效)
+    // FG 路由(整行;进程级,重启 mpv 生效;单档覆盖后端与内核架构)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("FG 路由");
     if (ImGui::IsItemHovered())
-        ShowTip("dlssg_for_sm86 代理的 GPU 架构路由:SM86 = RTX 30 系(Ampere),\n"
-                "SM75 = RTX 20 系(Turing;上游物理 Turing 验证仍有限)。\n"
-                "插件自动把路由写入 vs-plugins\\ngx\\dlssg_sm86.ini,无需手动改文件;\n"
-                "代理模块进程内常驻,切换后需重启 mpv 生效;仅官方 NGX 后端下无效。");
+        ShowTip("DLSS 帧生成路由:自动 = 官方可用(RTX 40/50)走官方签名运行时,\n"
+                "否则经 dlssg_for_sm86 代理(回落路由 SM86;RTX 20 系请选 SM75)。\n"
+                "SM86/SM75 = 固定走代理并写入 vs-plugins\\ngx\\dlssg_sm86.ini;\n"
+                "官方 NGX = 固定官方档(30/20 系被架构门禁拒载 → 补帧关,不回落)。\n"
+                "进程级,切换后重启 mpv 生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
-        const bool routerIdle =
-            std::clamp(g_app.params.fgBackend, kFgBackendMin, kFgBackendMax) == 1;
-        if (routerIdle) ImGui::BeginDisabled();
-        const int items = 2;
-        const char *labels[items] = { "SM86 (RTX 30 系)", "SM75 (RTX 20 系)" };
-        int sel = std::clamp(g_app.params.fgRouter, kFgRouterMin, kFgRouterMax);
-        ImGui::SetNextItemWidth(150 * s);
-        if (ImGui::Combo("##fg_router", &sel, labels, items)) {
-            g_app.params.fgRouter = sel;
+        const int items = 4;
+        const char *labels[items] = { "自动 (官方优先)", "SM86 (RTX 30 系)", "SM75 (RTX 20 系)",
+                                      "官方 NGX (RTX 40/50 系)" };
+        int sel = std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax);
+        ImGui::SetNextItemWidth(170 * s);
+        if (ImGui::Combo("##fg_route", &sel, labels, items)) {
+            g_app.params.fgRoute = sel;
             g_app.liveDirty = true;
         }
-        if (routerIdle) ImGui::EndDisabled();
     }
     y += rowH;
 

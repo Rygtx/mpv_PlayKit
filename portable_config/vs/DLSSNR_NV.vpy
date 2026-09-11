@@ -35,8 +35,7 @@ Motion_Vector_Quality = 0
 Nvof_Follow_Scaling = False
 Fg_Enabled = False
 Fg_Multiplier = 2
-Fg_Router = 0
-Fg_Backend = 0
+Fg_Route = 0
 H_Max = 0
 ## <True|False> 降噪总开关 (默认 True): False = 跳过降噪推理输出源帧,
 ##          补帧/光流照常工作不受影响; 降噪与帧生成都关时整个滤镜
@@ -73,13 +72,11 @@ H_Max = 0
 ##          显示端建议刷新率 >= 输出帧率
 ##          面板开关: 会话内关 = 插值帧改复制真实帧 (帧数不变);
 ##          未激活会话内开 = 下次播放生效
-## <0-1> 整数, FG 路由 (默认 0): 0 = SM86 (RTX 30 系), 1 = SM75 (RTX 20 系)
+## <0-3> 整数, FG 路由 (默认 0): 0 = 自动 (官方优先, 不可用回落代理 SM86),
+##          1 = SM86 (RTX 30 系走代理), 2 = SM75 (RTX 20 系走代理),
+##          3 = 官方 NGX (RTX 40/50 系, 30/20 系被拒载不回落)
 ##          插件自动把路由写入 ngx\dlssg_sm86.ini (无需手动改文件);
-##          代理模块进程内常驻, 切换后重启 mpv 生效; 面板保存的设置优先
-## <0-2> 整数, FG 后端 (默认 0): 0 = 自动 (官方优先, 不可用回落代理),
-##          1 = 仅官方 NGX (RTX 40/50), 2 = 仅代理 (RTX 30/20)
-##          显式档初始化失败直接 1:1, 不跨后端回退; 改动下个 seek 生效;
-##          面板 "FG 后端" 选项同步此值, 面板保存的设置优先
+##          进程级, 切换后重启 mpv 生效; 面板保存的设置优先
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
 
@@ -126,8 +123,7 @@ else :
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
 		fg_enabled = int(Fg_Enabled),
 		fg_multiplier = Fg_Multiplier,
-		fg_router = int(Fg_Router),
-		fg_backend = int(Fg_Backend),
+		fg_route = int(Fg_Route),
 	)
 
 ret.set_output()

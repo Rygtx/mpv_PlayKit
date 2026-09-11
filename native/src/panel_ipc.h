@@ -29,10 +29,12 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // (插帧倍数 2-4,live,源帧边界生效 —— 结构体增长,新旧混跑按 magic 拒读);
 // v9 adds fgRouter (FG 路由 0=SM86/1=SM75,进程级,重启 mpv 生效); v10 adds
 // fgBackend (FG 后端 0=自动/1=官方 NGX/2=代理,下个 seek 生效); v11 adds
-// nrEnabled (NR 总开关 0/1,默认 1;0 = 跳过降噪推理,补帧/光流不受影响)。
+// nrEnabled (NR 总开关 0/1,默认 1;0 = 跳过降噪推理,补帧/光流不受影响);
+// v12 merges fgRouter+fgBackend into fgRoute (0=自动/1=SM86/2=SM75/3=官方
+// NGX,进程级,重启 mpv 生效 —— 后端由硬件决定,自动档总能选对,单控件足够)。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x424C5344u; // "DSLB" (v11, 版本位走 hex:9 之后是 A/B)
+constexpr uint32_t PAYLOAD_MAGIC = 0x434C5344u; // "DSLC" (v12, 版本位走 hex:9 之后是 A/B/C)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -61,8 +63,7 @@ struct PanelPayload {
     int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
     int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,源帧边界生效)
-    int32_t fgRouter;            // 0/1 FG 路由(v9;0=SM86,1=SM75,重启 mpv 生效)
-    int32_t fgBackend;           // 0/1/2 FG 后端(v10;0=自动,1=官方 NGX,2=代理,下个 seek 生效)
+    int32_t fgRoute;             // 0-3 FG 路由(v12;0=自动,1=SM86,2=SM75,3=官方 NGX,重启生效)
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
 };
 #pragma pack(pop)
@@ -103,13 +104,10 @@ inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.inputResolutionPercent = std::clamp(pl.inputResolution, kResPctMin, kResPctMax);
     p.scalingEnabled = pl.scalingEnabled != 0;
     p.fgEnabled = pl.fgEnabled != 0;
-    // Router 不进 LoadLiveParams:proxy 模块进程内钉住,live 改动无运行时
-    // 效果;只在滤镜创建(下个 seek)与 proxy INI 同步时消费,重启后全面生效。
-    p.fgRouter = std::clamp(pl.fgRouter, kFgRouterMin, kFgRouterMax);
-    // Backend 同样不进 LoadLiveParams:后端选择发生在冷初始化。与 Router
-    // 不同的是它参与 hotMatch(plugin.cpp),面板改动会在下个 seek 触发冷
-    // 重建并当场生效 —— 无需重启 mpv。
-    p.fgBackend = std::clamp(pl.fgBackend, kFgBackendMin, kFgBackendMax);
+    // Route 进程级(proxy 模块钉住 + 后端选择都随重启对齐):不进
+    // LoadLiveParams,不参与 hotMatch;只在滤镜创建与 proxy INI 同步时
+    // 消费,重启后全面生效。
+    p.fgRoute = std::clamp(pl.fgRoute, kFgRouteMin, kFgRouteMax);
 }
 
 // Parameter fields only; the caller fills seq/generation/save/reset/log.
@@ -136,8 +134,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.nvofFollowScaling = p.nvofFollowScaling ? 1 : 0;
     pl.fgEnabled = p.fgEnabled ? 1 : 0;
     pl.fgMultiplier = std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax);
-    pl.fgRouter = std::clamp(p.fgRouter, kFgRouterMin, kFgRouterMax);
-    pl.fgBackend = std::clamp(p.fgBackend, kFgBackendMin, kFgBackendMax);
+    pl.fgRoute = std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
     return pl;
 }
 
@@ -159,11 +156,14 @@ static_assert(sizeof(StatsPayload) == PAYLOAD_SIZE, "stats payload must fit the 
 // format strings (dlssnr_context.cpp / d3d12_context.cpp) interpolate exactly
 // these; the panel reader is constant-driven.
 inline constexpr const char *SK_GPU_LAST = "gpu_last";
-// 五段用时走每帧 last(与 gpu_last 同语义):EMA 是 120 帧滚动平均,稳态
+// 六段用时走每帧 last(与 gpu_last 同语义):EMA 是 120 帧滚动平均,稳态
 // 播放时逐帧变化 <0.1ms,面板"处理用时"会冻结成"停几秒 + 突跳"的观感;
 // last 随帧呼吸。perf 日志行仍用 EMA(诊断要看趋势,不受影响)。
 inline constexpr const char *SK_PACK_LAST = "pack_last";
 inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
+// DLSS FG 段(补帧 eval 提交的 CPU 墙钟,与 eval_cpu 同口径;fg 关/门关帧
+// ≈ 0,面板零值段自动隐藏)。其 GPU 执行仍计入 gpu 段(同条槽 CL)。
+inline constexpr const char *SK_FG_LAST = "fg_last";
 // NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
 // 时恒 0,面板零值段自动隐藏)。与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
 inline constexpr const char *SK_NVOF_LAST = "nvof_last";

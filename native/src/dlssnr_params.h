@@ -21,18 +21,20 @@ inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
 // live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
 // 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
 inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
-// DLSS 帧生成 GPU 架构路由(0=SM86 Ampere/RTX 30 系,1=SM75 Turing/RTX 20 系)。
-// 进程级参数:proxy 模块(dlssg_for_sm86 version.dll)进程内钉住、永不卸载,
-// 改动只影响下次 proxy 加载 —— 面板提示"重启 mpv 生效"。插件在 proxy
+// DLSS 帧生成路由(0-3,单字段合并原 Router+Backend 两概念)。
+//   0 = 自动:官方优先,不可用回落 proxy(回落路由 SM86 —— proxy 无架构
+//       自动探测,RTX 20 系请显式选 SM75)
+//   1 = SM86:固定走 proxy,Router=SM86(RTX 30 系)
+//   2 = SM75:固定走 proxy,Router=SM75(RTX 20 系)
+//   3 = 官方 NGX:固定官方签名运行时(RTX 40/50;30/20 系被架构门禁拒载
+//       → 补帧关,不回落)
+// 进程级,重启 mpv 生效:proxy 模块进程内钉住(SM86/SM75 切换只影响下次
+// 加载),后端选择同样随重启对齐 —— 不参与 hotMatch。插件在 proxy
 // LoadLibrary 前把该值自动写入 proxy 同目录 dlssg_sm86.ini 的 Router 键
 // (plugin.cpp SyncProxyRouterIni),用户不接触 INI 文件。
-inline constexpr int kFgRouterMin = 0, kFgRouterMax = 1;
-// DLSS 帧生成后端(0=自动:官方优先、不可用回落 proxy;1=仅官方 NGX;2=仅
-// proxy)。显式档失败不跨后端回退(选错档 = FG 关,输出 1:1),免去自动档
-// 在能力外硬件上每次创建的官方双探开销(3080 实测:先 capability 拒载才
-// 落 proxy)。改动在下个 seek 生效:fgBackend 参与 plugin.cpp hotMatch,
-// 变化触发冷重建重选后端(与 fgEnabled 同节奏)。
-inline constexpr int kFgBackendMin = 0, kFgBackendMax = 2;
+inline constexpr int kFgRouteMin = 0, kFgRouteMax = 3;
+inline constexpr int kFgRouteAuto = 0, kFgRouteProxySm86 = 1,
+                     kFgRouteProxySm75 = 2, kFgRouteOfficial = 3;
 
 struct DlssnrParams {
     // NR 总开关(0/1,默认 1)—— 只关降噪,不影响补帧/光流:
@@ -100,12 +102,9 @@ struct DlssnrParams {
     // 插值),输出帧时长 = 源时长/M。源帧边界生效(当前源帧按触及时的 M
     // 走完),无重建/重启。fgEnabled=0 时忽略。
     int fgMultiplier = 2;
-    // DLSS 帧生成路由(0=SM86 RTX 30 系,1=SM75 RTX 20 系;进程级,重启
-    // mpv 生效):见 kFgRouterMin 注释 —— 面板选项,插件自动同步 proxy INI。
-    int fgRouter = 0;
-    // DLSS 帧生成后端(0=自动 官方优先回落 proxy,1=仅官方 NGX RTX 40/50,
-    // 2=仅 proxy RTX 30/20;下个 seek 生效):见 kFgBackendMin 注释。
-    int fgBackend = 0;
+    // DLSS 帧生成路由(0=自动 官方优先回落 proxy,1=SM86,2=SM75,3=仅官方
+    // NGX;进程级,重启 mpv 生效):见 kFgRouteMin 注释。
+    int fgRoute = 0;
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence

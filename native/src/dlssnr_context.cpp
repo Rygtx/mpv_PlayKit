@@ -600,12 +600,12 @@ bool DlssnrContext::Initialize(
     // 输入尺寸决策能感知 FG)。失败优雅降级:滤镜回退 1:1 输出(不翻倍
     // 帧率),NR 不受影响 —— FG 的 SEH 走本地闩锁,不进全局 NgxRuntimeGuard。
     if (_fgRequested) {
-        // FG 后端选择(0=自动:官方优先、不可用回落 proxy;1=仅官方 NGX;
-        // 2=仅 proxy)。显式档失败不跨后端回退 —— 免去自动档在能力外硬件
-        // 上每次创建的官方双探开销(3080 实测:先 capability 拒载才落
-        // proxy),选错档 = FG 关,输出 1:1。
-        const int fgBackend =
-            std::clamp(_shared->Snapshot().fgBackend, kFgBackendMin, kFgBackendMax);
+        // FG 路由选择(0=自动:官方优先、不可用回落 proxy(SM86);1=SM86;
+        // 2=SM75;3=仅官方 NGX)。钉档失败不跨后端回退(选错档 = FG 关,
+        // 输出 1:1),免去自动档在能力外硬件上每次创建的官方双探开销
+        // (3080 实测:先 capability 拒载才落 proxy)。
+        const int fgRoute =
+            std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax);
         // 官方 NGX 分支(PORTING #8):官方签名 nvngx_dlssg.dll 与模型
         // DLL 同目录(ngx\)部署且驱动报告 FG 能力(RTX 40/50)时,经共享
         // NGX core 走官方签名链 —— 免自签 proxy 与杀软误报面,cubin 由
@@ -626,7 +626,7 @@ bool DlssnrContext::Initialize(
             }
         }
         bool fgUp = false;
-        if (fgBackend != 2 && officialDll[0]) {
+        if ((fgRoute == kFgRouteAuto || fgRoute == kFgRouteOfficial) && officialDll[0]) {
             DWORD sehCode = 0;
             const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
             if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
@@ -642,7 +642,8 @@ bool DlssnrContext::Initialize(
                     std::snprintf(msg, sizeof(msg),
                                   "DLSSNR STATUS: dlssfg official init failed (%s); %s",
                                   fgErr,
-                                  fgBackend == 1 ? "FG off (backend pinned)" : "trying proxy");
+                                  fgRoute == kFgRouteOfficial ? "FG off (route pinned)"
+                                                              : "trying proxy");
                     DbgLine(msg);
                     TimingStatusLine(msg);
                     _fg.reset();
@@ -651,12 +652,12 @@ bool DlssnrContext::Initialize(
                     _fgParams = nullptr;
                 }
             } else {
-                TimingStatusLine(fgBackend == 1
-                                     ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (backend pinned)"
+                TimingStatusLine(fgRoute == kFgRouteOfficial
+                                     ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
                                      : "DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
             }
         }
-        if (!fgUp && fgBackend != 1 && fgDllPath && fgDllPath[0]) {
+        if (!fgUp && fgRoute != kFgRouteOfficial && fgDllPath && fgDllPath[0]) {
             DWORD sehCode = 0;
             const NVSDK_NGX_Result pr = CoreAllocateParametersSafely(&_fgParams, &sehCode);
             if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
@@ -681,14 +682,15 @@ bool DlssnrContext::Initialize(
             }
         }
         if (!fgUp) {
-            // 显式档连尝试都没发生(部署缺失)时,失败原因没有其它出口,
+            // 钉档连尝试都没发生(部署缺失)时,失败原因没有其它出口,
             // 这里补一行;各尝试路径自身失败已有带因状态行。
-            if (fgBackend == 1 && !officialDll[0]) {
+            if (fgRoute == kFgRouteOfficial && !officialDll[0]) {
                 TimingStatusLine(
-                    "DLSSNR STATUS: dlssfg backend pinned official but nvngx_dlssg.dll missing; 1:1 output");
-            } else if (fgBackend == 2 && !(fgDllPath && fgDllPath[0])) {
+                    "DLSSNR STATUS: dlssfg route pinned official but nvngx_dlssg.dll missing; 1:1 output");
+            } else if ((fgRoute == kFgRouteProxySm86 || fgRoute == kFgRouteProxySm75) &&
+                       !(fgDllPath && fgDllPath[0])) {
                 TimingStatusLine(
-                    "DLSSNR STATUS: dlssfg backend pinned proxy but version.dll missing; 1:1 output");
+                    "DLSSNR STATUS: dlssfg route pinned proxy but version.dll missing; 1:1 output");
             }
             _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
         }
@@ -1159,6 +1161,7 @@ bool DlssnrContext::ProcessFrame(
     // receives a per-frame segment string for the VS-log channel.
     const bool vsTiming = timingOut && timingLen > 0;
     LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3{}, t4{};
+    LARGE_INTEGER tFg0{}, tFg1{};    // FG 段 CPU 墙钟(stats fg_last)
     LARGE_INTEGER tSlot0{}, tSlot1{}; // AcquireSlot 等待(perf 行 slot=)
     LARGE_INTEGER tLock0{}, tLock1{}; // evaluate 互斥等待(perf 行 lock=)
     QueryPerformanceFrequency(&qpcFreq);
@@ -1556,6 +1559,7 @@ bool DlssnrContext::ProcessFrame(
     // 零光流帧整块跳过 —— 无运动信息可插,插值槽一律真实帧复制。
     // fgRan = 本帧向 proxy 提交过 eval(含播种):outputColor 已被置 NSR,
     // 真实帧转换以 NSR 为 stateBefore。
+    QueryPerformanceCounter(&tFg0);
     if (fgM > 0 && !skipEval && realMotion && !nvofHistoryReset) {
         const bool fgResetEval = _fg->NeedsReset();
         D3D12_RESOURCE_BARRIER fgBar[1]{
@@ -1639,6 +1643,7 @@ bool DlssnrContext::ProcessFrame(
         // 已死时 Enabled() 为 false 不进此分支)。
         _fg->ResetHistory();
     }
+    QueryPerformanceCounter(&tFg1);
     // guidance 纹理归位 COMMON(仅 realMotion 帧动过:播种/失败帧的
     // 发布走静态零纹理,per-slot motion 全程 COMMON 不被触碰)。
     // follow 内部管线只动过 reducedMotion/reducedConfidence —— 源尺寸
@@ -1864,6 +1869,7 @@ bool DlssnrContext::ProcessFrame(
         // see NOTE above); the submit+wait wall clock stands in for it.
         const double gpuWaitMs = ms(t2, t3, qpcFreq);
         const double unpackMs = ms(t3, t4, qpcFreq);
+        const double fgMs = ms(tFg0, tFg1, qpcFreq);
         // Magpie-style perf log line into dlssnr_timing.log (time-gated ≥1s,
         // see perfDue below). TimingLog takes g_timingMutex itself — format
         // the line under the lock, log outside of it, or this thread
@@ -1875,7 +1881,8 @@ bool DlssnrContext::ProcessFrame(
         double gpuLast = 0.0, gpuEma = 0.0, packEma = 0.0, nvofEma = 0.0,
                evalCpuEma = 0.0, unpackEma = 0.0;
         const double packLast = packMs, nvofLast = nvofMs,
-                     evalCpuLast = evalOnlyMs, unpackLast = unpackMs;
+                     evalCpuLast = evalOnlyMs, unpackLast = unpackMs,
+                     fgLast = fgMs;
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
             const double slotWaitMs = ms(tSlot0, tSlot1, qpcFreq);
@@ -1925,7 +1932,7 @@ bool DlssnrContext::ProcessFrame(
                 // fps = 1s 窗口帧入口计数,处理帧率 < 源帧率 = 宿主侧没来帧。
             }
         }
-        // stats 每帧发布(五段 last + 512B 共享内存写,开销可忽略):面板
+        // stats 每帧发布(六段 last + 512B 共享内存写,开销可忽略):面板
         // "处理用时"随帧呼吸,不再按日志节流跳变。perf 行(磁盘 IO)按时间
         // 门 ≥1s 一行(与帧率无关)。Snapshot/FrameRateWindow 在锁外取
         // (各自持独立互斥,勿在 g_timingMutex 内叠锁)。
@@ -1940,13 +1947,13 @@ bool DlssnrContext::ProcessFrame(
                                    : (fgEvaluatedCount > 0 ? "on" : "dup"));
             snprintf(body, sizeof(body),
                      "{\"%s\":%.1f,\"%s\":%.1f,"
-                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
+                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
                      "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d}",
                      SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
                      SK_EVAL_CPU_LAST, evalCpuLast, SK_UNPACK_LAST, unpackLast,
-                     SK_NVOF_LAST, nvofLast,
+                     SK_NVOF_LAST, nvofLast, SK_FG_LAST, fgLast,
                      SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
                      SK_WIDTH, _width, SK_HEIGHT, _height,
                      SK_SCALING, _d3d12->HasScaling() ? 1 : 0,

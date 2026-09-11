@@ -70,13 +70,12 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
 // 段内,无法安全外插)。时机:每次滤镜创建、proxy LoadLibrary 之前 —— 冷
 // 路径当场生效;proxy 模块进程内钉住,已加载会话的改动按面板提示重启后生效。
 // ---------------------------------------------------------------------------
-void SyncProxyRouterIni(const std::wstring &fgDllPath, int fgRouter) noexcept {
+void SyncProxyRouterIni(const std::wstring &fgDllPath, const char *router) noexcept {
     std::error_code ec;
     const std::filesystem::path proxyDll(fgDllPath);
     if (fgDllPath.empty() || !std::filesystem::exists(proxyDll, ec)) {
         return; // proxy 未部署:FG 本就不可用,不产生孤儿 INI
     }
-    const char *router = fgRouter == 1 ? "SM75" : "SM86";
     const std::filesystem::path iniPath = proxyDll.parent_path() / "dlssg_sm86.ini";
 
     // 整文件按字节读入,扫描定位 Router 行(只认行首(允许空白)的 Router
@@ -198,7 +197,6 @@ struct FilterData {
     std::mutex fgMutex;
     bool fgActive = false;
     std::wstring fgDllPath;
-    int fgBackend = 0;                        // 创建时 FG 后端(hotMatch 比对用)
     int fgCreateMult = 2;                     // 创建时倍数(vi.fps 元数据用)
     int fgNextN = 0;                          // 下一个待映射的输出索引
     int fgCurK = -1;                          // 当前源帧(首个 slot0 请求时 ++)
@@ -226,11 +224,10 @@ struct HotContext {
     int width = 0;
     int height = 0;
     int depth = 0;
-    // FG 状态参与 hotMatch:开关/后端/代理路径变化 = 槽资源形态或后端选择
-    // 变化(FG 纹理有无、官方 NGX vs proxy),必须冷重建。
+    // FG 状态参与 hotMatch:开关/代理路径变化 = 槽资源形态变化(FG 纹理
+    // 有无),必须冷重建。路由(route)进程级,重启生效,不参与。
     bool fgEnabled = false;
     std::wstring fgDllPath;
-    int fgBackend = 0;
     bool valid = false;
 };
 HotContext &Hot() {
@@ -584,7 +581,6 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().depth = d->depth;
         Hot().fgEnabled = d->fgActive;
         Hot().fgDllPath = std::move(d->fgDllPath);
-        Hot().fgBackend = d->fgBackend;
         Hot().valid = true;
         // 探针:停放行 —— 与下一次 create 的 "hot rebind kept"/"re-init"
         // 行配对,seek 生命周期序列(bridge stopped → freed → started →
@@ -656,10 +652,9 @@ static void VS_CC DlssnrCreate(
     ApplyFlagArg(in, vsapi, "fg_enabled", initial.fgEnabled);
     // 插帧倍数 2-4(live 参数,源帧边界生效;创建值定 vi.fps 元数据)
     ApplyIntArg(in, vsapi, "fg_multiplier", initial.fgMultiplier, kFgMultMin, kFgMultMax);
-    // FG 路由 0=SM86/1=SM75(进程级,重启生效;proxy INI 由插件自动同步)
-    ApplyIntArg(in, vsapi, "fg_router", initial.fgRouter, kFgRouterMin, kFgRouterMax);
-    // FG 后端 0=自动/1=仅官方 NGX/2=仅 proxy(下个 seek 生效;hotMatch 拦截)
-    ApplyIntArg(in, vsapi, "fg_backend", initial.fgBackend, kFgBackendMin, kFgBackendMax);
+    // FG 路由 0=自动/1=SM86/2=SM75/3=仅官方(进程级,重启生效;单字段合并
+    // 原 Router+Backend —— 后端由硬件决定,自动档总能选对)
+    ApplyIntArg(in, vsapi, "fg_route", initial.fgRoute, kFgRouteMin, kFgRouteMax);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
@@ -673,12 +668,12 @@ static void VS_CC DlssnrCreate(
     {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d router=%d backend=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d route=%d",
                       d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.nvofFollowScaling ? 1 : 0, initial.fgEnabled ? 1 : 0,
-                      initial.fgMultiplier, initial.fgRouter, initial.fgBackend);
+                      initial.fgMultiplier, initial.fgRoute);
         vsdlssnr::TimingStatusLine(msg);
     }
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
@@ -741,10 +736,10 @@ static void VS_CC DlssnrCreate(
         }
     }
 
-    // FG 路由面板选项落点:proxy LoadLibrary 之前同步其同目录 INI(冷路径
-    // 当场生效;模块已钉住的会话按面板提示重启后生效)。
-    d->fgBackend = initial.fgBackend;
-    SyncProxyRouterIni(d->fgDllPath, initial.fgRouter);
+    // FG 路由落点:proxy LoadLibrary 之前同步其同目录 INI。进程级,重启
+    // mpv 生效(模块钉住);INI 即时更新,重开即最新值。
+    SyncProxyRouterIni(d->fgDllPath,
+                       initial.fgRoute == kFgRouteProxySm75 ? "SM75" : "SM86");
 
     // Eager init: the D3D12/NGX bring-up costs ~1s (165MB snippet DLL load +
     // CreateFeature + first-evaluate warm-up). Doing it here — script
@@ -758,9 +753,8 @@ static void VS_CC DlssnrCreate(
     char err[256]{};
     // depth 参与 hotMatch:同尺寸换深度(P8↔P10)走冷重建 —— 热上下文的
     // 槽纹理按旧位深建,R8 纹理遇 P10 打包 = 数据撕裂(#40-① 同族)。
-    // FG 状态(开关 + 后端 + 代理路径)同样参与:槽资源形态(FG 纹理有无)
-    // 与后端选择(官方 NGX vs proxy)随之变化,必须冷重建 —— 面板切后端
-    // 因此在下个 seek 当场生效,无需重启 mpv。
+    // FG 状态(开关 + 代理路径)同样参与:槽资源形态(FG 纹理有无)随之
+    // 变化,必须冷重建。路由(route)进程级,重启生效,不参与。
     // NR+FG 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开秒回);
     // 仅 NR 关而 FG 开仍需热复用(设备与上下文都在用)。
     const bool hotMatch = (initial.nrEnabled || initial.fgEnabled) && Hot().valid &&
@@ -768,8 +762,7 @@ static void VS_CC DlssnrCreate(
                           Hot().width == d->width && Hot().height == d->height &&
                           Hot().depth == d->depth &&
                           Hot().fgEnabled == (initial.fgEnabled != 0) &&
-                          Hot().fgDllPath == d->fgDllPath &&
-                          Hot().fgBackend == d->fgBackend;
+                          Hot().fgDllPath == d->fgDllPath;
     if (hotMatch) {
         d->d3d12 = std::move(Hot().d3d12);
         d->ngx = std::move(Hot().ngx);
@@ -933,8 +926,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "nvof_follow_scaling:int:opt;"
         "fg_enabled:int:opt;"
         "fg_multiplier:int:opt;"
-        "fg_router:int:opt;"
-        "fg_backend:int:opt;"
+        "fg_route:int:opt;"
         "fg_dll:data:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);

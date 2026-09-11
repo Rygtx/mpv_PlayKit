@@ -65,7 +65,7 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   vs-plugins\ngx\nvngx_dlssnr.dll     DLSSNR 模型 (NVIDIA DLSS SDK 310.9.0)
   vs-plugins\ngx\version.dll          DLSS 帧生成代理 (dlssg_for_sm86 原生实现, 自签名, RTX 30/20 系)
   vs-plugins\ngx\dlssg_sm86.ini       帧生成代理配置 (Router 由面板 FG 路由选项自动写入)
-  vs-plugins\ngx\nvngx_dlssg.dll      DLSS 官方帧生成运行时 (NVIDIA 签名, RTX 40/50 系; 面板 "FG 后端" 可选)
+  vs-plugins\ngx\nvngx_dlssg.dll      DLSS 官方帧生成运行时 (NVIDIA 签名, RTX 40/50 系; 面板 "FG 路由" 可选)
 
 安装 (已有 mpv-lazy, 建议与打包基线同版或更新)
   1. 备份你的 portable_config\ (若有个人修改)
@@ -82,8 +82,8 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   删除 vs-plugins\dlssnr_ui.ini 可恢复脚本默认参数
 帧生成 (可选)
   vs\DLSSNR_NV.vpy 中 Fg_Enabled = True 开启: 输出帧率 x2-x4 (插值帧挂降噪之后)。
-  RTX 40/50 系: 经官方运行时 nvngx_dlssg.dll (NVIDIA 签名, 无需 proxy; 面板 "FG 后端" 可固定官方档);
-  RTX 30/20 系: 经 dlssg_for_sm86 代理 version.dll (面板 "FG 后端" 固定代理档, "FG 路由" 切换, 默认 SM86, RTX 20 系选 SM75, 重启 mpv 生效);
+  RTX 40/50 系: 经官方运行时 nvngx_dlssg.dll (NVIDIA 签名, 无需 proxy; 面板 "FG 路由" 可固定官方档);
+  RTX 30/20 系: 经 dlssg_for_sm86 代理 version.dll (面板 "FG 路由" 切换: 自动/SM86/SM75/官方 NGX, 默认 SM86, RTX 20 系选 SM75, 重启 mpv 生效);
   自动档初始化失败自动回退 1:1 (显式档不跨后端回退), 降噪不受影响; 建议配合面板光流质量 >= 2 使用
 
 要求: RTX 显卡
