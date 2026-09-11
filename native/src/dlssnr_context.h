@@ -75,13 +75,15 @@ public:
     // n is the frame index; discontinuity detection (NGX history reset) is
     // owned here, not by the glue layer. timingOut 非 NULL 时写入分段耗时
     // (毫秒,逗号分隔:pack,submit+gpu,unpack)
-    // FG 双输出(fgDstPlanes 非 NULL = 创建时 FG 激活,输出帧率 ×2):
-    // fgDst* 收插值帧(经 DLSSG eval 或真实帧复制),fgEvaluated 告知调用
-    // 方本帧是否真插值(false = 复制语义,调用方无须再处理 —— 双输出都在
-    // 本函数内完成回读/复制)。
+    // FG 多帧输出(fgDst* 非 NULL = 创建时 FG 激活):fgMultiplier = 本帧
+    // 倍数 M(2-4,调用方从参数快照取 —— 与输出帧数契约绑定,必须由调用
+    // 方定格),每源帧产出 1 真实 + M-1 插值帧。fgDst*/fgStrides 为扁平
+    // 数组 [gen][plane](gen 0..M-2,元素 = gen*3+plane);fgGenOk 出参逐
+    // 槽告知真插值/false = 复制真实帧(复位/零光流/面板关/eval 降级)。
     bool ProcessFrame(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                       uint8_t **dstPlanes, int64_t *dstStrides,
-                      uint8_t **fgDstPlanes, int64_t *fgDstStrides, bool &fgEvaluated,
+                      int fgMultiplier,
+                      uint8_t **fgDstPlanes, int64_t *fgDstStrides, bool *fgGenOk,
                       int width, int height, int n,
                       ColorMatrix matrix, ColorRange range,
                       char *err, size_t errLen,

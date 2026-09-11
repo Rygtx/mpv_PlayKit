@@ -5,6 +5,7 @@
 #include "dlssfg_context.h"
 #include "dlssnr_context.h" // TimingStatusLine(失败必须进 timing log)
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -274,6 +275,7 @@ bool DlssfgContext::NeedsReset() noexcept {
 bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *backbuffer,
                              ID3D12Resource *mvec, ID3D12Resource *depth,
                              ID3D12Resource *interpOut, int width, int height,
+                             int multiplier, int slotIndex,
                              bool reset, char *err, size_t errLen) noexcept {
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_ready.load(std::memory_order_acquire) || _faulted.load(std::memory_order_acquire)) {
@@ -286,13 +288,19 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
 
     // eval 参数(官方 helper NGX_D3D12_EVALUATE_DLSSG 的 proxy 消费面子集;
     // 布局对照 Magpie DLSSFrameGenerator.cpp:724-758 —— 恒等相机 + mvecScale
-    // 1,1 + 像素单位 current-to-previous)。
+    // 1,1 + 像素单位 current-to-previous)。multiFrameCount/Index:M 倍时每
+    // 真实帧产出 M-1 插值帧,slotIndex 1..M-1 必须按序递增(proxy 契约
+    // "MFG indices must be evaluated in order starting at 1")。
+    const unsigned int genCount =
+        static_cast<unsigned int>(std::clamp(multiplier - 1, 1, kFgMultMax - 1));
+    const unsigned int genIndex =
+        static_cast<unsigned int>(std::clamp(slotIndex, 1, kFgMultMax - 1));
     _params->Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, backbuffer);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_MVecs, mvec);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_Depth, depth);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, interpOut);
-    _params->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, 1u);
-    _params->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, 1u);
+    _params->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, genCount);
+    _params->Set(NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, genIndex);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_MvecScaleX, 1.0f);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_MvecScaleY, 1.0f);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_DepthInverted, 0u);

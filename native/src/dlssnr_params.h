@@ -17,6 +17,10 @@ inline constexpr float kResidualMultMin = 1.0f, kResidualMultMax = 2.0f;
 inline constexpr float kResidualFineMin = 0.0f, kResidualFineMax = 2.0f;
 // NVOF 光流质量(上游 motionVectorQuality,0-5;0 = 无光流,保持零 guidance)
 inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
+// DLSS 帧生成倍数(2-4;proxy MaxGeneratedFrames 上限 3 → 4X 封顶)。
+// live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
+// 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
+inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
 
 struct DlssnrParams {
     // NGX "DLSSNR.Hint.Render.Preset" 0-3
@@ -72,6 +76,10 @@ struct DlssnrParams {
     //   下次播放(seek 重建滤镜)才生效。
     // FG 路径要求挂 DLSSNR 之后:FG 的 backbuffer = NR 输出。
     int fgEnabled = 0;
+    // DLSS 帧生成倍数(2-4,live 参数):每源帧产出 M 帧(1 真实 + M-1
+    // 插值),输出帧时长 = 源时长/M。源帧边界生效(当前源帧按触及时的 M
+    // 走完),无重建/重启。fgEnabled=0 时忽略。
+    int fgMultiplier = 2;
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence

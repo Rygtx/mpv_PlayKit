@@ -33,6 +33,7 @@ Residual_Multiplier = 1.0
 Motion_Vector_Quality = 0
 Nvof_Follow_Scaling = False
 Fg_Enabled = False
+Fg_Multiplier = 2
 H_Max = 0
 ## <0-3> 整数, NR 预设档位
 ## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
@@ -57,12 +58,14 @@ H_Max = 0
 ##          帧生成开启时建议 >= 2 (Balanced): 光流是插值帧的运动来源
 ## <True|False> 光流输入跟随内部降采样 (默认 False); 帧生成激活时被忽略
 ## <True|False> DLSS 帧生成 (默认 False)
-##          挂降噪之后: 输出帧率 x2 (24fps 源 → 48fps 输出), 插值帧由
-##          DLSS FG 模型合成; 依赖 ngx\version.dll (dlssg_for_sm86),
+##          挂降噪之后: 每源帧产出 M 帧 (1 真实 + M-1 插值, 插值帧由
+##          DLSS FG 模型合成); 依赖 ngx\version.dll (dlssg_for_sm86),
 ##          初始化失败自动回退 1:1, 降噪不受影响
+## <2-4> 整数, 插帧倍数 (默认 2): 每源帧产出 M 帧, 输出帧时长 = 源时长/M
+##          面板可实时改 (当前源帧播完切换); 24fps 源 x3 = 72fps,
+##          显示端建议刷新率 >= 输出帧率
 ##          面板开关: 会话内关 = 插值帧改复制真实帧 (帧数不变);
 ##          未激活会话内开 = 下次播放生效
-##          显示端建议刷新率 >= 输出帧率 (24fps 源 x2 = 48fps < 60Hz OK)
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
 
@@ -107,6 +110,7 @@ else :
 		motion_vector_quality = Motion_Vector_Quality,
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
 		fg_enabled = int(Fg_Enabled),
+		fg_multiplier = Fg_Multiplier,
 	)
 
 ret.set_output()

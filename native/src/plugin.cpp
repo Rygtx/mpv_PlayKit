@@ -22,6 +22,8 @@
 #include <string>
 #include <windows.h>
 
+using vsdlssnr::kFgGenSlots; // FG 插值槽数上界(d3d12_context.h,kFgMultMax-1)
+
 namespace {
 
 constexpr char PLUGIN_IDENTIFIER[] = "dev.rygtx.vsdlssnr";
@@ -79,17 +81,25 @@ struct FilterData {
     // log the first failure only, re-arm on the next success.
     std::atomic<bool> failureLogged{ false };
 
-    // ---- DLSS FG 双输出 ----
-    // fgDoubled = 创建时 FG 激活(proxy 初始化成功),vi.fps 已 ×2,输出
-    // 帧索引 n 映射:偶数 = 真实帧 k=n/2,奇数 = 插值帧(源帧 k=(n+1)/2
-    // 的一次处理同时产出两帧)。fgMutex 串行处理与缓存(FG 链的 NVOF/
-    // DLSSG 历史本质按源帧顺序,缓存防止同源帧被并发双跑)。
+    // ---- DLSS FG 多帧输出 ----
+    // fgActive = 创建时 FG 激活(proxy 初始化成功):每源帧产出 M 帧
+    // (1 真实 + M-1 插值;M = live 倍数,源帧边界生效)。输出索引 n 由
+    // 状态机映射(fgNextN/fgCurK/fgSlot/fgM,fgMutex 内推进):序列 =
+    // real0, gen(1..M-1), real1, gen(1..M-1), ... —— gen(k) 由源帧 k 的
+    // 一次处理产出(插值落在 k-1 与 k 之间,与 Magpie 发布序一致)。
+    // fgMutex 串行处理与缓存(FG 链的 NVOF/DLSSG 历史本质按源帧顺序,
+    // 缓存防止同源帧被并发双跑)。
     std::mutex fgMutex;
-    bool fgDoubled = false;
+    bool fgActive = false;
     std::wstring fgDllPath;
-    int fgCacheK = -1;
-    const VSFrame *fgCacheReal = nullptr; // 各持一个引用,Free 时释放
-    const VSFrame *fgCacheGen = nullptr;
+    int fgCreateMult = 2;                     // 创建时倍数(vi.fps 元数据用)
+    int fgNextN = 0;                          // 下一个待映射的输出索引
+    int fgCurK = -1;                          // 当前源帧(首个 slot0 请求时 ++)
+    int fgSlot = 0;                           // 当前源帧的待发槽位(0=真实)
+    int fgM = 2;                              // 当前源帧的倍数(触及时定格)
+    int fgCacheK = -1;                        // 缓存命中 = 同源帧的后继请求
+    int fgCacheM = 0;
+    const VSFrame *fgCache[kFgMultMax] = {};  // [0]=真实 [1..M-1]=插值;持引用
 };
 
 // Process-lifetime hot context. mpv's vf_vapoursynth tears down and
@@ -122,13 +132,28 @@ HotContext &Hot() {
 
 } // namespace
 
-// FG 双输出共用的属性处理:输出帧各占源帧一半时长(_Duration,存在才写)。
-static void HalveDuration(VSFrame *frame, const VSAPI *vsapi) noexcept {
+// FG 多帧输出的时长语义:mpv 的 vf_vapoursynth 输出节奏只认输出帧 props
+// 的整数对 _DurationNum/_DurationDen(喂数时按 pkt_duration*1e6 写入源帧,
+// 收帧时读回算 nominal_fps;VS 的 vi.fps 只是元数据不参与节拍)。倍数 M 的
+// 每个输出帧各占源帧 1/M:_DurationDen ×= M(分子不变)—— 同源帧 M 个输出
+// 时长求和恒等于源时长,倍数变化不漂移。整数对缺失(非 mpv 宿主)时退
+// 回浮点 _Duration(存在才写)。
+static void ScaleOutputDuration(VSFrame *frame, const VSAPI *vsapi, int m) noexcept {
     VSMap *props = vsapi->getFramePropertiesRW(frame);
+    if (!props) return;
     int err = 0;
+    const int64_t num = vsapi->mapGetInt(props, "_DurationNum", 0, &err);
+    int err2 = 0;
+    const int64_t den = err ? 0 : vsapi->mapGetInt(props, "_DurationDen", 0, &err2);
+    if (!err && !err2 && den > 0 && num > 0) {
+        vsapi->mapSetInt(props, "_DurationNum", num, maReplace);
+        vsapi->mapSetInt(props, "_DurationDen", den * m, maReplace);
+        return;
+    }
+    err = 0;
     const double dur = vsapi->mapGetFloat(props, "_Duration", 0, &err);
     if (!err) {
-        vsapi->mapSetFloat(props, "_Duration", dur * 0.5, maReplace);
+        vsapi->mapSetFloat(props, "_Duration", dur / m, maReplace);
     }
 }
 
@@ -147,93 +172,217 @@ static void CopyPlanes(const VSFrame *src, VSFrame *dst, const VSAPI *vsapi,
     }
 }
 
-static const VSFrame *VS_CC DlssnrGetFrame(
-    int n, int activationReason, void *instanceData, void ** /*frameData*/,
-    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
-    auto *d = static_cast<FilterData *>(instanceData);
-
-    if (activationReason == arInitial) {
-        // FG 双输出:输出 n 的源帧 = (n+1)/2(偶 n=2k → 真实帧 k;奇
-        // n=2k+1 → 处理源帧 k+1 产出区间 (k,k+1) 的插值帧)。
-        const int k = d->fgDoubled ? (n + 1) / 2 : n;
-        vsapi->requestFrameFilter(k, d->node, frameCtx);
-        return nullptr;
-    }
-    if (activationReason != arAllFramesReady) return nullptr;
-
-    // FG 双输出:处理与缓存串行(FG 链的 NVOF/DLSSG 历史本质按源帧顺序;
-    // 同源帧的两条输出竞争时,后到者直接命中缓存)。
-    std::unique_lock<std::mutex> fgLock(d->fgMutex, std::defer_lock);
-    const int k = d->fgDoubled ? (n + 1) / 2 : n;
-    const bool wantGen = d->fgDoubled && (n & 1) != 0;
-    if (d->fgDoubled) {
-        fgLock.lock();
-        if (k == d->fgCacheK && d->fgCacheReal && d->fgCacheGen) {
-            // 缓存命中:同源帧的另一条输出。交出一个新引用(缓存自留一个)。
-            const VSFrame *hit = wantGen ? d->fgCacheGen : d->fgCacheReal;
-            const VSFrame *out = vsapi->addFrameRef(hit);
-            return out;
-        }
-    }
-
-    const VSFrame *src = vsapi->getFrameFilter(k, d->node, frameCtx);
-
-    const VSMap *props = vsapi->getFramePropertiesRO(src);
-    // 源色彩元数据(仓内 props 读取首例):矩阵/范围驱动 YUV↔RGB 展开,
-    // 缺失/未知回落 709 limited 并留痕(值变化才再 log,atomic 边沿去重)。
-    // VS _Matrix:1=BT.709,5(BT470BG)/6(SMPTE170M)=601 族,4(XYZ)=601 近似
-    // (XYZ→RGB 本需色度适配矩阵,近似到 601 是 D65 录制内容的可用降级);
-    // 9(BT.2020)/0(GBR) 等超范围,按 709 处理 + log 可见(vpy 层已有
-    // HDR 直通守卫,到这里的多半是属性缺失的裸流)。
+// 从源帧 props 解析色彩矩阵/范围(缺失/未知回落 709 limited);值变化时
+// 留痕一行(atomic 边沿去重)。VS _Matrix:1=BT.709,5(BT470BG)/6(SMPTE170M)
+// =601 族,4(XYZ)=601 近似(D65 录制内容的可用降级);9(BT.2020)/0(GBR)
+// 等超范围按 709 处理(vpy 层已有 HDR 直通守卫,到这里的多半是属性缺失
+// 的裸流)。
+static void ParseColorProps(const VSMap *props, const VSAPI *vsapi,
+                            vsdlssnr::ColorMatrix &matrix,
+                            vsdlssnr::ColorRange &range) noexcept {
     int perr = 0;
     const int matrixProp = vsapi->mapGetInt(props, "_Matrix", 0, &perr);
     const bool matrixKnown = perr == 0;
     perr = 0;
     const int rangeProp = vsapi->mapGetInt(props, "_ColorRange", 0, &perr);
     const bool rangeKnown = perr == 0;
-    vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
+    matrix = vsdlssnr::ColorMatrix::BT709;
     if (matrixKnown && (matrixProp == 4 || matrixProp == 5 || matrixProp == 6)) {
         matrix = vsdlssnr::ColorMatrix::BT601;
     }
-    vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
+    range = vsdlssnr::ColorRange::Limited;
     if (rangeKnown && rangeProp == 0) range = vsdlssnr::ColorRange::Full;
-    {
-        const int sig = (matrixKnown ? matrixProp : -1) * 16 + (rangeKnown ? rangeProp : -2);
-        static std::atomic<int> lastSig{ INT_MIN };
-        if (lastSig.exchange(sig, std::memory_order_relaxed) != sig) {
-            char msg[160];
-            std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: frame props matrix=%s(%d) range=%s(%d) -> %s/%s",
-                          matrixKnown ? "yes" : "missing", matrixProp,
-                          rangeKnown ? "yes" : "missing", rangeProp,
-                          matrix == vsdlssnr::ColorMatrix::BT709 ? "709" : "601",
-                          range == vsdlssnr::ColorRange::Limited ? "limited" : "full");
-            vsdlssnr::TimingStatusLine(msg);
-        }
+    const int sig = (matrixKnown ? matrixProp : -1) * 16 + (rangeKnown ? rangeProp : -2);
+    static std::atomic<int> lastSig{ INT_MIN };
+    if (lastSig.exchange(sig, std::memory_order_relaxed) != sig) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: frame props matrix=%s(%d) range=%s(%d) -> %s/%s",
+                      matrixKnown ? "yes" : "missing", matrixProp,
+                      rangeKnown ? "yes" : "missing", rangeProp,
+                      matrix == vsdlssnr::ColorMatrix::BT709 ? "709" : "601",
+                      range == vsdlssnr::ColorRange::Limited ? "limited" : "full");
+        vsdlssnr::TimingStatusLine(msg);
     }
+}
 
-    if (!d->initOk) {
-        // passthrough on any setup failure; FG 双输出模式下输出计数仍是
-        // 2×(fps 已翻倍):源帧复制入缓存,两条输出各交一个新引用。
-        if (d->fgDoubled) {
+static const VSFrame *VS_CC DlssnrGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    auto *d = static_cast<FilterData *>(instanceData);
+
+    if (activationReason == arInitial) {
+        if (d->fgActive) {
+            // 输出索引 → (源帧, 槽位) 状态机(fgMutex 内推进;结果经
+            // frameData 带到 arAllFramesReady —— VS 的 per-request 存储,
+            // fmParallel 多帧在飞时各 n 的映射互不串扰)。序列:real0,
+            // gen(1..M-1), real1, ... 倍数 M 在源帧边界取当前参数快照
+            // (live 生效点);同源帧的 M 触及时定格,时长求和恒等于源时长。
+            std::lock_guard<std::mutex> lock(d->fgMutex);
+            if (n != d->fgNextN) {
+                // 乱序请求(mpv 顺序拉流不应发生):按当前倍数闭式回退,
+                // 只服务本帧不推进状态机。
+                static std::atomic<bool> warned{ false };
+                if (!warned.exchange(true)) {
+                    vsdlssnr::TimingStatusLine("DLSSNR STATUS: fg out-of-order frame request; closed-form fallback");
+                }
+                const int k = (n + d->fgM - 1) / d->fgM;
+                const int slot = n % d->fgM;
+                *frameData = reinterpret_cast<void *>(static_cast<intptr_t>((k << 4) | slot));
+                vsapi->requestFrameFilter(k, d->node, frameCtx);
+                return nullptr;
+            }
+            if (d->fgSlot == 0) {
+                ++d->fgCurK;
+                DlssnrParams snap = d->params->Snapshot();
+                d->fgM = std::clamp(snap.fgMultiplier, kFgMultMin, kFgMultMax);
+            }
+            const int k = d->fgCurK;
+            const int slot = d->fgSlot;
+            d->fgSlot = (d->fgSlot + 1) % d->fgM;
+            ++d->fgNextN;
+            *frameData = reinterpret_cast<void *>(static_cast<intptr_t>((k << 4) | slot));
+            vsapi->requestFrameFilter(k, d->node, frameCtx);
+            return nullptr;
+        }
+        vsapi->requestFrameFilter(n, d->node, frameCtx);
+        return nullptr;
+    }
+    if (activationReason != arAllFramesReady) return nullptr;
+
+    static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
+
+    if (d->fgActive) {
+        const intptr_t fd = reinterpret_cast<intptr_t>(*frameData);
+        const int k = static_cast<int>(fd >> 4);
+        const int slot = static_cast<int>(fd & 0xF);
+        std::unique_lock<std::mutex> fgLock(d->fgMutex, std::defer_lock);
+        fgLock.lock();
+        if (k == d->fgCacheK && slot < d->fgCacheM && d->fgCache[0] && d->fgCache[slot]) {
+            // 缓存命中:同源帧已产出全部 M 帧,交出一个新引用(缓存自留)。
+            const VSFrame *out = vsapi->addFrameRef(d->fgCache[slot]);
+            fgLock.unlock();
+            return out;
+        }
+
+        const VSFrame *src = vsapi->getFrameFilter(k, d->node, frameCtx);
+        const int m = d->fgM; // 本源帧倍数(arInitial 时定格)
+        if (!d->initOk) {
+            // passthrough on any setup failure;FG 输出计数仍是 M(帧率
+            // 已 ×M):源帧复制入缓存,各槽交一个新引用。
             VSFrame *dup = vsapi->copyFrame(src, core);
             d->fgCacheK = k;
-            if (d->fgCacheReal) vsapi->freeFrame(d->fgCacheReal);
-            if (d->fgCacheGen) vsapi->freeFrame(d->fgCacheGen);
-            d->fgCacheReal = dup;                       // 接管 copyFrame 引用
-            d->fgCacheGen = vsapi->addFrameRef(dup);
-            const VSFrame *ret = vsapi->addFrameRef(wantGen ? d->fgCacheGen : d->fgCacheReal);
+            d->fgCacheM = m;
+            for (int i = 0; i < kFgMultMax; ++i) {
+                if (d->fgCache[i]) vsapi->freeFrame(d->fgCache[i]);
+                d->fgCache[i] = i == 0 ? dup : vsapi->addFrameRef(dup);
+            }
+            const VSFrame *ret = vsapi->addFrameRef(d->fgCache[slot]);
             vsapi->freeFrame(src);
+            fgLock.unlock();
             return ret;
         }
-        return src; // reference handed off to the caller
+
+        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
+        VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
+        // M-1 个插值输出帧(eval 失败/降级槽由下方复制真实帧填充)。
+        VSFrame *genFrame[kFgGenSlots] = {};
+        for (int g = 0; g < m - 1; ++g) {
+            genFrame[g] = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
+        }
+
+        const uint8_t *srcPlanes[3]{};
+        int64_t srcStrides[3]{};
+        uint8_t *dstPlanes[3]{};
+        int64_t dstStrides[3]{};
+        for (int p = 0; p < 3; ++p) {
+            srcPlanes[p] = vsapi->getReadPtr(src, p);
+            srcStrides[p] = vsapi->getStride(src, p);
+            dstPlanes[p] = vsapi->getWritePtr(out, p);
+            dstStrides[p] = vsapi->getStride(out, p);
+        }
+        uint8_t *genPlanes[kFgGenSlots * 3]{};
+        int64_t genStrides[kFgGenSlots * 3]{};
+        for (int g = 0; g < m - 1; ++g) {
+            for (int p = 0; p < 3; ++p) {
+                genPlanes[g * 3 + p] = vsapi->getWritePtr(genFrame[g], p);
+                genStrides[g * 3 + p] = vsapi->getStride(genFrame[g], p);
+            }
+        }
+
+        char err[256]{};
+        char timing[128]{};
+        vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
+        vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
+        ParseColorProps(vsapi->getFramePropertiesRO(src), vsapi, matrix, range);
+        // NGX history-reset policy (frame-gap heuristic) lives in DlssnrContext;
+        // only the frame index is forwarded here. 倍数 m 与 genPlanes 布局
+        // ([gen][plane] 扁平)即 ProcessFrame 的多帧输出契约。
+        bool fgGenOk[kFgGenSlots] = {};
+        const bool procOk =
+            d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
+                                 m, genPlanes, genStrides, fgGenOk,
+                                 d->width, d->height, k, matrix, range, err, sizeof(err),
+                                 timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0);
+        if (!procOk) {
+            if (!d->failureLogged.exchange(true)) {
+                char msg[512];
+                std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", k, err);
+                vsapi->logMessage(mtWarning, msg, core);
+                // 探针:首帧失败进 timing log(GUI mpv 完全看不到 logMessage)。
+                vsdlssnr::TimingStatusLine(msg);
+            }
+            // Failed frames fall back to a plain copy of the source content so
+            // the output planes are never left uninitialized. YUV420:色度半尺寸。
+            CopyPlanes(src, out, vsapi, d->width, d->height);
+        } else {
+            d->failureLogged.store(false);
+        }
+        // 插值帧内容:对应槽 eval 成功 = ProcessFrame 已回读;否则复制真实帧
+        // (复位/零光流/面板关/eval 降级 —— 重复帧优于垃圾插值)。
+        for (int g = 0; g < m - 1; ++g) {
+            if (genFrame[g] && (!procOk || !fgGenOk[g])) {
+                CopyPlanes(out, genFrame[g], vsapi, d->width, d->height);
+            }
+        }
+
+        if (timingEnabled && timing[0]) {
+            // Throttle: log every 30th frame (fmParallel: order irrelevant).
+            static std::atomic<int> timingFrameCount{ 0 };
+            if (timingFrameCount.fetch_add(1, std::memory_order_relaxed) % 30 == 1) {
+                char msg[192];
+                std::snprintf(msg, sizeof(msg), "vs_dlssnr timing[%d]: %s", k, timing);
+                vsapi->logMessage(mtInformation, msg, core);
+            }
+        }
+
+        // M 帧入缓存(FG 链按源帧序,同源帧后继请求直接命中);各输出帧
+        // 时长 = 源时长/M(_DurationNum/_DurationDen 整数对 —— mpv 唯一
+        // 认的节奏来源;vi.fps 只是元数据)。
+        for (int i = 0; i < m; ++i) {
+            ScaleOutputDuration(i == 0 ? out : genFrame[i - 1], vsapi, m);
+        }
+        for (int i = 0; i < kFgMultMax; ++i) {
+            if (d->fgCache[i]) vsapi->freeFrame(d->fgCache[i]);
+        }
+        d->fgCacheK = k;
+        d->fgCacheM = m;
+        d->fgCache[0] = out; // 接管 newVideoFrame 的引用
+        for (int g = 0; g < m - 1; ++g) {
+            d->fgCache[g + 1] = genFrame[g];
+        }
+        const VSFrame *ret = vsapi->addFrameRef(d->fgCache[slot]);
+        vsapi->freeFrame(src);
+        fgLock.unlock();
+        return ret;
     }
+
+    // ---- 非 FG 路径(1:1,与旧管线一致) ----
+    const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
+    if (!d->initOk) return src; // passthrough;引用移交调用方
 
     const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
     VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
-    // FG:第二个输出帧(插值帧;eval 失败/降级时由下方复制真实帧填充)。
-    VSFrame *genFrame = d->fgDoubled ? vsapi->newVideoFrame(fi, d->width, d->height, src, core) : nullptr;
-
     const uint8_t *srcPlanes[3]{};
     int64_t srcStrides[3]{};
     uint8_t *dstPlanes[3]{};
@@ -244,73 +393,33 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         dstPlanes[p] = vsapi->getWritePtr(out, p);
         dstStrides[p] = vsapi->getStride(out, p);
     }
-    uint8_t *genPlanes[3]{};
-    int64_t genStrides[3]{};
-    if (genFrame) {
-        for (int p = 0; p < 3; ++p) {
-            genPlanes[p] = vsapi->getWritePtr(genFrame, p);
-            genStrides[p] = vsapi->getStride(genFrame, p);
-        }
-    }
-
     char err[256]{};
     char timing[128]{};
-    static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
-    // NGX history-reset policy (frame-gap heuristic) lives in DlssnrContext;
-    // only the frame index is forwarded here.
-    bool fgEvaluated = false;
+    vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
+    vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
+    ParseColorProps(vsapi->getFramePropertiesRO(src), vsapi, matrix, range);
     if (!d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
-                              genPlanes, genStrides, fgEvaluated,
-                              d->width, d->height, k, matrix, range, err, sizeof(err),
+                              0, nullptr, nullptr, nullptr,
+                              d->width, d->height, n, matrix, range, err, sizeof(err),
                               timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0)) {
         if (!d->failureLogged.exchange(true)) {
             char msg[512];
-            std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", k, err);
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", n, err);
             vsapi->logMessage(mtWarning, msg, core);
-            // 探针:首帧失败进 timing log(GUI mpv 完全看不到 logMessage;
-            // 此前 PackInput/BeginFrameRecording 等不自带留痕的失败路径在这
-            // 里是唯一记录,而记录通道本身不可见)。latch 保证不刷屏。
             vsdlssnr::TimingStatusLine(msg);
         }
-        // Failed frames fall back to a plain copy of the source content so the
-        // output planes are never left uninitialized. YUV420:色度半尺寸。
         CopyPlanes(src, out, vsapi, d->width, d->height);
     } else {
         d->failureLogged.store(false);
     }
-    // FG 插值帧内容:eval 成功 = ProcessFrame 已回读到 genFrame;否则复制
-    // 真实帧(复位/零光流/面板关/eval 降级 —— 重复帧优于垃圾插值)。
-    if (genFrame && !fgEvaluated) {
-        CopyPlanes(out, genFrame, vsapi, d->width, d->height);
-    }
-
     if (timingEnabled && timing[0]) {
-        // Throttle: log every 30th frame to avoid flooding the log channel
-        // (fmParallel: the counter is bumped from several threads — order is
-        // irrelevant for a throttle, atomicity is not).
         static std::atomic<int> timingFrameCount{ 0 };
         if (timingFrameCount.fetch_add(1, std::memory_order_relaxed) % 30 == 1) {
             char msg[192];
-            std::snprintf(msg, sizeof(msg), "vs_dlssnr timing[%d]: %s", k, timing);
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr timing[%d]: %s", n, timing);
             vsapi->logMessage(mtInformation, msg, core);
         }
     }
-
-    // FG 双输出:两帧入缓存(FG 链按源帧序,后到的奇/偶请求直接命中);
-    // 每帧时长减半(_Duration 存在才写)。
-    if (d->fgDoubled) {
-        HalveDuration(out, vsapi);
-        if (genFrame) HalveDuration(genFrame, vsapi);
-        if (d->fgCacheReal) vsapi->freeFrame(d->fgCacheReal);
-        if (d->fgCacheGen) vsapi->freeFrame(d->fgCacheGen);
-        d->fgCacheK = k;
-        d->fgCacheReal = out;      // 接管 newVideoFrame 的引用
-        d->fgCacheGen = genFrame;
-        const VSFrame *ret = vsapi->addFrameRef(wantGen ? genFrame : out);
-        vsapi->freeFrame(src);
-        return ret;
-    }
-
     // getFrameFilter handed us a reference to src; release it or every source
     // frame leaks (~24MB per 1080p frame).
     vsapi->freeFrame(src);
@@ -326,8 +435,9 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
     // makes the next filter instance near-free to create.
     vsdlssnr::BridgeStop(d->params.get());
     // FG 缓存帧:最后一个引用(缓存自留),先于 filter 释放。
-    if (d->fgCacheReal) vsapi->freeFrame(d->fgCacheReal);
-    if (d->fgCacheGen) vsapi->freeFrame(d->fgCacheGen);
+    for (int i = 0; i < kFgMultMax; ++i) {
+        if (d->fgCache[i]) vsapi->freeFrame(d->fgCache[i]);
+    }
     if (d->initOk && d->d3d12 && d->ngx) {
         Hot().d3d12 = std::move(d->d3d12);
         Hot().ngx = std::move(d->ngx);
@@ -335,7 +445,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().width = d->width;
         Hot().height = d->height;
         Hot().depth = d->depth;
-        Hot().fgEnabled = d->fgDoubled;
+        Hot().fgEnabled = d->fgActive;
         Hot().fgDllPath = std::move(d->fgDllPath);
         Hot().valid = true;
         // 探针:停放行 —— 与下一次 create 的 "hot rebind kept"/"re-init"
@@ -343,7 +453,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         // rebind)在 timing log 里闭环;mpv 在停放后退出也有尾行可查。
         char msg[128];
         std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: filter freed (hot parked %dx%dd%d fg=%d)",
-                      d->width, d->height, d->depth, d->fgDoubled ? 1 : 0);
+                      d->width, d->height, d->depth, d->fgActive ? 1 : 0);
         vsdlssnr::TimingStatusLine(msg);
     }
     delete d;
@@ -399,9 +509,12 @@ static void VS_CC DlssnrCreate(
     ApplyIntArg(in, vsapi, "motion_vector_quality", initial.motionVectorQuality, kOfQualityMin, kOfQualityMax);
     // 光流输入跟随内部降采样(scaling 启用时 NVOF 按内部尺寸计算)
     ApplyFlagArg(in, vsapi, "nvof_follow_scaling", initial.nvofFollowScaling);
-    // DLSS 帧生成(0/1):激活时输出帧率 ×2(奇数索引 = 插值帧),失败
-    // 优雅回退 1:1。挂 DLSSNR 之后 —— backbuffer = NR 输出。
+    // DLSS 帧生成(0/1):激活时每源帧产出 M 帧(1 真实 + M-1 插值),
+    // 输出帧时长 = 源时长/M(mpv vapoursynth 契约),失败优雅回退 1:1。
+    // 挂 DLSSNR 之后 —— backbuffer = NR 输出。
     ApplyFlagArg(in, vsapi, "fg_enabled", initial.fgEnabled);
+    // 插帧倍数 2-4(live 参数,源帧边界生效;创建值定 vi.fps 元数据)
+    ApplyIntArg(in, vsapi, "fg_multiplier", initial.fgMultiplier, kFgMultMin, kFgMultMax);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
@@ -415,11 +528,12 @@ static void VS_CC DlssnrCreate(
     {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d",
                       d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
-                      initial.nvofFollowScaling ? 1 : 0, initial.fgEnabled ? 1 : 0);
+                      initial.nvofFollowScaling ? 1 : 0, initial.fgEnabled ? 1 : 0,
+                      initial.fgMultiplier);
         vsdlssnr::TimingStatusLine(msg);
     }
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
@@ -575,16 +689,21 @@ static void VS_CC DlssnrCreate(
         }
     }
 
-    // FG 双输出判定(两条初始化路径汇合):会话激活 = 输出帧率 ×2;否则
-    // 1:1(FG 失败的降级语义)。vi 副本翻倍 fps —— createVideoFilter 的
-    // 输出格式与输入帧格式一致,仅帧率/帧数语义变化。
-    d->fgDoubled = d->initOk && d->ngx && d->ngx->FgActive();
+    // FG 多帧输出判定(两条初始化路径汇合):会话激活 = 每源帧产出 M 帧
+    // (输出帧时长 = 源时长/M,mpv 逐帧认 _DurationNum/_DurationDen);
+    // 否则 1:1(FG 失败的降级语义)。vi 副本按创建值倍增 fps —— 纯元数据
+    // (mpv 不据此节拍,但下游工具/时长估算消费它)。
+    d->fgActive = d->initOk && d->ngx && d->ngx->FgActive();
     VSVideoInfo viOut = *vi;
-    if (d->fgDoubled) {
-        viOut.fpsNum *= 2;
+    if (d->fgActive) {
+        d->fgCreateMult = std::clamp(d->params->Snapshot().fgMultiplier, kFgMultMin, kFgMultMax);
+        viOut.fpsNum *= d->fgCreateMult;
+        // 帧数同步 ×M:VS4 里 n >= numFrames 的请求会被核心拒为越界 ——
+        // mpv 顺序拉流到尾帧时会提前 EOF(尾段丢插值帧)。
+        if (viOut.numFrames > 0) viOut.numFrames *= d->fgCreateMult;
         char msg[160];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: fg active, output fps x2 (%I64d/%I64d -> %I64d/%I64d)",
-                      vi->fpsNum, vi->fpsDen, viOut.fpsNum, viOut.fpsDen);
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: fg active, output fps x%d (%I64d/%I64d -> %I64d/%I64d)",
+                      d->fgCreateMult, vi->fpsNum, vi->fpsDen, viOut.fpsNum, viOut.fpsDen);
         vsdlssnr::TimingStatusLine(msg);
     }
 
@@ -634,6 +753,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "motion_vector_quality:int:opt;"
         "nvof_follow_scaling:int:opt;"
         "fg_enabled:int:opt;"
+        "fg_multiplier:int:opt;"
         "fg_dll:data:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);

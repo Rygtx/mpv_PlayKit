@@ -92,6 +92,7 @@ struct AppState {
     char ofMode[28]{};       // SK_OF_MODE: off / zero / forward[+cost] / both[+cost] q<N> grid<G>
                              // 最长 "forward+cost q5 grid4" = 22+1,28 防截断(与插件 _ofModeBuf 同尺寸)
     char fgState[16]{};      // SK_FG: on / dup / off / unavailable
+    int fgMult = 0;          // SK_FG_MULT: 当前插帧倍数(未激活 = 0)
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
     bool hasSegments = false;
@@ -289,6 +290,7 @@ void LoadStats() noexcept {
         g_app.ofMode[0] = 0;
     if (!JsonGetString(body, SK_FG, g_app.fgState, sizeof(g_app.fgState)))
         g_app.fgState[0] = 0;
+    g_app.fgMult = JsonGetInt(body, SK_FG_MULT, 0);
     if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
         // The hang payload has no gpu_last, so the gate below would keep
         // showing frozen pre-hang stats forever; surface it — with the
@@ -476,7 +478,12 @@ void DrawUi() noexcept {
                              : std::strcmp(g_app.fgState, "dup") == 0 ? "复制帧"
                              : std::strcmp(g_app.fgState, "unavailable") == 0 ? "不可用(1:1)"
                              : g_app.fgState;
-            ImGui::TextDisabled("帧生成: %s", desc);
+            if (g_app.fgMult >= 2 && (std::strcmp(g_app.fgState, "on") == 0 ||
+                                      std::strcmp(g_app.fgState, "dup") == 0)) {
+                ImGui::TextDisabled("帧生成: %s (%dx)", desc, g_app.fgMult);
+            } else {
+                ImGui::TextDisabled("帧生成: %s", desc);
+            }
         }
     }
     ImGui::Spacing();
@@ -697,20 +704,29 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-    // DLSS 帧生成(整行)
+    // DLSS 帧生成(整行:倍数选择 关/2x/3x/4x)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("帧生成");
     if (ImGui::IsItemHovered())
-        ShowTip("DLSS 帧生成(挂降噪之后):输出帧率 x2,插值帧由 DLSS FG 模型合成。\n"
-                "依赖 vs-plugins\\ngx\\version.dll(dlssg_for_sm86 代理,用户自备部署);\n"
-                "初始化失败自动回退 1:1 输出,降噪不受影响。\n"
-                "开启需要重启播放生效(帧率在滤镜创建时声明);会话内开关即时生效\n"
-                "(关 = 插值帧改为复制真实帧,帧数不变)。建议配合光流质量 > 0 使用。");
+        ShowTip("DLSS 帧生成(挂降噪之后):每源帧产出 M 帧(1 真实 + M-1 插值),\n"
+                "插值帧由 DLSS FG 模型合成。依赖 vs-plugins\\ngx\\version.dll\n"
+                "(dlssg_for_sm86 代理,用户自备部署);初始化失败自动回退 1:1,降噪不受影响。\n"
+                "倍数即时生效(当前源帧播完切换);会话内开关同样即时(关 = 插值帧\n"
+                "改为复制真实帧,帧数不变)。建议配合光流质量 > 0 使用。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
-        bool v = g_app.params.fgEnabled != 0;
-        if (ImGui::Checkbox("##fg_enabled", &v)) {
-            g_app.params.fgEnabled = v ? 1 : 0;
+        // 单一控件:关(=0)/2x/3x/4x,同步 fgEnabled + fgMultiplier 两键。
+        const int items = 4;
+        const char *labels[items] = { "关", "2x", "3x", "4x" };
+        int sel = g_app.params.fgEnabled ? std::clamp(g_app.params.fgMultiplier, kFgMultMin, kFgMultMax) - 1 : 0;
+        ImGui::SetNextItemWidth(110 * s);
+        if (ImGui::Combo("##fg_mode", &sel, labels, items)) {
+            if (sel <= 0) {
+                g_app.params.fgEnabled = 0;
+            } else {
+                g_app.params.fgEnabled = 1;
+                g_app.params.fgMultiplier = sel + 1; // 2..4
+            }
             g_app.liveDirty = true;
         }
     }

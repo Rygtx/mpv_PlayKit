@@ -25,10 +25,11 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // write-only resetRequest command field (a reset is just a payload full of
 // default values); v5 adds motionVectorQuality (NVOF 光流质量 0-5); v6 adds
 // nvofFollowScaling (光流输入跟随内部降采样); v7 adds fgEnabled (DLSS 帧生成,
-// 占用原 reserved[0] —— 布局不变,老面板写 0 = 关)。The bump keeps mixed-version
-// panel/plugin pairs from decoding shifted offsets as valid payloads — panel
-// and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x374C5344u; // "DSSL7"
+// 占用原 reserved[0] —— 布局不变,老面板写 0 = 关); v8 adds fgMultiplier
+// (插帧倍数 2-4,live,源帧边界生效 —— 结构体增长,新旧混跑按 magic 拒读)。
+// The bump keeps mixed-version panel/plugin pairs from decoding shifted
+// offsets as valid payloads — panel and plugin must be deployed as a pair.
+constexpr uint32_t PAYLOAD_MAGIC = 0x384C5344u; // "DSSL8"
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -56,6 +57,7 @@ struct PanelPayload {
     int32_t motionVectorQuality; // 0-5 (0 = 无光流)
     int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
+    int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,源帧边界生效)
 };
 #pragma pack(pop)
 
@@ -85,6 +87,7 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.motionVectorQuality = std::clamp(pl.motionVectorQuality, kOfQualityMin, kOfQualityMax);
     p.nvofFollowScaling = pl.nvofFollowScaling != 0;
     p.fgEnabled = pl.fgEnabled != 0;
+    p.fgMultiplier = std::clamp(pl.fgMultiplier, kFgMultMin, kFgMultMax);
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
@@ -116,6 +119,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.motionVectorQuality = p.motionVectorQuality;
     pl.nvofFollowScaling = p.nvofFollowScaling ? 1 : 0;
     pl.fgEnabled = p.fgEnabled ? 1 : 0;
+    pl.fgMultiplier = std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax);
     return pl;
 }
 
@@ -167,6 +171,8 @@ inline constexpr const char *SK_OF_MODE = "of_mode";
 // DLSS 帧生成状态:on(eval)/ dup(复制真实帧:复位帧/零光流/面板关)/
 // off(本会话未激活)/ unavailable(初始化失败,回退 1:1)
 inline constexpr const char *SK_FG = "fg";
+// 当前插帧倍数(2-4;FG 未激活 = 0。面板显示 "3x")
+inline constexpr const char *SK_FG_MULT = "fg_mult";
 
 // stats JSON 的 detail 字段走面板的朴素解析(strstr + 下一个引号):剔除
 // 引号、反斜杠与控制字符,防止 D3D12 debug-layer 文本(VSDLSSNR_D3D12_DEBUG=1

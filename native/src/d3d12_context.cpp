@@ -562,19 +562,26 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     for (int i = 0; i < 3; ++i) {
         if (slot.uploadYuv[i] && slot.uploadYuvMapped[i]) slot.uploadYuv[i]->Unmap(0, nullptr);
         if (slot.readbackYuv[i] && slot.readbackYuvMapped[i]) slot.readbackYuv[i]->Unmap(0, nullptr);
-        if (slot.readbackFg[i] && slot.readbackFgMapped[i]) slot.readbackFg[i]->Unmap(0, nullptr);
         slot.uploadYuvMapped[i] = nullptr;
         slot.readbackYuvMapped[i] = nullptr;
-        slot.readbackFgMapped[i] = nullptr;
+    }
+    for (int g = 0; g < kFgGenSlots; ++g) {
+        for (int i = 0; i < 3; ++i) {
+            if (slot.readbackFg[g][i] && slot.readbackFgMapped[g][i])
+                slot.readbackFg[g][i]->Unmap(0, nullptr);
+            slot.readbackFgMapped[g][i] = nullptr;
+        }
     }
     slot.commandList.Reset();
     slot.allocator.Reset();
     for (int i = 0; i < 3; ++i) {
         slot.uploadYuv[i].Reset();
         slot.readbackYuv[i].Reset();
-        slot.readbackFg[i].Reset();
         slot.yuvIn[i].Reset();
         slot.yuvOut[i].Reset();
+    }
+    for (int g = 0; g < kFgGenSlots; ++g) {
+        for (int i = 0; i < 3; ++i) slot.readbackFg[g][i].Reset();
     }
     slot.inputColor.Reset();
     slot.outputColor.Reset();
@@ -777,20 +784,22 @@ bool D3D12Context::CreateFgSlotResources(FrameSlot &slot, char *err, size_t errL
         return false;
     }
     const UINT planeBytes = _bitDepth > 8 ? 2 : 1;
-    for (int i = 0; i < 3; ++i) {
-        const int pw = i == 0 ? _width : _chromaW;
-        const int ph = i == 0 ? _height : _chromaH;
-        const UINT bytesPerRow = static_cast<UINT>(pw) * planeBytes;
-        if (!CreateRawBuffer(static_cast<UINT64>(ph) * bytesPerRow, D3D12_HEAP_TYPE_READBACK,
-                             D3D12_RESOURCE_STATE_COPY_DEST,
-                             slot.readbackFg[i].GetAddressOf(), slot.readbackPitchFg[i],
-                             bytesPerRow, err, errLen)) {
-            return false;
-        }
-        const HRESULT hr = slot.readbackFg[i]->Map(0, nullptr, &slot.readbackFgMapped[i]);
-        if (FAILED(hr)) {
-            SetErr(err, errLen, hr, "Map(readbackFg) failed");
-            return false;
+    for (int g = 0; g < kFgGenSlots; ++g) {
+        for (int i = 0; i < 3; ++i) {
+            const int pw = i == 0 ? _width : _chromaW;
+            const int ph = i == 0 ? _height : _chromaH;
+            const UINT bytesPerRow = static_cast<UINT>(pw) * planeBytes;
+            if (!CreateRawBuffer(static_cast<UINT64>(ph) * bytesPerRow, D3D12_HEAP_TYPE_READBACK,
+                                 D3D12_RESOURCE_STATE_COPY_DEST,
+                                 slot.readbackFg[g][i].GetAddressOf(), slot.readbackPitchFg[g][i],
+                                 bytesPerRow, err, errLen)) {
+                return false;
+            }
+            const HRESULT hr = slot.readbackFg[g][i]->Map(0, nullptr, &slot.readbackFgMapped[g][i]);
+            if (FAILED(hr)) {
+                SetErr(err, errLen, hr, "Map(readbackFg) failed");
+                return false;
+            }
         }
     }
     return true;
@@ -917,18 +926,20 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
 }
 
 bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen,
-                                      bool fgTarget) noexcept {
+                                      int fgGen) noexcept {
     // RecordYuvOutput 之后调用:yuvOut 处于 UAV 态 → COPY_SOURCE → 拷贝
     // → COMMON。三平面各自 footprint(格式同资源,跨格式 = 静默 E_INVALIDARG)。
-    // fgTarget = 拷入 FG 第二组回读缓冲(同一条 CL 上两次转换+两次回读,
-    // 目标缓冲必须不同)。
+    // fgGen >= 0 = 拷入 FG 插值帧第 fgGen 组回读缓冲(同一条 CL 上真实帧与
+    // 各插值槽先后转换+回读,共用 yuvOut,目标缓冲两两不同)。
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
     const int planeW[3]{ _width, _chromaW, _chromaW };
     const int planeH[3]{ _height, _chromaH, _chromaH };
     for (int i = 0; i < 3; ++i) {
-        ID3D12Resource *dstBuf = fgTarget ? slot.readbackFg[i].Get() : slot.readbackYuv[i].Get();
-        const size_t dstPitch = fgTarget ? slot.readbackPitchFg[i] : slot.readbackPitchYuv[i];
+        ID3D12Resource *dstBuf = fgGen >= 0 ? slot.readbackFg[fgGen][i].Get()
+                                            : slot.readbackYuv[i].Get();
+        const size_t dstPitch = fgGen >= 0 ? slot.readbackPitchFg[fgGen][i]
+                                           : slot.readbackPitchYuv[i];
         D3D12_RESOURCE_BARRIER toCopySrc[1]{
             Transition(slot.yuvOut[i].Get(),
                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -1005,7 +1016,7 @@ bool D3D12Context::UnpackOutput(
     FrameSlot &slot,
     uint8_t **dstPlanes, int64_t *dstStrides,
     int width, int height, char *err, size_t errLen,
-    bool fgSource) noexcept {
+    int fgGen) noexcept {
     if (width != _width || height != _height) {
         SetErr(err, errLen, E_INVALIDARG, "UnpackOutput: size mismatch");
         return false;
@@ -1015,14 +1026,15 @@ bool D3D12Context::UnpackOutput(
     // 10bit:yuvOut(R16_UNORM)存储字 = round(n*65535) = 10-bit 采样值
     // (shader 侧 w=n*1023/65535 精确缩放,见 BGRA_TO_YUV_HLSL),与 VS
     // P10 word 逐位一致 —— 所以是纯拷贝。
-    // fgSource = 读 FG 第二组回读缓冲(插值帧)。
+    // fgGen >= 0 = 读 FG 插值帧第 fgGen 组回读缓冲。
     for (int p = 0; p < 3; ++p) {
         const int pw = p == 0 ? width : _chromaW;
         const int ph = p == 0 ? height : _chromaH;
         const size_t rowBytes = static_cast<size_t>(pw) * (_bitDepth > 8 ? 2u : 1u);
         const uint8_t *srcRow = static_cast<const uint8_t *>(
-            fgSource ? slot.readbackFgMapped[p] : slot.readbackYuvMapped[p]);
-        const size_t srcPitch = fgSource ? slot.readbackPitchFg[p] : slot.readbackPitchYuv[p];
+            fgGen >= 0 ? slot.readbackFgMapped[fgGen][p] : slot.readbackYuvMapped[p]);
+        const size_t srcPitch = fgGen >= 0 ? slot.readbackPitchFg[fgGen][p]
+                                           : slot.readbackPitchYuv[p];
         uint8_t *dstRow = dstPlanes[p];
         for (int y = 0; y < ph; ++y, srcRow += srcPitch, dstRow += dstStrides[p]) {
             memcpy(dstRow, srcRow, rowBytes);

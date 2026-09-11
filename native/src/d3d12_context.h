@@ -23,9 +23,14 @@
 #include <mutex>
 #include <cstdint>
 
+#include "dlssnr_params.h" // kFgMultMax(FG 插值槽数上界)
+
 namespace vsdlssnr {
 
 using Microsoft::WRL::ComPtr;
+
+// 每源帧的最大插值帧数(倍数 M-1,M 封顶 4)—— FG 回读缓冲按此建组。
+inline constexpr int kFgGenSlots = kFgMultMax - 1;
 
 // Full-subresource transition barrier — the one barrier builder for the whole
 // plugin (frame path, NGX context and diagnostics all used to hand-roll the
@@ -101,10 +106,12 @@ struct FrameSlot {
     // 契约:输出为 UAV;NSR 化后走 RGB→YUV 第二遍转换)。
     ComPtr<ID3D12Resource> fgInterp;      // W×H BGRA8,UAV
     // FG 插值帧的独立回读缓冲(与真实帧的 readbackYuv 并存:同一条 CL 上
-    // 先后两次转换+回读,真实帧回读不能被插值帧覆写)。
-    ComPtr<ID3D12Resource> readbackFg[3];
-    void *readbackFgMapped[3] = {};
-    size_t readbackPitchFg[3] = {};
+    // 先后多次转换+回读,真实帧回读不能被插值帧覆写)。按插值槽分组
+    // [gen 0..kFgGenSlots-1][plane] —— 倍数 M 时 M-1 个插值帧各自落一组,
+    // 每组转换+回读后 yuvOut 归位供下一槽复用。
+    ComPtr<ID3D12Resource> readbackFg[kFgGenSlots][3];
+    void *readbackFgMapped[kFgGenSlots][3] = {};
+    size_t readbackPitchFg[kFgGenSlots][3] = {};
     // slot-local shader-visible heap: 0=srvInput 1=srvReducedColor
     // 2=srvReducedDenoised 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised
     // 6=uavHorizontal 7=uavOutput 8=srvControlled 9=uavControlled
@@ -248,18 +255,19 @@ public:
                    int width, int height, char *err, size_t errLen) noexcept;
     bool BeginFrameRecording(FrameSlot &slot) noexcept;
     // 记录:yuvOut ×3 UAV→COPY_SOURCE→拷贝→COMMON(在 RecordYuvOutput 之后,
-    // yuvOut 处于 UAV 态)。fgTarget = 拷入 FG 第二组回读缓冲(插值帧);
-    // 同一条 CL 上两次转换+两次回读共用 yuvOut,目标缓冲必须不同。
+    // yuvOut 处于 UAV 态)。fgGen >= 0 = 拷入 FG 插值帧第 fgGen 组回读缓冲;
+    // 同一条 CL 上真实帧 + 各插值槽的转换+回读共用 yuvOut,目标缓冲必须
+    // 两两不同。
     bool RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen,
-                            bool fgTarget = false) noexcept;
+                            int fgGen = -1) noexcept;
     bool SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
                      char *err, size_t errLen) noexcept; // [可选栅栏等待] close+execute+signal
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
     // GPU 完成后调用:回读缓冲 → VS 三平面(纯 CPU 行拷贝,色度半尺寸)。
-    // fgSource = 读 FG 第二组缓冲(插值帧)。
+    // fgGen >= 0 = 读 FG 插值帧第 fgGen 组缓冲。
     bool UnpackOutput(FrameSlot &slot, uint8_t **dstPlanes, int64_t *dstStrides,
                       int width, int height, char *err, size_t errLen,
-                      bool fgSource = false) noexcept;
+                      int fgGen = -1) noexcept;
 
     // 五段残差 compute 路径的命令记录(在该槽已 BeginFrameRecording 的列表上)。
     // 降采样两段可分离(Lanczos2),horizontalRes 复用为降采样 FP16 中间纹理

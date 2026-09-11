@@ -46,6 +46,7 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeInt(L"motion_vector_quality", std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax));
     writeInt(L"nvof_follow_scaling", p.nvofFollowScaling ? 1 : 0);
     writeInt(L"fg_enabled", p.fgEnabled ? 1 : 0);
+    writeInt(L"fg_multiplier", std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax));
     writeInt(L"saved", 1);
     return ok;
 }
@@ -88,6 +89,7 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.motionVectorQuality = std::clamp(readInt(L"motion_vector_quality", p.motionVectorQuality), kOfQualityMin, kOfQualityMax);
     p.nvofFollowScaling = readInt(L"nvof_follow_scaling", p.nvofFollowScaling) != 0;
     p.fgEnabled = readInt(L"fg_enabled", p.fgEnabled) != 0;
+    p.fgMultiplier = std::clamp(readInt(L"fg_multiplier", p.fgMultiplier), kFgMultMin, kFgMultMax);
     return true;
 }
 

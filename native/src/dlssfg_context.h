@@ -54,14 +54,17 @@ public:
 
     bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
 
-    // 每处理帧一次(fmParallel 并发由内部互斥串行;GPU dispatch 仍随各槽
-    // 命令列表重叠)。cl = 槽命令列表;资源状态契约:backbuffer/mvec/depth
-    // = NSR,interpOut = UAV(调用方负责屏障)。reset=true 的 eval 属于
-    // 重置帧,输出不消费。返回 false 时调用方降级复制真实帧;连续失败由
-    // 本类闩锁(_ready=false)停用整个 FG 会话。
+    // 每处理帧每插值槽一次(fmParallel 并发由内部互斥串行;GPU dispatch 仍
+    // 随各槽命令列表重叠)。multiplier = 本源帧倍数 M(2-4),slotIndex =
+    // 插值槽 1..M-1(同源帧内必须按序调用 —— proxy 契约)。cl = 槽命令
+    // 列表;资源状态契约:backbuffer/mvec/depth = NSR,interpOut = UAV
+    // (调用方负责屏障)。reset=true 的 eval 属于重置帧,输出不消费。返回
+    // false 时调用方降级复制真实帧;连续失败由本类闩锁(_ready=false)停用
+    // 整个 FG 会话。
     bool Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *backbuffer,
                   ID3D12Resource *mvec, ID3D12Resource *depth,
                   ID3D12Resource *interpOut, int width, int height,
+                  int multiplier, int slotIndex,
                   bool reset, char *err, size_t errLen) noexcept;
 
 private:

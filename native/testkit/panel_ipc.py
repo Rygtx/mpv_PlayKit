@@ -14,7 +14,7 @@ import ctypes
 import struct
 
 PAYLOAD_SIZE = 512
-PAYLOAD_MAGIC = 0x364C5344  # "DSSL6"
+PAYLOAD_MAGIC = 0x384C5344  # "DSSL8"
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
@@ -24,10 +24,10 @@ ALIVE_EVENT = "vs_dlssnr_bridge_alive"
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
 # localStructure,skinStructure | 3i useAutoMask,uiCorrection,inputResolution |
 # 5f residualMultiplier,residualSaturation,residualLightness,shadowStructure,
-# reflectionGlow | 5i scalingEnabled,saveRequest,logEnabled,motionVectorQuality,
-# nvofFollowScaling | 1I reserved
-_STRUCT = struct.Struct("<3I2i4f3i5f5iI")
-assert _STRUCT.size == 92, "PanelPayload 布局与 panel_ipc.h 不一致"
+# reflectionGlow | 7i scalingEnabled,saveRequest,logEnabled,motionVectorQuality,
+# nvofFollowScaling,fgEnabled,fgMultiplier
+_STRUCT = struct.Struct("<3I2i4f3i5f7i")
+assert _STRUCT.size == 96, "PanelPayload 布局与 panel_ipc.h 不一致"
 
 DEFAULTS = dict(
     preset=0, style=0,
@@ -37,7 +37,16 @@ DEFAULTS = dict(
     shadowStructure=1.0, reflectionGlow=1.0,
     scalingEnabled=1, saveRequest=0, logEnabled=1,
     motionVectorQuality=0, nvofFollowScaling=0,
+    fgEnabled=0, fgMultiplier=2,
 )
+
+_FIELDS = ("magic", "seq", "generation", "preset", "style",
+           "intensity", "localTone", "localStructure", "skinStructure",
+           "useAutoMask", "uiCorrection", "inputResolution",
+           "residualMultiplier", "residualSaturation", "residualLightness",
+           "shadowStructure", "reflectionGlow",
+           "scalingEnabled", "saveRequest", "logEnabled",
+           "motionVectorQuality", "nvofFollowScaling", "fgEnabled", "fgMultiplier")
 
 PAGE_READWRITE = 0x04
 FILE_MAP_READ = 0x0004
@@ -71,7 +80,8 @@ class ParamsChannel:
             vals["residualMultiplier"], vals["residualSaturation"],
             vals["residualLightness"], vals["shadowStructure"], vals["reflectionGlow"],
             vals["scalingEnabled"], vals["saveRequest"], vals["logEnabled"],
-            vals["motionVectorQuality"], vals["nvofFollowScaling"], 0)
+            vals["motionVectorQuality"], vals["nvofFollowScaling"],
+            vals["fgEnabled"], vals["fgMultiplier"])
         ctypes.memmove(ctypes.c_void_p(self._view), data, len(data))
 
     def read(self):
@@ -79,15 +89,7 @@ class ParamsChannel:
         magic, seq = struct.unpack_from("<II", buf, 0)
         if magic != PAYLOAD_MAGIC:
             return None
-        vals = dict(zip(
-            ("magic", "seq", "generation", "preset", "style",
-             "intensity", "localTone", "localStructure", "skinStructure",
-             "useAutoMask", "uiCorrection", "inputResolution",
-             "residualMultiplier", "residualSaturation", "residualLightness",
-             "shadowStructure", "reflectionGlow",
-             "scalingEnabled", "saveRequest", "logEnabled",
-             "motionVectorQuality", "nvofFollowScaling", "reserved"),
-            _STRUCT.unpack(buf[:_STRUCT.size])))
+        vals = dict(zip(_FIELDS, _STRUCT.unpack(buf[:_STRUCT.size])))
         return vals
 
 
