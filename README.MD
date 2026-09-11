@@ -1,3 +1,5 @@
+[English](README.en.md) | 简体中文
+
 ![](Temp/mpv_PK.jpg)
 
 # mpv_PlayKit — DLSSNR 定制版
@@ -102,6 +104,27 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
   - `VSDLSSNR_D3D12_DEBUG=1` 开 D3D12 debug layer
   - `VSDLSSNR_NGX_LOG=1` 接 NGX 内部日志
   - `VSDLSSNR_NO_PANEL=1` 禁面板自动拉起(无头/验收场景)
+
+## 显卡支持矩阵
+
+两个 AI 功能对显卡的要求不同:
+
+- **DLSSNR 降噪**:NVIDIA NGX 官方特性,需 Tensor Core,RTX 全系(Turing+)在官方支持范围内,非 RTX 不可用
+- **DLSS 插帧(帧生成)**:NVIDIA 官方仅对 RTX 40/50 提供游戏内 NGX 集成,mpv 播放场景没有官方路径;本项目通过 [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) 破解 proxy 接入,自带推理资源与 PTX,由驱动 JIT 适配架构,面板"FG 路由"可选 SM86(Ampere)/ SM75(Turing)
+
+| 显卡 | 架构 | DLSSNR 降噪 | DLSS 插帧 |
+|---|---|---|---|
+| RTX 50 | Blackwell(SM120) | 🟡 理论上支持(官方范围内,未实测) | 🟡 理论上支持(SM86 路由 PTX 前向 JIT,未实测) |
+| RTX 40 | Ada(SM89) | 🟡 理论上支持(官方范围内,未实测) | 🟡 理论上支持(SM86 路由 PTX 前向 JIT,未实测) |
+| RTX 30 | Ampere(SM86) | ✅ **实测可用**(RTX 3080) | ✅ **实测可用**(RTX 3080,SM86 路由) |
+| RTX 20 | Turing(SM75) | 🟡 理论上支持(官方范围内,未实测) | 🟡 理论上支持(SM75 路由;仅完成 PTX 前向验证,物理 Turing 卡未实测) |
+| GTX / 非 RTX | — | ❌ 不可用(无 Tensor Core) | ❌ 不可用 |
+
+图例:✅ 已实测可用 · 🟡 理论上支持(未实测) · ❌ 不可用
+
+> - NVOF 硬件光流引导(RTX Turing+)全系原生支持;不支持或非 N 卡时自动回退零 guidance,不挡功能
+> - RTX 30/20 系的 DLSS 插帧属于破解路径:proxy 不加载原厂 `nvngx_dlssg.dll`;RTX 40/50 系虽原生支持游戏内 DLSS FG,mpv 场景同样走本 proxy
+> - 实测基线为 RTX 3080;其余档位为理论推断,欢迎反馈实测结果
 
 ## 环境要求
 
