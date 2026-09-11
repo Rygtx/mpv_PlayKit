@@ -187,24 +187,32 @@ struct FilterData {
     std::atomic<int> nrPubState{ -1 };
 
     // ---- DLSS FG 多帧输出 ----
-    // fgActive = 创建时 FG 激活(proxy 初始化成功):每源帧产出 M 帧
-    // (1 真实 + M-1 插值;M = live 倍数,源帧边界生效)。输出索引 n 由
-    // 状态机映射(fgNextN/fgCurK/fgSlot/fgM,fgMutex 内推进):序列 =
-    // real0, gen(1..M-1), real1, gen(1..M-1), ... —— gen(k) 由源帧 k 的
-    // 一次处理产出(插值落在 k-1 与 k 之间,与 Magpie 发布序一致)。
-    // fgMutex 串行处理与缓存(FG 链的 NVOF/DLSSG 历史本质按源帧顺序,
-    // 缓存防止同源帧被并发双跑)。
+    // fgActive = 创建时 FG 激活(proxy 初始化成功):每源帧产出 M0 帧
+    // (M0 = fgCreateMult,创建时定格 —— 输出帧数/fps 元数据/每槽时长随之
+    // 与 mpv 定约,会话内恒定)。输出索引 n → (源帧 k, 槽位) 为无状态闭式
+    // 映射(见 DlssnrGetFrame):序列 = R0, [G(k-1,k)×(M0-1), R_k] ... ——
+    // 处理源帧 k 产出的插值帧落在 k-1 与 k 之间(DLSS-G 语义;Magpie
+    // Renderer::_CompleteBackendFrame 同款发布序:gen 先、真实帧后),
+    // 显示在 R_{k-1} 之后、R_k 之前。旧版"real 在前 gen 在后"把每个插值
+    // 帧晚放一个源帧位,运动画面持续前后抖动(用户实测)。
+    // 会话内有效密度 = min(live 倍数, M0):live 关闭/降档即时生效(多余
+    // 槽位回落真实帧引用);升档超过 M0 无槽可填,需下个 seek(重建即新
+    // M0)。输出帧数/节奏契约因此恒定 —— 旧版随 live 倍数改组尺寸会撕裂
+    // 契约(提前 EOF / 尾部冻结)。
+    // 注:曾有按 n 单调推进的顺序状态机,实测 VS core(fmParallel)的评估
+    // 启动顺序不保证单调(timing log "fg out-of-order" 行)—— 首个乱序
+    // 请求即失位,此后全部请求走闭式回退且 fgM 冻结在创建值(live 倍数
+    // 静默失效)。已删;闭式映射对请求顺序天然免疫。
+    // fgMutex 只串行缓存与处理(同源帧一次处理、各槽从缓存出;FG 链的
+    // NVOF/DLSSG 历史按处理序推进,帧序门自愈乱序)。
     std::mutex fgMutex;
     bool fgActive = false;
     std::wstring fgDllPath;
-    int fgCreateMult = 2;                     // 创建时倍数(vi.fps 元数据用)
-    int fgNextN = 0;                          // 下一个待映射的输出索引
-    int fgCurK = -1;                          // 当前源帧(首个 slot0 请求时 ++)
-    int fgSlot = 0;                           // 当前源帧的待发槽位(0=真实)
-    int fgM = 2;                              // 当前源帧的倍数(触及时定格)
-    int fgCacheK = -1;                        // 缓存命中 = 同源帧的后继请求
-    int fgCacheM = 0;
-    const VSFrame *fgCache[kFgMultMax] = {};  // [0]=真实 [1..M-1]=插值;持引用
+    int fgCreateMult = 2;                     // 创建时倍数(vi.fps/帧数元数据 + 组槽位结构)
+    int srcFrames = 0;                        // 源帧数(vi.numFrames;0 = 未知,尾部钳制禁用)
+    int fgCacheK = -1;                        // 缓存命中 = 同源帧的后继槽位请求
+    int fgCacheM = 0;                         // 有效缓存条目上界(1 + 插值槽数;空位判 null)
+    const VSFrame *fgCache[kFgMultMax] = {};  // [0]=真实帧 [1..]=插值帧;持引用
 };
 
 // Process-lifetime hot context. mpv's vf_vapoursynth tears down and
@@ -318,36 +326,27 @@ static const VSFrame *VS_CC DlssnrGetFrame(
 
     if (activationReason == arInitial) {
         if (d->fgActive) {
-            // 输出索引 → (源帧, 槽位) 状态机(fgMutex 内推进;结果经
-            // frameData 带到 arAllFramesReady —— VS 的 per-request 存储,
-            // fmParallel 多帧在飞时各 n 的映射互不串扰)。序列:real0,
-            // gen(1..M-1), real1, ... 倍数 M 在源帧边界取当前参数快照
-            // (live 生效点);同源帧的 M 触及时定格,时长求和恒等于源时长。
-            std::lock_guard<std::mutex> lock(d->fgMutex);
-            if (n != d->fgNextN) {
-                // 乱序请求(mpv 顺序拉流不应发生):按当前倍数闭式回退,
-                // 只服务本帧不推进状态机。映射必须与状态机同款 floor
-                // (k = n/M)——ceil 会让 gen 槽偏到 k+1,且尾帧
-                // (n = 源帧数×M-1)算出 k = 源帧数,requestFrameFilter 越界。
-                static std::atomic<bool> warned{ false };
-                if (!warned.exchange(true)) {
-                    vsdlssnr::TimingStatusLine("DLSSNR STATUS: fg out-of-order frame request; closed-form fallback");
+            // 输出索引 → (源帧, 槽位) 无状态闭式映射。VS core(fmParallel)
+            // 的评估启动顺序不保证 n 单调,任何依赖请求顺序的状态机都会
+            // 失位 —— 每个输出索引独立换算,天然免疫乱序:
+            //   n == 0    → R0(播种源帧,仅真实帧)
+            //   n >= 1    → 组 g = (n-1)/M0;源帧 k = g+1;组内位 p = (n-1)%M0
+            //               p < M0-1 → 槽 p+1(插值帧,随处理源帧 k 产出)
+            //               p == M0-1 → 槽 0(真实帧 R_k,组末尾)
+            // 尾部(k 越过最后一源帧)= 重复 R_{S-1} 占位(无后续源帧可
+            // 插值,首尾帧保持优于越界请求)。
+            const int m0 = d->fgCreateMult;
+            int k = 0, slot = 0;
+            if (n > 0) {
+                k = (n - 1) / m0 + 1;
+                if (d->srcFrames > 0 && k >= d->srcFrames) {
+                    k = d->srcFrames - 1;
+                    slot = 0;
+                } else {
+                    const int p = (n - 1) % m0;
+                    slot = (p == m0 - 1) ? 0 : p + 1;
                 }
-                const int k = n / d->fgM;
-                const int slot = n % d->fgM;
-                *frameData = reinterpret_cast<void *>(static_cast<intptr_t>((k << 4) | slot));
-                vsapi->requestFrameFilter(k, d->node, frameCtx);
-                return nullptr;
             }
-            if (d->fgSlot == 0) {
-                ++d->fgCurK;
-                DlssnrParams snap = d->params->Snapshot();
-                d->fgM = std::clamp(snap.fgMultiplier, kFgMultMin, kFgMultMax);
-            }
-            const int k = d->fgCurK;
-            const int slot = d->fgSlot;
-            d->fgSlot = (d->fgSlot + 1) % d->fgM;
-            ++d->fgNextN;
             *frameData = reinterpret_cast<void *>(static_cast<intptr_t>((k << 4) | slot));
             vsapi->requestFrameFilter(k, d->node, frameCtx);
             return nullptr;
@@ -383,41 +382,61 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         const intptr_t fd = reinterpret_cast<intptr_t>(*frameData);
         const int k = static_cast<int>(fd >> 4);
         const int slot = static_cast<int>(fd & 0xF);
-        std::unique_lock<std::mutex> fgLock(d->fgMutex, std::defer_lock);
-        fgLock.lock();
-        if (k == d->fgCacheK && slot < d->fgCacheM && d->fgCache[0] && d->fgCache[slot]) {
-            // 缓存命中:同源帧已产出全部 M 帧,交出一个新引用(缓存自留)。
-            const VSFrame *out = vsapi->addFrameRef(d->fgCache[slot]);
-            fgLock.unlock();
+        // fgMutex 串行处理与缓存(同源帧一次处理,各槽从缓存出;FG 链的
+        // NVOF/DLSSG 历史按处理序推进,乱序由 NVOF 帧序门自愈)。
+        std::lock_guard<std::mutex> fgLock(d->fgMutex);
+        // 有效密度 = min(live 倍数, 结构倍数 M0)。M0(帧数/节奏契约)创建时
+        // 定格;live 倍数只决定组内多少槽位产出真插值 —— 关闭/降档即时生效
+        // (多余槽位回落真实帧引用),升档超过 M0 无槽可填(需下个 seek)。
+        // 播种源帧(k=0)仅真实帧:无消费槽,不带插值平面(eval 门随之关闭,
+        // 历史重置留给首个插值组,与其对齐 Magpie 的 reset 帧不发布插值)。
+        const int m0 = d->fgCreateMult;
+        const DlssnrParams snap = d->params->Snapshot();
+        int effM = snap.fgEnabled
+                       ? (std::min)(std::clamp(snap.fgMultiplier, kFgMultMin, kFgMultMax), m0)
+                       : 1;
+        int effGens = effM - 1;
+        if (k == 0) {
+            effM = 1;
+            effGens = 0;
+        }
+        if (k == d->fgCacheK && d->fgCache[0]) {
+            // 缓存命中:同源帧已处理,任意槽位交一个新引用(缓存自留)。
+            // 无缓存内容的槽位(密度下调的多余槽/播种帧/eval 降级)回落
+            // 真实帧 —— 槽位照常占位,输出节奏不变。
+            const VSFrame *out =
+                (slot >= 1 && slot < d->fgCacheM && d->fgCache[slot])
+                    ? vsapi->addFrameRef(d->fgCache[slot])
+                    : vsapi->addFrameRef(d->fgCache[0]);
             return out;
         }
 
         const VSFrame *src = vsapi->getFrameFilter(k, d->node, frameCtx);
-        const int m = d->fgM; // 本源帧倍数(arInitial 时定格)
         if (!d->initOk) {
             // passthrough on setup failure(防御:fgActive 恒蕴含 initOk;
             // NR 关不在此列 —— ProcessFrame 内部门控跳过降噪评估,补帧以
-            // 直通帧为 backbuffer 照常插值)。FG 输出计数仍是 M(帧率已
-            // ×M):源帧单次复制入缓存,各槽交新引用,时长按 1/M 摊分。
+            // 直通帧为 backbuffer 照常插值)。FG 输出计数仍是 M0(帧率已
+            // ×M0):源帧单次复制入缓存,各槽回落该帧,时长按 1/M0 摊分。
             VSFrame *dup = vsapi->copyFrame(src, core);
-            ScaleOutputDuration(dup, vsapi, m);
+            ScaleOutputDuration(dup, vsapi, m0);
             d->fgCacheK = k;
-            d->fgCacheM = m;
+            d->fgCacheM = 1;
             for (int i = 0; i < kFgMultMax; ++i) {
                 if (d->fgCache[i]) vsapi->freeFrame(d->fgCache[i]);
-                d->fgCache[i] = i == 0 ? dup : vsapi->addFrameRef(dup);
+                d->fgCache[i] = nullptr;
             }
-            const VSFrame *ret = vsapi->addFrameRef(d->fgCache[slot]);
+            d->fgCache[0] = dup;
+            const VSFrame *ret = vsapi->addFrameRef(d->fgCache[0]);
             vsapi->freeFrame(src);
-            fgLock.unlock();
             return ret;
         }
 
         const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
         VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
-        // M-1 个插值输出帧(eval 失败/降级槽由下方复制真实帧填充)。
+        // effGens 个插值输出帧(仅 eval 成功槽进缓存;失败/降级槽直接释放,
+        // 槽位在出帧时回落真实帧引用 —— 零复制优于再拷一份重复帧)。
         VSFrame *genFrame[kFgGenSlots] = {};
-        for (int g = 0; g < m - 1; ++g) {
+        for (int g = 0; g < effGens; ++g) {
             genFrame[g] = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
         }
 
@@ -433,7 +452,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         }
         uint8_t *genPlanes[kFgGenSlots * 3]{};
         int64_t genStrides[kFgGenSlots * 3]{};
-        for (int g = 0; g < m - 1; ++g) {
+        for (int g = 0; g < effGens; ++g) {
             for (int p = 0; p < 3; ++p) {
                 genPlanes[g * 3 + p] = vsapi->getWritePtr(genFrame[g], p);
                 genStrides[g * 3 + p] = vsapi->getStride(genFrame[g], p);
@@ -446,12 +465,13 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
         ParseColorProps(vsapi->getFramePropertiesRO(src), vsapi, matrix, range);
         // NGX history-reset policy (frame-gap heuristic) lives in DlssnrContext;
-        // only the frame index is forwarded here. 倍数 m 与 genPlanes 布局
-        // ([gen][plane] 扁平)即 ProcessFrame 的多帧输出契约。
+        // only the frame index is forwarded here. 有效密度 effM 与 genPlanes
+        // 布局([gen][plane] 扁平)即 ProcessFrame 的多帧输出契约。
         bool fgGenOk[kFgGenSlots] = {};
         const bool procOk =
             d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
-                                 m, genPlanes, genStrides, fgGenOk,
+                                 effM, effGens > 0 ? genPlanes : nullptr,
+                                 effGens > 0 ? genStrides : nullptr, fgGenOk,
                                  d->width, d->height, k, matrix, range, err, sizeof(err),
                                  timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0);
         if (!procOk) {
@@ -468,11 +488,11 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         } else {
             d->failureLogged.store(false);
         }
-        // 插值帧内容:对应槽 eval 成功 = ProcessFrame 已回读;否则复制真实帧
-        // (复位/零光流/面板关/eval 降级 —— 重复帧优于垃圾插值)。
-        for (int g = 0; g < m - 1; ++g) {
+        // 失败/未评插值槽:释放帧(出帧时槽位回落真实帧引用)。
+        for (int g = 0; g < effGens; ++g) {
             if (genFrame[g] && (!procOk || !fgGenOk[g])) {
-                CopyPlanes(out, genFrame[g], vsapi, d->width, d->height);
+                vsapi->freeFrame(genFrame[g]);
+                genFrame[g] = nullptr;
             }
         }
 
@@ -486,28 +506,33 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             }
         }
 
-        // M 帧入缓存(FG 链按源帧序,同源帧后继请求直接命中);各输出帧
-        // 时长 = 源时长/M(_DurationNum/_DurationDen 整数对 —— mpv 唯一
-        // 认的节奏来源;vi.fps 只是元数据)。
-        for (int i = 0; i < m; ++i) {
-            ScaleOutputDuration(i == 0 ? out : genFrame[i - 1], vsapi, m);
+        // 时长契约:每输出帧 = 源时长/M0(_DurationNum/_DurationDen 整数对
+        // —— mpv 逐帧读回累加 pts、nominal_fps 也由它重算;vi.fps 只是元
+        // 数据)。密度变化不改变节奏 —— 同源帧 M0 个输出时长求和恒等于源
+        // 时长。缓存帧各设一次(出帧交引用,props 随帧)。
+        ScaleOutputDuration(out, vsapi, m0);
+        for (int g = 0; g < effGens; ++g) {
+            if (genFrame[g]) ScaleOutputDuration(genFrame[g], vsapi, m0);
         }
+        // 缓存替换:[0]=真实帧,[1..effGens]=成功插值帧(slot g+1)。
         for (int i = 0; i < kFgMultMax; ++i) {
             if (d->fgCache[i]) {
                 vsapi->freeFrame(d->fgCache[i]);
-                d->fgCache[i] = nullptr; // 置空:live 下调 m 后高位槽不再回填,
+                d->fgCache[i] = nullptr; // 置空:密度下调后高位槽不再回填,
                                          // 残留旧指针会被下一次填充/Free 双重释放
             }
         }
         d->fgCacheK = k;
-        d->fgCacheM = m;
+        d->fgCacheM = effGens + 1;
         d->fgCache[0] = out; // 接管 newVideoFrame 的引用
-        for (int g = 0; g < m - 1; ++g) {
+        for (int g = 0; g < effGens; ++g) {
             d->fgCache[g + 1] = genFrame[g];
         }
-        const VSFrame *ret = vsapi->addFrameRef(d->fgCache[slot]);
+        const VSFrame *ret =
+            (slot >= 1 && slot < d->fgCacheM && d->fgCache[slot])
+                ? vsapi->addFrameRef(d->fgCache[slot])
+                : vsapi->addFrameRef(d->fgCache[0]);
         vsapi->freeFrame(src);
-        fgLock.unlock();
         return ret;
     }
 
@@ -621,6 +646,7 @@ static void VS_CC DlssnrCreate(
     d->width = vi->width;
     d->height = vi->height;
     d->depth = vi->format.bitsPerSample;
+    d->srcFrames = vi->numFrames; // FG 尾部映射;0 = 未知长度(尾部钳制禁用)
 
     DlssnrParams initial{}; // member initializers are the default authority
     // NR 总开关(0/1):0 = 跳过 D3D12/NGX 全部初始化,滤镜纯直通零开销,

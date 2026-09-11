@@ -92,7 +92,7 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 | `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA optical-flow guidance level (0 = zero guidance; 1–5 use hardware optical flow to reduce motion-scene temporal artifacts; higher is more accurate but slower) |
 | `Nvof_Follow_Scaling` | True/False | False | Optical-flow input follows internal downsampling (requires Scaling_Enabled; greatly reduces optical-flow engine load at a slight motion-accuracy cost) |
 | `Fg_Enabled` | True/False | False | DLSS frame generation (chained after denoise, output fps ×2–×4; requires `ngx\version.dll`, falls back to 1:1 on init failure) |
-| `Fg_Multiplier` | 2–4 | 2 | Interpolation multiplier (live via panel, applied at source-frame boundaries; 24fps ×3 = 72fps) |
+| `Fg_Multiplier` | 2–4 | 2 | Interpolation multiplier (output frame count/pacing is fixed per session; panel changes auto-trigger an in-place mpv reload via `input-ipc-server`; without IPC, off/down-grade falls back to in-session real-frame duplication and up-grade needs a manual seek; 24fps ×3 = 72fps) |
 | `Fg_Route` | 0–3 | 0 | FG route (0 = auto, official first with SM86 proxy fallback; 1 = SM86/RTX 30 via proxy; 2 = SM75/RTX 20 via proxy; 3 = official NGX/RTX 40/50, no fallback when rejected. Process-level, mpv restart required after switching) |
 | `H_Max` | integer | 0 | Output height cap (sources above it skip processing; 0 = unlimited) |
 

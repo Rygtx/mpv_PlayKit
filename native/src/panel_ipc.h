@@ -62,7 +62,7 @@ struct PanelPayload {
     int32_t motionVectorQuality; // 0-5 (0 = 无光流)
     int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
-    int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,源帧边界生效)
+    int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,会话内有效密度 = min(此值, 创建倍数))
     int32_t fgRoute;             // 0-3 FG 路由(v12;0=自动,1=SM86,2=SM75,3=官方 NGX,重启生效)
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
 };

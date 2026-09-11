@@ -92,7 +92,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA 光流引导档位(0 = 零 guidance;1–5 用硬件光流减轻运动场景时域伪影,档位越高越精确也越耗时) |
 | `Nvof_Follow_Scaling` | True/False | False | 光流输入跟随内部降采样(需 Scaling_Enabled;大幅降低光流引擎占用,运动精度略降) |
 | `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×4;依赖 `ngx\version.dll`,初始化失败自动回退 1:1) |
-| `Fg_Multiplier` | 2–4 | 2 | 插帧倍数(面板实时改,源帧边界生效;24fps ×3 = 72fps) |
+| `Fg_Multiplier` | 2–4 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps) |
 | `Fg_Route` | 0–3 | 0 | FG 路由(0 = 自动,官方优先回落代理 SM86;1 = SM86/RTX 30 系走代理;2 = SM75/RTX 20 系走代理;3 = 官方 NGX/RTX 40/50 系,被拒载不回落。进程级,重启 mpv 生效) |
 | `H_Max` | 整数 | 0 | 输出高度限制(源超过该值跳过处理;0 = 不限制) |
 

@@ -79,6 +79,8 @@ struct AppState {
     float uiScale = 1.0f;
     int dpi = 96;
     bool liveDirty = false;
+    bool reseekDirty = false; // 需要重建会话的变动(FG 档位/开、全关后开 NR):
+                              // flush 时 WritePayload 后自动触发 mpv 原地 seek
     bool timingLog = true;
     bool advancedOpen = false; // 残差精调折叠区(ini [panel] advanced 记忆)
     double lastLiveWrite = 0.0;
@@ -196,6 +198,94 @@ void WritePayload(bool saveRequest = false) noexcept {
         g_paramsEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, PARAMS_EVENT);
     }
     if (g_paramsEvent) SetEvent(g_paramsEvent);
+}
+
+// ---------------------------------------------------------------------------
+// mpv IPC 自动重载:需要重建滤镜会话的变动(FG 倍数/开关、创建即全关后重开
+// NR)由面板经 mpv JSON IPC 直接触发一次原地 seek —— mpv 的 vf_vapoursynth
+// 在每次 seek 时整脚本重建,新实例采纳面板刚写入的 payload,变动即时生效,
+// 免手动拖进度条。输出契约(帧数/节奏)随创建倍数定格,会话内无法改 ——
+// 真档位变化只能重建,这正是自动 seek 的存在理由。
+// 管道名发现:解析 ..\portable_config\mpv.conf 的 input-ipc-server,缺失时
+// 回落常见默认名。全程 best-effort:连接失败(未启用 IPC / mpv 未运行 /
+// 已退出)静默放弃,变动退化为插件的会话内 live 机制(降档复制真实帧)。
+// ---------------------------------------------------------------------------
+bool TriggerMpvReseek() noexcept {
+    wchar_t base[MAX_PATH];
+    if (!BasePath(base, MAX_PATH)) return false;
+
+    // 管道名候选:mpv.conf 解析值优先(用户自定义名也能跟上),其后默认名。
+    wchar_t *parsedName = nullptr; // _wcsdup;末尾 free(nullptr) 恒安全
+    const wchar_t *candidates[3] = { nullptr, L"mpvpipe", L"mpvsocket" };
+    {
+        wchar_t confPath[MAX_PATH];
+        swprintf_s(confPath, L"%s\\..\\portable_config\\mpv.conf", base);
+        FILE *f = nullptr;
+        if (_wfopen_s(&f, confPath, L"rb") == 0 && f) {
+            char buf[16384]{};
+            const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+            fclose(f);
+            // 逐行找未注释的 input-ipc-server = <名>(值可带引号)
+            size_t pos = 0;
+            while (pos < n) {
+                const size_t eol = pos + strcspn(buf + pos, "\r\n");
+                size_t s = pos;
+                while (s < eol && (buf[s] == ' ' || buf[s] == '\t')) ++s;
+                if (s + 16 <= eol && _strnicmp(buf + s, "input-ipc-server", 16) == 0) {
+                    size_t eq = s + 16;
+                    while (eq < eol && (buf[eq] == ' ' || buf[eq] == '\t')) ++eq;
+                    if (eq < eol && buf[eq] == '=') {
+                        ++eq;
+                        while (eq < eol && (buf[eq] == ' ' || buf[eq] == '\t')) ++eq;
+                        size_t e = eol;
+                        while (e > eq && (buf[e - 1] == ' ' || buf[e - 1] == '\t' ||
+                                          buf[e - 1] == '"' || buf[e - 1] == '\'')) --e;
+                        if (e > eq && e - eq < 64) {
+                            wchar_t parsed[64]{};
+                            const int cw = MultiByteToWideChar(
+                                CP_UTF8, 0, buf + eq, static_cast<int>(e - eq),
+                                parsed, 63);
+                            if (cw > 0) {
+                                parsed[cw] = L'\0';
+                                parsedName = _wcsdup(parsed); // 首选 = 配置值
+                                candidates[0] = parsedName;
+                            }
+                        }
+                        break; // 注释行(前导 #)不进此分支:首字符已是 '#'
+                    }
+                }
+                pos = eol + 1;
+            }
+        }
+    }
+
+    bool ok = false;
+    for (int i = 0; i < 3 && !ok; ++i) {
+        if (!candidates[i] || !candidates[i][0]) continue;
+        wchar_t pipePath[MAX_PATH];
+        swprintf_s(pipePath, L"\\\\.\\pipe\\%s", candidates[i]);
+        HANDLE pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
+                                  0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) continue;
+        // 原地微 seek(1ms 向前,exact):目标必异于当前帧 → 走完整 seek 路径
+        // → vf_vapoursynth 整脚本重建;显示位置几乎不动。暂停态同样生效。
+        const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
+        DWORD written = 0;
+        ok = WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)), &written, nullptr) &&
+             written == strlen(cmd);
+        char reply[128]{}; // 读掉一行响应(mpv 回显 success/error),内容不关心
+        DWORD got = 0;
+        ReadFile(pipe, reply, sizeof(reply) - 1, &got, nullptr);
+        CloseHandle(pipe);
+        if (ok) {
+            PanelLog("panel: mpv reseek via IPC pipe %ls", candidates[i]);
+        }
+    }
+    if (!ok) {
+        PanelLog("panel: mpv IPC reseek unavailable (input-ipc-server off? mpv closed?); falling back to in-session live");
+    }
+    free(parsedName);
+    return ok;
 }
 
 void WriteIniNow() noexcept {
@@ -677,14 +767,21 @@ void DrawUi() noexcept {
     if (ImGui::IsItemHovered())
         ShowTip("DLSSNR 降噪总开关:关闭 = 跳过降噪推理输出源帧(补帧/光流\n"
                 "照常工作,不受影响)。已激活的会话内切换立即生效;\n"
-                "降噪与帧生成都关时,整个滤镜零初始化零开销(重开需下个 seek,\n"
-                "热上下文保留,同参数重开秒回)。面板开关优先于 vpy 的 NR_Enabled。");
+                "降噪与帧生成都关时,整个滤镜零初始化零开销,重开由面板自动\n"
+                "触发 mpv 原地重载(热上下文保留,秒回;需 mpv.conf 启用\n"
+                "input-ipc-server,未启用时需手动 seek)。面板开关优先于 vpy 的 NR_Enabled。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         bool v = g_app.params.nrEnabled != 0;
         if (ImGui::Checkbox("##nr_enabled", &v)) {
+            // 会话未初始化(passthrough 且非 live 关)时开 NR 无法 live 恢复
+            // —— 需要重建,自动触发原地 seek;其余情况 live 门即时生效。
+            const bool needsReseek =
+                v && strcmp(g_app.filterState, "passthrough") == 0 &&
+                strncmp(g_app.stateDetail, "NR off", 6) != 0;
             g_app.params.nrEnabled = v ? 1 : 0;
             g_app.liveDirty = true;
+            if (needsReseek) g_app.reseekDirty = true;
         }
     }
     y += rowH;
@@ -731,11 +828,13 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("帧生成");
     if (ImGui::IsItemHovered())
-        ShowTip("DLSS 帧生成(挂降噪之后):每源帧产出 M 帧(1 真实 + M-1 插值),\n"
-                "插值帧由 DLSS FG 模型合成。依赖 vs-plugins\\ngx\\version.dll\n"
-                "(dlssg_for_sm86 代理,用户自备部署);初始化失败自动回退 1:1,降噪不受影响。\n"
-                "倍数即时生效(当前源帧播完切换);会话内开关同样即时(关 = 插值帧\n"
-                "改为复制真实帧,帧数不变)。建议配合光流质量 > 0 使用。");
+        ShowTip("DLSS 帧生成(挂降噪之后):每源帧产出 M 帧,插值帧由 DLSS FG 模型合成,\n"
+                "落在相邻两真实帧之间(前一真实帧之后、当前真实帧之前)。\n"
+                "依赖 vs-plugins\\ngx\\version.dll(dlssg_for_sm86 代理,用户自备部署);\n"
+                "初始化失败自动回退 1:1,降噪不受影响。建议配合光流质量 > 0 使用。\n"
+                "输出帧数/节奏随创建档位定格,档位/开关变化由面板自动触发 mpv 原地\n"
+                "重载(需 mpv.conf 启用 input-ipc-server;未启用时关/降档退化为\n"
+                "会话内复制真实帧,升档需手动 seek)。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         // 单一控件:关(=0)/2x/3x/4x,同步 fgEnabled + fgMultiplier 两键。
@@ -751,6 +850,10 @@ void DrawUi() noexcept {
                 g_app.params.fgMultiplier = sel + 1; // 2..4
             }
             g_app.liveDirty = true;
+            // 输出契约(帧数/节奏)随创建档位定格,任何档位/开关的真变化都
+            // 需要 mpv 重建滤镜 —— 自动触发原地 seek(payload 先落,重建的
+            // 新实例即采纳);IPC 不可用时插件侧退化为会话内降档复制。
+            g_app.reseekDirty = true;
         }
     }
     y += rowH;
@@ -1258,6 +1361,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             WritePayload();
             g_app.liveDirty = false;
             g_app.lastLiveWrite = nowSec;
+            // 需要重建会话的变动:payload 落地后立即触发 mpv 原地 seek,
+            // 重建的滤镜实例即采纳新值(免手动拖进度条)。
+            if (g_app.reseekDirty) {
+                g_app.reseekDirty = false;
+                TriggerMpvReseek();
+            }
         }
 
         // Throttled stats read (plugin publishes into the stats mapping every
