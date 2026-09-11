@@ -594,8 +594,8 @@ void DrawUi() noexcept {
                 { g_app.segPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
                 { g_app.segNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
                 { g_app.segEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
-                { g_app.segFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧)" },
-                { g_app.segGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NGX+残差)" },
+                { g_app.segFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" },
+                { g_app.segGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR+输出)" },
                 { g_app.segUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
             constexpr int kSegCount = 6;

@@ -21,8 +21,8 @@
 //      proxy 忽略未知键无害,官方 DLSSG 依赖这些键)。
 // 时序契约(README:输入 NSR / 输出 UAV,提交与同步归调用方):proxy 的
 // CUDA 互操作工作以 DLSSG.CmdQueue/D3D12 互操作语义与槽队列保序,插值
-// 输出的就绪由本槽 SubmitFrame→WaitFrame 的栅栏覆盖(与 NVOF densify 同
-// 款"同队列 FIFO"论证);首个 eval 的输出异常由 VSDLSSNR_DUMP 诊断。
+// 输出的就绪由本槽 WaitFrame(fg 段栅栏)覆盖(与 NVOF densify 同款
+// "同队列 FIFO"论证);首个 eval 的输出异常由 VSDLSSNR_DUMP 诊断。
 
 #include "d3d12_context.h"
 #include <atomic>

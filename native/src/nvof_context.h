@@ -47,7 +47,7 @@ class D3D12Context;
 class NvofContext {
 public:
     struct StageResult {
-        uint64_t waitFenceValue = 0; // SubmitFrame 需等待的 done 栅栏值(0 = 无)
+        uint64_t waitFenceValue = 0; // 槽提交需等待的 done 栅栏值(0 = 无;现状恒 0,execute 已 CPU 等待)
         bool publishZero = false;    // 本帧清零 per-slot motion/confidence
         bool historyReset = false;   // 本帧对 NGX 置 PARAM_RESET
         int inputIndex = -1;         // 本帧写入的输入 ping-pong 槽位(dump 用)
@@ -80,7 +80,7 @@ public:
     }
     // 注册输入纹理(ping-pong,诊断 dump 用;index 0/1)。
     ID3D12Resource *InputTexture(int index) const noexcept { return _input[index].Get(); }
-    // densify 的 cbuffer 旗标与 SubmitFrame 的栅栏等待目标。
+    // densify 的 cbuffer 旗标与槽提交的栅栏等待目标。
     uint32_t GridSize() const noexcept { return _gridSize; }
     bool Bidirectional() const noexcept { return _bidirectional; }
     bool CostEnabled() const noexcept { return _costEnabled; }

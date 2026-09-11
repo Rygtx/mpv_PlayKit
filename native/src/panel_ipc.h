@@ -161,8 +161,10 @@ inline constexpr const char *SK_GPU_LAST = "gpu_last";
 // last 随帧呼吸。perf 日志行仍用 EMA(诊断要看趋势,不受影响)。
 inline constexpr const char *SK_PACK_LAST = "pack_last";
 inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
-// DLSS FG 段(补帧 eval 提交的 CPU 墙钟,与 eval_cpu 同口径;fg 关/门关帧
-// ≈ 0,面板零值段自动隐藏)。其 GPU 执行仍计入 gpu 段(同条槽 CL)。
+// DLSS FG 段(插帧 GPU 耗时:FG 推理 + 插值 YUV/回读 —— 与 gpu 段按 base/fg
+// 两次提交的栅栏完成点差分,timestamp query 与 NGX 同 CL 会 SEH 无法直测;
+// fg 关/门关帧 ≈ 0,面板零值段自动隐藏)。gpu 段 = base CL(NR 推理/残差/
+// 直通 + 真实帧输出链)。
 inline constexpr const char *SK_FG_LAST = "fg_last";
 // NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
 // 时恒 0,面板零值段自动隐藏)。与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。

@@ -227,6 +227,10 @@ void D3D12Context::Finalize() noexcept {
             CloseHandle(s.fenceEvent);
             s.fenceEvent = nullptr;
         }
+        if (s.baseFenceEvent) {
+            CloseHandle(s.baseFenceEvent);
+            s.baseFenceEvent = nullptr;
+        }
         for (int p = 0; p < 3; ++p) {
             if (s.uploadYuv[p] && s.uploadYuvMapped[p]) s.uploadYuv[p]->Unmap(0, nullptr);
             if (s.readbackYuv[p] && s.readbackYuvMapped[p]) s.readbackYuv[p]->Unmap(0, nullptr);
@@ -292,9 +296,10 @@ bool D3D12Context::BeginCtlRecording() noexcept {
 bool D3D12Context::ExecuteCtlAndWait() noexcept {
     HRESULT hr = _ctlCommandList->Close();
     if (FAILED(hr)) return false;
-    // 与 SubmitFrame 共享 _fence:fetch_add + Signal 必须同锁,否则并发
-    // 槽提交会让 Signal 值乱序(fence 值回退 = 驱动未定义行为)。CtlMutex
-    // → _submitMutex 的加锁顺序与 SubmitFrame(仅 _submitMutex)无环。
+    // 与分段提交(SubmitBaseFrame/SubmitFgFrame)共享 _fence:fetch_add +
+    // Signal 必须同锁,否则并发槽提交会让 Signal 值乱序(fence 值回退 =
+    // 驱动未定义行为)。CtlMutex → _submitMutex 的加锁顺序与分段提交
+    // (仅 _submitMutex)无环。
     std::lock_guard<std::mutex> lock(_submitMutex);
     ID3D12CommandList *lists[]{ _ctlCommandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
@@ -558,6 +563,10 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         CloseHandle(slot.fenceEvent);
         slot.fenceEvent = nullptr;
     }
+    if (slot.baseFenceEvent) {
+        CloseHandle(slot.baseFenceEvent);
+        slot.baseFenceEvent = nullptr;
+    }
     // YUV 原生:三对 persist-mapped buffer(Y 全分辨率 + U/V 半分辨率)。
     for (int i = 0; i < 3; ++i) {
         if (slot.uploadYuv[i] && slot.uploadYuvMapped[i]) slot.uploadYuv[i]->Unmap(0, nullptr);
@@ -574,6 +583,8 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     }
     slot.commandList.Reset();
     slot.allocator.Reset();
+    slot.fgCommandList.Reset();
+    slot.fgAllocator.Reset();
     for (int i = 0; i < 3; ++i) {
         slot.uploadYuv[i].Reset();
         slot.readbackYuv[i].Reset();
@@ -619,6 +630,30 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     slot.fenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
     if (!slot.fenceEvent) {
         SetErr(err, errLen, E_FAIL, "Create slot fence event failed");
+        return false;
+    }
+    slot.baseFenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+    if (!slot.baseFenceEvent) {
+        SetErr(err, errLen, E_FAIL, "Create slot base fence event failed");
+        return false;
+    }
+    // FG 分段 CL(与 base 同型;门关帧不录制不提交,资源闲置无害)。
+    hr = _device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(slot.fgAllocator.GetAddressOf()));
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "CreateCommandAllocator(slot fg) failed");
+        return false;
+    }
+    hr = _device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.fgAllocator.Get(), nullptr,
+        IID_PPV_ARGS(slot.fgCommandList.GetAddressOf()));
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "CreateCommandList(slot fg) failed");
+        return false;
+    }
+    hr = slot.fgCommandList->Close();
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "Close initial slot fg command list failed");
         return false;
     }
 
@@ -925,13 +960,15 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
     cl->ResourceBarrier(3, inBack);
 }
 
-bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen,
+bool D3D12Context::RecordReadbackCopy(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                      char *err, size_t errLen,
                                       int fgGen) noexcept {
     // RecordYuvOutput 之后调用:yuvOut 处于 UAV 态 → COPY_SOURCE → 拷贝
     // → COMMON。三平面各自 footprint(格式同资源,跨格式 = 静默 E_INVALIDARG)。
-    // fgGen >= 0 = 拷入 FG 插值帧第 fgGen 组回读缓冲(同一条 CL 上真实帧与
-    // 各插值槽先后转换+回读,共用 yuvOut,目标缓冲两两不同)。
-    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+    // fgGen >= 0 = 拷入 FG 插值帧第 fgGen 组回读缓冲(真实帧与各插值槽先后
+    // 转换+回读,共用 yuvOut,目标缓冲两两不同)。cl 由调用方显式给定
+    // (真实帧 = base CL,插值 = fg CL)。
+    ID3D12GraphicsCommandList *cl = &clRef;
     const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
     const int planeW[3]{ _width, _chromaW, _chromaW };
     const int planeH[3]{ _height, _chromaH, _chromaH };
@@ -968,17 +1005,28 @@ bool D3D12Context::RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen,
     return true;
 }
 
-bool D3D12Context::SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence,
-                               uint64_t waitValue, char *err, size_t errLen) noexcept {
+bool D3D12Context::BeginFgRecording(FrameSlot &slot) noexcept {
+    // 与 BeginFrameRecording 同款防砖:上次录制中途失败遗留 open CL 会让
+    // allocator Reset 报 E_FAIL —— force-close 一次再试。
+    HRESULT hr = slot.fgAllocator->Reset();
+    if (FAILED(hr)) {
+        slot.fgCommandList->Close();
+        hr = slot.fgAllocator->Reset();
+        if (FAILED(hr)) return false;
+    }
+    hr = slot.fgCommandList->Reset(slot.fgAllocator.Get(), nullptr);
+    return SUCCEEDED(hr);
+}
+
+// 分段提交共用体:Close 目标 CL → 队列执行 → signal 全局栅栏新值。提交互斥
+// 保证栅栏值顺序与队列 ExecuteCommandLists 顺序一致(值永不回退)。
+bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence,
+                                   uint64_t waitValue, char *err, size_t errLen) noexcept {
     HRESULT hr = slot.commandList->Close();
     if (FAILED(hr)) {
-        SetErr(err, errLen, hr, "Close(slot) failed");
+        SetErr(err, errLen, hr, "Close(slot base) failed");
         return false;
     }
-    // Submit mutex keeps the fence value order identical to the queue's
-    // ExecuteCommandLists order — concurrent frame threads must not let a
-    // later Signal (smaller value) land after an earlier one (fence values
-    // must never regress).
     // 探针:提交互斥等待(3 槽并发提交在此串行)。>50ms = 提交路径拥塞,
     // 与 GPU 执行慢(gpu 段)分家。
     LARGE_INTEGER s0{}, s1{}, sf{};
@@ -997,15 +1045,34 @@ bool D3D12Context::SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence,
     }
     // NVOF guidance:本槽 densify 依赖 NVOF execute 的 flow 输出 —— 队列级
     // 栅栏等待(顺序无关:常规顺序下该值已满足,零开销;乱序提交时它把本
-    // 槽命令排到 NVOF 输出之后,防 GPU 端读-写竞争)。
+    // 槽命令排到 NVOF 输出之后,防 GPU 端读-写竞争)。现状恒空:StageFrame
+    // 已 CPU 等待 NVOF execute 完成。
     if (waitFence && waitValue) {
         _queue->Wait(waitFence, waitValue);
     }
     ID3D12CommandList *lists[]{ slot.commandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
+    slot.baseFenceValue = _fenceValue.fetch_add(1) + 1;
+    _queue->Signal(_fence.Get(), slot.baseFenceValue);
+    return true;
+}
+
+bool D3D12Context::SubmitFgFrame(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    HRESULT hr = slot.fgCommandList->Close();
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "Close(slot fg) failed");
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(_submitMutex);
+    ID3D12CommandList *lists[]{ slot.fgCommandList.Get() };
+    _queue->ExecuteCommandLists(1, lists);
     slot.fenceValue = _fenceValue.fetch_add(1) + 1;
     _queue->Signal(_fence.Get(), slot.fenceValue);
     return true;
+}
+
+bool D3D12Context::WaitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    return WaitFenceValue(slot.baseFenceValue, slot.baseFenceEvent, err, errLen);
 }
 
 bool D3D12Context::WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept {
@@ -2477,7 +2544,8 @@ void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameS
                  (static_cast<UINT>(dstH) + 7) / 8, 1);
 }
 
-void D3D12Context::RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRange range,
+void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                   ColorMatrix matrix, ColorRange range,
                                    D3D12_RESOURCE_STATES outputStateBefore,
                                    ID3D12Resource *srcColor, UINT srcSrvIndex) noexcept {
     // RGB→YUV(YUV 原生化):srcColor(缺省 outputColor;FG 路径传
@@ -2485,11 +2553,12 @@ void D3D12Context::RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRan
     // → luma + chroma 两个 dispatch 写 yuvOut(留 UAV 交
     // RecordReadbackCopy)→ srcColor 归 COMMON。constant 的 Lo/Span 按
     // 平面语义填充(luma 用 yLo/ySpan,chroma 用 cMid/cSpan)。
+    // cl 由调用方显式给定(真实帧 = base CL,插值 = fg CL)。
     if (!srcColor) {
         srcColor = slot.outputColor.Get();
         srcSrvIndex = kSrvOutputColor;
     }
-    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+    ID3D12GraphicsCommandList *cl = &clRef;
     const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _bitDepth);
     // FG 路径传 NSR(Evaluate 已消费 backbuffer):同态迁移不录屏障。
     if (outputStateBefore != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {

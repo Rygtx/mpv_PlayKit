@@ -71,6 +71,15 @@ struct FrameSlot {
     ComPtr<ID3D12GraphicsCommandList> commandList;
     HANDLE fenceEvent = nullptr;      // dedicated event for this slot's fence wait
     uint64_t fenceValue = 0;          // fence value of this slot's last submission
+    // FG 分段提交(处理用时拆账):base CL(基础管线:NR/直通 + 真实帧输出)
+    // 先提交并 signal baseFenceValue,FG 插帧链(推理 + 插值输出)录在独立
+    // fg CL 上后提交并 signal fenceValue。两段 GPU 耗时 = 两个栅栏完成点的
+    // CPU 墙钟差 —— timestamp query 与 NGX 同 CL 会 SEH(2026-09-05 实锤),
+    // 栅栏差分是唯一无损精确拆分法。
+    ComPtr<ID3D12CommandAllocator> fgAllocator;
+    ComPtr<ID3D12GraphicsCommandList> fgCommandList;
+    HANDLE baseFenceEvent = nullptr;  // base 段栅栏等待专用事件(fg 等待用 fenceEvent)
+    uint64_t baseFenceValue = 0;      // base 段提交的栅栏值(恒 ≤ fenceValue)
 
     // YUV 原生管道:VS 帧(YUV420P8/P10 三平面)与 GPU 之间纯行拷贝。
     // [0]=Y 全分辨率,[1]=U [2]=V 半分辨率;pitch 256 对齐,persist-mapped。
@@ -222,8 +231,8 @@ public:
     void RecordConvertInput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                             ColorMatrix matrix, ColorRange range,
                             D3D12_RESOURCE_STATES stateAfter) noexcept;
-    void RecordYuvOutput(FrameSlot &slot, ColorMatrix matrix, ColorRange range,
-                         D3D12_RESOURCE_STATES outputStateBefore,
+    void RecordYuvOutput(ID3D12GraphicsCommandList &cl, FrameSlot &slot, ColorMatrix matrix,
+                         ColorRange range, D3D12_RESOURCE_STATES outputStateBefore,
                          ID3D12Resource *srcColor = nullptr,
                          UINT srcSrvIndex = kSrvOutputColor) noexcept;
     // 光流输入降采样(#46/#48):YUV→RGB 转换已在同一 CL 上产出 inputColor
@@ -254,14 +263,26 @@ public:
     bool PackInput(FrameSlot &slot, const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                    int width, int height, char *err, size_t errLen) noexcept;
     bool BeginFrameRecording(FrameSlot &slot) noexcept;
+    // FG 分段 CL 的录制起点(防砖 retry 与 base 同款)。仅 FG 插帧链录在
+    // fgCommandList 上;门关帧不 Begin/不提交,slot.fenceValue 停在 base 值。
+    bool BeginFgRecording(FrameSlot &slot) noexcept;
     // 记录:yuvOut ×3 UAV→COPY_SOURCE→拷贝→COMMON(在 RecordYuvOutput 之后,
     // yuvOut 处于 UAV 态)。fgGen >= 0 = 拷入 FG 插值帧第 fgGen 组回读缓冲;
     // 同一条 CL 上真实帧 + 各插值槽的转换+回读共用 yuvOut,目标缓冲必须
-    // 两两不同。
-    bool RecordReadbackCopy(FrameSlot &slot, char *err, size_t errLen,
-                            int fgGen = -1) noexcept;
-    bool SubmitFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
-                     char *err, size_t errLen) noexcept; // [可选栅栏等待] close+execute+signal
+    // 两两不同。cl 由调用方显式给定(真实帧 = base CL,插值 = fg CL)。
+    bool RecordReadbackCopy(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                            char *err, size_t errLen, int fgGen = -1) noexcept;
+    // 分段提交(处理用时拆账):base = 基础管线(NR/直通 + 真实帧输出),
+    // fg = 插帧链(FG 推理 + 插值输出)。base 先提交(栅栏值 baseFenceValue),
+    // fg CL 录完后提交(栅栏值 fenceValue)。CPU 侧先后等两个栅栏,完成点
+    // 差 = 各段 GPU 耗时(等 fg 前先等 base:fg 排 base 后,醒来时 base 必
+    // 已完成,等待开销 = 一次事件唤醒)。waitFence/waitValue = NVOF copy
+    // 栅栏(可选,base 段 GPU 消费 flow 前排队;现状恒空 —— StageFrame 已
+    // CPU 等待 NVOF execute 完成)。
+    bool SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+                         char *err, size_t errLen) noexcept;
+    bool SubmitFgFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
+    bool WaitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
     // GPU 完成后调用:回读缓冲 → VS 三平面(纯 CPU 行拷贝,色度半尺寸)。
     // fgGen >= 0 = 读 FG 插值帧第 fgGen 组缓冲。
