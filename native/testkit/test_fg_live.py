@@ -14,6 +14,11 @@ import testenv  # noqa: E402
 
 import vapoursynth as vs  # noqa: E402
 
+# 隔离部署根的已存 profile:ini 的 fg_multiplier 会盖掉 vpy 实参(三层优先级),
+# 断言"帧数 ×M"就随用户面板设置漂移(与 validate_params 等测试同款隔离)。
+if os.path.exists(testenv.INI):
+    os.remove(testenv.INI)
+
 core = vs.core
 M = 3
 src = core.std.BlankClip(width=320, height=240, format=vs.YUV420P8, length=12, fpsnum=24)

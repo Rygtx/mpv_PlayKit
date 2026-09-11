@@ -221,12 +221,14 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             std::lock_guard<std::mutex> lock(d->fgMutex);
             if (n != d->fgNextN) {
                 // 乱序请求(mpv 顺序拉流不应发生):按当前倍数闭式回退,
-                // 只服务本帧不推进状态机。
+                // 只服务本帧不推进状态机。映射必须与状态机同款 floor
+                // (k = n/M)——ceil 会让 gen 槽偏到 k+1,且尾帧
+                // (n = 源帧数×M-1)算出 k = 源帧数,requestFrameFilter 越界。
                 static std::atomic<bool> warned{ false };
                 if (!warned.exchange(true)) {
                     vsdlssnr::TimingStatusLine("DLSSNR STATUS: fg out-of-order frame request; closed-form fallback");
                 }
-                const int k = (n + d->fgM - 1) / d->fgM;
+                const int k = n / d->fgM;
                 const int slot = n % d->fgM;
                 *frameData = reinterpret_cast<void *>(static_cast<intptr_t>((k << 4) | slot));
                 vsapi->requestFrameFilter(k, d->node, frameCtx);

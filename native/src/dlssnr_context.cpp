@@ -1265,6 +1265,9 @@ bool DlssnrContext::ProcessFrame(
             b.Transition.StateAfter = tmp;
         }
         cl->ResourceBarrier(2, bar);
+        // t2 与正常路径 eval 后同位:此分支不赋值的话 gpuWaitMs = ms(t2=0, t3)
+        // = 开机以来毫秒,面板/perf 日志的 gpu 段被巨值吞没。
+        QueryPerformanceCounter(&t2);
     } else {
         auto *cl = slot->commandList.Get();
         const bool scaling = _d3d12->HasScaling();
@@ -1535,6 +1538,13 @@ bool DlssnrContext::ProcessFrame(
                 };
                 cl->ResourceBarrier(1, fgUndo);
             }
+        } else if (_fg && _fg->Enabled()) {
+            // 门关帧(面板关/诊断跳过/播种/零光流)不向 proxy 提交 eval:
+            // 其内部 backbuffer 历史滞留在跳过前 —— 置位重置让恢复帧重新
+            // 播种(播种帧插值输出照常降级复制),否则"关→开"/播种后的
+            // 首个 eval 用陈旧历史插出鬼影。逐帧置位无害(布尔位;会话
+            // 已死时 Enabled() 为 false 不进此分支)。
+            _fg->ResetHistory();
         }
         // guidance 纹理归位 COMMON(仅 realMotion 帧动过:播种/失败帧的
         // 发布走静态零纹理,per-slot motion 全程 COMMON 不被触碰)。
