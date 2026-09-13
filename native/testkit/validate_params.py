@@ -15,6 +15,15 @@
   mult2 : residual_multiplier=2 -> DIFF
   fine  : saturation=0 lightness=0.5 -> DIFF
   clamp : intensity=1.5 钳到 kStrengthMax=1.0 -> SAME as default
+  -- 2026-09-14 交叉验证补的契约面(AIO 72 用例矩阵 + RTX 3080 A/B,
+     换 nvngx_dlssnr.dll 版本后复跑,防参数行为静默漂移):
+  style : style=1 / style=2 各自 -> DIFF(Style 是真模型选择器;
+          AIO 矩阵:preset 1-3 输出不变,Style 0/1/2 三个不同输出)
+  am0   : use_auto_mask=0 -> DIFF(自动蒙版键有效性哨兵)
+  nr0   : nr_enabled=0 -> DIFF(直通路径健康基线)
+  preset: preset=1 / preset=3 -> SAME(哨兵断言,记录当前 DLL 不消费
+          Hint.Render.Preset 的事实;哪天变 DIFF = preset 被新 DLL 激活,
+          此时应恢复面板"预设"下拉,FAIL 不是 bug)
 
 运行: <部署根>\\python.exe testkit\\validate_params.py
 """
@@ -87,6 +96,25 @@ print(f"intensity=1.5 (clamp 1.0): {g}  {'CLAMPED-OK' if g == a else 'NOT CLAMPE
 s = capture({"shadow_structure": 0.0, "reflection_glow": 1.8})
 print(f"shadow=0 glow=1.8:         {s}  {'DIFF' if s != a else 'SAME!'}")
 
+# -- 契约面(2026-09-14):Style / AutoMask / NR 总开关 / Preset 哨兵 --
+st1 = capture({"style": 1})
+print(f"style=1:                   {st1}  {'DIFF' if st1 != a else 'SAME!'}")
+st2 = capture({"style": 2})
+print(f"style=2:                   {st2}  {'DIFF' if st2 != a else 'SAME!'}")
+am = capture({"use_auto_mask": 0})
+print(f"use_auto_mask=0:           {am}  {'DIFF' if am != a else 'SAME!'}")
+nr0 = capture({"nr_enabled": 0})
+print(f"nr_enabled=0 (passthrough):{nr0}  {'DIFF' if nr0 != a else 'SAME!'}")
+p1 = capture({"preset": 1})
+p3 = capture({"preset": 3})
+p_ok = (p1 == a) and (p3 == a)
+print(f"preset=1:                  {p1}  {'SAME (预期:DLL 不消费 preset)' if p1 == a else 'DIFF (preset 被激活!)'}")
+print(f"preset=3:                  {p3}  {'SAME (预期:DLL 不消费 preset)' if p3 == a else 'DIFF (preset 被激活!)'}")
+if not p_ok:
+    print("  ^ SENTINEL TRIPPED: 新 DLL 消费 Hint.Render.Preset 了 —— "
+          "恢复面板\"预设\"下拉(对照 2026-09-14 的移除提交)")
+
 ok = (a2 == a) and (b != a) and (d != a) and (e != a) and (g == a) and (s != a)
+ok = ok and (st1 != a) and (st2 != a) and (am != a) and (nr0 != a) and p_ok
 print("VALIDATE-PARAMS:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

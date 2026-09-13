@@ -63,7 +63,6 @@ constexpr struct { const char *key; const char *label; const char *tip;
     { "shadow_structure",    "阴影结构",   "残差中变暗分量的倍率(0-2,默认 1):\n调低减轻暗部噪点,调高增强暗部结构。", kResidualFineMin, kResidualFineMax, &DlssnrParams::shadowStructureMultiplier },
     { "reflection_glow",     "反射辉光",   "残差中变亮分量的倍率(0-2,默认 1):\n调低抑制高光泛光,调高增强辉光。", kResidualFineMin, kResidualFineMax, &DlssnrParams::reflectionGlowMultiplier },
 };
-constexpr const char *kPresetNames[] = { "0(默认)", "1(预设 #1)", "2(预设 #2)", "3(预设 #3)" };
 constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
 // 光流质量(上游 motionVectorQuality 0-5,文案对齐上游 resw)
 constexpr const char *kOfQualityNames[] = {
@@ -713,7 +712,7 @@ void DrawUi() noexcept {
     // —— 高度预算的主压缩之一,控件 frame 本体不动)。
     const float rowH = ImGui::GetFrameHeight() + 4 * s;
 
-    // 参数行布局:相关短控件两两并排(预设|风格、四条强度滑杆),复杂控件
+    // 参数行布局:相关短控件两两并排(风格半格行、四条强度滑杆),复杂控件
     // 保整行 —— 13 行 → 9 行。控件列统一对齐:整行与半格行的控件都从
     // colCtrl(半格行第二列从 colCtrl+halfW)起步,标签列宽 = colCtrl−marginX。
     // 整行控件宽度封顶 260*s(下拉/滑杆拉满整行会过长);半格控件 ~102*s。
@@ -783,11 +782,13 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-    // (预设 | 风格)
-    pairLabel(0, "预设", "NR 推理预设:0=默认,1-3=预设 #1/#2/#3。切换会短暂重建模型(毫秒级)。");
-    pairCombo("preset", &DlssnrParams::preset, 4, kPresetNames, 0);
-    pairLabel(1, "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。");
-    pairCombo("style", &DlssnrParams::style, 3, kStyleNames, 1);
+    // (风格半格行):预设下拉已移除(2026-09-14)—— 310.9 DLL 不消费
+    // DLSSNR.Hint.Render.Preset,A/B 实测输出恒等(死旋钮);上游 r2-fix1
+    // 同款处置。preset 参数链(vpy/ini/IPC/NGX 写入)保留:vpy 是
+    // validate_params 的 preset 哨兵断言测试通道,新 DLL 激活 preset 时
+    // (哨兵变 DIFF)面板加回下拉即可。
+    pairLabel(0, "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。");
+    pairCombo("style", &DlssnrParams::style, 3, kStyleNames, 0);
     y += rowH;
 
     // 光流质量(整行:档位文案长,半宽会截断)
