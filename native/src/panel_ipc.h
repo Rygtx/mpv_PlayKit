@@ -31,10 +31,13 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // fgBackend (FG 后端 0=自动/1=官方 NGX/2=代理,下个 seek 生效); v11 adds
 // nrEnabled (NR 总开关 0/1,默认 1;0 = 跳过降噪推理,补帧/光流不受影响);
 // v12 merges fgRouter+fgBackend into fgRoute (0=自动/1=SM86/2=SM75/3=官方
-// NGX,进程级,重启 mpv 生效 —— 后端由硬件决定,自动档总能选对,单控件足够)。
+// NGX,进程级,重启 mpv 生效 —— 后端由硬件决定,自动档总能选对,单控件足够);
+// v13 adds debugView(差异调试 ×20 视图 0/1,live,不持久化 —— 输出被替换为
+// |NR改动|×20 灰度图)并退役 uiCorrection(视频管线无 UI 图层,模型端结构性
+// no-op —— 字段保留占位防布局漂移,写入恒 1,面板不再暴露)。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x434C5344u; // "DSLC" (v12, 版本位走 hex:9 之后是 A/B/C)
+constexpr uint32_t PAYLOAD_MAGIC = 0x444C5344u; // "DSLD" (v13, 版本位走 hex:9 之后是 A/B/C/D)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -49,7 +52,7 @@ struct PanelPayload {
     float localStructure;        // 0-1
     float skinStructure;         // -1-2
     int32_t useAutoMask;         // 0/1
-    int32_t uiCorrection;        // 0/1
+    int32_t uiCorrection;        // 保留字段(v13 退役:视频管线无 UI 图层,恒写 1)
     int32_t inputResolution;     // 25-100
     float residualMultiplier;    // 1-2
     float residualSaturation;    // 0-2 (relative to DLSSNR's own change)
@@ -65,6 +68,7 @@ struct PanelPayload {
     int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,会话内有效密度 = min(此值, 创建倍数))
     int32_t fgRoute;             // 0-3 FG 路由(v12;0=自动,1=SM86,2=SM75,3=官方 NGX,重启生效)
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
+    int32_t debugView;           // 0/1 差异调试 ×20 视图(v13;live,不持久化)
 };
 #pragma pack(pop)
 
@@ -86,7 +90,6 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.localStructureStrength = std::clamp(pl.localStructure, kStrengthMin, kStrengthMax);
     p.skinStructureStrength = std::clamp(pl.skinStructure, kSkinMin, kSkinMax);
     p.useAutoMask = pl.useAutoMask != 0;
-    p.uiCorrection = pl.uiCorrection != 0;
     p.residualMultiplier = std::clamp(pl.residualMultiplier, kResidualMultMin, kResidualMultMax);
     p.residualSaturation = std::clamp(pl.residualSaturation, kResidualFineMin, kResidualFineMax);
     p.residualLightness = std::clamp(pl.residualLightness, kResidualFineMin, kResidualFineMax);
@@ -96,6 +99,7 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.nvofFollowScaling = pl.nvofFollowScaling != 0;
     p.fgEnabled = pl.fgEnabled != 0;
     p.fgMultiplier = std::clamp(pl.fgMultiplier, kFgMultMin, kFgMultMax);
+    p.debugView = pl.debugView != 0;
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
@@ -122,7 +126,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.localStructure = p.localStructureStrength;
     pl.skinStructure = p.skinStructureStrength;
     pl.useAutoMask = p.useAutoMask ? 1 : 0;
-    pl.uiCorrection = p.uiCorrection ? 1 : 0;
+    pl.uiCorrection = 1; // 退役保留字段(v13):视频管线无 UI 图层,恒写模型默认
     pl.inputResolution = p.inputResolutionPercent;
     pl.scalingEnabled = p.scalingEnabled ? 1 : 0;
     pl.residualMultiplier = p.residualMultiplier;
@@ -135,6 +139,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.fgEnabled = p.fgEnabled ? 1 : 0;
     pl.fgMultiplier = std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax);
     pl.fgRoute = std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
+    pl.debugView = p.debugView ? 1 : 0;
     return pl;
 }
 

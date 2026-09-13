@@ -60,8 +60,6 @@ struct DlssnrParams {
     float skinStructureStrength = -1.0f;
     // NGX "DLSSNR.UseAutoMask" 0/1
     int useAutoMask = 1;
-    // NGX "DLSSNR.UICorrection" 0/1
-    int uiCorrection = 1;
     // Internal processing resolution in percent of source (25-100, create-time;
     // changing it rebuilds the feature + scaling resources). Ignored when
     // scalingEnabled == 0.
@@ -105,6 +103,11 @@ struct DlssnrParams {
     // DLSS 帧生成路由(0=自动 官方优先回落 proxy,1=SM86,2=SM75,3=仅官方
     // NGX;进程级,重启 mpv 生效):见 kFgRouteMin 注释。
     int fgRoute = 0;
+    // 差异调试视图(0/1,live 参数,**不持久化**):1 = 输出被替换为
+    // |NR改动|×20 的灰度图 —— 白 = 改动大,一片灰 = 模型没动画面
+    // (OptiScaler DLSSNR fork 的 DebugView=3 同语义,回应"看不出参数
+    // 有没有效果")。面板"差异调试 ×20"开关,仅当前会话有效。
+    int debugView = 0;
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence

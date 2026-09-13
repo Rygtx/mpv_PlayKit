@@ -27,7 +27,6 @@ Local_Tone = 1.0
 Local_Structure = 1.0
 Skin_Structure = -1
 Use_Auto_Mask = True
-UI_Correction = True
 Scaling_Enabled = True
 Input_Resolution = 100
 Residual_Multiplier = 1.0
@@ -48,7 +47,6 @@ H_Max = 0
 ## <0-1> 浮点, 局部结构强度 (默认 1.0)
 ## <-1-2> 浮点, 皮肤结构强度 (-1 = 自动, 默认)
 ## <True|False> 使用自动蒙版
-## <True|False> UI 文字修正
 ## <True|False> 内部分辨率缩放总开关 (默认 True)
 ##          False = 彻底关闭残差管线: 不建中间纹理/compute, 按源尺寸直接处理,
 ##          且 Input_Resolution 被忽略; 需要零缩放开销时用
@@ -115,7 +113,6 @@ else :
 		local_structure = Local_Structure,
 		skin_structure = Skin_Structure,
 		use_auto_mask = int(Use_Auto_Mask),
-		ui_correction = int(UI_Correction),
 		scaling_enabled = int(Scaling_Enabled),
 		input_resolution = Input_Resolution,
 		residual_multiplier = Residual_Multiplier,

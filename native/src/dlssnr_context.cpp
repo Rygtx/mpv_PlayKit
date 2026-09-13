@@ -388,6 +388,13 @@ void DlssnrContext::SetCreateParametersUnsafe() noexcept {
     p->Set(PARAM_SCALING_RATIO, 1.0f);
     p->Set(PARAM_SCALING_RATIO_CALLBACK, FunctionAddress(&SetScalingRatioCallback));
     p->Set(PARAM_PRESET, createParams.preset);
+    // OptiScaler DLSSNR fork 对齐:模型建 feature 时读一次 tuning("set
+    // before create"),create 侧同键双写;evaluate 侧逐帧写入是 mpv 路径
+    // 实测生效的机制(A/B DIFF),双写无害。UICorrection 依赖引擎提供的
+    // UI/UIAlpha 图层资源 —— 视频管线无 UI 图层,结构性 no-op,恒写模型
+    // 默认 1(与 OptiScaler 的处理一致,不复露为用户选项)。
+    p->Set(PARAM_AUTO_MASK, createParams.useAutoMask ? 1 : 0);
+    p->Set(PARAM_UI_CORRECTION, 1);
     p->Set(NVSDK_NGX_Parameter_Width, iw);
     p->Set(NVSDK_NGX_Parameter_Height, ih);
     p->Set(NVSDK_NGX_Parameter_PerfQualityValue,
@@ -435,7 +442,9 @@ void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHisto
     p->Set(PARAM_LOCAL_STRUCTURE, params.localStructureStrength);
     p->Set(PARAM_SKIN_STRUCTURE, params.skinStructureStrength);
     p->Set(PARAM_AUTO_MASK, params.useAutoMask ? 1 : 0);
-    p->Set(PARAM_UI_CORRECTION, params.uiCorrection ? 1 : 0);
+    // UICorrection 退役(v13):视频管线无 UI 图层,结构性 no-op。恒写模型
+    // 默认 1,防参数块复用时残留旧值静默生效(OptiScaler 显式写入策略)。
+    p->Set(PARAM_UI_CORRECTION, 1);
 }
 
 bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion, DWORD *sehCode) noexcept {
@@ -1566,6 +1575,12 @@ bool DlssnrContext::ProcessFrame(
     }
     const bool fgOnFgCl = fgGateOpen && fgBeginOk;
 
+    // 差异调试视图(面板"差异调试 ×20"):|输出−输入|×20 灰度替换输出。
+    // 此处是三条路径(skipEval/nrOff/eval)帧末 outputColor=UAV 的唯一
+    // 公共插入点;FG 激活时插帧链会拿到调试图当 backbuffer(调试态可接受)。
+    if (frameParams.debugView != 0) {
+        _d3d12->RecordDebugDiff(*slot);
+    }
     // 真实帧输出(base CL 收尾):outputColor 到达时 = UAV(evaluate 写/
     // 垂直合成写/直通拷贝写,三路一致),RecordYuvOutput 统一 NSR 化转换、
     // 收尾归 COMMON;yuvOut 留 UAV 交 readback 后归 COMMON。

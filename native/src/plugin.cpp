@@ -659,7 +659,6 @@ static void VS_CC DlssnrCreate(
     ApplyFloatArg(in, vsapi, "local_structure", initial.localStructureStrength, kStrengthMin, kStrengthMax);
     ApplyFloatArg(in, vsapi, "skin_structure", initial.skinStructureStrength, kSkinMin, kSkinMax);
     ApplyFlagArg(in, vsapi, "use_auto_mask", initial.useAutoMask);
-    ApplyFlagArg(in, vsapi, "ui_correction", initial.uiCorrection);
     ApplyFloatArg(in, vsapi, "residual_multiplier", initial.residualMultiplier, kResidualMultMin, kResidualMultMax);
     ApplyFloatArg(in, vsapi, "residual_saturation", initial.residualSaturation, kResidualFineMin, kResidualFineMax);
     ApplyFloatArg(in, vsapi, "residual_lightness", initial.residualLightness, kResidualFineMin, kResidualFineMax);
@@ -940,7 +939,6 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "local_structure:float:opt;"
         "skin_structure:float:opt;"
         "use_auto_mask:int:opt;"
-        "ui_correction:int:opt;"
         "residual_multiplier:float:opt;"
         "residual_saturation:float:opt;"
         "residual_lightness:float:opt;"

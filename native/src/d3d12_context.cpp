@@ -458,6 +458,14 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, err, errLen)) {
         return false;
     }
+    // 差异调试纹理(共享单实例):每槽描述符堆的槽 34 视图都指向它,
+    // 因此必须先于槽池循环创建。重建(hot 复用换尺寸)时整槽纹理按
+    // GetAddressOf 惯例重造(与 _motion/_depth 同款)。
+    if (!CreateColorTexture(_debugDiff.GetAddressOf(), width, height,
+                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
 
     if (ProbeEnabled()) TimingStatusLine("PROBE: d3d12 frame-res before clear"); // init 细分(DEVICE_HUNG 时序定位)
     {
@@ -749,11 +757,11 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     {
         // slot-local shader-visible descriptor heap; input/output descriptors
         // here, the residual pipeline descriptors on every scaling rebuild.
-        // 34 = 0..31 原有 + 32/33(FG 插值输出的 SRV/UAV;堆空间常备,
-        // 非 FG 槽写占位视图)。
+        // 35 = 0..31 原有 + 32/33(FG 插值输出的 SRV/UAV;堆空间常备,
+        // 非 FG 槽写占位视图)+ 34(共享差异调试纹理 UAV)。
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 34;
+        heapDesc.NumDescriptors = 35;
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -807,6 +815,10 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
             _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(32));
             _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(33));
         }
+        // 34:共享差异调试纹理的 UAV(资源 = context 级 _debugDiff,已在
+        // CreateFrameResources 槽池循环前创建;每槽堆各持一份指向同一
+        // 资源的视图,dispatch 只被本槽 CL 引用)。
+        _device->CreateUnorderedAccessView(_debugDiff.Get(), nullptr, nullptr, slotHandle(34));
     }
     return true;
 }
@@ -1611,6 +1623,31 @@ void NvofDownsample(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// 差异调试视图(面板"差异调试 ×20",OptiScaler DLSSNR fork 的 DebugView=3
+// 同语义):|NR输出 − 原帧| 逐通道最大差 × 放大系数的灰度图 —— 白 = 改动
+// 大,一片灰 = 模型没动画面。两输入同为 BGRA8 的 typed SRV(逻辑 RGBA,
+// 通道序一致,差值与分量序无关);alpha 恒 1。
+constexpr char DEBUG_DIFF_HLSL[] = R"(
+Texture2D<float4> SourceInput : register(t0);   // 原帧(YUV→RGB 转换后)
+Texture2D<float4> SourceOutput : register(t1);  // NR/残差/直通输出
+RWTexture2D<float4> DebugDiff : register(u0);
+
+cbuffer DebugDiffParams : register(b0) {
+    uint2 Extent;        // dispatch 边界(全分辨率)
+    float Amplification; // 20
+    uint Pad0;
+};
+
+[numthreads(8, 8, 1)]
+void DebugDiffMain(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= Extent)) return;
+    const float3 src = SourceInput[tid.xy].xyz;
+    const float3 dst = SourceOutput[tid.xy].xyz;
+    const float d = max(abs(dst.r - src.r), max(abs(dst.g - src.g), abs(dst.b - src.b)));
+    DebugDiff[tid.xy] = float4(saturate(d * Amplification).xxx, 1.0);
+}
+)";
+
 // YUV→RGB(YUV 原生化):采样 Y/U/V 平面(色度双线性上采),按位深恢复
 // 整数采样字、按范围展开,矩阵求逆得 RGB,UAV 直写 inputColor。深度/矩阵/
 // 范围全在 root constants(C0/C1,由 YuvCoeffsFor 按 _bitDepth 推导)——
@@ -2072,6 +2109,68 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
         }
         if (ProbeEnabled()) TimingStatusLine("PROBE: pso nvofds done");
     }
+    // 差异调试视图:b0 4 常量 + t0/t1 两张 SRV 表(input/output)+ u0 一张
+    // UAV 表(共享 _debugDiff)。SRV 各自独立表参数(同表重叠 range 禁忌
+    // 见 densify 块注释)。
+    {
+        D3D12_DESCRIPTOR_RANGE srvRanges[2]{};
+        for (UINT i = 0; i < 2; ++i) {
+            srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            srvRanges[i].NumDescriptors = 1;
+            srvRanges[i].BaseShaderRegister = i;
+            srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
+        }
+        D3D12_DESCRIPTOR_RANGE uavRange{};
+        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRange.NumDescriptors = 1;
+        uavRange.BaseShaderRegister = 0;
+        uavRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_ROOT_PARAMETER params[4]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.ShaderRegister = 0;
+        params[0].Constants.Num32BitValues = 4; // extent(2)+amp(1)+pad(1)
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        for (UINT i = 0; i < 2; ++i) {
+            params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
+            params[1 + i].DescriptorTable.pDescriptorRanges = &srvRanges[i];
+            params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[3].DescriptorTable.NumDescriptorRanges = 1;
+        params[3].DescriptorTable.pDescriptorRanges = &uavRange;
+        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+        rsDesc.NumParameters = 4;
+        rsDesc.pParameters = params;
+        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ComPtr<ID3DBlob> rsBlob, rsErr;
+        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(debug diff) failed");
+            return false;
+        }
+        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsDebugDiff.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateRootSignature(debug diff) failed");
+            return false;
+        }
+        ComPtr<ID3DBlob> code, csErr;
+        if (FAILED(D3DCompile(DEBUG_DIFF_HLSL, strlen(DEBUG_DIFF_HLSL),
+                              nullptr, nullptr, nullptr, "DebugDiffMain", "cs_5_0",
+                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(debug diff) failed");
+            return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+        psoDesc.pRootSignature = _rsDebugDiff.Get();
+        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
+        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoDebugDiff.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(debug diff) failed");
+            return false;
+        }
+    }
     // YUV↔RGB 转换(YUV 原生化):convertIn = t0/t1/t2 三张 SRV 表(Y/U/V)
     // + u0 一张 UAV 表(inputColor)+ b0 10 常量;convertOut = t0 一张 SRV 表
     // (outputColor)+ u0/u1 两张 UAV 表(Y/U,V)+ b0 12 常量。深度/矩阵/
@@ -2509,6 +2608,57 @@ void D3D12Context::RecordGuidanceDownsample(FrameSlot &slot) noexcept {
                        20, 21,          // u0 reducedMotion, u1 reducedConfidence
                        (static_cast<UINT>(_internalWidth) + 7) / 8,
                        (static_cast<UINT>(_internalHeight) + 7) / 8);
+}
+
+void D3D12Context::RecordDebugDiff(FrameSlot &slot) noexcept {
+    // 差异调试视图(契约见头文件):input COMMON / output UAV 入,输出
+    // 保持 UAV、input 归 COMMON 出。dispatch 写共享 _debugDiff,同 CL 内
+    // COPY_SOURCE 化后拷回 outputColor —— RGBA8 无 UAV load,读写同纹理
+    // 非法,中转纹理是必须的。每槽堆的槽 34 视图都指向共享资源,dispatch
+    // + 拷回在同一 CL 上原子成对,队列提交序串行,并发帧不交错。
+    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+    cl->SetComputeRootSignature(_rsDebugDiff.Get());
+    cl->SetPipelineState(_psoDebugDiff.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+
+    // cbuffer 布局(与 DEBUG_DIFF_HLSL 同步,三处同步铁律):
+    // extent@0 amp@2 pad@3。
+    const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+    const float amp = 20.0f;
+    const UINT pad = 0u;
+    cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+    cl->SetComputeRoot32BitConstants(0, 1, &amp, 2);
+    cl->SetComputeRoot32BitConstants(0, 1, &pad, 3);
+
+    D3D12_RESOURCE_BARRIER pre[3]{
+        Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+    };
+    cl->ResourceBarrier(3, pre);
+    cl->SetComputeRootDescriptorTable(1, gpu(0));               // t0 inputColor
+    cl->SetComputeRootDescriptorTable(2, gpu(kSrvOutputColor)); // t1 outputColor
+    cl->SetComputeRootDescriptorTable(3, gpu(kUavDebugDiff));   // u0 debugDiff
+    cl->Dispatch((static_cast<UINT>(_width) + 7) / 8,
+                 (static_cast<UINT>(_height) + 7) / 8, 1);
+    // input 用完即归位;debugDiff → COPY_SOURCE、output → COPY_DEST 接拷贝
+    // (状态转换对先前 UAV 写入自带同步语义,无需额外 UAV barrier)。
+    D3D12_RESOURCE_BARRIER mid[3]{
+        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+        Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
+    };
+    cl->ResourceBarrier(3, mid);
+    cl->CopyResource(slot.outputColor.Get(), _debugDiff.Get());
+    D3D12_RESOURCE_BARRIER post[2]{
+        Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    };
+    cl->ResourceBarrier(2, post);
 }
 
 void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,

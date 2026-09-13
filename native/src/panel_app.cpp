@@ -971,12 +971,14 @@ void DrawUi() noexcept {
         }
         if (ImGui::IsItemHovered()) ShowTip("自动蒙版。模型自动识别区域并区别处理。");
         ImGui::SameLine(0, 24 * s);
-        bool uiFix = g_app.params.uiCorrection != 0;
-        if (ImGui::Checkbox("UI 文字修正", &uiFix)) {
-            g_app.params.uiCorrection = uiFix ? 1 : 0;
+        bool dbgView = g_app.params.debugView != 0;
+        if (ImGui::Checkbox("差异调试 ×20", &dbgView)) {
+            g_app.params.debugView = dbgView ? 1 : 0;
             g_app.liveDirty = true;
         }
-        if (ImGui::IsItemHovered()) ShowTip("UI 修正。降低对画面内文字/UI 元素的涂抹。");
+        if (ImGui::IsItemHovered())
+            ShowTip("输出替换为 |NR改动|×20 的灰度图:白 = 改动大,一片灰 = 模型没动画面。\n"
+                    "用于确认模型/参数是否真的在起作用;仅当前会话有效,不写入保存设置。");
         ImGui::SameLine(0, 24 * s);
         bool logOn = g_app.timingLog;
         if (ImGui::Checkbox("写入性能日志", &logOn)) {

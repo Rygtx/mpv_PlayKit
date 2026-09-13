@@ -14,7 +14,7 @@ import ctypes
 import struct
 
 PAYLOAD_SIZE = 512
-PAYLOAD_MAGIC = 0x434C5344  # "DSLC" (v12, 版本位走 hex: 9 之后是 A/B/C)
+PAYLOAD_MAGIC = 0x444C5344  # "DSLD" (v13, 版本位走 hex: 9 之后是 A/B/C/D)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
@@ -22,12 +22,13 @@ ALIVE_EVENT = "vs_dlssnr_bridge_alive"
 
 # mirror of PanelPayload (#pragma pack push, 全 4 字节字段无对齐缝隙):
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
-# localStructure,skinStructure | 3i useAutoMask,uiCorrection,inputResolution |
-# 5f residualMultiplier,residualSaturation,residualLightness,shadowStructure,
-# reflectionGlow | 9i scalingEnabled,saveRequest,logEnabled,motionVectorQuality,
-# nvofFollowScaling,fgEnabled,fgMultiplier,fgRoute,nrEnabled
-_STRUCT = struct.Struct("<3I2i4f3i5f9i")
-assert _STRUCT.size == 104, "PanelPayload 布局与 panel_ipc.h 不一致"
+# localStructure,skinStructure | 3i useAutoMask,uiCorrection(保留,恒 1),
+# inputResolution | 5f residualMultiplier,residualSaturation,residualLightness,
+# shadowStructure,reflectionGlow | 10i scalingEnabled,saveRequest,logEnabled,
+# motionVectorQuality,nvofFollowScaling,fgEnabled,fgMultiplier,fgRoute,
+# nrEnabled,debugView
+_STRUCT = struct.Struct("<3I2i4f3i5f10i")
+assert _STRUCT.size == 108, "PanelPayload 布局与 panel_ipc.h 不一致"
 
 DEFAULTS = dict(
     preset=0, style=0,
@@ -38,6 +39,7 @@ DEFAULTS = dict(
     scalingEnabled=1, saveRequest=0, logEnabled=1,
     motionVectorQuality=0, nvofFollowScaling=0,
     fgEnabled=0, fgMultiplier=2, fgRoute=0, nrEnabled=1,
+    debugView=0,
 )
 
 _FIELDS = ("magic", "seq", "generation", "preset", "style",
@@ -47,7 +49,7 @@ _FIELDS = ("magic", "seq", "generation", "preset", "style",
            "shadowStructure", "reflectionGlow",
            "scalingEnabled", "saveRequest", "logEnabled",
            "motionVectorQuality", "nvofFollowScaling", "fgEnabled", "fgMultiplier",
-           "fgRoute", "nrEnabled")
+           "fgRoute", "nrEnabled", "debugView")
 
 PAGE_READWRITE = 0x04
 FILE_MAP_READ = 0x0004
@@ -83,7 +85,7 @@ class ParamsChannel:
             vals["scalingEnabled"], vals["saveRequest"], vals["logEnabled"],
             vals["motionVectorQuality"], vals["nvofFollowScaling"],
             vals["fgEnabled"], vals["fgMultiplier"], vals["fgRoute"],
-            vals["nrEnabled"])
+            vals["nrEnabled"], vals["debugView"])
         ctypes.memmove(ctypes.c_void_p(self._view), data, len(data))
 
     def read(self):

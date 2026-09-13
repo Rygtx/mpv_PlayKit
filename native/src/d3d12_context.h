@@ -137,6 +137,8 @@ struct FrameSlot {
     // 31=uavInput(inputColor 的 UAV,YUV→RGB 转换直写)
     // 32=srvFgInterp 33=uavFgInterp(FG 插值输出;非 FG 槽 = outputColor
     // 占位视图 —— 绝不写 NULL 描述符,见 14-17 注释)
+    // 34=uavDebugDiff(共享差异调试纹理的 UAV,"差异调试 ×20" 视图写入目标;
+    // 资源为 context 级单例,每槽堆各持一份视图)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 };
 
@@ -301,6 +303,14 @@ public:
     // controlledRes(Magpie 的 verticalResidual 绑定切换)。
     void RecordResidualVertical(FrameSlot &slot, const ResidualControls &rc,
                                 bool equalWidth) noexcept;
+    // 差异调试视图(面板"差异调试 ×20",OptiScaler DebugView=3 同语义):
+    // |outputColor − inputColor| 逐通道最大差 ×20 的灰度图替换输出。
+    // 调用契约(dlssnr_context 帧路径):outputColor 处于 UAV 态(eval/残差/
+    // 直通三路帧末一致),inputColor 处于 COMMON;调用后 outputColor 保持
+    // UAV(RecordYuvOutput 的 stateBefore 契约不变),inputColor 归 COMMON。
+    // _debugDiff 为 context 级共享单纹理:dispatch+copyback 在同一条槽 CL
+    // 上原子成对,队列按提交序串行,并发帧的记录对不交错。
+    void RecordDebugDiff(FrameSlot &slot) noexcept;
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
@@ -308,6 +318,7 @@ public:
     // 描述符堆槽位(RecordYuvOutput / FG 转换共用)。
     static constexpr UINT kSrvOutputColor = 22; // outputColor 的 SRV
     static constexpr UINT kSrvFgInterp = 32;    // fgInterp 的 SRV(FG 槽)
+    static constexpr UINT kUavDebugDiff = 34;   // 共享差异调试纹理的 UAV
     // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
@@ -415,6 +426,13 @@ private:
     // 注册输入纹理(1 SRV + 1 UAV + 5 常量)。
     ComPtr<ID3D12RootSignature> _rsNvofDownsample;
     ComPtr<ID3D12PipelineState> _psoNvofDownsample;
+    // 差异调试视图:2 SRV(input/output)+ 1 UAV(debugDiff)+ 4 常量
+    // (extent 2 + 放大系数 1 + pad 1)。
+    ComPtr<ID3D12RootSignature> _rsDebugDiff;
+    ComPtr<ID3D12PipelineState> _psoDebugDiff;
+    // 差异调试中间纹理(W×H BGRA8,UAV):dispatch 写差值 → 同 CL 拷回
+    // outputColor(RGBA8 无 UAV load,读写同纹理非法,必须中转)。
+    ComPtr<ID3D12Resource> _debugDiff;
     // YUV↔RGB 转换(YUV 原生化):深度/矩阵/范围全走 root constants,
     // R8/R16_UNORM 的 Texture2D<float> 视图同构 —— 仅 3 个 PSO:
     // convertIn(Y/U/V 3 SRV → inputColor 1 UAV,8 常量);

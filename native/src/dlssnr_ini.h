@@ -36,7 +36,6 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeX100(L"local_structure_x100", p.localStructureStrength);
     writeX100(L"skin_structure_x100", p.skinStructureStrength);
     writeInt(L"use_auto_mask", p.useAutoMask ? 1 : 0);
-    writeInt(L"ui_correction", p.uiCorrection ? 1 : 0);
     writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax));
     writeInt(L"scaling_enabled", p.scalingEnabled ? 1 : 0);
     writeX100(L"residual_multiplier_x100", p.residualMultiplier);
@@ -78,7 +77,6 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.localStructureStrength = readX100(L"local_structure_x100", p.localStructureStrength, kStrengthMin, kStrengthMax);
     p.skinStructureStrength = readX100(L"skin_structure_x100", p.skinStructureStrength, kSkinMin, kSkinMax);
     p.useAutoMask = readInt(L"use_auto_mask", p.useAutoMask ? 1 : 0) != 0;
-    p.uiCorrection = readInt(L"ui_correction", p.uiCorrection ? 1 : 0) != 0;
     p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), kResPctMin, kResPctMax);
     // 与其它布尔位同款 != 0 归一:GetPrivateProfileInt 对非数字("true")
     // 返回 0 会静默关掉缩放;>1 的值又会让 CreateParamsChanged 每次热复用
