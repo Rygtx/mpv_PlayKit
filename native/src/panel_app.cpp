@@ -82,6 +82,7 @@ struct AppState {
                               // flush 时 WritePayload 后自动触发 mpv 原地 seek
     bool timingLog = true;
     bool advancedOpen = false; // 残差精调折叠区(ini [panel] advanced 记忆)
+    int page = 0;              // 功能页签:0=降噪增强,1=帧生成(ini [panel] page 记忆)
     double lastLiveWrite = 0.0;
     double lastStatsRead = 0.0;
     char status[160]{};
@@ -306,6 +307,7 @@ void LoadIni() noexcept {
     // (independent of the saved profile)
     g_app.timingLog = GetPrivateProfileIntW(L"panel", L"log", 1, path) != 0;
     g_app.advancedOpen = GetPrivateProfileIntW(L"panel", L"advanced", 0, path) != 0;
+    g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 1u));
     LoadDlssnrIni(g_app.params, path);
 }
 
@@ -580,7 +582,379 @@ void DrawUi() noexcept {
     }
     ImGui::Spacing();
 
-    // 效果渲染用时(堆叠时间线,列宽 = 耗时占比)
+    // 遥测带底(供下一帧背景):带内只留状态行。处理用时整段移到窗口
+    // 最底部 —— 分段行随帧出现/消失引起的高度变化只影响底部收口,
+    // 不再推动上方的参数控件(高度快速抖动问题)。
+    s_bandBottom = ImGui::GetCursorPosY() + 8 * s;
+    float y = s_bandBottom + 12 * s;
+
+    // Label 与控件垂直居中:控件文本在 frame 内偏移 FramePadding.y,标签
+    // 按同一中心线对齐。旧的硬编码 +7/+8*s 在高 DPI 下漂移(字体随 s 放大,
+    // FramePadding 固定不放大),表现为参数名与滑块错位。
+    const float labelDy = (ImGui::GetFrameHeight() - ImGui::GetTextLineHeight()) * 0.5f;
+    // 行高 = 控件 frame + 紧凑间距(#38 度量驱动;间距从 10*s 收紧到 4*s
+    // —— 高度预算的主压缩之一,控件 frame 本体不动)。
+    const float rowH = ImGui::GetFrameHeight() + 4 * s;
+
+    // 参数行布局:相关短控件两两并排(风格半格行、四条强度滑杆),复杂控件
+    // 保整行 —— 13 行 → 9 行。控件列统一对齐:整行与半格行的控件都从
+    // colCtrl(半格行第二列从 colCtrl+halfW)起步,标签列宽 = colCtrl−marginX。
+    // 整行控件宽度封顶 260*s(下拉/滑杆拉满整行会过长);半格控件 ~102*s。
+    const float halfW = (wsize.x - 2 * marginX) * 0.5f;
+    const float pairLabelW = colCtrl - marginX;
+    auto pairLabel = [&](int col, const char *label, const char *tip) {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW, wpos.y + y + labelDy));
+        ImGui::TextUnformatted(label);
+        if (tip && ImGui::IsItemHovered()) ShowTip(tip);
+    };
+    auto pairCombo = [&](const char *key, int DlssnrParams::*f, int count,
+                         const char *const *names, int col) {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW + pairLabelW, wpos.y + y));
+        ImGui::SetNextItemWidth(halfW - pairLabelW - 8 * s);
+        int v = g_app.params.*f;
+        if (ImGui::Combo((std::string("##") + key).c_str(), &v, names, count)) {
+            g_app.params.*f = v;
+            g_app.liveDirty = true;
+        }
+    };
+    auto pairSlider = [&](const char *key, float DlssnrParams::*f, float lo, float hi, int col) {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW + pairLabelW, wpos.y + y));
+        ImGui::SetNextItemWidth(halfW - pairLabelW - 8 * s);
+        float v = g_app.params.*f;
+        if (ImGui::SliderFloat((std::string("##") + key).c_str(), &v, lo, hi, "%.2f")) {
+            // NGX accepts continuous float steps (verified: 0.01 steps produce
+            // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
+            g_app.params.*f = v;
+            g_app.liveDirty = true;
+        }
+    };
+    auto fullSlider = [&](const char *key, const char *label, const char *tip,
+                          float DlssnrParams::*f, float lo, float hi) {
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+        ImGui::TextUnformatted(label);
+        if (ImGui::IsItemHovered()) ShowTip(tip);
+        ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+        // (std::min) 括号抑制 windows.h 的 min 宏(无 NOMINMAX)
+        ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
+        float v = g_app.params.*f;
+        if (ImGui::SliderFloat((std::string("##") + key).c_str(), &v, lo, hi, "%.2f")) {
+            g_app.params.*f = v;
+            g_app.liveDirty = true;
+        }
+        y += rowH;
+    };
+    // 页签选择记忆落 ini([panel] page),与 advancedOpen 同款。
+    auto savePagePref = [&](int p) {
+        g_app.page = p;
+        wchar_t base[MAX_PATH], path[MAX_PATH];
+        if (BasePath(base, MAX_PATH)) {
+            swprintf_s(path, MAX_PATH, L"%s\\%s", base, INI_FILE);
+            WritePrivateProfileStringW(L"panel", L"page", p == 0 ? L"0" : L"1", path);
+        }
+    };
+
+    // --- 功能页签:降噪增强 / 帧生成分页,不再全挤在一页 ---
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+    if (ImGui::BeginTabBar("##feature_tabs")) {
+        // --- 页:降噪增强(NR + 光流 + 分辨率缩放) ---
+        if (ImGui::BeginTabItem("降噪增强", nullptr,
+                                g_app.page == 0 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            // 只在用户真实点击时落盘:首帧 ImGui 默认选中第一个提交的页签,
+            // 若此处无条件同步,保存的 page 会被默认选中行为覆盖回 0。
+            if (g_app.page != 0 && ImGui::IsItemClicked(ImGuiMouseButton_Left)) savePagePref(0);
+            y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
+
+    // 降噪增强总开关(整行;live 即时,只关降噪不影响补帧/光流)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("降噪增强");
+    if (ImGui::IsItemHovered())
+        ShowTip("降噪总开关。关闭 = 跳过降噪,补帧/光流照常;与帧生成都关时滤镜零开销。\n"
+                "重开自动触发 mpv 重载(需 IPC,未启用时手动 seek)。面板优先于 vpy。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        bool v = g_app.params.nrEnabled != 0;
+        if (ImGui::Checkbox("##nr_enabled", &v)) {
+            // 会话未初始化(passthrough 且非 live 关)时开 NR 无法 live 恢复
+            // —— 需要重建,自动触发原地 seek;其余情况 live 门即时生效。
+            const bool needsReseek =
+                v && strcmp(g_app.filterState, "passthrough") == 0 &&
+                strncmp(g_app.stateDetail, "NR off", 6) != 0;
+            g_app.params.nrEnabled = v ? 1 : 0;
+            g_app.liveDirty = true;
+            if (needsReseek) g_app.reseekDirty = true;
+        }
+    }
+    y += rowH;
+
+    // (风格半格行):预设下拉已移除(2026-09-14)—— 310.9 DLL 不消费
+    // DLSSNR.Hint.Render.Preset,A/B 实测输出恒等(死旋钮);上游 r2-fix1
+    // 同款处置。preset 参数链(vpy/ini/IPC/NGX 写入)保留:vpy 是
+    // validate_params 的 preset 哨兵断言测试通道,新 DLL 激活 preset 时
+    // (哨兵变 DIFF)面板加回下拉即可。
+    pairLabel(0, "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。");
+    pairCombo("style", &DlssnrParams::style, 3, kStyleNames, 0);
+    y += rowH;
+
+    // 光流质量(整行:档位文案长,半宽会截断)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("光流质量");
+    if (ImGui::IsItemHovered())
+        ShowTip("NVIDIA 光流引导,减轻运动场景的时域伪影;档位越高越精确也越耗时。\n"
+                "需 RTX Turing+,不支持时自动回退\"无\"。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
+    {
+        int v = g_app.params.motionVectorQuality;
+        if (ImGui::Combo("##motion_vector_quality", &v, kOfQualityNames, 6)) {
+            g_app.params.motionVectorQuality = v;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
+    // 光流跟随降采样(整行)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("光流跟随降采样");
+    if (ImGui::IsItemHovered())
+        ShowTip("光流按内部缩放尺寸计算,省光流开销、精度略降(需先开分辨率缩放)。\n帧生成激活时忽略。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        bool v = g_app.params.nvofFollowScaling != 0;
+        if (ImGui::Checkbox("##nvof_follow_scaling", &v)) {
+            g_app.params.nvofFollowScaling = v ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
+    // (强度 | 局部色调)
+    pairLabel(0, "强度", "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。");
+    pairSlider("intensity", &DlssnrParams::intensity, kStrengthMin, kStrengthMax, 0);
+    pairLabel(1, "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。");
+    pairSlider("local_tone", &DlssnrParams::localToneStrength, kStrengthMin, kStrengthMax, 1);
+    y += rowH;
+
+    // (局部结构 | 皮肤结构)
+    pairLabel(0, "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。");
+    pairSlider("local_structure", &DlssnrParams::localStructureStrength, kStrengthMin, kStrengthMax, 0);
+    pairLabel(1, "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。");
+    pairSlider("skin_structure", &DlssnrParams::skinStructureStrength, kSkinMin, kSkinMax, 1);
+    y += rowH;
+
+    // 残差乘数(整行)
+    fullSlider("residual_multiplier", "残差乘数",
+               "重建细节的增强倍率(1-2,默认 1),配合分辨率缩放使用。",
+               &DlssnrParams::residualMultiplier, kResidualMultMin, kResidualMultMax);
+
+    // 分辨率缩放(整行:开关 + 百分比滑杆)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("分辨率缩放");
+    if (ImGui::IsItemHovered())
+        ShowTip("按百分比分辨率推理再重建回源,降耗省帧;关闭则按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        bool scalingOn = g_app.params.scalingEnabled != 0;
+        if (ImGui::Checkbox("##scaling_enabled", &scalingOn)) {
+            g_app.params.scalingEnabled = scalingOn ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+        ImGui::SameLine(0, 12 * s);
+        ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX - 60 * s, 200 * s));
+        int ir = g_app.params.inputResolutionPercent;
+        if (ImGui::SliderInt("##input_resolution", &ir, kResPctMin, kResPctMax, "%d%%")) {
+            g_app.params.inputResolutionPercent = std::clamp(ir, kResPctMin, kResPctMax);
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // Debounce: rebuilding per drag tick would recreate the feature +
+            // textures every frame; push once on slider release instead.
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
+    auto drawSliderRows = [&](const auto &table) {
+        for (const auto &sl : table) {
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+            ImGui::Text("%s", sl.label);
+            if (ImGui::IsItemHovered()) ShowTip(sl.tip);
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+            ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
+            float v = g_app.params.*(sl.field);
+            if (ImGui::SliderFloat(("##" + std::string(sl.key)).c_str(), &v, sl.lo, sl.hi, "%.2f")) {
+                // NGX accepts continuous float steps (verified: 0.01 steps produce
+                // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
+                g_app.params.*(sl.field) = v;
+                g_app.liveDirty = true;
+            }
+            y += rowH;
+        }
+    };
+
+    // 残差精调(高级):默认收起;展开状态记忆在 ini [panel] advanced。
+    // SetNextItemOpen 把 ini 值喂给 ImGui 的内部开合存储——CollapsingHeader
+    // 的状态在 ImGui 自己的 storage 里,不播种的话首帧永远读到"收起",还会
+    // 把 ini 值回写成 0。
+    ImGui::SetNextItemOpen(g_app.advancedOpen, ImGuiCond_Once);
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+    const bool advanced = ImGui::CollapsingHeader("残差精调(高级)");
+    if (ImGui::IsItemHovered())
+        ShowTip("残差微调:1 = 保持 DLSSNR 的变化,默认全部中性,一般无需调整。");
+    if (advanced != g_app.advancedOpen) {
+        g_app.advancedOpen = advanced;
+        wchar_t base[MAX_PATH], path[MAX_PATH];
+        if (BasePath(base, MAX_PATH)) {
+            swprintf_s(path, MAX_PATH, L"%s\\%s", base, INI_FILE);
+            WritePrivateProfileStringW(L"panel", L"advanced", advanced ? L"1" : L"0", path);
+        }
+    }
+    // 用实际渲染高度推进 y(标题条高度随字体/DPI 变化,硬编码预算会和
+    // 下一个区块贴死或重叠)。
+    y = ImGui::GetItemRectMax().y - wpos.y + 8 * s;
+    if (advanced) drawSliderRows(kFineSliders);
+
+    // (自动蒙版 | 差异调试 ×20):NR 侧复选框一行
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+    {
+        bool autoMask = g_app.params.useAutoMask != 0;
+        if (ImGui::Checkbox("自动蒙版", &autoMask)) {
+            g_app.params.useAutoMask = autoMask ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+        if (ImGui::IsItemHovered()) ShowTip("自动蒙版。模型自动识别区域并区别处理。");
+        ImGui::SameLine(0, 24 * s);
+        bool dbgView = g_app.params.debugView != 0;
+        if (ImGui::Checkbox("差异调试 ×20", &dbgView)) {
+            g_app.params.debugView = dbgView ? 1 : 0;
+            g_app.liveDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ShowTip("输出替换为 |NR改动|×20 的灰度图:白 = 改动大,一片灰 = 模型没动画面。\n"
+                    "用于确认模型/参数是否真的在起作用;仅当前会话有效,不写入保存设置。");
+    }
+    y += rowH;
+
+            ImGui::EndTabItem();
+        }
+
+        // --- 页:帧生成(DLSS-FG 后端与路由) ---
+        if (ImGui::BeginTabItem("帧生成", nullptr,
+                                g_app.page == 1 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
+            if (g_app.page != 1 && ImGui::IsItemClicked(ImGuiMouseButton_Left)) savePagePref(1);
+            y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
+
+    // DLSS 帧生成(整行:倍数选择 关/2x/3x/4x)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("帧生成");
+    if (ImGui::IsItemHovered())
+        ShowTip("DLSS 补帧,输出帧率 ×2–×4,插值帧落在相邻真实帧之间。\n"
+                "需光流质量 > 0(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
+                "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        // 单一控件:关(=0)/2x/3x/4x,同步 fgEnabled + fgMultiplier 两键。
+        const int items = 4;
+        const char *labels[items] = { "关", "2x", "3x", "4x" };
+        int sel = g_app.params.fgEnabled ? std::clamp(g_app.params.fgMultiplier, kFgMultMin, kFgMultMax) - 1 : 0;
+        ImGui::SetNextItemWidth(110 * s);
+        if (ImGui::Combo("##fg_mode", &sel, labels, items)) {
+            if (sel <= 0) {
+                g_app.params.fgEnabled = 0;
+            } else {
+                g_app.params.fgEnabled = 1;
+                g_app.params.fgMultiplier = sel + 1; // 2..4
+            }
+            g_app.liveDirty = true;
+            // 输出契约(帧数/节奏)随创建档位定格,任何档位/开关的真变化都
+            // 需要 mpv 重建滤镜 —— 自动触发原地 seek(payload 先落,重建的
+            // 新实例即采纳);IPC 不可用时插件侧退化为会话内降档复制。
+            g_app.reseekDirty = true;
+        }
+    }
+    y += rowH;
+
+    // FG 路由(整行;进程级,重启 mpv 生效;单档覆盖后端与内核架构)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("FG 路由");
+    if (ImGui::IsItemHovered())
+        ShowTip("帧生成后端:自动 = 官方优先(RTX 40/50),回落代理(30 系)。\n"
+                "SM86/SM75 = 固定走代理;官方 NGX = 固定官方档(拒载不回落)。\n"
+                "进程级,重启 mpv 生效。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        const int items = 4;
+        const char *labels[items] = { "自动 (官方优先)", "SM86 (RTX 30 系)", "SM75 (RTX 20 系)",
+                                      "官方 NGX (RTX 40/50 系)" };
+        int sel = std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax);
+        ImGui::SetNextItemWidth(170 * s);
+        if (ImGui::Combo("##fg_route", &sel, labels, items)) {
+            g_app.params.fgRoute = sel;
+            g_app.liveDirty = true;
+        }
+    }
+    y += rowH;
+
+            // 跨页依赖提示:光流质量在降噪增强页
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+            ImGui::TextDisabled("提示: 帧生成需光流质量 > 0(降噪增强页),否则只复制帧。");
+            y += rowH;
+
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    y += 8 * s;
+
+    // --- 全局行:性能日志 + 保存/重置(不随页签切换) ---
+    dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
+    y += 14 * s;
+
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+    {
+        bool logOn = g_app.timingLog;
+        if (ImGui::Checkbox("写入性能日志", &logOn)) {
+            g_app.timingLog = logOn;
+            wchar_t iniPath[MAX_PATH];
+            if (BasePath(iniPath, MAX_PATH)) {
+                wchar_t iniFile[MAX_PATH];
+                swprintf_s(iniFile, L"%s\\%s", iniPath, INI_FILE);
+                WritePrivateProfileStringW(L"panel", L"log", logOn ? L"1" : L"0", iniFile);
+            }
+            WritePayload(); // logEnabled included
+            g_app.liveDirty = false;
+        }
+        if (ImGui::IsItemHovered()) ShowTip("每秒追加一行性能统计到 mpv 同目录 dlssnr_timing.log;排查性能问题时附上该文件。");
+    }
+    y += rowH;
+
+    y += 8 * s;
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+    if (ImGui::Button("保存设置", ImVec2(120 * s, 30 * s))) {
+        WriteIniNow();
+        WritePayload(true); // persist-through-bridge flag included
+        snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
+    }
+    if (ImGui::IsItemHovered()) {
+        ShowTip("当前设置即时生效(下一帧画面);保存为默认值(dlssnr_ui.ini)后,下次加载滤镜自动生效。");
+    }
+    ImGui::SameLine(0, 14 * s);
+    if (ImGui::Button("重置默认", ImVec2(120 * s, 30 * s))) {
+        // Reset = push the factory-default payload itself; the plugin applies
+        // it through the same Request*/Update path as any other edit (there
+        // is no separate reset command in the protocol).
+        g_app.params = DlssnrParams{};
+        WritePayload();
+        snprintf(g_app.status, sizeof(g_app.status), "已重置");
+    }
+    ImGui::SameLine(0, 16 * s);
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6 * s);
+    if (g_app.status[0]) ImGui::TextUnformatted(g_app.status);
+    y += 38 * s;
+
+    // --- 处理用时(窗口最底部):分段行随帧出现/消失时,高度变化只影响
+    // 底部收口,上方的页签、参数与按钮保持静止(不再快速跳动)。---
+    dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
+    y += 14 * s;
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     const bool timingsOpen = ImGui::CollapsingHeader("处理用时", ImGuiTreeNodeFlags_DefaultOpen);
     if (timingsOpen && g_app.hasSegments) {
         // 分段 = 帧内执行顺序:nvof(光流等待)在 pack 之后、NGX 录制之前。
@@ -696,333 +1070,9 @@ void DrawUi() noexcept {
         }
     }
 
-    // 遥测带底(供下一帧背景;随 Collapse 自动收缩)
-    s_bandBottom = ImGui::GetCursorPosY() + 10 * s;
-    float y = s_bandBottom + 12 * s;
-
-    // --- 内容(独立提示行已删:live-apply 语义并入 保存设置 的 tooltip) ---
-    dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
-    y += 14 * s;
-
-    // Label 与控件垂直居中:控件文本在 frame 内偏移 FramePadding.y,标签
-    // 按同一中心线对齐。旧的硬编码 +7/+8*s 在高 DPI 下漂移(字体随 s 放大,
-    // FramePadding 固定不放大),表现为参数名与滑块错位。
-    const float labelDy = (ImGui::GetFrameHeight() - ImGui::GetTextLineHeight()) * 0.5f;
-    // 行高 = 控件 frame + 紧凑间距(#38 度量驱动;间距从 10*s 收紧到 4*s
-    // —— 高度预算的主压缩之一,控件 frame 本体不动)。
-    const float rowH = ImGui::GetFrameHeight() + 4 * s;
-
-    // 参数行布局:相关短控件两两并排(风格半格行、四条强度滑杆),复杂控件
-    // 保整行 —— 13 行 → 9 行。控件列统一对齐:整行与半格行的控件都从
-    // colCtrl(半格行第二列从 colCtrl+halfW)起步,标签列宽 = colCtrl−marginX。
-    // 整行控件宽度封顶 260*s(下拉/滑杆拉满整行会过长);半格控件 ~102*s。
-    const float halfW = (wsize.x - 2 * marginX) * 0.5f;
-    const float pairLabelW = colCtrl - marginX;
-    auto pairLabel = [&](int col, const char *label, const char *tip) {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW, wpos.y + y + labelDy));
-        ImGui::TextUnformatted(label);
-        if (tip && ImGui::IsItemHovered()) ShowTip(tip);
-    };
-    auto pairCombo = [&](const char *key, int DlssnrParams::*f, int count,
-                         const char *const *names, int col) {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW + pairLabelW, wpos.y + y));
-        ImGui::SetNextItemWidth(halfW - pairLabelW - 8 * s);
-        int v = g_app.params.*f;
-        if (ImGui::Combo((std::string("##") + key).c_str(), &v, names, count)) {
-            g_app.params.*f = v;
-            g_app.liveDirty = true;
-        }
-    };
-    auto pairSlider = [&](const char *key, float DlssnrParams::*f, float lo, float hi, int col) {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + col * halfW + pairLabelW, wpos.y + y));
-        ImGui::SetNextItemWidth(halfW - pairLabelW - 8 * s);
-        float v = g_app.params.*f;
-        if (ImGui::SliderFloat((std::string("##") + key).c_str(), &v, lo, hi, "%.2f")) {
-            // NGX accepts continuous float steps (verified: 0.01 steps produce
-            // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
-            g_app.params.*f = v;
-            g_app.liveDirty = true;
-        }
-    };
-    auto fullSlider = [&](const char *key, const char *label, const char *tip,
-                          float DlssnrParams::*f, float lo, float hi) {
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-        ImGui::TextUnformatted(label);
-        if (ImGui::IsItemHovered()) ShowTip(tip);
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-        // (std::min) 括号抑制 windows.h 的 min 宏(无 NOMINMAX)
-        ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
-        float v = g_app.params.*f;
-        if (ImGui::SliderFloat((std::string("##") + key).c_str(), &v, lo, hi, "%.2f")) {
-            g_app.params.*f = v;
-            g_app.liveDirty = true;
-        }
-        y += rowH;
-    };
-
-    // 降噪增强总开关(整行;live 即时,只关降噪不影响补帧/光流)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("降噪增强");
-    if (ImGui::IsItemHovered())
-        ShowTip("降噪总开关。关闭 = 跳过降噪,补帧/光流照常;与帧生成都关时滤镜零开销。\n"
-                "重开自动触发 mpv 重载(需 IPC,未启用时手动 seek)。面板优先于 vpy。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    {
-        bool v = g_app.params.nrEnabled != 0;
-        if (ImGui::Checkbox("##nr_enabled", &v)) {
-            // 会话未初始化(passthrough 且非 live 关)时开 NR 无法 live 恢复
-            // —— 需要重建,自动触发原地 seek;其余情况 live 门即时生效。
-            const bool needsReseek =
-                v && strcmp(g_app.filterState, "passthrough") == 0 &&
-                strncmp(g_app.stateDetail, "NR off", 6) != 0;
-            g_app.params.nrEnabled = v ? 1 : 0;
-            g_app.liveDirty = true;
-            if (needsReseek) g_app.reseekDirty = true;
-        }
-    }
-    y += rowH;
-
-    // (风格半格行):预设下拉已移除(2026-09-14)—— 310.9 DLL 不消费
-    // DLSSNR.Hint.Render.Preset,A/B 实测输出恒等(死旋钮);上游 r2-fix1
-    // 同款处置。preset 参数链(vpy/ini/IPC/NGX 写入)保留:vpy 是
-    // validate_params 的 preset 哨兵断言测试通道,新 DLL 激活 preset 时
-    // (哨兵变 DIFF)面板加回下拉即可。
-    pairLabel(0, "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。");
-    pairCombo("style", &DlssnrParams::style, 3, kStyleNames, 0);
-    y += rowH;
-
-    // 光流质量(整行:档位文案长,半宽会截断)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("光流质量");
-    if (ImGui::IsItemHovered())
-        ShowTip("NVIDIA 光流引导,减轻运动场景的时域伪影;档位越高越精确也越耗时。\n"
-                "需 RTX Turing+,不支持时自动回退\"无\"。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
-    {
-        int v = g_app.params.motionVectorQuality;
-        if (ImGui::Combo("##motion_vector_quality", &v, kOfQualityNames, 6)) {
-            g_app.params.motionVectorQuality = v;
-            g_app.liveDirty = true;
-        }
-    }
-    y += rowH;
-
-    // 光流跟随降采样(整行)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("光流跟随降采样");
-    if (ImGui::IsItemHovered())
-        ShowTip("光流按内部缩放尺寸计算,省光流开销、精度略降(需先开分辨率缩放)。\n帧生成激活时忽略。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    {
-        bool v = g_app.params.nvofFollowScaling != 0;
-        if (ImGui::Checkbox("##nvof_follow_scaling", &v)) {
-            g_app.params.nvofFollowScaling = v ? 1 : 0;
-            g_app.liveDirty = true;
-        }
-    }
-    y += rowH;
-
-    // DLSS 帧生成(整行:倍数选择 关/2x/3x/4x)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("帧生成");
-    if (ImGui::IsItemHovered())
-        ShowTip("DLSS 补帧,输出帧率 ×2–×4,插值帧落在相邻真实帧之间。\n"
-                "需光流质量 > 0(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
-                "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    {
-        // 单一控件:关(=0)/2x/3x/4x,同步 fgEnabled + fgMultiplier 两键。
-        const int items = 4;
-        const char *labels[items] = { "关", "2x", "3x", "4x" };
-        int sel = g_app.params.fgEnabled ? std::clamp(g_app.params.fgMultiplier, kFgMultMin, kFgMultMax) - 1 : 0;
-        ImGui::SetNextItemWidth(110 * s);
-        if (ImGui::Combo("##fg_mode", &sel, labels, items)) {
-            if (sel <= 0) {
-                g_app.params.fgEnabled = 0;
-            } else {
-                g_app.params.fgEnabled = 1;
-                g_app.params.fgMultiplier = sel + 1; // 2..4
-            }
-            g_app.liveDirty = true;
-            // 输出契约(帧数/节奏)随创建档位定格,任何档位/开关的真变化都
-            // 需要 mpv 重建滤镜 —— 自动触发原地 seek(payload 先落,重建的
-            // 新实例即采纳);IPC 不可用时插件侧退化为会话内降档复制。
-            g_app.reseekDirty = true;
-        }
-    }
-    y += rowH;
-
-    // FG 路由(整行;进程级,重启 mpv 生效;单档覆盖后端与内核架构)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("FG 路由");
-    if (ImGui::IsItemHovered())
-        ShowTip("帧生成后端:自动 = 官方优先(RTX 40/50),回落代理(30 系)。\n"
-                "SM86/SM75 = 固定走代理;官方 NGX = 固定官方档(拒载不回落)。\n"
-                "进程级,重启 mpv 生效。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    {
-        const int items = 4;
-        const char *labels[items] = { "自动 (官方优先)", "SM86 (RTX 30 系)", "SM75 (RTX 20 系)",
-                                      "官方 NGX (RTX 40/50 系)" };
-        int sel = std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax);
-        ImGui::SetNextItemWidth(170 * s);
-        if (ImGui::Combo("##fg_route", &sel, labels, items)) {
-            g_app.params.fgRoute = sel;
-            g_app.liveDirty = true;
-        }
-    }
-    y += rowH;
-
-    // (强度 | 局部色调)
-    pairLabel(0, "强度", "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。");
-    pairSlider("intensity", &DlssnrParams::intensity, kStrengthMin, kStrengthMax, 0);
-    pairLabel(1, "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。");
-    pairSlider("local_tone", &DlssnrParams::localToneStrength, kStrengthMin, kStrengthMax, 1);
-    y += rowH;
-
-    // (局部结构 | 皮肤结构)
-    pairLabel(0, "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。");
-    pairSlider("local_structure", &DlssnrParams::localStructureStrength, kStrengthMin, kStrengthMax, 0);
-    pairLabel(1, "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。");
-    pairSlider("skin_structure", &DlssnrParams::skinStructureStrength, kSkinMin, kSkinMax, 1);
-    y += rowH;
-
-    // 残差乘数(整行)
-    fullSlider("residual_multiplier", "残差乘数",
-               "重建细节的增强倍率(1-2,默认 1),配合分辨率缩放使用。",
-               &DlssnrParams::residualMultiplier, kResidualMultMin, kResidualMultMax);
-
-    // 分辨率缩放(整行:开关 + 百分比滑杆)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("分辨率缩放");
-    if (ImGui::IsItemHovered())
-        ShowTip("按百分比分辨率推理再重建回源,降耗省帧;关闭则按源分辨率直接处理。\n百分比改动会短暂重建模型(毫秒级)。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    {
-        bool scalingOn = g_app.params.scalingEnabled != 0;
-        if (ImGui::Checkbox("##scaling_enabled", &scalingOn)) {
-            g_app.params.scalingEnabled = scalingOn ? 1 : 0;
-            g_app.liveDirty = true;
-        }
-        ImGui::SameLine(0, 12 * s);
-        ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX - 60 * s, 200 * s));
-        int ir = g_app.params.inputResolutionPercent;
-        if (ImGui::SliderInt("##input_resolution", &ir, kResPctMin, kResPctMax, "%d%%")) {
-            g_app.params.inputResolutionPercent = std::clamp(ir, kResPctMin, kResPctMax);
-        }
-        if (ImGui::IsItemDeactivatedAfterEdit()) {
-            // Debounce: rebuilding per drag tick would recreate the feature +
-            // textures every frame; push once on slider release instead.
-            g_app.liveDirty = true;
-        }
-    }
-    y += rowH;
-
-    auto drawSliderRows = [&](const auto &table) {
-        for (const auto &sl : table) {
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-            ImGui::Text("%s", sl.label);
-            if (ImGui::IsItemHovered()) ShowTip(sl.tip);
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-            ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
-            float v = g_app.params.*(sl.field);
-            if (ImGui::SliderFloat(("##" + std::string(sl.key)).c_str(), &v, sl.lo, sl.hi, "%.2f")) {
-                // NGX accepts continuous float steps (verified: 0.01 steps produce
-                // distinct outputs), so no snapping to Magpie's UI-level 0.05 grid.
-                g_app.params.*(sl.field) = v;
-                g_app.liveDirty = true;
-            }
-            y += rowH;
-        }
-    };
-
-    // 残差精调(高级):默认收起;展开状态记忆在 ini [panel] advanced。
-    // SetNextItemOpen 把 ini 值喂给 ImGui 的内部开合存储——CollapsingHeader
-    // 的状态在 ImGui 自己的 storage 里,不播种的话首帧永远读到"收起",还会
-    // 把 ini 值回写成 0。
-    ImGui::SetNextItemOpen(g_app.advancedOpen, ImGuiCond_Once);
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-    const bool advanced = ImGui::CollapsingHeader("残差精调(高级)");
-    if (ImGui::IsItemHovered())
-        ShowTip("残差微调:1 = 保持 DLSSNR 的变化,默认全部中性,一般无需调整。");
-    if (advanced != g_app.advancedOpen) {
-        g_app.advancedOpen = advanced;
-        wchar_t base[MAX_PATH], path[MAX_PATH];
-        if (BasePath(base, MAX_PATH)) {
-            swprintf_s(path, MAX_PATH, L"%s\\%s", base, INI_FILE);
-            WritePrivateProfileStringW(L"panel", L"advanced", advanced ? L"1" : L"0", path);
-        }
-    }
-    // 用实际渲染高度推进 y(标题条高度随字体/DPI 变化,硬编码预算会和
-    // 下一个区块贴死或重叠)。
-    y = ImGui::GetItemRectMax().y - wpos.y + 8 * s;
-    if (advanced) drawSliderRows(kFineSliders);
-
-    dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
-    y += 14 * s;
-
-    // 模型行为开关 + 性能日志:三个短复选框一行(高度压缩;tooltip 不变)
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-    {
-        bool autoMask = g_app.params.useAutoMask != 0;
-        if (ImGui::Checkbox("自动蒙版", &autoMask)) {
-            g_app.params.useAutoMask = autoMask ? 1 : 0;
-            g_app.liveDirty = true;
-        }
-        if (ImGui::IsItemHovered()) ShowTip("自动蒙版。模型自动识别区域并区别处理。");
-        ImGui::SameLine(0, 24 * s);
-        bool dbgView = g_app.params.debugView != 0;
-        if (ImGui::Checkbox("差异调试 ×20", &dbgView)) {
-            g_app.params.debugView = dbgView ? 1 : 0;
-            g_app.liveDirty = true;
-        }
-        if (ImGui::IsItemHovered())
-            ShowTip("输出替换为 |NR改动|×20 的灰度图:白 = 改动大,一片灰 = 模型没动画面。\n"
-                    "用于确认模型/参数是否真的在起作用;仅当前会话有效,不写入保存设置。");
-        ImGui::SameLine(0, 24 * s);
-        bool logOn = g_app.timingLog;
-        if (ImGui::Checkbox("写入性能日志", &logOn)) {
-            g_app.timingLog = logOn;
-            wchar_t iniPath[MAX_PATH];
-            if (BasePath(iniPath, MAX_PATH)) {
-                wchar_t iniFile[MAX_PATH];
-                swprintf_s(iniFile, L"%s\\%s", iniPath, INI_FILE);
-                WritePrivateProfileStringW(L"panel", L"log", logOn ? L"1" : L"0", iniFile);
-            }
-            WritePayload(); // logEnabled included
-            g_app.liveDirty = false;
-        }
-        if (ImGui::IsItemHovered()) ShowTip("每秒追加一行性能统计到 mpv 同目录 dlssnr_timing.log;排查性能问题时附上该文件。");
-    }
-    y += rowH;
-
-    y += 8 * s;
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-    if (ImGui::Button("保存设置", ImVec2(120 * s, 30 * s))) {
-        WriteIniNow();
-        WritePayload(true); // persist-through-bridge flag included
-        snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
-    }
-    if (ImGui::IsItemHovered()) {
-        ShowTip("当前设置即时生效(下一帧画面);保存为默认值(dlssnr_ui.ini)后,下次加载滤镜自动生效。");
-    }
-    ImGui::SameLine(0, 14 * s);
-    if (ImGui::Button("重置默认", ImVec2(120 * s, 30 * s))) {
-        // Reset = push the factory-default payload itself; the plugin applies
-        // it through the same Request*/Update path as any other edit (there
-        // is no separate reset command in the protocol).
-        g_app.params = DlssnrParams{};
-        WritePayload();
-        snprintf(g_app.status, sizeof(g_app.status), "已重置");
-    }
-    ImGui::SameLine(0, 16 * s);
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6 * s);
-    if (g_app.status[0]) ImGui::TextUnformatted(g_app.status);
-    y += 38 * s;
-
     // 高度收口:按内容实际底部调整窗口(WS_POPUP 尺寸 = client 尺寸)
-    const float needH = y + 10 * s;
+    y = ImGui::GetCursorPosY() - wpos.y + 10 * s;
+    const float needH = y + 8 * s;
     RECT wrc{};
     GetWindowRect(g_hwnd, &wrc);
     if (std::abs((wrc.bottom - wrc.top) - static_cast<int>(needH)) > 1) {
