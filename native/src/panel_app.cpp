@@ -83,6 +83,7 @@ struct AppState {
     bool timingLog = true;
     bool advancedOpen = false; // 残差精调折叠区(ini [panel] advanced 记忆)
     int page = 0;              // 功能页签:0=降噪增强,1=帧生成(ini [panel] page 记忆)
+    bool pageRestore = true;   // 一次性恢复锁:SetSelected 仅在启动首帧携带(见页签绘制),EndTabBar 后清除 —— 此后选择完全由点击驱动
     double lastLiveWrite = 0.0;
     double lastStatsRead = 0.0;
     char status[160]{};
@@ -658,10 +659,13 @@ void DrawUi() noexcept {
     if (ImGui::BeginTabBar("##feature_tabs")) {
         // --- 页:降噪增强(NR + 光流 + 分辨率缩放) ---
         if (ImGui::BeginTabItem("降噪增强", nullptr,
-                                g_app.page == 0 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
-            // 只在用户真实点击时落盘:首帧 ImGui 默认选中第一个提交的页签,
-            // 若此处无条件同步,保存的 page 会被默认选中行为覆盖回 0。
-            if (g_app.page != 0 && ImGui::IsItemClicked(ImGuiMouseButton_Left)) savePagePref(0);
+                                (g_app.pageRestore && g_app.page == 0)
+                                    ? ImGuiTabItemFlags_SetSelected
+                                    : ImGuiTabItemFlags_None)) {
+            // 内容可见且 page 不符 = 用户刚点击切到本页(点击帧内容尚未可
+            // 见,次日帧才渲染 —— IsItemClicked 检测不到,改为以"可见性"
+            // 落盘)。启动恢复路径 page 恒相符,不会误写 ini。
+            if (g_app.page != 0) savePagePref(0);
             y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
 
     // 降噪增强总开关(整行;live 即时,只关降噪不影响补帧/光流)
@@ -838,8 +842,10 @@ void DrawUi() noexcept {
 
         // --- 页:帧生成(DLSS-FG 后端与路由) ---
         if (ImGui::BeginTabItem("帧生成", nullptr,
-                                g_app.page == 1 ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None)) {
-            if (g_app.page != 1 && ImGui::IsItemClicked(ImGuiMouseButton_Left)) savePagePref(1);
+                                (g_app.pageRestore && g_app.page == 1)
+                                    ? ImGuiTabItemFlags_SetSelected
+                                    : ImGuiTabItemFlags_None)) {
+            if (g_app.page != 1) savePagePref(1);
             y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
 
     // DLSS 帧生成(整行:倍数选择 关/2x/3x/4x)
@@ -901,6 +907,9 @@ void DrawUi() noexcept {
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
+        // 一次性恢复已消费(SetSelected 的排队焦点在下一帧 TabBarLayout 落
+        // 地),此后页签选择完全由用户点击驱动。
+        g_app.pageRestore = false;
     }
     y += 8 * s;
 
