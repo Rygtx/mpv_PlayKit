@@ -34,10 +34,12 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // NGX,进程级,重启 mpv 生效 —— 后端由硬件决定,自动档总能选对,单控件足够);
 // v13 adds debugView(差异调试 ×20 视图 0/1,live,不持久化 —— 输出被替换为
 // |NR改动|×20 灰度图)并退役 uiCorrection(视频管线无 UI 图层,模型端结构性
-// no-op —— 字段保留占位防布局漂移,写入恒 1,面板不再暴露)。
+// no-op —— 字段保留占位防布局漂移,写入恒 1,面板不再暴露);
+// v14 adds antiFlicker(抗闪烁时域稳定器 0-4,live —— 结构体增长,新旧混跑
+// 按 magic 拒读)。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x444C5344u; // "DSLD" (v13, 版本位走 hex:9 之后是 A/B/C/D)
+constexpr uint32_t PAYLOAD_MAGIC = 0x454C5344u; // "DSLE" (v14, 版本位走 hex:9 之后是 A/B/C/D/E)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -50,7 +52,7 @@ struct PanelPayload {
     float intensity;             // 0-1
     float localTone;             // 0-1
     float localStructure;        // 0-1
-    float skinStructure;         // -1-2
+    float skinStructure;         // 0-2 (上游 beta3 起 -1=auto 移除,默认 0)
     int32_t useAutoMask;         // 0/1
     int32_t uiCorrection;        // 保留字段(v13 退役:视频管线无 UI 图层,恒写 1)
     int32_t inputResolution;     // 25-100
@@ -69,6 +71,7 @@ struct PanelPayload {
     int32_t fgRoute;             // 0-3 FG 路由(v12;0=自动,1=SM86,2=SM75,3=官方 NGX,重启生效)
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
     int32_t debugView;           // 0/1 差异调试 ×20 视图(v13;live,不持久化)
+    int32_t antiFlicker;         // 0-4 抗闪烁时域稳定器(v14;live)
 };
 #pragma pack(pop)
 
@@ -100,6 +103,7 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.fgEnabled = pl.fgEnabled != 0;
     p.fgMultiplier = std::clamp(pl.fgMultiplier, kFgMultMin, kFgMultMax);
     p.debugView = pl.debugView != 0;
+    p.antiFlicker = std::clamp(pl.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
@@ -140,6 +144,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.fgMultiplier = std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax);
     pl.fgRoute = std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
     pl.debugView = p.debugView ? 1 : 0;
+    pl.antiFlicker = std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
     return pl;
 }
 

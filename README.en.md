@@ -80,17 +80,17 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 | `NR_Enabled` | True/False | True | NR master switch; False = skip the denoise inference and pass source frames through while **frame generation / optical flow keep working untouched**; with both NR and FG off the whole filter initializes nothing at zero cost; panel toggles apply immediately within an activated session |
 | `Preset` | 0–3 | 0 | NR preset level (create-time parameter; switching triggers hot rebuild) |
 | `Style` | 0–2 | 0 | Style level (0 default / 1 natural / 2 cinematic) |
-| `Intensity` | 0–1 | 1.0 | Intensity |
-| `Local_Tone` | 0–1 | 1.0 | Local tone strength |
-| `Local_Structure` | 0–1 | 1.0 | Local structure strength |
-| `Skin_Structure` | −1–2 | −1 | Skin structure strength (−1 = auto) |
+| `Intensity` | 0–2 | 1.0 | Intensity |
+| `Local_Tone` | 0–2 | 1.0 | Local tone strength |
+| `Local_Structure` | 0–2 | 1.0 | Local structure strength |
+| `Skin_Structure` | 0–2 | 0 | Skin structure strength (upstream beta3 removed the −1 = auto mode) |
 | `Use_Auto_Mask` | True/False | True | Use auto mask |
-| `UI_Correction` | True/False | True | UI text correction |
 | `Scaling_Enabled` | True/False | True | Residual pipeline master switch; False = fully disabled (no intermediate textures, process at source size) |
 | `Input_Resolution` | 25–100 | 100 | NGX internal inference resolution as a percentage of source size; residual reconstruction restores source resolution |
 | `Residual_Multiplier` | 1.0–2.0 | 1.0 | Residual multiplier, compensating detail together with internal resolution scaling |
 | `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA optical-flow guidance level (0 = zero guidance; 1–5 use hardware optical flow to reduce motion-scene temporal artifacts; higher is more accurate but slower) |
 | `Nvof_Follow_Scaling` | True/False | False | Optical-flow input follows internal downsampling (requires Scaling_Enabled; greatly reduces optical-flow engine load at a slight motion-accuracy cost) |
+| `Anti_Flicker` | 0–4 | 0 | Temporal anti-flicker stabilizer (upstream Magpie v0.6.8): motion-compensated temporal accumulation of the denoiser's changes to reduce frame-to-frame luminance/structure flicker. 0 = off; 1 = static accumulation; 2 = optical-flow accumulation; 3 = optical-flow accumulation+; 4 = low-frequency temporal reconstruction. Works on a single pass; modes 2–4 prefer optical-flow quality ≥ 1 (graceful fallback to static validation without it); switching modes rebuilds in milliseconds |
 | `Fg_Enabled` | True/False | False | DLSS frame generation (chained after denoise, output fps ×2–×4; requires `ngx\version.dll`, falls back to 1:1 on init failure) |
 | `Fg_Multiplier` | 2–4 | 2 | Interpolation multiplier (output frame count/pacing is fixed per session; panel changes auto-trigger an in-place mpv reload via `input-ipc-server`; without IPC, off/down-grade falls back to in-session real-frame duplication and up-grade needs a manual seek; 24fps ×3 = 72fps) |
 | `Fg_Route` | 0–3 | 0 | FG route (0 = auto, official first with SM86 proxy fallback; 1 = SM86/RTX 30 via proxy; 2 = SM75/RTX 20 via proxy; 3 = official NGX/RTX 40/50, no fallback when rejected. Process-level, mpv restart required after switching) |
@@ -104,6 +104,7 @@ Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 
 |---|---|---|
 | Optical-flow guidance levels 1–5 | RTX Turing+ GPU | Auto-falls back to zero guidance; nothing else is blocked |
 | Optical-flow follow scaling | `Scaling_Enabled = True`; **force-ignored while frame generation is active** (FG requires a source-sized motion field) | Switch has no effect; optical flow runs at source size |
+| Anti-flicker modes 2–4 (optical-flow accumulation / accumulation+ / low-freq temporal) | Optical-flow quality ≥ 1 (motion compensation needs a real motion field) | Gracefully degrades to static validation (equivalent to mode 1 without optical flow); other features unaffected |
 | `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | Meaningless (processing happens at source size when scaling is off) |
 | Frame generation `Fg_Enabled` | ① **Motion_Vector_Quality ≥ 1** (zero guidance has no real motion field) ② a matching runtime under `ngx\` (official `nvngx_dlssg.dll` or proxy `version.dll`) | With zero guidance every interpolated frame degrades to a duplicated real frame (switching it on accomplishes nothing); missing/rejected runtime falls back to 1:1, denoise unaffected |
 | FG multiplier/switch auto-reload | mpv.conf `input-ipc-server` (enabled by default in the shipped config) | Off/down-grade degrades to in-session real-frame duplication; up-grade needs a manual seek |

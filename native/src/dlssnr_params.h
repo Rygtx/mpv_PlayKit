@@ -7,16 +7,26 @@
 // size) must reference these constants; a bare literal is a drift bug.
 inline constexpr int kPresetMin = 0, kPresetMax = 3;
 inline constexpr int kStyleMin = 0, kStyleMax = 2;
-// intensity / local tone / local structure: 上游 r2-fix1 从 0-2 收紧回 0-1
-// (v0.6.5 DLSSNR_AI_Filter.hlsl / DLSSNRFilter.cpp ClampFinite)
-inline constexpr float kStrengthMin = 0.0f, kStrengthMax = 1.0f;
-inline constexpr float kSkinMin = -1.0f, kSkinMax = 2.0f;        // skin structure (-1 = auto)
+// intensity / local tone / local structure: 上游 beta3(3ee4121c,v0.6.7 起)
+// 把三项上限从 0-1 重新放宽到 0-2(HEAD DLSSNRFilter.cpp ClampFinite 0-2 实证;
+// r2-fix1 的 0-1 收紧期结束)。旧 ini 的 0-100 存量值天然兼容,上限放宽到 200。
+inline constexpr float kStrengthMin = 0.0f, kStrengthMax = 2.0f;
+inline constexpr float kSkinMin = 0.0f, kSkinMax = 2.0f;         // skin structure(上游 beta3 起 -1=auto 语义整体移除,默认 0)
 inline constexpr int kResPctMin = 25, kResPctMax = 100;          // internal resolution percent
 inline constexpr float kResidualMultMin = 1.0f, kResidualMultMax = 2.0f;
 // 残差精调 4 项(r1-r10 新增):saturation / lightness / shadow structure / reflection glow
 inline constexpr float kResidualFineMin = 0.0f, kResidualFineMax = 2.0f;
 // NVOF 光流质量(上游 motionVectorQuality,0-5;0 = 无光流,保持零 guidance)
 inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
+// 抗闪烁时域稳定器(上游 antiFlicker,v0.6.8 093efe21/55d4cc38;live 参数):
+//   0 = 无  1 = 静态累积(稳定区域检测 + 自适应 EMA,无光流)
+//   2 = 光流累积(重投影 + 输入验证 + 自适应 EMA,需光流质量 ≥ 1)
+//   3 = 光流累积+(条件幅度 + 持续性迟滞,需光流质量 ≥ 1)
+//   4 = 低频时域重建(半分辨率残差历史 + 原色引导重建,需光流质量 ≥ 1)
+// 对 NR 链残差做运动补偿累积,**单 pass 即生效**(上游 _temporal 只看
+// antiFlicker != 0)。模式 2-4 无光流时自动降级为静态验证(UseMotion=0)。
+// 切换重建时域资源(PoolHold 排空,毫秒级纹理分配),不动 NGX feature。
+inline constexpr int kAntiFlickerMin = 0, kAntiFlickerMax = 4;
 // DLSS 帧生成倍数(2-4;proxy MaxGeneratedFrames 上限 3 → 4X 封顶)。
 // live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
 // 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
@@ -56,8 +66,8 @@ struct DlssnrParams {
     float localToneStrength = 1.0f;
     // NGX "DLSSNR.LocalStructureStrength" 0-1
     float localStructureStrength = 1.0f;
-    // NGX "DLSSNR.SkinStructureStrength" -1..2 (-1 = auto)
-    float skinStructureStrength = -1.0f;
+    // NGX "DLSSNR.SkinStructureStrength" 0-2(上游 beta3 默认 0;-1=auto 已移除)
+    float skinStructureStrength = 0.0f;
     // NGX "DLSSNR.UseAutoMask" 0/1
     int useAutoMask = 1;
     // Internal processing resolution in percent of source (25-100, create-time;
@@ -88,6 +98,12 @@ struct DlssnrParams {
     // 注意 FG(DLSS FG)激活时本开关被忽略:FG 的 MVecs 契约要求与
     // backbuffer 同尺寸的稠密运动场,必须按源尺寸建 NVOF 会话。
     int nvofFollowScaling = 0;
+    // 抗闪烁时域稳定器(0-4,live 参数):对 NR 链残差做运动补偿历史累积,
+    // 治 NR 输出的逐帧明暗/结构修正抖动(上游 v0.6.8 antiFlicker,单 pass
+    // 即生效)。语义见 kAntiFlickerMin 注释。切换只重建时域资源(PoolHold
+    // 排空),不动 NGX feature;NR 关(skipEval/诊断/直通)时本帧跳过并
+    // 作废历史。模式 2-4 建议光流质量 ≥ 1,无光流自动降级静态验证。
+    int antiFlicker = 0;
     // DLSS 帧生成(0/1)。语义分两层:
     //   create-time —— 非零且 FG 上下文初始化成功时,滤镜输出帧率 ×2
     //   (vi.fps 翻倍,奇数索引输出插值帧);初始化失败优雅回退 1:1。

@@ -191,6 +191,19 @@ private:
     std::unique_ptr<DlssfgContext> _fg;
     NVSDK_NGX_Parameter *_fgParams = nullptr; // FG 专用核心参数块(core 拥有)
     bool _fgRequested = false;
+    // 抗闪烁时域稳定器(上游 antiFlicker v0.6.8):_curAntiFlicker = 当前
+    // 已建资源的模式(0 = 关)。时间线状态(上游 DLSSNRTemporalState 移植,
+    // 捕获时间戳 → 帧入口 QPC):weight = exp(-Δt/80ms),>250ms / 帧序
+    // 不连续 / useMotion 翻转 / 重建帧一律 weight 0(播种:历史写当前残差,
+    // 下一帧起正常累积)。_tNext 由 ProcessFrame 的 evaluate 串行域内推进,
+    // 与 NGX feature 单例同一把 _evaluateMutex 保护(记录序 ≠ 提交序的
+    // 风险面与 NGX 时域历史一致:乱序帧 weight 0 拒混,双缓冲容忍一帧偏斜)。
+    int _curAntiFlicker = 0;
+    long long _tLastFrame = -1;
+    double _tLastQpc = 0.0;
+    int _tNext = 0;
+    bool _tValid = false;
+    bool _tLastUseMotion = false;
     // fmParallel: several frame threads call EvaluateFeature concurrently.
     // The feature and the parameter block are singletons, so evaluate
     // (parameter setup + snippet call) is serialized; GPU-side dispatches

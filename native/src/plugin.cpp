@@ -671,6 +671,9 @@ static void VS_CC DlssnrCreate(
     ApplyIntArg(in, vsapi, "motion_vector_quality", initial.motionVectorQuality, kOfQualityMin, kOfQualityMax);
     // 光流输入跟随内部降采样(scaling 启用时 NVOF 按内部尺寸计算)
     ApplyFlagArg(in, vsapi, "nvof_follow_scaling", initial.nvofFollowScaling);
+    // 抗闪烁时域稳定器 0-4(live 参数):对 NR 残差做运动补偿历史累积,
+    // 单 pass 即生效;模式 2-4 建议光流质量 ≥ 1(无光流自动降级静态验证)
+    ApplyIntArg(in, vsapi, "anti_flicker", initial.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
     // DLSS 帧生成(0/1):激活时每源帧产出 M 帧(1 真实 + M-1 插值),
     // 输出帧时长 = 源时长/M(mpv vapoursynth 契约),失败优雅回退 1:1。
     // 挂 DLSSNR 之后 —— backbuffer = NR 输出。
@@ -693,11 +696,12 @@ static void VS_CC DlssnrCreate(
     {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d follow=%d fg=%d mult=%d route=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d follow=%d af=%d fg=%d mult=%d route=%d",
                       d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
-                      initial.nvofFollowScaling ? 1 : 0, initial.fgEnabled ? 1 : 0,
+                      initial.nvofFollowScaling ? 1 : 0, initial.antiFlicker,
+                      initial.fgEnabled ? 1 : 0,
                       initial.fgMultiplier, initial.fgRoute);
         vsdlssnr::TimingStatusLine(msg);
     }
@@ -948,6 +952,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "input_resolution:int:opt;"
         "motion_vector_quality:int:opt;"
         "nvof_follow_scaling:int:opt;"
+        "anti_flicker:int:opt;"
         "fg_enabled:int:opt;"
         "fg_multiplier:int:opt;"
         "fg_route:int:opt;"

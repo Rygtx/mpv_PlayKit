@@ -68,6 +68,10 @@ constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
 constexpr const char *kOfQualityNames[] = {
     "无", "性能", "均衡(推荐)", "质量", "高质量(高开销)", "最高质量(极高开销)"
 };
+// 抗闪烁时域稳定器(上游 antiFlicker 0-4,文案对齐上游界面命名)
+constexpr const char *kAntiFlickerNames[] = {
+    "无", "静态累积", "光流累积", "光流累积+", "低频时域重建"
+};
 // 预设/风格/光流质量/各滑块/开关原以 kEnums/kSliders/kFlags 成员指针表
 // 驱动通用循环;两列归并后每行控件异构(组合/滑块/复选框/整行),改为
 // DrawUi 内联 + pairLabel/pairCombo/pairSlider lambda,tip 随行内联。
@@ -731,17 +735,37 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
+    // 抗闪烁(整行)—— 暂时下架(2026-09-17 裁定:当前素材上 NR 输出收敛
+    // 稳定,EMA 位移低于 8bit 量化半 LSB,感知无差异;机制已全链验证
+    // [test_temporal ALL PASS],vpy/ini/IPC 参数链保留可编程调用)。
+    // 恢复暴露:取消本块注释即可,无其它接线改动。
+    // ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    // ImGui::TextUnformatted("抗闪烁");
+    // if (ImGui::IsItemHovered())
+    //     ShowTip("对降噪改动做时域累积,减轻画面明暗/结构的逐帧抖动。\n"
+    //             "\"光流累积\"两档需光流质量 > 1(否则退化为静态验证);\n切换短暂重建(毫秒级)。");
+    // ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    // ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
+    // {
+    //     int v = g_app.params.antiFlicker;
+    //     if (ImGui::Combo("##anti_flicker", &v, kAntiFlickerNames, kAntiFlickerMax + 1)) {
+    //         g_app.params.antiFlicker = v;
+    //         g_app.liveDirty = true;
+    //     }
+    // }
+    // y += rowH;
+
     // (强度 | 局部色调)
-    pairLabel(0, "强度", "整体处理强度(0-1,默认 1)。数值越高降噪/增强越明显。");
+    pairLabel(0, "强度", "整体处理强度(0-2,默认 1)。数值越高降噪/增强越明显。");
     pairSlider("intensity", &DlssnrParams::intensity, kStrengthMin, kStrengthMax, 0);
-    pairLabel(1, "局部色调", "局部色调强度(0-1,默认 1)。影响明暗过渡区域的处理力度。");
+    pairLabel(1, "局部色调", "局部色调强度(0-2,默认 1)。影响明暗过渡区域的处理力度。");
     pairSlider("local_tone", &DlssnrParams::localToneStrength, kStrengthMin, kStrengthMax, 1);
     y += rowH;
 
     // (局部结构 | 皮肤结构)
-    pairLabel(0, "局部结构", "局部结构强度(0-1,默认 1)。越高保留越多细节纹理。");
+    pairLabel(0, "局部结构", "局部结构强度(0-2,默认 1)。越高保留越多细节纹理。");
     pairSlider("local_structure", &DlssnrParams::localStructureStrength, kStrengthMin, kStrengthMax, 0);
-    pairLabel(1, "皮肤结构", "皮肤结构强度(-1=保持默认行为,范围 -1~2)。影响人物皮肤区域的细节保留。");
+    pairLabel(1, "皮肤结构", "皮肤结构强度(0-2,默认 0)。影响人物皮肤区域的细节保留。");
     pairSlider("skin_structure", &DlssnrParams::skinStructureStrength, kSkinMin, kSkinMax, 1);
     y += rowH;
 

@@ -81,16 +81,17 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `NR_Enabled` | True/False | True | 降噪总开关;False = 跳过降噪推理输出源帧,**补帧/光流照常工作不受影响**;降噪与帧生成都关时整个滤镜零初始化零开销;已激活会话内面板切换立即生效 |
 | `Preset` | 0–3 | 0 | NR 预设档位(创建参数,切换触发热重建) |
 | `Style` | 0–2 | 0 | 风格档位(0 默认 / 1 自然 / 2 电影) |
-| `Intensity` | 0–1 | 1.0 | 强度 |
-| `Local_Tone` | 0–1 | 1.0 | 局部色调强度 |
-| `Local_Structure` | 0–1 | 1.0 | 局部结构强度 |
-| `Skin_Structure` | −1–2 | −1 | 皮肤结构强度(−1 = 自动) |
+| `Intensity` | 0–2 | 1.0 | 强度 |
+| `Local_Tone` | 0–2 | 1.0 | 局部色调强度 |
+| `Local_Structure` | 0–2 | 1.0 | 局部结构强度 |
+| `Skin_Structure` | 0–2 | 0 | 皮肤结构强度(上游 beta3 起 −1=auto 已移除) |
 | `Use_Auto_Mask` | True/False | True | 使用自动蒙版 |
 | `Scaling_Enabled` | True/False | True | 残差管线总开关;False = 彻底关闭(不建中间纹理,按源尺寸直接处理) |
 | `Input_Resolution` | 25–100 | 100 | NGX 内部推理分辨率占源尺寸的百分比,残差重建恢复到源分辨率 |
 | `Residual_Multiplier` | 1.0–2.0 | 1.0 | 残差乘数,配合内部分辨率缩放补偿细节 |
 | `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA 光流引导档位(0 = 零 guidance;1–5 用硬件光流减轻运动场景时域伪影,档位越高越精确也越耗时) |
 | `Nvof_Follow_Scaling` | True/False | False | 光流输入跟随内部降采样(需 Scaling_Enabled;大幅降低光流引擎占用,运动精度略降) |
+| `Anti_Flicker` | 0–4 | 0 | 抗闪烁时域稳定器(上游 Magpie v0.6.8):对降噪改动做运动补偿时域累积,减轻画面明暗/结构的逐帧抖动。0 = 无;1 = 静态累积;2 = 光流累积;3 = 光流累积+;4 = 低频时域重建。单 pass 即生效;2–4 建议光流质量 ≥ 1(无光流自动退化静态验证);切换档位短暂重建(毫秒级) |
 | `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×4;依赖 `ngx\version.dll`,初始化失败自动回退 1:1) |
 | `Fg_Multiplier` | 2–4 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps) |
 | `Fg_Route` | 0–3 | 0 | FG 路由(0 = 自动,官方优先回落代理 SM86;1 = SM86/RTX 30 系走代理;2 = SM75/RTX 20 系走代理;3 = 官方 NGX/RTX 40/50 系,被拒载不回落。进程级,重启 mpv 生效) |
@@ -104,6 +105,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 |---|---|---|
 | 光流引导 1–5 档 | RTX Turing+ 显卡 | 自动回退零 guidance,不挡其他功能 |
 | 光流跟随降采样 | `Scaling_Enabled = True`;**帧生成激活时被强制忽略**(帧生成要求源尺寸运动场) | 开关无效,光流按源尺寸计算 |
+| 抗闪烁模式 2–4(光流累积/累积+/低频时域重建) | 光流质量 ≥ 1(运动补偿需要真运动场) | 自动退化为静态验证(等效模式 1 的无光流路径),不挡其他功能 |
 | `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | 无意义(关闭缩放按源尺寸直接处理) |
 | 帧生成 `Fg_Enabled` | ① **光流质量 ≥ 1**(零 guidance 无真运动场)② `ngx\` 内对应运行时(官方 `nvngx_dlssg.dll` 或代理 `version.dll`) | 零 guidance 下插值帧全部退化为复制真实帧(等于白开);运行时缺失/拒载自动回退 1:1,降噪不受影响 |
 | 帧生成改档/开关自动重载 | mpv.conf `input-ipc-server`(本包发行配置已默认开启) | 关/降档退化为会话内复制真实帧;升档需手动 seek |

@@ -114,6 +114,14 @@ struct FrameSlot {
     // DLSS FG(仅 _fgSlots 建立时分配):FG 插值输出(BGRA8,UAV —— DLSSG
     // 契约:输出为 UAV;NSR 化后走 RGB→YUV 第二遍转换)。
     ComPtr<ID3D12Resource> fgInterp;      // W×H BGRA8,UAV
+    // 抗闪烁时域稳定器(仅 _temporalSlots 建立时分配):稳定后的输出帧。
+    // 与 outputColor 分离 —— temporal 主 shader 同帧读 outputColor(t2 raw)
+    // 写本纹理(u0),读写同纹理非法。temporal 激活帧:RGB→YUV 转换与 FG
+    // backbuffer 都取本纹理,colorSrc 切换见 dlssnr_context 帧路径。
+    ComPtr<ID3D12Resource> temporalOut;   // W×H BGRA8,UAV
+    // 时域历史(context 级 ping-pong:hist/guide ×2 + mode4 半分辨率
+    // low ×2,均在 D3D12Context,每槽堆持视图 —— 视图随 RebuildTemporal
+    // 重建,不在本结构)。
     // FG 插值帧的独立回读缓冲(与真实帧的 readbackYuv 并存:同一条 CL 上
     // 先后多次转换+回读,真实帧回读不能被插值帧覆写)。按插值槽分组
     // [gen 0..kFgGenSlots-1][plane] —— 倍数 M 时 M-1 个插值帧各自落一组,
@@ -139,6 +147,14 @@ struct FrameSlot {
     // 占位视图 —— 绝不写 NULL 描述符,见 14-17 注释)
     // 34=uavDebugDiff(共享差异调试纹理的 UAV,"差异调试 ×20" 视图写入目标;
     // 资源为 context 级单例,每槽堆各持一份视图)
+    // 35=srvTempHist0 36=srvTempHist1 37=srvTempGuide0 38=srvTempGuide1
+    //   (时域历史 ping-pong 的 SRV;资源 = context 级单例,RebuildTemporal
+    //   在每槽堆覆盖写入 —— temporal 关闭时为 inputColor 占位视图)
+    // 39=uavTempHist0 40=uavTempHist1 41=uavTempGuide0 42=uavTempGuide1
+    // 43=uavTemporalOut 44=srvTemporalOut(per-slot temporalOut;关闭时
+    //   outputColor 占位视图)
+    // 45=srvTempLow0 46=srvTempLow1 47=uavTempLow0 48=uavTempLow1
+    //   (mode4 半分辨率残差/引导;关闭时 inputColor 占位视图)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 };
 
@@ -312,13 +328,41 @@ public:
     // 上原子成对,队列按提交序串行,并发帧的记录对不交错。
     void RecordDebugDiff(FrameSlot &slot) noexcept;
 
+    // 抗闪烁时域稳定器(上游 DLSSNRTemporal 移植,v0.6.8)。调用方必须持
+    // PoolHold(替换每槽 temporalOut 纹理 + context 级历史纹理)。mode 0 =
+    // 释放全部时域资源;1-4 = 建历史/引导 ping-pong + mode4 半分辨率 low +
+    // 每槽 temporalOut,并覆盖写入每槽堆的 35-48 视图。切换不动 NGX
+    // feature,历史由调用方重置(纹理新建即 undefined,首个 dispatch 全量
+    // 覆写,无需清零 —— 主 shader 对 History 的消费全部走 weight 门,
+    // weight=0 帧不读)。
+    bool RebuildTemporal(int mode, char *err, size_t errLen) noexcept;
+    bool TemporalSlots() const noexcept { return _temporalSlots; }
+    // 记录时域稳定 dispatch(mode4 先 reduce 后主 pass)。调用点 = 槽 CL,
+    // outputColor UAV / inputColor COMMON / 历史 COMMON / motion NSR 入;
+    // 出:outputColor 归 COMMON(下游改读 temporalOut)、temporalOut 保持
+    // UAV(RecordYuvOutput stateBefore=UAV)、历史归 COMMON。
+    // next = ping-pong 写索引(0/1,调用方在 evaluate 串行域内推进);
+    // useMotion=false 时 motion 描述符仍需绑定但绝不被读(shader
+    // UseMotion=0 全路径守卫);motionSrvIndex = 槽 10(源尺寸)或
+    // 18(follow 内部尺寸),motionW/H = 对应运动场尺寸(shader 按
+    // Size/MotionExtent 自算采样映射与向量单位换算)。
+    void RecordTemporal(FrameSlot &slot, int mode, int next, bool useMotion,
+                        UINT motionSrvIndex, UINT motionW, UINT motionH,
+                        float weight) noexcept;
+
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
     ID3D12Resource *FgInterp(FrameSlot &s) const noexcept { return s.fgInterp.Get(); }
+    ID3D12Resource *TemporalOut(FrameSlot &s) const noexcept { return s.temporalOut.Get(); }
+    // 时域历史纹理(context 级,诊断 dump 用;index 0/1 ping-pong)。
+    ID3D12Resource *TemporalHist(FrameSlot &, int index) const noexcept {
+        return _tempHist[index].Get();
+    }
     // 描述符堆槽位(RecordYuvOutput / FG 转换共用)。
     static constexpr UINT kSrvOutputColor = 22; // outputColor 的 SRV
     static constexpr UINT kSrvFgInterp = 32;    // fgInterp 的 SRV(FG 槽)
     static constexpr UINT kUavDebugDiff = 34;   // 共享差异调试纹理的 UAV
+    static constexpr UINT kSrvTemporalOut = 44; // temporalOut 的 SRV(temporal 激活帧的 colorSrc)
     // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
@@ -433,6 +477,21 @@ private:
     // 差异调试中间纹理(W×H BGRA8,UAV):dispatch 写差值 → 同 CL 拷回
     // outputColor(RGBA8 无 UAV load,读写同纹理非法,必须中转)。
     ComPtr<ID3D12Resource> _debugDiff;
+    // 抗闪烁时域历史(上游 DLSSNRTemporal 的资源面):history/guide 各
+    // ping-pong ×2(全尺寸 R16G16B16A16_FLOAT,FP16 有符号,alpha=有效性
+    // 标记)+ mode4 半分辨率 low ×2。_temporalSlots 语义同 _fgSlots。
+    ComPtr<ID3D12Resource> _tempHist[2];
+    ComPtr<ID3D12Resource> _tempGuide[2];
+    ComPtr<ID3D12Resource> _tempLow[2];
+    // 抗闪烁 compute(RS = 16 常量 + 8 独立 SRV 表 + 3 独立 UAV 表;主
+    // shader 一份覆盖 Route 1-4,mode4 另有半分辨率 reduce)。PSO 无状态
+    // 常驻,无条件创建(PSO 生命周期跟着"使用条件"而不是"首次搭车路径",
+    // #43-①)。
+    ComPtr<ID3D12RootSignature> _rsTemporal;
+    ComPtr<ID3D12PipelineState> _psoTemporalMain;
+    ComPtr<ID3D12PipelineState> _psoTemporalReduce;
+    bool _temporalSlots = false; // 槽池当前含 temporalOut(RebuildTemporal 维护)
+    int _temporalMode = 0;       // 当前已建资源的模式(0 = 无)
     // YUV↔RGB 转换(YUV 原生化):深度/矩阵/范围全走 root constants,
     // R8/R16_UNORM 的 Texture2D<float> 视图同构 —— 仅 3 个 PSO:
     // convertIn(Y/U/V 3 SRV → inputColor 1 UAV,8 常量);

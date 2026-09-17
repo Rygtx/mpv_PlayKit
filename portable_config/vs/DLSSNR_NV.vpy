@@ -25,13 +25,14 @@ Style = 0
 Intensity = 1.0
 Local_Tone = 1.0
 Local_Structure = 1.0
-Skin_Structure = -1
+Skin_Structure = 0
 Use_Auto_Mask = True
 Scaling_Enabled = True
 Input_Resolution = 100
 Residual_Multiplier = 1.0
 Motion_Vector_Quality = 0
 Nvof_Follow_Scaling = False
+Anti_Flicker = 0
 Fg_Enabled = False
 Fg_Multiplier = 2
 Fg_Route = 0
@@ -42,10 +43,10 @@ H_Max = 0
 ##          立即生效; 面板 "降噪增强" 开关同步此值, 面板保存的设置优先
 ## <0-3> 整数, NR 预设档位
 ## <0-2> 整数, 风格档位 (0 默认 / 1 自然 / 2 电影)
-## <0-1> 浮点, 强度 (默认 1.0)
-## <0-1> 浮点, 局部色调强度 (默认 1.0)
-## <0-1> 浮点, 局部结构强度 (默认 1.0)
-## <-1-2> 浮点, 皮肤结构强度 (-1 = 自动, 默认)
+## <0-2> 浮点, 强度 (默认 1.0)
+## <0-2> 浮点, 局部色调强度 (默认 1.0)
+## <0-2> 浮点, 局部结构强度 (默认 1.0)
+## <0-2> 浮点, 皮肤结构强度 (默认 0; 上游 beta3 起 -1=auto 已移除)
 ## <True|False> 使用自动蒙版
 ## <True|False> 内部分辨率缩放总开关 (默认 True)
 ##          False = 彻底关闭残差管线: 不建中间纹理/compute, 按源尺寸直接处理,
@@ -61,6 +62,11 @@ H_Max = 0
 ##          播放中可在面板实时切换 (只重建光流会话, 毫秒级)
 ##          帧生成开启时建议 >= 2 (Balanced): 光流是插值帧的运动来源
 ## <True|False> 光流输入跟随内部降采样 (默认 False); 帧生成激活时被忽略
+## <0-4> 整数, 抗闪烁时域稳定器 (默认 0): 对降噪改动做时域累积,
+##          减轻画面明暗/结构的逐帧抖动 (上游 Magpie v0.6.8 antiFlicker)
+##          0 = 无; 1 = 静态累积; 2 = 光流累积; 3 = 光流累积+; 4 = 低频时域重建
+##          单 pass 即生效; 2-4 建议光流质量 >= 1 (无光流自动退化为静态验证);
+##          切换档位短暂重建 (毫秒级), 面板保存的设置优先
 ## <True|False> DLSS 帧生成 (默认 False)
 ##          挂降噪之后: 每源帧产出 M 帧, 插值帧由 DLSS FG 模型合成,
 ##          落在相邻两真实帧之间; 依赖 ngx\version.dll (dlssg_for_sm86),
@@ -118,6 +124,7 @@ else :
 		residual_multiplier = Residual_Multiplier,
 		motion_vector_quality = Motion_Vector_Quality,
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
+		anti_flicker = Anti_Flicker,
 		fg_enabled = int(Fg_Enabled),
 		fg_multiplier = Fg_Multiplier,
 		fg_route = int(Fg_Route),
