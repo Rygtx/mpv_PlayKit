@@ -72,6 +72,7 @@ add_library(vs_dlssnr SHARED
     src/plugin.cpp
     src/dlssnr_context.cpp
     src/dlssfg_context.cpp
+    src/dlssfg_gate.cpp          # 官方链运行库适配(40 系 mfg gate 解锁 + 代理族判定)
     src/nvof_context.cpp
     src/ffxof_context.cpp        # AMD FidelityFX OF 会话(of_backend=0,默认)
     src/iat_hook.cpp

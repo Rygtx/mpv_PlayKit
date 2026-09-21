@@ -3,6 +3,7 @@
 // 的 optionalParams 对照(官方 DLSSG 依赖全量键面)。
 
 #include "dlssfg_context.h"
+#include "dlssfg_gate.h"
 #include "dlssnr_context.h" // TimingStatusLine(失败必须进 timing log)
 
 #include <algorithm>
@@ -182,13 +183,22 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
             return fail(msg);
         }
     }
-    // MultiFrameCountMax = 运行库插值帧上限(代理 ini MaxGeneratedFrames 钳定;
-    // 310.9 出厂 3 → 4X,面板改 5x/6x 时写 4/5)。超出上限的插值槽不提交
-    // eval(调用方降级复制真实帧)—— 5x/6x 刚选、未重启 mpv 时发生。
+    // MultiFrameCountMax = 运行库插值帧上限(代理路径:ini MaxGeneratedFrames
+    // 钳定;官方路径:运行库报值)。超出上限的插值槽不提交 eval(调用方降级
+    // 复制真实帧)—— 5x/6x 刚选、未重启 mpv 时发生。
     {
-        unsigned int maxGen = 0;
+        unsigned maxGen = 0;
         if (_params->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maxGen) ==
             NVSDK_NGX_Result_Success) {
+            // Ada(RTX 40)上官方运行库把生成帧数钳 1(2x)= 库内 count gate
+            // 软件策略,MFG 模型本身可用(50 系同款 DLL 原生多帧)。查询值
+            // 不足 kFgMultMax-1 时尝试进程内 gate 解锁(RTX40MFG-Unlock 同源
+            // 字节补丁;未命中/失败原样回落,代理路径天然不触发 —— 其查询
+            // 已达上限)。见 dlssfg_gate.h。
+            if (maxGen < static_cast<unsigned>(kFgMultMax - 1)) {
+                maxGen = dlssfg_gate::UnlockMfgCountGate(
+                    ::GetModuleHandleW(L"nvngx_dlssg.dll"), maxGen);
+            }
             _maxGen = std::clamp(static_cast<int>(maxGen), 1, kFgMultMax - 1);
             char msg[96];
             std::snprintf(msg, sizeof(msg),

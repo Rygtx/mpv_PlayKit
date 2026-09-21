@@ -1,5 +1,6 @@
 // Ported from Magpie experimental DLSSNRFilter.cpp / NgxD3D12Core.cpp (see header).
 #include "dlssnr_context.h"
+#include "dlssfg_gate.h"
 #include "ffxof_context.h"
 #include "ngx_runtime_guard.h"
 #include "nvof_context.h"
@@ -500,9 +501,13 @@ bool DlssnrContext::Initialize(
     // 的非设计路径下钩子生效极慢(2026-09-22 实测:预载当拍查询 + 250ms×20
     // 轮询全败 0xBAD0000B,+17s seek 后同进程重查才过)。挪到核心初始化前
     // 即走设计路径。纯官方档/FG 未请求不预载。
+    // GPU 族分流:SM86 代理只适用 Turing/Ampere;Ada 及更新走官方链,由
+    // dlssfg_context 的 mfg gate 解锁拿多帧(RTX 40 6x)。探测失败 fail-open
+    // 维持预载(30 系无损)。
     if (_shared->Snapshot().fgEnabled &&
         std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
         fgDllPath && fgDllPath[0] &&
+        dlssfg_gate::GpuFamilyPrefersProxy() &&
         DlssfgContext::PreloadProxyModule(fgDllPath)) {
         TimingStatusLine(
             "DLSSNR STATUS: dlssfg proxy preloaded before NGX core (load-monitor hook attach path)");
