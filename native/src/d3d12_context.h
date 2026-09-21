@@ -344,7 +344,8 @@ public:
     // 上原子成对,队列按提交序串行,并发帧的记录对不交错。
     void RecordDebugDiff(FrameSlot &slot) noexcept;
     // 光流场调试视图(面板"调试视图=光流场"):稠密运动场(R16G16_FLOAT,
-    // 像素单位)方向→色相(HSV 环:红=右、绿=上、蓝=左…),幅值→亮度,
+    // 像素单位)方向→色相(HSV 环,图像坐标 y 向下:红=右、绿=下、青=左、
+    // 紫=上),幅值→亮度,
     // 静止/无光流 = 黑。复用 _debugDiff 中转拷回 outputColor(契约同
     // RecordDebugDiff,但 outputColor 无需 NSR 化 —— 本视图不读它)。
     //   realMotion: true = 读真运动场 —— useReduced 决定源尺寸 slot.motion
