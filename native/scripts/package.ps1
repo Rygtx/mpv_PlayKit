@@ -22,13 +22,14 @@ $model      = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"
 $fgDll      = Join-Path $native "vendor\ngx\version.dll"
 $fgIni      = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
 $fgOfficial = Join-Path $native "vendor\ngx\nvngx_dlssg.dll"
-# 全部文件必须齐备(fetch-deps.ps1 自动落地官方 runtime 与 NVOF/NGX 依赖;
-# 模型与 proxy 为手工/vendor 部署)。缺任一件 = 打包失败,杜绝残缺发行包。
+# 全部文件必须齐备(fetch-deps.ps1 自动落地官方 runtime / dlssg_for_sm86
+# 代理 / NVOF·NGX 依赖;仅模型 nvngx_dlssnr.dll 为手工 vendor 部署)。
+# 缺任一件 = 打包失败,杜绝残缺发行包。
 if (-not (Test-Path $binDll))     { throw "缺少编译产物: $binDll (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $binPanel))   { throw "缺少编译产物: $binPanel (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $model))      { throw "缺少模型文件: $model (把 nvngx_dlssnr.dll 复制到 native\vendor\ngx\)" }
-if (-not (Test-Path $fgDll))      { throw "缺少帧生成代理: $fgDll (dlssg_for_sm86 的 version.dll 放入 native\vendor\ngx\)" }
-if (-not (Test-Path $fgIni))      { throw "缺少帧生成代理配置: $fgIni (dlssg_sm86.ini 放入 native\vendor\ngx\)" }
+if (-not (Test-Path $fgDll))      { throw "缺少帧生成代理: $fgDll (先运行 scripts\fetch-deps.ps1 自动拉取)" }
+if (-not (Test-Path $fgIni))      { throw "缺少帧生成代理配置: $fgIni (先运行 scripts\fetch-deps.ps1 自动拉取)" }
 if (-not (Test-Path $fgOfficial)) { throw "缺少官方帧生成运行时: $fgOfficial (先运行 scripts\fetch-deps.ps1 自动下载)" }
 
 $dist  = Join-Path $native "dist"

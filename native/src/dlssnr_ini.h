@@ -94,16 +94,9 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.nvofFollowScaling = readInt(L"nvof_follow_scaling", p.nvofFollowScaling) != 0;
     p.fgEnabled = readInt(L"fg_enabled", p.fgEnabled) != 0;
     p.fgMultiplier = std::clamp(readInt(L"fg_multiplier", p.fgMultiplier), kFgMultMin, kFgMultMax);
-    // v20 两档 remap(仅键存在时):存量 ini 的 1/2(旧 SM86/SM75 钉 proxy
-    // 档)归 0(自动 —— 0.3.x 下 proxy 经自动档预载交付),≥3(旧钉官方)
-    // 归 1(纯官方);纯 clamp 会把旧 1 归到新 1(纯官方)= 30/20 系用户 FG
-    // 静默关闭。键缺失(-1 哨兵)不动 adopt/vpy 传入值。
-    {
-        const int raw = readInt(L"fg_route", -1);
-        if (raw >= 3) p.fgRoute = kFgRouteOfficial;
-        else if (raw >= 1) p.fgRoute = kFgRouteAuto;
-        else if (raw == 0) p.fgRoute = kFgRouteAuto;
-    }
+    // v20 起两档(0=自动/1=纯官方),不兼容旧值:存量 1-3 按 clamp 归 1,
+    // 升级后在面板选回自动即可。
+    p.fgRoute = std::clamp(readInt(L"fg_route", p.fgRoute), kFgRouteMin, kFgRouteMax);
     p.ofBackend = std::clamp(readInt(L"of_backend", p.ofBackend), kOfBackendMin, kOfBackendMax);
     return true;
 }

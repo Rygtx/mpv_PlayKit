@@ -48,6 +48,37 @@ if (-not (Test-Path $fgOfficial)) {
     Write-Host "official DLSSG runtime: $fgOfficial ($len bytes)"
 }
 
+# --- dlssg_for_sm86 FG hook proxy(RTX 30/20 DLSS-G 接管层;上游仓库直取)---
+# version.dll 与出厂 dlssg_sm86.ini 都在上游仓库根(普通 git blob,非 LFS),
+# codeload tag 归档直下解出。tag 与 dll 尺寸双钉:升级上游时同步改两处;
+# 既有文件尺寸不符(含手工放置的旧版)一律重取覆盖,vendor 是可重建暂存区,
+# 不承载手工修改(出厂 ini 同理,部署侧要改请改部署副本)。
+$fgProxyDll = Join-Path $root "vendor\ngx\version.dll"
+$fgProxyIni = Join-Path $root "vendor\ngx\dlssg_sm86.ini"
+$sm86Tag = "0.3.5"
+$sm86DllBytes = 30021920
+if (-not (Test-Path $fgProxyDll) -or (Get-Item $fgProxyDll).Length -ne $sm86DllBytes) {
+    New-Item -ItemType Directory -Force (Split-Path -Parent $fgProxyDll) | Out-Null
+    $zip = Join-Path $env:TEMP "dlssg_for_sm86-$sm86Tag.zip"
+    Fetch "https://codeload.github.com/sdli1995/dlssg_for_sm86/zip/refs/tags/$sm86Tag" $zip
+    $extract = Join-Path $env:TEMP "sm86-extract"
+    if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+    New-Item -ItemType Directory -Force $extract | Out-Null
+    Expand-Archive $zip $extract -Force
+    $repoRootDir = Get-ChildItem $extract -Directory | Select-Object -First 1
+    if (-not $repoRootDir) { throw "dlssg_for_sm86 zip layout unexpected" }
+    $dllSrc = Join-Path $repoRootDir.FullName "version.dll"
+    $iniSrc = Join-Path $repoRootDir.FullName "dlssg_sm86.ini"
+    if (-not (Test-Path $dllSrc)) { throw "dlssg_for_sm86 zip: version.dll missing" }
+    if ((Get-Item $dllSrc).Length -ne $sm86DllBytes) { throw "dlssg_for_sm86 zip: version.dll size mismatch (tag/binary drift; update sm86Tag/sm86DllBytes)" }
+    if (-not (Test-Path $iniSrc)) { throw "dlssg_for_sm86 zip: dlssg_sm86.ini missing" }
+    Copy-Item $dllSrc $fgProxyDll -Force
+    Copy-Item $iniSrc $fgProxyIni -Force
+    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    Write-Host "dlssg_for_sm86 ${sm86Tag}: $fgProxyDll ($sm86DllBytes bytes) + factory ini"
+}
+
 # --- VapourSynth R73 headers (runtime is R73 / API4, see mpv-lazy Lib\site-packages\vapoursynth-73.dist-info) ---
 foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
     Fetch "https://raw.githubusercontent.com/VapourSynth/VapourSynth/R73/include/$h" (Join-Path $vsInc $h)
