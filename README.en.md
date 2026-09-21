@@ -48,7 +48,7 @@ For general mpv tweaks from upstream (configuration guides, mpv-lazy usage, etc.
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR model (must reside in the `ngx\` subdirectory; the plugin resolves it by this relative path; taken from the RenoDX project) |
 | `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, official-chain carrier; selectable via "FG route") |
 | `vs-plugins\ngx\version.dll` | DLSS frame-generation hook proxy 0.3.x ([dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0, RTX 30/20; self-signed; intercepts the `nvngx_dlssg.dll` load and swaps in its embedded runtime) |
-| `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy factory config (shipped as-is; the plugin no longer writes it) |
+| `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy config (shipped as-is; the panel "kernel tier" writes the `Optimized` key only, everything else stays untouched) |
 | `portable_config\vs\DLSSNR_NV.vpy` | Filter script (parameters in the table below) |
 
 ## Installation (existing mpv-lazy)
@@ -70,6 +70,7 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
   - Parameter changes take effect in real time; **"Save settings"** writes to `vs-plugins\dlssnr_ui.ini` and applies automatically on next filter load; **"Reset defaults"** restores factory parameters
   - **ini takes precedence over vpy parameters**; delete `dlssnr_ui.ini` to restore script defaults
   - Optical-flow quality dropdown (0–5) and the "optical flow follows scaling" switch are live-adjustable; when optical flow is unavailable the panel shows "degraded to zero guidance"
+  - Frame-generation tab **"kernel tier"** (dlssg_for_sm86 `Optimized` 0–3): 1 = bit-identical acceleration (default, exactly the official image), 2/3 = lossy faster tiers; writes `ngx\dlssg_sm86.ini`, the proxy reads it once at process load — **mpv restart required**
   - **Diagnostics tab**: the single home for monitoring — the tuning tabs stay clean. Session facts (requested vs actual: optical flow degraded to zero guidance, effective FG route off / official NGX (0.3.x proxy takeover) / official NGX direct / duplicate-frames with the failure reason, panel multiplier above the session cap — all highlighted in red; **which backend "auto" actually picked is shown here, no log digging**) plus queueing details (slot-pool wait / NGX serialize wait / optical-flow gate skip·expired·reset counters) plus the **"debug view" dropdown** (diff ×20 grayscale: white = big change, flat gray = untouched; optical flow = direction → hue, brightness = speed, black = no motion data) and the **"write performance log" switch** (controls `dlssnr_timing.log`). No red on the page = the plugin is working
   - Processing-time timeline chart (gpu / optical flow / inference segments)
   - The panel exits automatically when the filter is turned off / mpv exits

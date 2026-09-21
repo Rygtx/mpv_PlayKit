@@ -48,7 +48,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR 模型(必须位于 `ngx\` 子目录,插件按此相对路径寻找;取自 RenoDX 项目) |
 | `vs-plugins\ngx\nvngx_dlssg.dll` | DLSS 官方帧生成运行时(NVIDIA 签名,官方链载体;面板"FG 路由"可选) |
 | `vs-plugins\ngx\version.dll` | DLSS 帧生成 hook 代理 0.3.x([dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0,RTX 30/20 系;自签名;拦截 `nvngx_dlssg.dll` 加载替换为内嵌运行库) |
-| `vs-plugins\ngx\dlssg_sm86.ini` | 帧生成代理出厂配置(上游原样分发;插件不再写入) |
+| `vs-plugins\ngx\dlssg_sm86.ini` | 帧生成代理配置(上游原样分发;面板"内核档位"写 `Optimized` 单键,其余键保持原样) |
 | `portable_config\vs\DLSSNR_NV.vpy` | 滤镜脚本(参数见下表) |
 
 ## 安装(已有 mpv-lazy)
@@ -70,6 +70,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
   - 参数改动实时生效;**「保存设置」** 写入 `vs-plugins\dlssnr_ui.ini`,下次加载滤镜自动生效;**「重置默认」** 恢复出厂参数
   - **ini 优先于 vpy 参数**;删除 `dlssnr_ui.ini` 可恢复脚本默认值
   - 光流质量下拉(0–5)与"光流跟随降采样"开关实时可调;光流不可用时显示"已降级为零 guidance"
+  - 帧生成页 **「内核档位」**(dlssg_for_sm86 `Optimized` 0–3):1 = 逐位一致加速(默认,与官方画面完全相同),2/3 = 有损加速;写入 `ngx\dlssg_sm86.ini`,代理只在进程加载时读取,**重启 mpv 生效**
   - **「诊断」页**:监控与诊断集中地,调参页保持纯净 ——
     会话事实(请求 vs 实际:光流降级零 guidance、FG 实际路由 off/官方 NGX(0.3.x 代理接管)/官方 NGX 直连/复制帧及失败原因、创建倍数与面板档位不符等一律红色高亮;**"自动"路由这次到底走了谁在此直读,不再翻日志**)+ 排队细分(槽池等待 / NGX 串行等待 / 光流门跳帧·过期·重置计数)+ **「调试视图」下拉**(差异 ×20 灰度 = 白改动画大/灰没动;光流场 = 方向→色相、亮度=速度、黑=无运动数据)+ **「写入性能日志」开关**(控制 `dlssnr_timing.log`)。全页无红 = 插件正常工作
   - 处理用时时间线图(gpu/光流/推理分段)

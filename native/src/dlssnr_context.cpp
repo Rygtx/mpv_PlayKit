@@ -495,6 +495,19 @@ bool DlssnrContext::Initialize(
         std::memcpy(_appDataPath, dirStr.c_str(), (dirStr.size() + 1) * sizeof(wchar_t));
     }
 
+    // 0) FG hook 代理预载(先于 NGX 核心存在)。0.3.x 的设计路径 = 代理
+    // DllMain 挂 LoadLibrary 监视、等核心出现再装钩;"核心先在、代理后进"
+    // 的非设计路径下钩子生效极慢(2026-09-22 实测:预载当拍查询 + 250ms×20
+    // 轮询全败 0xBAD0000B,+17s seek 后同进程重查才过)。挪到核心初始化前
+    // 即走设计路径。纯官方档/FG 未请求不预载。
+    if (_shared->Snapshot().fgEnabled &&
+        std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
+        fgDllPath && fgDllPath[0] &&
+        DlssfgContext::PreloadProxyModule(fgDllPath)) {
+        TimingStatusLine(
+            "DLSSNR STATUS: dlssfg proxy preloaded before NGX core (load-monitor hook attach path)");
+    }
+
     // 1) NGX static core (NgxD3D12Core.cpp:118-151)
     {
         const wchar_t *featurePaths[]{ _appDataPath };
@@ -640,19 +653,10 @@ bool DlssnrContext::Initialize(
                 }
             }
         }
-        // 自动档预载(时序铁律:代理先于 DLSS-G 能力查询加载)。0.3.x
-        // version.dll LoadLibrary 即装钩:只拦截 nvngx_dlssg.dll 的加载
-        // (替换为内嵌运行库 + SM86 后端,其 snippet 申报物理最低架构,
-        // 核心 0xBAD0000B 架构比对自过)+ fg_gate 钩子接答核心能力查询/
-        // CreateFeature;晚了核心真答 0xBAD0000B 且 Available=0,插件不会
-        // 再调 CreateFeature。纯官方档跳过预载(40/50 直连官方运行库;
-        // 30/20 系预期拒载留因)。无 nvngx_dlssg.dll 时预载无官方链可救,
-        // 不装(徒增加载面)。
-        if (fgRoute == kFgRouteAuto && officialDll[0] && fgDllPath && fgDllPath[0] &&
-            DlssfgContext::PreloadProxyModule(fgDllPath)) {
-            TimingStatusLine(
-                "DLSSNR STATUS: dlssfg proxy preloaded (hook capability unlock, official chain next)");
-        }
+        // (自动档预载已前移至 NGX 核心初始化之前 —— 见 Initialize 第 0 步:
+        // 0.3.x 钩子的设计路径是代理先在、监视核心加载后再装;0.3.x 代理
+        // 拦截 nvngx_dlssg.dll 加载替换为内嵌运行库 + fg_gate 钩子接答核心
+        // 能力查询/CreateFeature。)
         bool fgUp = false;
         if (officialDll[0]) {
             DWORD sehCode = 0;

@@ -25,7 +25,9 @@ using namespace vsdlssnr;
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <string>
 
 #pragma comment(lib, "d3d11.lib")
@@ -102,6 +104,8 @@ struct AppState {
     char fgRouteEff[16]{};   // SK_FG_ROUTE_EFFECTIVE: off/official-hook/official/copy
     int fgMultCreate = 0;    // SK_FG_MULT_CREATE: 会话创建倍数(FG 未激活 = 0)
     char fgDetail[128]{};    // SK_FG_DETAIL: FG 最近一次初始化失败原因(成功 = 空)
+    int fgOptimized = 1;     // dlssg_for_sm86 [FrameGeneration] Optimized 0-3
+                             // (存储单点 = 代理 ini;面板启动回读,重启 mpv 生效)
     float slotWait = 0.0f;   // SK_SLOT_WAIT: 槽池等待 last(诊断页)
     float lockWait = 0.0f;   // SK_LOCK_WAIT: evaluate 互斥等待 last(诊断页)
     int gateSkips = 0;       // SK_GATE_SKIPS: 光流帧序门跳帧累计(诊断页)
@@ -158,6 +162,85 @@ void PanelLog(const char *fmt, ...) noexcept {
     if (_wfopen_s(&f, path, L"a") != 0 || !f) return;
     fwrite(stamped, 1, strlen(stamped), f);
     fclose(f);
+}
+
+// ---- dlssg_for_sm86 代理 ini(ngx\dlssg_sm86.ini)的 Optimized 单键 ----
+// 存储单点 = 代理 ini 本身(代理只在进程加载时读一次,重启 mpv 生效);
+// 面板不做 ui.ini 双写,启动时回读 ini 为准。写 = 行内原位替换,文件其余
+// 字节(上游注释/用户排查段)逐字节保留 —— 不走 WritePrivateProfile*,
+// 其重写整文件会把 UTF-8 无 BOM 的中文注释按 ANSI 碾碎。
+bool FgProxyIniPath(wchar_t *path, size_t len) noexcept {
+    wchar_t base[MAX_PATH];
+    if (!BasePath(base, MAX_PATH)) return false;
+    swprintf_s(path, len, L"%s\\ngx\\dlssg_sm86.ini", base);
+    return true;
+}
+
+int ReadFgOptimizedIni() noexcept {
+    wchar_t path[MAX_PATH];
+    if (!FgProxyIniPath(path, MAX_PATH)) return 1;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return 1; // 代理未部署:显示默认,写入时同样跳过
+    std::string content((std::istreambuf_iterator<char>(in)),
+                        std::istreambuf_iterator<char>());
+    size_t pos = 0;
+    while (pos < content.size()) {
+        const size_t eol = content.find('\n', pos);
+        const size_t stop = (eol == std::string::npos) ? content.size() : eol;
+        size_t len = stop - pos;
+        if (len && content[pos + len - 1] == '\r') --len;
+        const size_t s = content.find_first_not_of(" \t", pos);
+        if (s != std::string::npos && s < pos + len &&
+            content.compare(s, 9, "Optimized") == 0) {
+            const bool boundary = (s + 9 == pos + len) || content[s + 9] == '=' ||
+                                  content[s + 9] == ' ' || content[s + 9] == '\t';
+            const size_t eq = boundary ? content.find('=', s + 9) : std::string::npos;
+            if (eq != std::string::npos && eq < pos + len) {
+                return std::clamp(std::atoi(content.c_str() + eq + 1), 0, 3);
+            }
+        }
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+    return 1;
+}
+
+void WriteFgOptimizedIni(int v) noexcept {
+    wchar_t path[MAX_PATH];
+    if (!FgProxyIniPath(path, MAX_PATH)) return;
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        PanelLog("panel: fg proxy ini missing, Optimized not written");
+        return;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    std::string content = ss.str();
+    in.close();
+    size_t pos = 0;
+    while (pos < content.size()) {
+        const size_t eol = content.find('\n', pos);
+        const size_t stop = (eol == std::string::npos) ? content.size() : eol;
+        size_t len = stop - pos;
+        if (len && content[pos + len - 1] == '\r') --len;
+        const size_t s = content.find_first_not_of(" \t", pos);
+        if (s != std::string::npos && s < pos + len &&
+            content.compare(s, 9, "Optimized") == 0) {
+            const bool boundary = (s + 9 == pos + len) || content[s + 9] == '=' ||
+                                  content[s + 9] == ' ' || content[s + 9] == '\t';
+            const size_t eq = boundary ? content.find('=', s + 9) : std::string::npos;
+            if (eq != std::string::npos && eq < pos + len) {
+                content.replace(eq + 1, pos + len - (eq + 1), std::to_string(v));
+                std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                out << content;
+                if (!out) PanelLog("panel: fg proxy ini write FAILED (locked?)");
+                return;
+            }
+        }
+        if (eol == std::string::npos) break;
+        pos = eol + 1;
+    }
+    PanelLog("panel: fg proxy ini has no Optimized key; not written");
 }
 
 // Shared-memory parameter channel: the panel creates the mapping and pushes
@@ -322,6 +405,9 @@ void LoadIni() noexcept {
     // 页签:0=降噪增强 1=帧生成 2=诊断
     g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 2u));
     LoadDlssnrIni(g_app.params, path);
+    // Optimized 档位的存储单点 = 代理 ini(代理只在进程加载时读一次),
+    // 面板启动回读为准 —— 不落 ui.ini,避免双存储漂移。
+    g_app.fgOptimized = ReadFgOptimizedIni();
 }
 
 // Flat-object JSON extraction for the stats blob (our own writer's format)
@@ -532,6 +618,7 @@ const char *FgRouteLabel(const char *v) noexcept {
     if (std::strcmp(v, "copy") == 0) return "未生效(复制帧)";
     return "";
 }
+
 
 // 不一致红色(请求了但没在跑):状态带 / 帧生成页 / 诊断页共用。
 inline const ImVec4 kErrRed(1.0f, 0.42f, 0.42f, 1.0f);
@@ -999,6 +1086,29 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
+    // Optimized 内核档(整行;dlssg_for_sm86 一致性档位。代理只在进程加载
+    // 时读一次 ini → 重启 mpv 生效;存储单点 = 代理 ini,面板启动回读)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("内核档位");
+    if (ImGui::IsItemHovered())
+        ShowTip("dlssg_for_sm86 一致性档位:0 = 原厂内核不加速;\n"
+                "1 = 全部逐位一致加速(推荐,默认,与官方画面完全相同);\n"
+                "2/3 = 再开有损内核,更快但画面渐让。\n"
+                "写入 ngx\\dlssg_sm86.ini,重启 mpv 生效。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    {
+        const int items = 4;
+        const char *labels[items] = { "0 原厂", "1 逐位一致 (默认)", "2 有损 (PSNR>50dB)",
+                                      "3 全部有损" };
+        int sel = std::clamp(g_app.fgOptimized, 0, 3);
+        ImGui::SetNextItemWidth(170 * s);
+        if (ImGui::Combo("##fg_optimized", &sel, labels, items)) {
+            g_app.fgOptimized = sel;
+            WriteFgOptimizedIni(sel);
+        }
+    }
+    y += rowH;
+
             // 跨页依赖提示:光流质量在降噪增强页
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
             ImGui::TextDisabled("提示: 帧生成需光流质量 > 0(降噪增强页),否则只复制帧。");
@@ -1191,6 +1301,10 @@ void DrawUi() noexcept {
         // is no separate reset command in the protocol).
         g_app.params = DlssnrParams{};
         WritePayload();
+        // Optimized 档位不在 payload 里(插件不消费):随重置归 1 并写回
+        // 代理 ini,与面板显示保持一致。
+        g_app.fgOptimized = 1;
+        WriteFgOptimizedIni(1);
         snprintf(g_app.status, sizeof(g_app.status), "已重置");
     }
     ImGui::SameLine(0, 16 * s);
