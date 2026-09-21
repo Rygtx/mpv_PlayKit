@@ -19,11 +19,13 @@ constexpr uint32_t kNvapiIdInitialize = 0x0150e828;
 constexpr uint32_t kNvapiIdEnumPhysicalGPUs = 0xe5ac921f;
 constexpr uint32_t kNvapiIdGetArchitecture = 0xd8265d24;
 
-// NVAPI_GPU_ARCHITECTURE:Gxxxx(Ampere)= 0x170(RTX40MFG-Unlock 实证),
-// Txxxx(Turing)= 0x160(社区 NVAPI 头一致值)。两者 = dlssg_for_sm86
-// 代理的适用族;ADxxx(Ada, 0x190)及更新一律走官方链。
+// NVAPI_GPU_ARCHITECTURE(NV_GPU_ARCHITECTURE_ID,官方 nvapi.h 枚举;
+// 0x170 另为 RTX40MFG-Unlock 实证值):TU100=0x160 Turing、GA100=0x170
+// Ampere = dlssg_for_sm86 代理的适用族;AD100=0x190 Ada = mfg gate 解锁的
+// 唯一目标(GB200=0x1B0 Blackwell 原生 MFG,不碰)。
 constexpr uint32_t kArchTuring = 0x160;
 constexpr uint32_t kArchAmpere = 0x170;
+constexpr uint32_t kArchAda = 0x190;
 
 // ---- Ada count gate 字节判定(RTX40MFG-Unlock ngx_mfg_gate.h 同源)----
 // test dl,dl ; je <reject> ; mov esi,<cap>  —— cap = 运行库多帧上限常量
@@ -106,11 +108,15 @@ bool PageOfModuleIsExecuteRead(HMODULE provider, uintptr_t address, size_t size)
            owner == provider;
 }
 
-} // namespace
-
-bool GpuFamilyPrefersProxy() noexcept {
+// 枚举物理 GPU 架构值(官方 NVAPI NV_GPU_ARCHITECTURE_ID)。返回是否有
+// 任一块 GPU 查到架构;false(含 NVAPI 缺失/初始化失败/全部失败)时
+// *archCount 可能为 0。成功初始化后 nvapi64.dll 进程常驻(内部工作线程
+// 存活期不明,FreeLibrary 死锁风险;与 nvofapi64.dll 同哲学,进程退出
+// OS 回收);未成功初始化即卸载。
+bool GetGpuArchs(uint32_t *archs, size_t cap, size_t *archCount) noexcept {
+    *archCount = 0;
     HMODULE nvapi = LoadLibraryW(L"nvapi64.dll");
-    if (!nvapi) return true; // fail-open:维持无条件预载的现状
+    if (!nvapi) return false;
     using QueryFn = void *__cdecl(uint32_t);
     auto query = reinterpret_cast<QueryFn *>(
         reinterpret_cast<void *>(GetProcAddress(nvapi, "nvapi_QueryInterface")));
@@ -125,26 +131,50 @@ bool GpuFamilyPrefersProxy() noexcept {
         query ? reinterpret_cast<void *>(query(kNvapiIdGetArchitecture)) : nullptr);
     if (!init || !enumGpus || !getArch || init() != 0) {
         FreeLibrary(nvapi); // 未成功初始化,无内部线程,可安全卸载
-        return true;
+        return false;
     }
-    // 初始化成功后 nvapi64.dll 永不卸载(内部工作线程存活期不明,
-    // FreeLibrary 死锁风险;与 nvofapi64.dll 同哲学,进程退出 OS 回收)。
     void *gpus[64]{};
     uint32_t count = 0;
-    if (enumGpus(gpus, &count) != 0 || !count) return true;
-    bool identified = false;
-    bool proxyFamily = false;
+    if (enumGpus(gpus, &count) != 0 || !count) return false;
+    bool any = false;
     for (uint32_t i = 0; i < count && i < 64; ++i) {
         if (!gpus[i]) continue;
         uint32_t arch = 0;
         if (getArch(gpus[i], &arch) != 0) continue;
-        identified = true;
-        if (arch == kArchTuring || arch == kArchAmpere) proxyFamily = true;
+        if (*archCount < cap) archs[*archCount] = arch;
+        ++*archCount;
+        any = true;
     }
-    return identified ? proxyFamily : true;
+    return any;
+}
+
+} // namespace
+
+bool GpuFamilyPrefersProxy() noexcept {
+    uint32_t archs[64]{};
+    size_t count = 0;
+    if (!GetGpuArchs(archs, 64, &count))
+        return true; // fail-open:维持无条件预载的现状
+    for (size_t i = 0; i < count; ++i)
+        if (archs[i] == kArchTuring || archs[i] == kArchAmpere) return true;
+    return false;
 }
 
 unsigned UnlockMfgCountGate(HMODULE provider, unsigned currentMax) noexcept {
+    // 仅 Ada:50 系原生 MFG,不碰官方运行库;非 Ada/探测失败保守跳过。
+    uint32_t archs[64]{};
+    size_t archCount = 0;
+    bool ada = false;
+    if (GetGpuArchs(archs, 64, &archCount)) {
+        for (size_t i = 0; i < archCount; ++i)
+            if (archs[i] == kArchAda) { ada = true; break; }
+    }
+    if (!ada) {
+        TimingStatusLine(
+            "DLSSNR STATUS: dlssfg mfg gate unlock skipped (not Ada; "
+            "Blackwell ships native MFG)");
+        return currentMax;
+    }
     uint8_t *site = FindGateSite(provider);
     if (!site) {
         TimingStatusLine(

@@ -12,11 +12,14 @@
 // 手法与字节判定源自 RTX40MFG-Unlock(MIT License)ngx_mfg_gate.h,精简移植:
 // 仅进程内存映像、不落盘;唯一匹配 + 目标指令双锚校验,未命中/校验失败一律
 // 原样返回 —— 解锁失败只意味着回落 2x,不存在更坏结果。
+// **解锁仅对 Ada(NVAPI AD100=0x190)生效**:50 系原生 MFG 无需解锁,不动
+// 官方运行库;非 Ada/探测失败一律跳过(保守)。
 //
 // 代理族判定:dlssg_for_sm86 0.3.x 代理(SM86 后端)只适用于 Turing/Ampere
-// (NVAPI 架构 TUxxx=0x160 / GAxxx=0x170,后者为 RTX40MFG-Unlock 实证值)。
-// Ada 及更新架构在 40 系上预载该代理会以 SM86 SASS 内核接管官方链 = 未定义
-// 行为,自动档据此分流:代理族预载代理,其余走官方链 + gate 解锁。
+// (NVAPI 架构 TU100=0x160 / GA100=0x170,官方 nvapi.h 枚举,后者另为
+// RTX40MFG-Unlock 实证值)。Ada 及更新架构预载该代理会以 SM86 SASS 内核
+// 接管官方链 = 未定义行为,自动档据此分流:代理族预载代理,其余走官方链
+// + gate 解锁。
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,10 +35,12 @@ namespace dlssfg_gate {
 // 0.3.x 部署形态,按"存在代理族卡"处理,不再按 LUID 细分。
 bool GpuFamilyPrefersProxy() noexcept;
 
-// 尝试对 nvngx_dlssg 运行库进程内解锁 MFG count gate。currentMax = 解锁前
-// 能力查询值;返回解锁后应采用的上限(未命中/已锁死/校验失败 = currentMax,
-// 日志入 timing log)。仅当 provider 模块已加载时有效 —— 调用方在能力查询
-// 之后调用,核心此时必然已加载运行库。
+// 尝试对 nvngx_dlssg 运行库进程内解锁 MFG count gate —— 仅当本机存在
+// Ada(SM89,AD100=0x190)物理 GPU 时执行;其余架构(50 系原生 MFG、
+// 30/20 系走代理、非 NVIDIA/探测失败)原样返回,不碰官方运行库。
+// currentMax = 解锁前能力查询值;返回解锁后应采用的上限(未命中/已锁死/
+// 校验失败 = currentMax,日志入 timing log)。仅当 provider 模块已加载时
+// 有效 —— 调用方在能力查询之后调用,核心此时必然已加载运行库。
 unsigned UnlockMfgCountGate(HMODULE provider, unsigned currentMax) noexcept;
 
 } // namespace dlssfg_gate

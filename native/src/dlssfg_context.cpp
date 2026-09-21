@@ -193,8 +193,9 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
             // Ada(RTX 40)上官方运行库把生成帧数钳 1(2x)= 库内 count gate
             // 软件策略,MFG 模型本身可用(50 系同款 DLL 原生多帧)。查询值
             // 不足 kFgMultMax-1 时尝试进程内 gate 解锁(RTX40MFG-Unlock 同源
-            // 字节补丁;未命中/失败原样回落,代理路径天然不触发 —— 其查询
-            // 已达上限)。见 dlssfg_gate.h。
+            // 字节补丁;仅 Ada 架构生效,50 系原生 MFG 不碰官方运行库;
+            // 未命中/失败原样回落,代理路径天然不触发 —— 其查询已达上限)。
+            // 见 dlssfg_gate.h。
             if (maxGen < static_cast<unsigned>(kFgMultMax - 1)) {
                 maxGen = dlssfg_gate::UnlockMfgCountGate(
                     ::GetModuleHandleW(L"nvngx_dlssg.dll"), maxGen);

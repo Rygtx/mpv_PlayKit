@@ -97,7 +97,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Of_Backend` | 0–1 | 0 | 光流后端(0 = FFX/AMD FidelityFX,跨厂商通用,默认;1 = NVOF/NVIDIA 专属引擎)。切换只影响下一次光流会话建立(下一帧/seek 生效) |
 | `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×6;自动档依赖 `ngx\version.dll`(dlssg_for_sm86 ≥0.3.0),初始化失败自动回退 1:1) |
 | `Fg_Multiplier` | 2–6 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps)。运行库上限默认开到 6x(部署 ini `MaxGeneratedFrames=5`,上限只是钳位),改倍数原地重载即时生效;输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率) |
-| `Fg_Route` | 0–1 | 0 | FG 路由(0 = 自动,按 GPU 族分流——RTX 30/20 系预载 dlssg_for_sm86 0.3.x hook 代理接管 DLSS-G,仍走官方签名链;RTX 40 系起走官方运行库并自动做 mfg gate 解锁放行 3–6x,未命中回落 2x;1 = 纯官方,不预载代理,直连官方运行时,40 系同样解锁,30/20 系被拒载不回落。进程级,重启 mpv 生效;v20 起不兼容旧值,存量 1–3 按越界归 1,升级后在面板选回自动) |
+| `Fg_Route` | 0–1 | 0 | FG 路由(0 = 自动,按 GPU 族分流——RTX 30/20 系预载 dlssg_for_sm86 0.3.x hook 代理接管 DLSS-G,仍走官方签名链;RTX 40 系走官方运行库并自动做 mfg gate 解锁放行 3–6x(仅 Ada 触发,50 系原生多帧不解锁),未命中回落 2x;1 = 纯官方,不预载代理,直连官方运行时,40 系同样解锁,30/20 系被拒载不回落。进程级,重启 mpv 生效;v20 起不兼容旧值,存量 1–3 按越界归 1,升级后在面板选回自动) |
 | `H_Max` | 整数 | 0 | 输出高度限制(源超过该值跳过处理;0 = 不限制) |
 
 调参参考:100% 开缩放 ≈ 关闭缩放(multiplier = 1 时等价);降档位省不了多少帧耗(NGX 固定成本主导),主要影响高频细节,1080p 内容建议 50–75%,25% 仅极端省电场景;4K 源建议配合 `Input_Resolution = 50`。4K 全分辨率(res=100%)推理约 200ms/帧,物理性上限,非卡顿。
@@ -112,7 +112,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | 帧生成 `Fg_Enabled` | ① **光流质量 ≥ 1**(零 guidance 无真运动场)② `ngx\` 内对应运行时(官方 `nvngx_dlssg.dll` 或代理 `version.dll`) | 零 guidance 下插值帧全部退化为复制真实帧(等于白开);运行时缺失/拒载自动回退 1:1,降噪不受影响 |
 | 帧生成改档/开关自动重载 | mpv.conf `input-ipc-server`(本包发行配置已默认开启) | 关/降档退化为会话内复制真实帧;升档需手动 seek |
 | `Fg_Route` 纯官方档 | `nvngx_dlssg.dll` 存在且硬件在官方支持范围(RTX 40/50) | 30/20 系被架构门禁拒载(0xBAD0000B)**不回落**,补帧直接关(诊断页 `fg_detail` 留因) |
-| RTX 40 系 3–6x 插帧 | 官方运行库 `nvngx_dlssg.dll` 内 count gate 字节特征命中(插件进程内解锁,RTX40MFG-Unlock 同源手法;仅进程内存,不落盘) | 特征未命中(驱动升级改版)自动回落 2x,timing log 留因 |
+| RTX 40 系 3–6x 插帧 | 本机 GPU 为 Ada(SM89,NVAPI AD100=0x190;仅 Ada 触发,50 系原生 MFG 不碰官方运行库)+ 官方运行库 count gate 字节特征命中(进程内解锁,RTX40MFG-Unlock 同源手法;仅进程内存,不落盘) | 非 Ada 一律跳过;特征未命中(驱动升级改版)自动回落 2x,timing log 留因 |
 | 只关降噪 `NR_Enabled = False` | 无(帧生成/光流可独立工作) | 与帧生成**同时**全关 → 整个滤镜零初始化零开销,其余参数全部无效 |
 | DLSSNR 滤镜整体 | RTX 显卡(Tensor Core)+ `ngx\nvngx_dlssnr.dll` 模型 + YUV420 8/10bit SDR 源 | 缺任一自动直通(正常播放不增强) |
 | 面板统计/状态区 | 滤镜已加载 | 面板可单独运行改参并保存 ini(下次加载生效),统计区空白 |
@@ -151,7 +151,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 
 > - NVOF 硬件光流引导(RTX Turing+)全系原生支持,面板"光流后端"可选;FFX(默认)跨厂商通用,不支持时自动回退零 guidance,不挡功能
 > - 官方链要求 `nvngx_dlssg.dll`(NVIDIA 签名,发行包已含)与模型 DLL 同目录;自动档按 GPU 族分流(NVAPI 架构探测:30/20 系在初始化前预载 0.3.x 代理,钩子先于能力查询装好,一次过闸不重试;40 系起不预载代理,走官方 + gate 解锁),"纯官方"档跳过预载(30/20 系被架构门禁拒载 0xBAD0000B,FG 关,诊断页 `fg_detail` 留因)
-> - RTX 40 系 6x 说明:官方运行库把 40 系钳在 2x(库内 count gate + 驱动 per-game override 两层;后者只作用于 Streamline 游戏,mpv 直驱不经过)。插件在能力查询低于上限时对 `nvngx_dlssg.dll` 进程内做 2 字节 gate 解锁(唯一匹配 + 目标指令双锚校验,失败原样回落),解锁结果与上限值都进 timing log(`dlssfg mfg gate unlocked` / `pattern not found`)
+> - RTX 40 系 6x 说明:官方运行库把 40 系钳在 2x(库内 count gate + 驱动 per-game override 两层;后者只作用于 Streamline 游戏,mpv 直驱不经过)。解锁**仅对 Ada(SM89)触发**(NVAPI 架构判定;50 系原生 MFG,官方运行库分毫不动;非 Ada/探测失败一律跳过)。触发后对 `nvngx_dlssg.dll` 进程内做 2 字节 gate 解锁(唯一匹配 + 目标指令双锚校验,失败原样回落),解锁结果与上限值都进 timing log(`dlssfg mfg gate unlocked` / `pattern not found` / `unlock skipped (not Ada)`)
 > - RTX 30/20 系的 DLSS 插帧依赖 [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0(自签名):0.3.x 为 hook 型代理(内嵌运行库,与官方逐位一致;0.2.4 直驱契约已移除,旧版本.dll 部署会 FG 关且 `fg_detail` 报 0xBAD0000B,请升级)
 > - 实测基线为 RTX 3080;其余档位为理论推断,欢迎反馈实测结果
 
