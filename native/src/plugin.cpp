@@ -32,7 +32,7 @@ constexpr char PLUGIN_IDENTIFIER[] = "dev.rygtx.vsdlssnr";
 constexpr char PLUGIN_NAMESPACE[] = "dlssnr";
 constexpr char PLUGIN_NAME[] = "NVIDIA DLSSNR filter (Magpie port)";
 constexpr char SNIPPET_DLL_NAME[] = "nvngx_dlssnr.dll";
-constexpr char FG_PROXY_DLL_NAME[] = "version.dll"; // dlssg_for_sm86 原生代理
+constexpr char FG_PROXY_DLL_NAME[] = "version.dll"; // dlssg_for_sm86 0.3.x hook 型代理
 
 // vpy explicit arguments overwrite the DlssnrParams member initializers —
 // the struct defaults in dlssnr_params.h are the single authority, so a
@@ -57,105 +57,6 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
     int err = 0;
     const long long v = vsapi->mapGetInt(in, key, 0, &err);
     if (!err) field = v != 0;
-}
-
-// ---------------------------------------------------------------------------
-// FG proxy INI 同步:Router 面板选项的落点。dlssg_for_sm86 从 proxy DLL 同
-// 目录读 dlssg_sm86.ini(五键,见其 docs/NATIVE_INI.md);mpv_PlayKit 拥有
-// 该文件的 Router 键 —— 面板改路由后这里在 proxy 加载前自动同步,用户不
-// 接触 INI。保留策略:Router 行按目标值原位替换,文件其余字节(用户自行
-// 添加的 [Diagnostics] 排查段、注释、CRLF/LF 行尾风格)逐字节保留 —— 官方
-// 文档(NATIVE_INI.md)推荐排查时手改此文件,切路由不得清空;文件缺失或无
-// Router 键时才落地整套上游 0.2.4 默认模板(Router 键挂在 [Compatibility]
-// 段内,无法安全外插)。时机:每次滤镜创建、proxy LoadLibrary 之前 —— 冷
-// 路径当场生效;proxy 模块进程内钉住,已加载会话的改动按面板提示重启后生效。
-// ---------------------------------------------------------------------------
-void SyncProxyRouterIni(const std::wstring &fgDllPath, const char *router) noexcept {
-    std::error_code ec;
-    const std::filesystem::path proxyDll(fgDllPath);
-    if (fgDllPath.empty() || !std::filesystem::exists(proxyDll, ec)) {
-        return; // proxy 未部署:FG 本就不可用,不产生孤儿 INI
-    }
-    const std::filesystem::path iniPath = proxyDll.parent_path() / "dlssg_sm86.ini";
-
-    // 整文件按字节读入,扫描定位 Router 行(只认行首(允许空白)的 Router
-    // 键:上游注释 "; SM86 for Ampere ..." 无 Router 前缀,天然跳过)。
-    std::string content;
-    {
-        std::ifstream in(iniPath, std::ios::binary);
-        if (in) {
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            content = ss.str();
-        }
-    }
-    bool found = false;     // Router 键存在且带 '='(值待比对)
-    size_t lineStart = 0, lineEnd = 0; // 行区间 [lineStart, lineEnd),不含行尾符
-    size_t pos = 0;
-    while (pos < content.size()) {
-        const size_t eol = content.find('\n', pos);
-        const size_t stop = (eol == std::string::npos) ? content.size() : eol;
-        size_t len = stop - pos;
-        if (len && content[pos + len - 1] == '\r') --len; // 行尾 \r 归入 EOL,替换时保留
-        const size_t s = content.find_first_not_of(" \t", pos);
-        if (s != std::string::npos && s < pos + len &&
-            content.compare(s, 6, "Router") == 0) {
-            const bool boundary = (s + 6 == pos + len) || content[s + 6] == '=' ||
-                                  content[s + 6] == ' ' || content[s + 6] == '\t';
-            const size_t eq = boundary ? content.find('=', s + 6) : std::string::npos;
-            if (eq != std::string::npos && eq < pos + len) {
-                found = true;
-                lineStart = pos;
-                lineEnd = pos + len; // 行内容末尾(不含 \r):替换后原 CRLF/LF 行尾原样保留
-                const size_t v = content.find_first_not_of(" \t", eq + 1);
-                if (v < pos + len && content.compare(v, 4, router) == 0) {
-                    return; // 已是目标值:整文件不动,用户排查段原样
-                }
-                break; // Router 键存在但值不同 -> 仅替换该行
-            }
-        }
-        if (eol == std::string::npos) break;
-        pos = eol + 1;
-    }
-
-    std::string out;
-    if (found) {
-        out = content;
-        out.replace(lineStart, lineEnd - lineStart, std::string("Router=") + router);
-    } else {
-        // 文件缺失 / 空 / 无 Router 键:落地整套上游默认模板。
-        static const char *kIniFmt =
-            "; Native proxy config maintained by mpv_PlayKit (FG Router panel option).\n"
-            "; Other keys mirror dlssg_for_sm86 0.2.4 defaults; restart mpv after switching.\n"
-            "[Compatibility]\n"
-            "; SM86 for Ampere (RTX 30); SM75 for Turing (RTX 20) with KernelImage=PTX.\n"
-            "Router=%s\n"
-            "; PTX uses driver JIT. Cubin requires an exact GPU/Router match.\n"
-            "KernelImage=PTX\n"
-            "; 0 = exact output (default); 1 = optional approximate sampling, SM86 only.\n"
-            "HardwareBilinear=0\n"
-            "\n"
-            "[FrameGeneration]\n"
-            "; Capability limit: 1=2X, 2=3X, 3=4X. The filter requests the actual multiplier.\n"
-            "MaxGeneratedFrames=3\n"
-            "\n"
-            "[Logging]\n"
-            "; 0=off, 1=errors, 2=diagnostics, 3=verbose.\n"
-            "Level=1\n";
-        char buf[768];
-        std::snprintf(buf, sizeof(buf), kIniFmt, router);
-        out = buf;
-    }
-    std::ofstream file(iniPath, std::ios::binary | std::ios::trunc);
-    if (!file) {
-        vsdlssnr::TimingStatusLine(
-            "DLSSNR STATUS: fg proxy ini sync FAILED (write); Router stays as on disk");
-        return;
-    }
-    file << out;
-    char msg[128];
-    std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: fg proxy ini synced Router=%s", router);
-    vsdlssnr::TimingStatusLine(msg);
 }
 
 struct FilterData {
@@ -187,7 +88,7 @@ struct FilterData {
     std::atomic<int> nrPubState{ -1 };
 
     // ---- DLSS FG 多帧输出 ----
-    // fgActive = 创建时 FG 激活(proxy 初始化成功):每源帧产出 M0 帧
+    // fgActive = 创建时 FG 激活(官方链初始化成功):每源帧产出 M0 帧
     // (M0 = fgCreateMult,创建时定格 —— 输出帧数/fps 元数据/每槽时长随之
     // 与 mpv 定约,会话内恒定)。输出索引 n → (源帧 k, 槽位) 为无状态闭式
     // 映射(见 DlssnrGetFrame):序列 = R0, [G(k-1,k)×(M0-1), R_k] ... ——
@@ -680,8 +581,8 @@ static void VS_CC DlssnrCreate(
     ApplyFlagArg(in, vsapi, "fg_enabled", initial.fgEnabled);
     // 插帧倍数 2-4(live 参数,源帧边界生效;创建值定 vi.fps 元数据)
     ApplyIntArg(in, vsapi, "fg_multiplier", initial.fgMultiplier, kFgMultMin, kFgMultMax);
-    // FG 路由 0=自动/1=SM86/2=SM75/3=仅官方(进程级,重启生效;单字段合并
-    // 原 Router+Backend —— 后端由硬件决定,自动档总能选对)
+    // FG 路由 0=自动(预载 0.3.x hook 代理)/1=纯官方(不预载;进程级,
+    // 重启生效)
     ApplyIntArg(in, vsapi, "fg_route", initial.fgRoute, kFgRouteMin, kFgRouteMax);
     ApplyIntArg(in, vsapi, "of_backend", initial.ofBackend, kOfBackendMin, kOfBackendMax);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
@@ -736,12 +637,12 @@ static void VS_CC DlssnrCreate(
         }
     }
 
-    // NR+FG 皆关时也照常同步 Router INI(重开时即最新值);热/冷初始化
+    // NR+FG 皆关时也照常解析 FG DLL 路径(重开时即最新值);热/冷初始化
     // 由下方各守卫跳过 —— 零设备、零显存、零 GPU。仅 NR 关而 FG 开:
     // 初始化照常,降噪评估在 ProcessFrame 内部跳过。
 
-    // FG proxy DLL(dlssg_for_sm86 的 version.dll;用户自备部署,与模型
-    // DLL 同目录约定)。默认 <plugin dir>/ngx/version.dll。
+    // FG hook 代理 DLL(dlssg_for_sm86 0.3.x 的 version.dll;用户自备部署,
+    // 与模型 DLL 同目录约定)。默认 <plugin dir>/ngx/version.dll。
     {
         int fgDllErr = 0;
         const char *fgDllArg = vsapi->mapGetData(in, "fg_dll", 0, &fgDllErr);
@@ -766,11 +667,6 @@ static void VS_CC DlssnrCreate(
             }
         }
     }
-
-    // FG 路由落点:proxy LoadLibrary 之前同步其同目录 INI。进程级,重启
-    // mpv 生效(模块钉住);INI 即时更新,重开即最新值。
-    SyncProxyRouterIni(d->fgDllPath,
-                       initial.fgRoute == kFgRouteProxySm75 ? "SM75" : "SM86");
 
     // Eager init: the D3D12/NGX bring-up costs ~1s (165MB snippet DLL load +
     // CreateFeature + first-evaluate warm-up). Doing it here — script

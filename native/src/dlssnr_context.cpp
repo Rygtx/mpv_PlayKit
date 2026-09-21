@@ -618,19 +618,16 @@ bool DlssnrContext::Initialize(
     // 输入尺寸决策能感知 FG)。失败优雅降级:滤镜回退 1:1 输出(不翻倍
     // 帧率),NR 不受影响 —— FG 的 SEH 走本地闩锁,不进全局 NgxRuntimeGuard。
     if (_fgRequested) {
-        // FG 路由选择(0=自动:官方优先、不可用回落 proxy(SM86);1=SM86;
-        // 2=SM75;3=仅官方 NGX)。钉档失败不跨后端回退(选错档 = FG 关,
-        // 输出 1:1),免去自动档在能力外硬件上每次创建的官方双探开销
-        // (3080 实测:先 capability 拒载才落 proxy)。
+        // FG 路由选择(0=自动:预载 0.3.x hook 代理后走官方链;1=纯官方:
+        // 不预载代理直连官方运行时)。钉档失败不回落(选错档 = FG 关,
+        // 输出 1:1)。
         const int fgRoute =
             std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax);
-        // 官方 NGX 分支(PORTING #8):官方签名 nvngx_dlssg.dll 与模型
-        // DLL 同目录(ngx\)部署且驱动报告 FG 能力(RTX 40/50)时,经共享
-        // NGX core 走官方签名链 —— 免自签 proxy 与杀软误报面,cubin 由
-        // NVIDIA 预编译(SM89/SM120,无 PTX JIT)。参数块 = GetCapability
-        // (官方 DLSSG 的 Magpie 同款 create/eval 块)。自动档不可用时回落
-        // dlssg_for_sm86 proxy —— RTX 30/20 官方拒载(FrameGeneration
-        // .Available=0),proxy 是该区间唯一路径。
+        // 官方 NGX 链(PORTING #8):官方签名 nvngx_dlssg.dll 与模型 DLL
+        // 同目录(ngx\)部署,经共享 NGX core 走官方签名链 —— 免自签
+        // proxy 与杀软误报面。参数块 = GetCapability(官方 DLSSG 的 Magpie
+        // 同款 create/eval 块)。RTX 30/20 的 DLSS-G 由 dlssg_for_sm86
+        // 0.3.x hook 代理接管交付(见下方预载段),链路形态不变。
         wchar_t officialDll[MAX_PATH]{};
         {
             const std::filesystem::path p =
@@ -643,52 +640,48 @@ bool DlssnrContext::Initialize(
                 }
             }
         }
+        // 自动档预载(时序铁律:代理先于 DLSS-G 能力查询加载)。0.3.x
+        // version.dll LoadLibrary 即装钩:只拦截 nvngx_dlssg.dll 的加载
+        // (替换为内嵌运行库 + SM86 后端,其 snippet 申报物理最低架构,
+        // 核心 0xBAD0000B 架构比对自过)+ fg_gate 钩子接答核心能力查询/
+        // CreateFeature;晚了核心真答 0xBAD0000B 且 Available=0,插件不会
+        // 再调 CreateFeature。纯官方档跳过预载(40/50 直连官方运行库;
+        // 30/20 系预期拒载留因)。无 nvngx_dlssg.dll 时预载无官方链可救,
+        // 不装(徒增加载面)。
+        if (fgRoute == kFgRouteAuto && officialDll[0] && fgDllPath && fgDllPath[0] &&
+            DlssfgContext::PreloadProxyModule(fgDllPath)) {
+            TimingStatusLine(
+                "DLSSNR STATUS: dlssfg proxy preloaded (hook capability unlock, official chain next)");
+        }
         bool fgUp = false;
-        if ((fgRoute == kFgRouteAuto || fgRoute == kFgRouteOfficial) && officialDll[0]) {
-            // official 两段式(0.3.x hook 型代理的能力闸解锁):DLSS-G 能力
-            // 闸 = 核心按 NVAPI 读到的物理架构比对 snippet 声明最低架构,
-            // Ampere/20 系首次查询必拒(0xBAD0000B);而 dlssg_for_sm86
-            // 0.3.x 的 version.dll LoadLibrary 即装钩(内嵌原厂运行库接管
-            // 宿主 NGX 调用),同进程重查即过 —— 2026-09-21 实测:首建必败,
-            // 预载 proxy 后第二次创建 "dlssfg ready (official ngx)" 且真实
-            // 产帧(fg 段 3.5-3.9ms)。首败后预载 proxy 重试一次;0.2.4 型
-            // (native NGX 导出)预载无副作用,回落 proxy 路由行为不变。
-            for (int attempt = 0; attempt < 2 && !fgUp; ++attempt) {
-                if (attempt > 0) {
-                    if (!(fgDllPath && fgDllPath[0]) ||
-                        !DlssfgContext::PreloadProxyModule(fgDllPath)) {
-                        break; // 无 proxy 可预载:按首败结果走既有回落链
-                    }
-                    TimingStatusLine(
-                        "DLSSNR STATUS: dlssfg proxy preloaded; retrying official (hook-proxy capability unlock)");
-                }
-                DWORD sehCode = 0;
-                const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
-                if (sehCode || !NVSDK_NGX_SUCCEED(pr) || !_fgParams) {
-                    TimingStatusLine(fgRoute == kFgRouteOfficial
-                                         ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
-                                         : "DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
-                    std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
-                    break;
-                }
+        if (officialDll[0]) {
+            DWORD sehCode = 0;
+            const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
+            if (sehCode || !NVSDK_NGX_SUCCEED(pr) || !_fgParams) {
+                TimingStatusLine(fgRoute == kFgRouteOfficial
+                                     ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
+                                     : "DLSSNR STATUS: dlssfg official capability block FAILED; FG off");
+                std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
+            } else {
                 _fg = std::make_unique<DlssfgContext>();
                 char fgErr[256]{};
-                if (_fg->Initialize(*_d3d12, officialDll, _appDataPath, _fgParams,
+                if (_fg->Initialize(*_d3d12, officialDll, _fgParams,
                                     _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
-                                    DlssfgContext::FgBackend::OfficialNgx,
                                     fgErr, sizeof(fgErr))) {
                     fgUp = true;
-                    std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "official");
-                    _fgDetail[0] = '\0'; // 首败可能已写原因,重试成功即清
+                    // 钩子进程级、装上不可拆:只要缓存模块是 hook 型就标
+                    // official-hook(与本次是否预载解耦 —— 上会话自动档
+                    // 预载后,本会话纯官方在 30/20 系实际仍是 hook 在托)。
+                    std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
+                                  DlssfgContext::CachedProxyIsHookStyle() ? "official-hook" : "official");
                 } else {
-                    const bool retryNext = attempt == 0 && fgDllPath && fgDllPath[0];
                     char msg[352];
                     std::snprintf(msg, sizeof(msg),
                                   "DLSSNR STATUS: dlssfg official init failed (%s); %s",
                                   fgErr,
-                                  retryNext ? "retrying after proxy preload"
-                                  : fgRoute == kFgRouteOfficial ? "FG off (route pinned)"
-                                                                : "trying proxy");
+                                  fgRoute == kFgRouteOfficial
+                                      ? "FG off (route pinned)"
+                                      : "FG off (dlssg_for_sm86 >= 0.3.0 required for RTX 30/20)");
                     DbgLine(msg);
                     TimingStatusLine(msg);
                     SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
@@ -699,82 +692,13 @@ bool DlssnrContext::Initialize(
                 }
             }
         }
-        if (!fgUp && fgRoute != kFgRouteOfficial && fgDllPath && fgDllPath[0]) {
-            DWORD sehCode = 0;
-            const NVSDK_NGX_Result pr = CoreAllocateParametersSafely(&_fgParams, &sehCode);
-            if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
-                _fg = std::make_unique<DlssfgContext>();
-                char fgErr[256]{};
-                if (_fg->Initialize(*_d3d12, fgDllPath, _appDataPath, _fgParams,
-                                    _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
-                                    DlssfgContext::FgBackend::Proxy,
-                                    fgErr, sizeof(fgErr))) {
-                    fgUp = true;
-                    // proxy 内核档 = 本次创建前写入 dlssg_sm86.ini 的 Router 键
-                    // (SyncProxyRouterIni;proxy 按它选 SM86/SM75 内核)。
-                    std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
-                                  fgRoute == kFgRouteProxySm75 ? "proxy-sm75" : "proxy-sm86");
-                } else {
-                    char msg[352];
-                    std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg init failed (%s); 1:1 output",
-                                  fgErr);
-                    DbgLine(msg);
-                    TimingStatusLine(msg);
-                    SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
-                    _fg.reset();
-                    _fgParams = nullptr;
-                    // 0.3.x hook 型代理(pinned proxy 档):无 NGX 直接驱动
-                    // 导出,契约不存在;但钩子已随本次 LoadLibrary 装好 ——
-                    // 借官方 NGX 链驱动一次(auto 档不经此路:official 两段
-                    // 式已带预载重试,避免第三次无效尝试)。
-                    if ((fgRoute == kFgRouteProxySm86 || fgRoute == kFgRouteProxySm75) &&
-                        officialDll[0] && DlssfgContext::CachedProxyIsHookStyle()) {
-                        TimingStatusLine(
-                            "DLSSNR STATUS: dlssfg hook proxy (0.3.x); driving via official NGX path");
-                        DWORD sehCode2 = 0;
-                        const NVSDK_NGX_Result pr2 =
-                            CoreGetCapabilityParametersSafely(&_fgParams, &sehCode2);
-                        if (!sehCode2 && NVSDK_NGX_SUCCEED(pr2) && _fgParams) {
-                            _fg = std::make_unique<DlssfgContext>();
-                            char fgErr2[256]{};
-                            if (_fg->Initialize(*_d3d12, officialDll, _appDataPath, _fgParams,
-                                                _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
-                                                DlssfgContext::FgBackend::OfficialNgx,
-                                                fgErr2, sizeof(fgErr2))) {
-                                fgUp = true;
-                                std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "official");
-                                _fgDetail[0] = '\0';
-                            } else {
-                                char msg2[352];
-                                std::snprintf(msg2, sizeof(msg2),
-                                              "DLSSNR STATUS: dlssfg official via hook proxy failed (%s); 1:1 output",
-                                              fgErr2);
-                                DbgLine(msg2);
-                                TimingStatusLine(msg2);
-                                SanitizeJsonDetail(fgErr2, _fgDetail, sizeof(_fgDetail));
-                                _fg.reset();
-                                _fgParams = nullptr;
-                            }
-                        }
-                    }
-                }
-            } else {
-                TimingStatusLine("DLSSNR STATUS: dlssfg core parameter block FAILED; 1:1 output");
-                std::snprintf(_fgDetail, sizeof(_fgDetail), "core parameter block failed");
-            }
-        }
         if (!fgUp) {
-            // 钉档连尝试都没发生(部署缺失)时,失败原因没有其它出口,
-            // 这里补一行;各尝试路径自身失败已有带因状态行。
-            if (fgRoute == kFgRouteOfficial && !officialDll[0]) {
+            // 部署缺失时尝试路径没跑,失败原因没有其它出口,这里补一行;
+            // 尝试路径自身失败已有带因状态行。
+            if (!officialDll[0]) {
                 TimingStatusLine(
-                    "DLSSNR STATUS: dlssfg route pinned official but nvngx_dlssg.dll missing; 1:1 output");
+                    "DLSSNR STATUS: dlssfg nvngx_dlssg.dll missing; 1:1 output");
                 std::snprintf(_fgDetail, sizeof(_fgDetail), "nvngx_dlssg.dll missing");
-            } else if ((fgRoute == kFgRouteProxySm86 || fgRoute == kFgRouteProxySm75) &&
-                       !(fgDllPath && fgDllPath[0])) {
-                TimingStatusLine(
-                    "DLSSNR STATUS: dlssfg route pinned proxy but version.dll missing; 1:1 output");
-                std::snprintf(_fgDetail, sizeof(_fgDetail), "version.dll (proxy) missing");
             }
             _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
             _fgCreateMult = 0;    // 未激活:面板倍数 mismatch 判定归零
@@ -2207,12 +2131,11 @@ bool DlssnrContext::ProcessFrame(
             char body[960];
             // FG 状态:on = 本帧有真插值(附当前倍数);dup = 复制真实帧
             // (复位/零光流/面板关/降级);off = 本会话未激活;unavailable =
-            // proxy 初始化或 eval 失败闩停(帧率仍 ×M,内容为复制帧)。
+            // official 初始化或 eval 失败闩停(帧率仍 ×M,内容为复制帧)。
             // fg_mult = 当前倍数(面板显示 "3x" 用;未激活 = 0)。
-            // fg_route_eff = 实际生效路由(off/official/proxy-sm86/
-            // proxy-sm75/copy),fg_mult_create = 会话创建倍数 —— "auto 档
-            // 这次到底走了官方还是 proxy""4x 为什么只跑 2x"面板直读,不翻
-            // timing log。
+            // fg_route_eff = 实际生效路由(off/official-hook/official/
+            // copy),fg_mult_create = 会话创建倍数 —— "auto 档这次到底
+            // 走没走 hook 代理""4x 为什么只跑 2x"面板直读,不翻 timing log。
             const char *fgState = !_fg ? "off"
                 : (!_fg->Enabled() ? "unavailable"
                                    : (fgEvaluatedCount > 0 ? "on" : "dup"));

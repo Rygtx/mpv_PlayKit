@@ -34,9 +34,9 @@ foreach ($h in $ngxHeaders) {
 Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" (Join-Path $ngxLib "nvsdk_ngx_s.lib")
 
 # --- Official signed NGX FG runtime (PORTING #8 官方帧生成后端) ---
-# 落到 vendor\ngx\ 与模型 DLL 同目录,打包脚本按存在与否选装;插件只在驱动
-# 报告 DLSSG 能力(RTX 40/50)时经共享 NGX core 加载,否则回落 dlssg_for_sm86
-# proxy。尺寸门槛:HTML 错误页 / LFS 指针文件能通过非空检查,必须拦下。
+# 落到 vendor\ngx\ 与模型 DLL 同目录,打包脚本按存在与否选装;官方链是 FG
+# 唯一路径,RTX 30/20 由 dlssg_for_sm86 0.3.x hook 代理接管交付(自动档
+# 预载)。尺寸门槛:HTML 错误页 / LFS 指针文件能通过非空检查,必须拦下。
 $fgOfficial = Join-Path $root "vendor\ngx\nvngx_dlssg.dll"
 if (-not (Test-Path $fgOfficial)) {
     New-Item -ItemType Directory -Force (Split-Path -Parent $fgOfficial) | Out-Null

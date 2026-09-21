@@ -46,9 +46,9 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `vs-plugins\vs_dlssnr.dll` | VapourSynth API4 插件(mpv-lazy 会自动加载) |
 | `vs-plugins\dlssnr_panel.exe` | ImGui 独立调参面板(可选,滤镜加载时自动拉起) |
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR 模型(必须位于 `ngx\` 子目录,插件按此相对路径寻找;取自 RenoDX 项目) |
-| `vs-plugins\ngx\nvngx_dlssg.dll` | DLSS 官方帧生成运行时(NVIDIA 签名,RTX 40/50 系;面板"FG 路由"可选) |
-| `vs-plugins\ngx\version.dll` | DLSS 帧生成 proxy(dlssg_for_sm86,RTX 30/20 系;自签名) |
-| `vs-plugins\ngx\dlssg_sm86.ini` | 帧生成 proxy 配置(Router 由面板"FG 路由"选项自动写入) |
+| `vs-plugins\ngx\nvngx_dlssg.dll` | DLSS 官方帧生成运行时(NVIDIA 签名,官方链载体;面板"FG 路由"可选) |
+| `vs-plugins\ngx\version.dll` | DLSS 帧生成 hook 代理 0.3.x([dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0,RTX 30/20 系;自签名;拦截 `nvngx_dlssg.dll` 加载替换为内嵌运行库) |
+| `vs-plugins\ngx\dlssg_sm86.ini` | 帧生成代理出厂配置(上游原样分发;插件不再写入) |
 | `portable_config\vs\DLSSNR_NV.vpy` | 滤镜脚本(参数见下表) |
 
 ## 安装(已有 mpv-lazy)
@@ -71,7 +71,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
   - **ini 优先于 vpy 参数**;删除 `dlssnr_ui.ini` 可恢复脚本默认值
   - 光流质量下拉(0–5)与"光流跟随降采样"开关实时可调;光流不可用时显示"已降级为零 guidance"
   - **「诊断」页**:监控与诊断集中地,调参页保持纯净 ——
-    会话事实(请求 vs 实际:光流降级零 guidance、FG 实际路由 off/官方 NGX/代理 SM86/代理 SM75/复制帧及失败原因、创建倍数与面板档位不符等一律红色高亮;**"自动"路由这次到底走了谁在此直读,不再翻日志**)+ 排队细分(槽池等待 / NGX 串行等待 / 光流门跳帧·过期·重置计数)+ **「调试视图」下拉**(差异 ×20 灰度 = 白改动画大/灰没动;光流场 = 方向→色相、亮度=速度、黑=无运动数据)+ **「写入性能日志」开关**(控制 `dlssnr_timing.log`)。全页无红 = 插件正常工作
+    会话事实(请求 vs 实际:光流降级零 guidance、FG 实际路由 off/官方 NGX(0.3.x 代理接管)/官方 NGX 直连/复制帧及失败原因、创建倍数与面板档位不符等一律红色高亮;**"自动"路由这次到底走了谁在此直读,不再翻日志**)+ 排队细分(槽池等待 / NGX 串行等待 / 光流门跳帧·过期·重置计数)+ **「调试视图」下拉**(差异 ×20 灰度 = 白改动画大/灰没动;光流场 = 方向→色相、亮度=速度、黑=无运动数据)+ **「写入性能日志」开关**(控制 `dlssnr_timing.log`)。全页无红 = 插件正常工作
   - 处理用时时间线图(gpu/光流/推理分段)
   - 面板随滤镜关闭 / mpv 退出自动退出
 
@@ -94,9 +94,9 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Ffx_Quality` | 0–2 | 0 | FFX 光流引导档位(0 = 零 guidance;1 = 性能/OF 半分辨率;2 = 质量/全分辨率)。仅后端 = FFX(默认)时消费。两字段独立;面板"光流质量"单下拉按当前后端读写对应档位 |
 | `Nvof_Follow_Scaling` | True/False | False | 光流输入跟随内部降采样(需 Scaling_Enabled;大幅降低光流引擎占用,运动精度略降) |
 | `Of_Backend` | 0–1 | 0 | 光流后端(0 = FFX/AMD FidelityFX,跨厂商通用,默认;1 = NVOF/NVIDIA 专属引擎)。切换只影响下一次光流会话建立(下一帧/seek 生效) |
-| `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×4;依赖 `ngx\version.dll`,初始化失败自动回退 1:1) |
+| `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×4;自动档依赖 `ngx\version.dll`(dlssg_for_sm86 ≥0.3.0),初始化失败自动回退 1:1) |
 | `Fg_Multiplier` | 2–4 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps) |
-| `Fg_Route` | 0–3 | 0 | FG 路由(0 = 自动,官方优先回落代理 SM86;1 = SM86/RTX 30 系走代理;2 = SM75/RTX 20 系走代理;3 = 官方 NGX/RTX 40/50 系,被拒载不回落。进程级,重启 mpv 生效) |
+| `Fg_Route` | 0–1 | 0 | FG 路由(0 = 自动,预载 dlssg_for_sm86 0.3.x hook 代理——RTX 30/20 系由其接管 DLSS-G,仍走官方签名链;1 = 纯官方,不预载,直连官方运行时/RTX 40/50 系,30/20 系被拒载不回落。进程级,重启 mpv 生效。**v20 起值域 0–3 收拢为两档:存量 ini/vpy 的 1/2 归自动,3 归纯官方**) |
 | `H_Max` | 整数 | 0 | 输出高度限制(源超过该值跳过处理;0 = 不限制) |
 
 调参参考:100% 开缩放 ≈ 关闭缩放(multiplier = 1 时等价);降档位省不了多少帧耗(NGX 固定成本主导),主要影响高频细节,1080p 内容建议 50–75%,25% 仅极端省电场景;4K 源建议配合 `Input_Resolution = 50`。4K 全分辨率(res=100%)推理约 200ms/帧,物理性上限,非卡顿。
@@ -110,7 +110,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | 无意义(关闭缩放按源尺寸直接处理) |
 | 帧生成 `Fg_Enabled` | ① **光流质量 ≥ 1**(零 guidance 无真运动场)② `ngx\` 内对应运行时(官方 `nvngx_dlssg.dll` 或代理 `version.dll`) | 零 guidance 下插值帧全部退化为复制真实帧(等于白开);运行时缺失/拒载自动回退 1:1,降噪不受影响 |
 | 帧生成改档/开关自动重载 | mpv.conf `input-ipc-server`(本包发行配置已默认开启) | 关/降档退化为会话内复制真实帧;升档需手动 seek |
-| `Fg_Route` 钉档(非自动) | 对应运行时存在(SM86/SM75 → `version.dll`;官方档 → `nvngx_dlssg.dll`) | 官方档被架构门禁拒载**不回落**,补帧直接关 |
+| `Fg_Route` 纯官方档 | `nvngx_dlssg.dll` 存在且硬件在官方支持范围(RTX 40/50) | 30/20 系被架构门禁拒载(0xBAD0000B)**不回落**,补帧直接关(诊断页 `fg_detail` 留因) |
 | 只关降噪 `NR_Enabled = False` | 无(帧生成/光流可独立工作) | 与帧生成**同时**全关 → 整个滤镜零初始化零开销,其余参数全部无效 |
 | DLSSNR 滤镜整体 | RTX 显卡(Tensor Core)+ `ngx\nvngx_dlssnr.dll` 模型 + YUV420 8/10bit SDR 源 | 缺任一自动直通(正常播放不增强) |
 | 面板统计/状态区 | 滤镜已加载 | 面板可单独运行改参并保存 ini(下次加载生效),统计区空白 |
@@ -135,21 +135,21 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 两个 AI 功能对显卡的要求不同:
 
 - **DLSSNR 降噪**:NVIDIA NGX 官方特性,需 Tensor Core,RTX 全系(Turing+)在官方支持范围内,非 RTX 不可用
-- **DLSS 插帧(帧生成)**:双后端 —— RTX 40/50 系走**官方 NGX 分支**(Magpie 同款:官方签名 `nvngx_dlssg.dll` 经共享 NGX core 加载 + NVOF 自产运动矢量,无 proxy 无自签);RTX 30/20 系官方拒载,走 [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) 破解 proxy(自带推理资源与 PTX)。面板"FG 路由"单控件全覆盖:自动(官方优先,回落代理 SM86)/ SM86(30 系)/ SM75(20 系)/ 官方 NGX(40/50 系) —— 进程级,重启 mpv 生效
+- **DLSS 插帧(帧生成)**:官方 NGX 链单路(Magpie 同款:官方签名 `nvngx_dlssg.dll` 经共享 NGX core + NVOF 自产运动矢量);RTX 30/20 系由 [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) **0.3.x hook 代理**接管交付(version.dll LoadLibrary 即装钩:拦截 `nvngx_dlssg.dll` 加载替换为内嵌运行库,内核按物理架构自动选,档位 1 与官方逐位一致)。面板"FG 路由"两档:自动(预载 0.3.x 代理)/ 纯官方(不预载,直连官方运行时) —— 进程级,重启 mpv 生效
 
 | 显卡 | 架构 | DLSSNR 降噪 | DLSS 插帧 |
 |---|---|---|---|
 | RTX 50 | Blackwell(SM120) | 🟡 理论上支持(官方范围内,未实测) | 🟡 理论上支持(官方 NGX 分支,未实测) |
 | RTX 40 | Ada(SM89) | 🟡 理论上支持(官方范围内,未实测) | 🟡 理论上支持(官方 NGX 分支,未实测) |
-| RTX 30 | Ampere(SM86) | ✅ **实测可用**(RTX 3080) | ✅ **实测可用**(RTX 3080,proxy SM86 路由) |
-| RTX 20 | Turing(SM75) | 🟡 理论上支持(官方范围内,未实测) | 🟡 理论上支持(proxy SM75 路由;仅完成 PTX 前向验证,物理 Turing 卡未实测) |
+| RTX 30 | Ampere(SM86) | ✅ **实测可用**(RTX 3080) | ✅ **实测可用**(RTX 3080,0.3.x 代理接管官方链) |
+| RTX 20 | Turing(SM75) | 🟡 理论上支持(官方范围内,未实测) | 🟡 理论上支持(0.3.x 代理内核族按物理架构自动选 SM75;上游 2080 Ti 实测,本插件未实测) |
 | GTX / 非 RTX | — | ❌ 不可用(无 Tensor Core) | ❌ 不可用 |
 
 图例:✅ 已实测可用 · 🟡 理论上支持(未实测) · ❌ 不可用
 
 > - NVOF 硬件光流引导(RTX Turing+)全系原生支持,面板"光流后端"可选;FFX(默认)跨厂商通用,不支持时自动回退零 guidance,不挡功能
-> - 官方 NGX 分支要求 `nvngx_dlssg.dll`(NVIDIA 签名,发行包已含)与模型 DLL 同目录;3080 实测确认其被架构门禁正常拒载(自动档随后回落 proxy,不影响 30/20 系),面板"FG 路由"固定官方档可跳过该双探
-> - RTX 30/20 系的 DLSS 插帧属于破解路径:proxy 不加载原厂 `nvngx_dlssg.dll`
+> - 官方链要求 `nvngx_dlssg.dll`(NVIDIA 签名,发行包已含)与模型 DLL 同目录;自动档在初始化前预载 0.3.x 代理(钩子先于能力查询装好,一次过闸不重试),"纯官方"档跳过预载(30/20 系被架构门禁拒载 0xBAD0000B,FG 关,诊断页 `fg_detail` 留因)
+> - RTX 30/20 系的 DLSS 插帧依赖 [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0(自签名):0.3.x 为 hook 型代理(内嵌运行库,与官方逐位一致;0.2.4 直驱契约已移除,旧版本.dll 部署会 FG 关且 `fg_detail` 报 0xBAD0000B,请升级)
 > - 实测基线为 RTX 3080;其余档位为理论推断,欢迎反馈实测结果
 
 ## 环境要求

@@ -91,7 +91,7 @@ public:
                       char *err, size_t errLen,
                       char *timingOut = nullptr, size_t timingLen = 0) noexcept;
 
-    // FG 会话是否激活(创建时 fgEnabled 且 proxy 初始化成功且槽资源在)。
+    // FG 会话是否激活(创建时 fgEnabled 且官方链初始化成功且槽资源在)。
     // 决定滤镜输出帧率是否 ×2(插件 create 侧)。
     bool FgActive() const noexcept {
         return _fg && _fg->Enabled();
@@ -139,10 +139,11 @@ private:
     // ---- FG 会话级事实(stats 通道 SK_FG_ROUTE_EFFECTIVE / SK_FG_MULT_CREATE
     // / SK_FG_DETAIL 的数据源;"auto 档到底走了谁 / 为什么没插帧"不再翻
     // timing log)----
-    // 实际生效路由:off(FG 未请求)/ official / proxy-sm86 / proxy-sm75 /
-    // copy(请求了但初始化失败 → 复制帧)。Initialize 的 FG 段一次性定值,
-    // 此后只读(路由进程级,会话内不变;运行期 eval 失败闩停由 SK_FG=
-    // unavailable 表达,路由值保留"最后是谁在跑"的的事实)。
+    // 实际生效路由:off(FG 未请求)/ official-hook(官方链,0.3.x hook
+    // 代理接管)/ official(官方链直连)/ copy(请求了但初始化失败 → 复制
+    // 帧)。Initialize 的 FG 段一次性定值,此后只读(路由进程级,会话内
+    // 不变;运行期 eval 失败闩停由 SK_FG=unavailable 表达,路由值保留
+    // "最后是谁在跑"的的事实)。
     char _fgRouteEff[16] = "off";
     // 最近一次 FG 初始化失败原因(消毒串;成功路径清空)。失败通常发生在
     // 会话创建期,不会有逐帧更新 —— 常规 tick 恒定携带,死亡态 body 缺键

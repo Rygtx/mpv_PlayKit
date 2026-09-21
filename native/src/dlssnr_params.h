@@ -30,20 +30,18 @@ inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
 // 调试视图(live,不持久化):0 = 关,1 = 差异 ×20(|NR改动|×20 灰度),
 // 2 = 光流场(方向→色相、幅值→亮度;排查"光流有没有流/方向对不对")。
 inline constexpr int kDebugViewMax = 2;
-// DLSS 帧生成路由(0-3,单字段合并原 Router+Backend 两概念)。
-//   0 = 自动:官方优先,不可用回落 proxy(回落路由 SM86 —— proxy 无架构
-//       自动探测,RTX 20 系请显式选 SM75)
-//   1 = SM86:固定走 proxy,Router=SM86(RTX 30 系)
-//   2 = SM75:固定走 proxy,Router=SM75(RTX 20 系)
-//   3 = 官方 NGX:固定官方签名运行时(RTX 40/50;30/20 系被架构门禁拒载
-//       → 补帧关,不回落)
-// 进程级,重启 mpv 生效:proxy 模块进程内钉住(SM86/SM75 切换只影响下次
-// 加载),后端选择同样随重启对齐 —— 不参与 hotMatch。插件在 proxy
-// LoadLibrary 前把该值自动写入 proxy 同目录 dlssg_sm86.ini 的 Router 键
-// (plugin.cpp SyncProxyRouterIni),用户不接触 INI 文件。
-inline constexpr int kFgRouteMin = 0, kFgRouteMax = 3;
-inline constexpr int kFgRouteAuto = 0, kFgRouteProxySm86 = 1,
-                     kFgRouteProxySm75 = 2, kFgRouteOfficial = 3;
+// DLSS 帧生成路由(0-1,单字段;0.3.x 起代理为 hook 型、按物理架构自动
+// 选核,原 SM86/SM75 内核档与 Router INI 写入语义作废)。
+//   0 = 自动:FG 初始化前预载 hook 代理(version.dll,LoadLibrary 即装钩
+//       —— 只拦截 nvngx_dlssg.dll 加载替换为内嵌运行库 + fg_gate 钩子接管
+//       核心能力查询/CreateFeature),官方链被其接管后 30/20 系照常出帧;
+//       无代理部署 = 纯官方降级
+//   1 = 纯官方:不预载代理,直连官方签名运行时(RTX 40/50;30/20 系被架构
+//       门禁拒载 0xBAD0000B → 补帧关,不回落)
+// 进程级,重启 mpv 生效:预载模块钉住且钩子装上不可逆(自动→纯官方同进程
+// 降不回去),不参与 hotMatch。0.2.4 直驱 proxy 契约已随本版删除。
+inline constexpr int kFgRouteMin = 0, kFgRouteMax = 1;
+inline constexpr int kFgRouteAuto = 0, kFgRouteOfficial = 1;
 // 光流后端(0-1,创建时 —— 会话重建/seek 生效,面板热改 = 下一帧):
 //   0 = ffx(默认;AMD FidelityFX Optical Flow,FSR3 SDK 金字塔+块匹配;
 //       跨厂商通用,需 D3D12 SM6.2 + WaveOps + R16G16_SINT UAV;上游 Magpie
@@ -123,8 +121,8 @@ struct DlssnrParams {
     // 插值),输出帧时长 = 源时长/M。源帧边界生效(当前源帧按触及时的 M
     // 走完),无重建/重启。fgEnabled=0 时忽略。
     int fgMultiplier = 2;
-    // DLSS 帧生成路由(0=自动 官方优先回落 proxy,1=SM86,2=SM75,3=仅官方
-    // NGX;进程级,重启 mpv 生效):见 kFgRouteMin 注释。
+    // DLSS 帧生成路由(0=自动 预载 0.3.x hook 代理,1=纯官方 不预载;
+    // 进程级,重启 mpv 生效):见 kFgRouteMin 注释。
     int fgRoute = 0;
     // 光流后端(0=ffx 1=nvof,创建时,下一帧生效):见 kOfBackendMin 注释。
     // 切换只影响下一次光流会话建立,不改 NGX feature。

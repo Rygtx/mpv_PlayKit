@@ -14,7 +14,7 @@ import ctypes
 import struct
 
 PAYLOAD_SIZE = 1024
-PAYLOAD_MAGIC = 0x4A4C5344  # "DSLJ" (v19, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
+PAYLOAD_MAGIC = 0x4B4C5344  # "DSLK" (v20, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"

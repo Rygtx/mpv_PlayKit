@@ -1,6 +1,6 @@
 // DLSS 帧生成上下文实现(契约与时序模型见 dlssfg_context.h)。
-// proxy 消费面 = dlssg_for_sm86 二进制字符串表 + 官方 nvsdk_ngx_defs_dlssg.h
-// 的交集;eval 布局对照 Magpie DLSSFrameGenerator.cpp 的 optionalParams。
+// eval 键面 = 官方 nvsdk_ngx_defs_dlssg.h + Magpie DLSSFrameGenerator.cpp
+// 的 optionalParams 对照(官方 DLSSG 依赖全量键面)。
 
 #include "dlssfg_context.h"
 #include "dlssnr_context.h" // TimingStatusLine(失败必须进 timing log)
@@ -13,26 +13,10 @@ namespace vsdlssnr {
 
 namespace {
 
-// proxy 未要求特定 appId;与 NR snippet 的 0x0876232C 区分开,避免两条
-// NGX 驱动链的身份混淆(任意稳定非零值即可)。
-constexpr unsigned long long DLSSFG_PROXY_APPLICATION_ID = 0x0876232Dull;
-
 constexpr NVSDK_NGX_Feature FEATURE_DLSSG = NVSDK_NGX_Feature_FrameGeneration; // 11
 
-// proxy 自有键(来自 0.2.4 二进制字符串表,官方 nvsdk_ngx_defs_dlssg.h 无宏;
-// MultiFrameCountMax 除外,官方头有)。能力三键是 proxy 在 Init 后写入参数块
-// 的查询结果,读不到 = 旧版 proxy,fail-open 保持原行为。
-constexpr char KFG_KEY_AVAILABLE[] = "?DLSSG.Available";
-constexpr char KFG_KEY_NEEDS_UPDATED_DRIVER[] = "DLSSG.NeedsUpdatedDriver";
-constexpr char KFG_KEY_FEATURE_INIT_RESULT[] = "DLSSG.FeatureInitResult";
-// 调用方 D3D12 队列:proxy 的 CUDA 互操作与可选 GPU 计时([Diagnostics]
-// Performance=1)以它为锚(二进制明文 "Performance tracing requires
-// DLSSG.CmdQueue")。传槽 CL 的执行队列 → 同队列 FIFO 保序(见
-// dlssfg_context.h 时序契约);不传时 proxy 自管,诊断计时不可用。
-constexpr char KFG_KEY_CMD_QUEUE[] = "DLSSG.CmdQueue";
-
 // 官方 create 资源旗标(Magpie DLSSFrameGenerator.cpp:513-518 原样):
-// 声明永不提供的可选输入,省 VRAM。proxy 未读该键时无害。
+// 声明永不提供的可选输入,省 VRAM。
 constexpr unsigned int DLSSG_NEVER_PROVIDED_FLAGS =
     NVSDK_NGX_DLSSG_ResourceFlags_HUDLess |
     NVSDK_NGX_DLSSG_ResourceFlags_UI |
@@ -53,7 +37,7 @@ FgModuleCache &FgModule() noexcept {
 }
 
 // ---- FG 本地 SEH(与 NgxRuntimeGuard::_InvokeSafely 同构,但闩锁本类)----
-// FG proxy 的 SEH 绝不上抛全局闩锁:NR 的 NGX core/snippet 是独立模块,
+// FG 的 SEH 绝不上抛全局闩锁:NR 的 NGX core/snippet 是独立模块,
 // FG 崩溃不应连带杀 NR(降级边界:本类 _faulted = FG 永久停用)。
 LONG DlssfgCaptureException(EXCEPTION_POINTERS *exception, DWORD *sehCode) noexcept {
     *sehCode = exception->ExceptionRecord->ExceptionCode;
@@ -75,9 +59,10 @@ bool DlssfgSehCall(Fn &&fn, DWORD *sehCode) noexcept {
 } // namespace
 
 bool DlssfgContext::PreloadProxyModule(const wchar_t *dllPath) noexcept {
-    // 官方路由首败后的预载(0.3.x hook 型代理的能力闸解锁,调用点见
-    // dlssnr_context Initialize 的 official 两段式)。同缓存复用:后续
-    // proxy 路由尝试经路径比对直接命中,不重复 LoadLibrary。
+    // official 能力查询前的预载(0.3.x hook 型代理:LoadLibrary 即装钩,
+    // 先于查询才有"接答 Available=1"的时序;调用点见 dlssnr_context
+    // Initialize FG 段)。同缓存复用:重复调用路径相同即命中,不重复
+    // LoadLibrary。
     if (!dllPath || !dllPath[0]) return false;
     FgModuleCache &cache = FgModule();
     if (cache.module && wcscmp(cache.path, dllPath) == 0) return true;
@@ -93,16 +78,17 @@ bool DlssfgContext::PreloadProxyModule(const wchar_t *dllPath) noexcept {
 bool DlssfgContext::CachedProxyIsHookStyle() noexcept {
     // 0.3.x 起代理模式:内嵌原厂运行库,仅暴露 DlssgProxy_Name/Role 查询
     // 导出(version 桩转发系统 version.dll);NGX 调用靠钩子接管,不经
-    // GetProcAddress 直接驱动 —— pinned proxy 档据此改走 official NGX 链。
+    // GetProcAddress 直接驱动 —— fg_route_eff 据此定名 official-hook/
+    // official(钩子进程级不可拆,与本次是否预载解耦)。
     HMODULE mod = FgModule().module;
     return mod && GetProcAddress(mod, "DlssgProxy_Role") != nullptr;
 }
 
 DlssfgContext::~DlssfgContext() {
-    // 故障后绝不重入 proxy(闩锁语义;模块/feature 泄漏给 OS 回收,与热
-    // 上下文同哲学)。健康路径也只弃引用:ReleaseFeature 在 Rebuild 尺寸
+    // 故障后绝不重入 NGX FG feature(闩锁语义;feature 泄漏给 OS 回收,与
+    // 热上下文同哲学)。健康路径也只弃引用:ReleaseFeature 在 Rebuild 尺寸
     // 重建时显式走,析构不补 —— 进程退出即回收,避免 DllMain/loader 锁
-    // 下调 proxy 代码(与 NR Shutdown 的理由一致)。
+    // 下调 NGX 代码(与 NR Shutdown 的理由一致)。
 }
 
 template <typename Fn>
@@ -132,9 +118,8 @@ bool DlssfgContext::SehCall(Fn &&fn, const char *what, char *err, size_t errLen)
 }
 
 bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
-                               const wchar_t *appDataPath, NVSDK_NGX_Parameter *params,
+                               NVSDK_NGX_Parameter *params,
                                int width, int height, DXGI_FORMAT backbufferFormat,
-                               FgBackend backend,
                                char *err, size_t errLen) noexcept {
     auto fail = [&](const char *what) {
         if (err && errLen) std::snprintf(err, errLen, "%s", what);
@@ -148,162 +133,72 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
         _params = nullptr;
         return false;
     };
-    _backend = backend;
-    // OfficialNgx:dllPath 是官方 snippet 路径,仅作部署指纹(核心解析由
-    // 共享 NGX core 的 PathList 完成,本类不做 LoadLibrary);Proxy:必须
-    // 提供 version.dll 路径。
-    if (_backend == FgBackend::Proxy && (!dllPath || !dllPath[0])) {
-        return fail("no proxy dll path");
-    }
+    // dllPath 是官方 snippet 路径,仅作部署指纹(核心解析由共享 NGX core
+    // 的 PathList 完成,本类不做 LoadLibrary;hook 代理若在托,该加载由其
+    // 拦截替换为内嵌运行库)。
     if (!params) return fail("no core parameter block");
 
     _d3d12 = &d3d12;
     _params = params;
 
-    if (_backend == FgBackend::OfficialNgx) {
-        // ---- 官方 NGX 后端(PORTING #8;Magpie DLSSFrameGenerator 同款)----
-        // 部署指纹(同 proxy 行款:官方 DLL 被换/缺失时一行定位)。
-        if (dllPath && dllPath[0]) {
-            WIN32_FILE_ATTRIBUTE_DATA fa{};
-            if (GetFileAttributesExW(dllPath, GetFileExInfoStandard, &fa)) {
-                ULARGE_INTEGER sz{};
-                sz.HighPart = fa.nFileSizeHigh;
-                sz.LowPart = fa.nFileSizeLow;
-                char msg[128];
-                std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: dlssfg official snippet %llu bytes",
-                              static_cast<unsigned long long>(sz.QuadPart));
-                TimingStatusLine(msg);
-            }
-        }
-        // 能力预检(Magpie DLSSFrameGenerator.cpp:469-485):capability 块
-        // 的 FrameGeneration.Available 由驱动侧解析 —— RTX 30/20 / 驱动过旧
-        // / snippet 缺失时为 0,本类失败由调用方回落 proxy。官方契约必有
-        // 该键,读不到 = 驱动 NGX 运行时过旧,同样视为不可用。
-        int available = 0;
-        {
-            char sehErr[160]{};
-            const bool haveCap = SehCall([&] {
-                return _params->Get(NVSDK_NGX_Parameter_FrameGeneration_Available,
-                                    &available) == NVSDK_NGX_Result_Success;
-            }, "Get(FrameGeneration.Available)", sehErr, sizeof(sehErr));
-            if (!haveCap || !available) {
-                // FeatureInitResult 读回(官方键,失败精确归因)。
-                unsigned int initResult = 0;
-                const bool haveResult =
-                    _params->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult,
-                                 &initResult) == NVSDK_NGX_Result_Success;
-                char tag[48]{};
-                if (haveResult) {
-                    std::snprintf(tag, sizeof(tag), " (FeatureInitResult 0x%X)", initResult);
-                }
-                char msg[160];
-                std::snprintf(msg, sizeof(msg), "official NGX reports DLSSG unavailable%s%s",
-                              tag, haveCap ? "" : " (capability key missing)");
-                return fail(msg);
-            }
-        }
-        // MultiFrameCountMax(信息性;Ada/Blackwell 均为 3 → 4X 封顶)。
-        {
-            unsigned int maxGen = 0;
-            if (_params->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maxGen) ==
-                NVSDK_NGX_Result_Success) {
-                char msg[96];
-                std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: dlssfg official maxGen=%u", maxGen);
-                TimingStatusLine(msg);
-            }
-        }
-        // 函数指针 = 静态 SDK(与 proxy 导出同签名;Init 免除 —— core 已由
-        // NR 初始化,FG feature 直接在共享 core 上创建)。
-        _initExt = nullptr;
-        _createFeature = &NVSDK_NGX_D3D12_CreateFeature;
-        _evaluateFeature = &NVSDK_NGX_D3D12_EvaluateFeature;
-        _releaseFeature = &NVSDK_NGX_D3D12_ReleaseFeature;
-    } else {
-        // ---- proxy 后端(dlssg_for_sm86,现状路径)----
-        // 模块缓存:同路径复用;路径变化(升级/换文件)才重新 LoadLibrary。
-        // 旧模块同样永不卸载(多模块共存无害,显存随 feature 释放)。
-        FgModuleCache &cache = FgModule();
-        if (!cache.module || wcscmp(cache.path, dllPath) != 0) {
-            HMODULE mod = LoadLibraryExW(dllPath, nullptr,
-                                         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                                             LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-            if (!mod) {
-                char msg[96];
-                std::snprintf(msg, sizeof(msg), "LoadLibraryExW(proxy) failed (err=%lu)",
-                              static_cast<unsigned long>(GetLastError()));
-                return fail(msg);
-            }
-            cache.module = mod;
-            wcsncpy_s(cache.path, dllPath, _TRUNCATE);
-            // 部署指纹(与 NR snippet 的 dll 指纹行同款:代理文件被换时一行定位)。
-            WIN32_FILE_ATTRIBUTE_DATA fa{};
-            if (GetFileAttributesExW(dllPath, GetFileExInfoStandard, &fa)) {
-                ULARGE_INTEGER sz{};
-                sz.HighPart = fa.nFileSizeHigh;
-                sz.LowPart = fa.nFileSizeLow;
-                char msg[128];
-                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg proxy %llu bytes",
-                              static_cast<unsigned long long>(sz.QuadPart));
-                TimingStatusLine(msg);
-            }
-        }
-        HMODULE mod = cache.module;
-
-        _initExt = reinterpret_cast<InitExtFn>(GetProcAddress(mod, "NVSDK_NGX_D3D12_Init_Ext"));
-        _createFeature = reinterpret_cast<CreateFeatureFn>(GetProcAddress(mod, "NVSDK_NGX_D3D12_CreateFeature"));
-        _evaluateFeature = reinterpret_cast<EvaluateFeatureFn>(GetProcAddress(mod, "NVSDK_NGX_D3D12_EvaluateFeature"));
-        _releaseFeature = reinterpret_cast<ReleaseFeatureFn>(GetProcAddress(mod, "NVSDK_NGX_D3D12_ReleaseFeature"));
-        if (!_initExt || !_createFeature || !_evaluateFeature || !_releaseFeature) {
-            return fail("proxy D3D12 exports incomplete (not the dlssg proxy dll?)");
-        }
-
-        {
-            char sehErr[160]{};
-            const bool ok = SehCall([&] {
-                return _initExt(DLSSFG_PROXY_APPLICATION_ID, appDataPath,
-                                d3d12.Device(), NVSDK_NGX_Version_API, nullptr) ==
-                       NVSDK_NGX_Result_Success;
-            }, "Init_Ext", sehErr, sizeof(sehErr));
-            if (!ok) {
-                char msg[224];
-                std::snprintf(msg, sizeof(msg),
-                              "Init_Ext failed%s%s (proxy refused; existing NGX runtime conflict?)",
-                              sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "");
-                return fail(msg);
-            }
-        }
-
-        // 能力预检(fail-open):proxy 在 Init_Ext 后写入参数块的能力键。读到
-        // Available=0 / NeedsUpdatedDriver=1 时带因降级(比 CreateFeature 失败
-        // 更早、原因更准);键不存在 = 旧版 proxy,保持原路径继续。
-        {
-            unsigned int available = 1, needsDriver = 0, maxGen = 0;
-            const bool haveCap =
-                _params->Get(KFG_KEY_AVAILABLE, &available) == NVSDK_NGX_Result_Success;
-            const bool haveDriver =
-                _params->Get(KFG_KEY_NEEDS_UPDATED_DRIVER, &needsDriver) == NVSDK_NGX_Result_Success;
-            const bool haveMaxGen =
-                _params->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maxGen) ==
-                NVSDK_NGX_Result_Success;
-            if (haveCap && !available) {
-                return fail("proxy reports DLSSG unavailable (?DLSSG.Available=0)");
-            }
-            if (haveDriver && needsDriver) {
-                return fail("proxy reports driver update required (NeedsUpdatedDriver=1)");
-            }
-            if (haveCap || haveDriver || haveMaxGen) {
-                char msg[160];
-                std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: dlssfg capability available=%d driver=%d maxGen=%u",
-                              haveCap ? static_cast<int>(available) : -1,
-                              haveDriver ? static_cast<int>(needsDriver) : -1,
-                              haveMaxGen ? maxGen : 0u);
-                TimingStatusLine(msg);
-            }
+    // 部署指纹(官方 DLL 被换/缺失时一行定位)。
+    if (dllPath && dllPath[0]) {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (GetFileAttributesExW(dllPath, GetFileExInfoStandard, &fa)) {
+            ULARGE_INTEGER sz{};
+            sz.HighPart = fa.nFileSizeHigh;
+            sz.LowPart = fa.nFileSizeLow;
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: dlssfg official snippet %llu bytes",
+                          static_cast<unsigned long long>(sz.QuadPart));
+            TimingStatusLine(msg);
         }
     }
+    // 能力预检(Magpie DLSSFrameGenerator.cpp:469-485):capability 块
+    // 的 FrameGeneration.Available 由核心侧解析 —— RTX 30/20 无 hook 代理
+    // 在托 / 驱动过旧 / snippet 缺失时为 0,本类失败由调用方定夺。官方契约
+    // 必有该键,读不到 = 驱动 NGX 运行时过旧,同样视为不可用。
+    int available = 0;
+    {
+        char sehErr[160]{};
+        const bool haveCap = SehCall([&] {
+            return _params->Get(NVSDK_NGX_Parameter_FrameGeneration_Available,
+                                &available) == NVSDK_NGX_Result_Success;
+        }, "Get(FrameGeneration.Available)", sehErr, sizeof(sehErr));
+        if (!haveCap || !available) {
+            // FeatureInitResult 读回(官方键,失败精确归因)。
+            unsigned int initResult = 0;
+            const bool haveResult =
+                _params->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult,
+                             &initResult) == NVSDK_NGX_Result_Success;
+            char tag[48]{};
+            if (haveResult) {
+                std::snprintf(tag, sizeof(tag), " (FeatureInitResult 0x%X)", initResult);
+            }
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "official NGX reports DLSSG unavailable%s%s",
+                          tag, haveCap ? "" : " (capability key missing)");
+            return fail(msg);
+        }
+    }
+    // MultiFrameCountMax(信息性;hook 代理 310.9 运行库可报 5 → 6X,面板
+    // 倍数上限仍 4)。
+    {
+        unsigned int maxGen = 0;
+        if (_params->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maxGen) ==
+            NVSDK_NGX_Result_Success) {
+            char msg[96];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: dlssfg official maxGen=%u", maxGen);
+            TimingStatusLine(msg);
+        }
+    }
+    // 函数指针 = 静态 SDK(Init 免除 —— core 已由 NR 初始化,FG feature
+    // 直接在共享 core 上创建)。
+    _createFeature = &NVSDK_NGX_D3D12_CreateFeature;
+    _evaluateFeature = &NVSDK_NGX_D3D12_EvaluateFeature;
+    _releaseFeature = &NVSDK_NGX_D3D12_ReleaseFeature;
 
     _width = width;
     _height = height;
@@ -315,8 +210,8 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
     _ready.store(true, std::memory_order_release);
     {
         char msg[128];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg ready (%s, %dx%d)",
-                      BackendName(), width, height);
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg ready (official ngx, %dx%d)",
+                      width, height);
         TimingStatusLine(msg);
     }
     return true;
@@ -331,8 +226,7 @@ bool DlssfgContext::CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbu
         if (err && errLen) std::snprintf(err, errLen, "dlssfg: BeginCtlRecording failed");
         return false;
     }
-    // create 参数(官方 helper NGX_D3D12_CREATE_DLSSG 的子集;proxy 未读
-    // 的键无害)。
+    // create 参数(官方 helper NGX_D3D12_CREATE_DLSSG 的子集)。
     _params->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
     _params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
     _params->Set(NVSDK_NGX_Parameter_Width, static_cast<unsigned int>(width));
@@ -343,10 +237,8 @@ bool DlssfgContext::CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbu
     _params->Set(NVSDK_NGX_DLSSG_Parameter_InternalHeight, static_cast<unsigned int>(height));
     _params->Set(NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0u);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_ResourceNeverProvided_Flags, DLSSG_NEVER_PROVIDED_FLAGS);
-    // 调用方队列(代理自有键):CUDA 互操作与 GPU 计时诊断的锚;与槽 CL
-    // 同队列 → FIFO 保序。Set 与 Eval 的其余键同款普通调用(参数块 vtable
-    // 属 NGX core,与 proxy 故障隔离无关)。
-    _params->Set(KFG_KEY_CMD_QUEUE, static_cast<void *>(_d3d12->Queue()));
+    // (0.2.4 时代的 DLSSG.CmdQueue 代理私有键已删:官方 DLSSG 忽略未知键,
+    // 插值输出就绪本就由槽队列 FIFO + WaitFrame 保证,无需锚。)
 
     char sehErr[160]{};
     bool ok = SehCall([&] {
@@ -360,11 +252,13 @@ bool DlssfgContext::CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbu
     }
     if (!ok) {
         if (err && errLen) {
-            // 官方 DLSS 同款:CreateFeature 失败后从同一参数块读 snippet 的
-            // 精确初始化结果码(proxy 自有键;读不到 = 旧版 proxy,原样)。
+            // 官方 DLSS 同款:CreateFeature 失败后从同一参数块读核心记下的
+            // 精确初始化结果码(官方 FrameGeneration.FeatureInitResult 键;
+            // 读不到 = 核心没记,原样)。
             unsigned int initResult = 0;
             const bool haveResult =
-                _params->Get(KFG_KEY_FEATURE_INIT_RESULT, &initResult) == NVSDK_NGX_Result_Success;
+                _params->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult,
+                             &initResult) == NVSDK_NGX_Result_Success;
             char resultTag[40]{};
             if (haveResult) {
                 std::snprintf(resultTag, sizeof(resultTag), " (FeatureInitResult 0x%X)", initResult);
@@ -393,7 +287,7 @@ bool DlssfgContext::Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,
             return _releaseFeature(_feature) == NVSDK_NGX_Result_Success;
         }, "ReleaseFeature", nullptr, 0);
         if (!released) {
-            // Release 失败 = proxy 状态不可信,整体停用(官方"final release
+            // Release 失败 = feature 状态不可信,整体停用(官方"final release
             // 失败不可重试"同语义)。
             _ready.store(false, std::memory_order_release);
             if (err && errLen) std::snprintf(err, errLen, "dlssfg: ReleaseFeature failed on rebuild");
@@ -435,10 +329,10 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
     _needsReset = false;
     ++_frameId;
 
-    // eval 参数(官方 helper NGX_D3D12_EVALUATE_DLSSG 的 proxy 消费面子集;
+    // eval 参数(官方 helper NGX_D3D12_EVALUATE_DLSSG;
     // 布局对照 Magpie DLSSFrameGenerator.cpp:724-758 —— 恒等相机 + mvecScale
     // 1,1 + 像素单位 current-to-previous)。multiFrameCount/Index:M 倍时每
-    // 真实帧产出 M-1 插值帧,slotIndex 1..M-1 必须按序递增(proxy 契约
+    // 真实帧产出 M-1 插值帧,slotIndex 1..M-1 必须按序递增(官方 MFG 契约
     // "MFG indices must be evaluated in order starting at 1")。
     const unsigned int genCount =
         static_cast<unsigned int>(std::clamp(multiplier - 1, 1, kFgMultMax - 1));
@@ -462,8 +356,7 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
     // 相机契约(Magpie optionalParams,DLSSFrameGenerator.cpp:724-773 原样
     // 语义):视频无相机 → 全部矩阵恒等、相机为单位基座、jitter 0;
     // MVecs 为像素单位 current-to-previous(与 NVOF densify 输出对齐)→
-    // 单位缩放。proxy 只消费 ClipToPrevClip/PrevClipToClip,其余键忽略
-    // 无害;官方 DLSSG 依赖全量键面。
+    // 单位缩放。官方 DLSSG 依赖全量键面。
     static const float kIdentity[16] = {
         1, 0, 0, 0,
         0, 1, 0, 0,

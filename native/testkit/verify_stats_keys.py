@@ -37,7 +37,7 @@ pull(ret, 1)
 st = panel_ipc.read_stats()
 print("stats:", st[2] if st else "MAPPING MISSING")
 
-# v19 新键:实际路由 / 创建倍数 / 排队细分(FG 未请求 → route=off,
+# v19+ 新键:实际路由 / 创建倍数 / 排队细分(FG 未请求 → route=off,
 # mult_create=0;存活 tick 必带 slot_wait/lock_wait/gate_*)。
 # 断言挂在 case 1 的存活 body 上 —— case 2/3 会因同进程第二个滤镜实例
 # 的 IAT hook 单例走 passthrough,边缘 body 不带 tick 键(环境特性,非回归)。
@@ -73,7 +73,7 @@ pull(ret3, 0)  # 应直通(帧返回源内容)
 st = panel_ipc.read_stats()
 print("stats:", st[2] if st else "MAPPING MISSING")
 
-# 断言:case1 应 ok/off;case3 应 passthrough 且带原因;v19 新键齐全
+# 断言:case1 应 ok/off;case3 应 passthrough 且带原因;v19+ 新键齐全
 ok = new_keys_present
 if st is None:
     ok = False

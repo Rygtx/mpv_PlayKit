@@ -44,10 +44,14 @@ constexpr uint32_t PAYLOAD_SIZE = 1024;
 // 缩减,新旧混跑按 magic 拒读;
 // v19:debugView 值域 0/1 → 0-2(2 = 光流场调试视图,kDebugViewMax)。
 // 布局不变,但新旧混跑时旧插件把 2 归一成 true(= 差异视图),视图语义
-// 漂移 —— 按 magic 拒读,面板与插件必须成对部署。
+// 漂移 —— 按 magic 拒读,面板与插件必须成对部署;
+// v20:fgRoute 值域 0-3 → 0-1(0=自动 预载 0.3.x hook 代理,1=纯官方;
+// dlssg_for_sm86 0.3.x 起 SM86/SM75 内核档语义作废)。布局不变,但旧面板
+// 发 2/3 会被新插件 clamp 成 1(纯官方)= 语义漂移 —— 按 magic 拒读,
+// 面板与插件必须成对部署。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x4A4C5344u; // "DSLJ" (v19, 版本位走 hex:9 之后是 A/B/C/D/E/F)
+constexpr uint32_t PAYLOAD_MAGIC = 0x4B4C5344u; // "DSLK" (v20, 版本位走 hex:9 之后是 A/B/C/D/E/F)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -77,7 +81,7 @@ struct PanelPayload {
     int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
     int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,会话内有效密度 = min(此值, 创建倍数))
-    int32_t fgRoute;             // 0-3 FG 路由(v12;0=自动,1=SM86,2=SM75,3=官方 NGX,重启生效)
+    int32_t fgRoute;             // 0-1 FG 路由(v12;v20 两档化:0=自动预载 0.3.x 代理,1=纯官方,重启生效)
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
     int32_t debugView;           // 0-2 调试视图(v13;v19 起含光流场;live,不持久化)
     int32_t ofBackend;           // 0-1 光流后端(v16;0=ffx 默认 1=nvof;切档下一帧生效)
@@ -122,9 +126,8 @@ inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.inputResolutionPercent = std::clamp(pl.inputResolution, kResPctMin, kResPctMax);
     p.scalingEnabled = pl.scalingEnabled != 0;
     p.fgEnabled = pl.fgEnabled != 0;
-    // Route 进程级(proxy 模块钉住 + 后端选择都随重启对齐):不进
-    // LoadLiveParams,不参与 hotMatch;只在滤镜创建与 proxy INI 同步时
-    // 消费,重启后全面生效。
+    // Route 进程级(hook 代理预载与否随重启对齐,钩子装上不可拆):不进
+    // LoadLiveParams,不参与 hotMatch;只在滤镜创建时消费,重启后全面生效。
     p.fgRoute = std::clamp(pl.fgRoute, kFgRouteMin, kFgRouteMax);
 }
 
@@ -216,12 +219,12 @@ inline constexpr const char *SK_FG = "fg";
 inline constexpr const char *SK_FG_MULT = "fg_mult";
 // FG 路由实际生效档(面板核心诉求:auto 档下"这次到底走了谁"不再翻
 // timing log):
-//   off        — 创建时 FG 未请求(面板 FG = 关)
-//   official   — 官方 NGX 分支(RTX 40/50,共享 NGX core)
-//   proxy-sm86 / proxy-sm75 — dlssg_for_sm86 proxy(Router 键决定内核档,
-//                 由面板路由下拉在 proxy 加载前写入 dlssg_sm86.ini)
-//   copy       — FG 已请求但初始化失败 → 输出回落 1:1/复制帧(与 SK_FG
-//                的 unavailable/dup 互补:那个说"帧是什么",这个说"谁产的")
+//   off           — 创建时 FG 未请求(面板 FG = 关)
+//   official-hook — 官方 NGX 链,0.3.x hook 代理在托接管 DLSS-G(RTX 30/20
+//                   唯一路径;进程级,与本次是否预载解耦)
+//   official      — 官方 NGX 链直连(无 hook 代理在托;RTX 40/50)
+//   copy          — FG 已请求但初始化失败 → 输出回落 1:1/复制帧(与 SK_FG
+//                   的 unavailable/dup 互补:那个说"帧是什么",这个说"谁产的")
 inline constexpr const char *SK_FG_ROUTE_EFFECTIVE = "fg_route_eff";
 // FG 会话创建倍数(2-4;FG 未激活 = 0)。live 倍数超过它时多出的档位本
 // 会话无槽可填(面板红色提示"需 seek 重建")。

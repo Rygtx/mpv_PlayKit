@@ -1,7 +1,7 @@
 ### NVIDIA DLSSNR 同分辨率 AI 画质增强 <RTX N卡专用>
 ### 依赖_ vs-plugins\vs_dlssnr.dll (VapourSynth 插件, 自动加载)
 ###       vs-plugins\ngx\nvngx_dlssnr.dll (模型文件, 310.9.0, 取自 RenoDX)
-###       vs-plugins\ngx\version.dll (DLSS FG 原生代理, dlssg_for_sm86; 帧生成可选, 用户自备)
+###       vs-plugins\ngx\version.dll (DLSS FG hook 代理 0.3.x, dlssg_for_sm86; 帧生成可选, 用户自备)
 ###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
 ### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18)
 ###       处理为同分辨率 (非超分); 默认零 guidance, 可选硬件光流引导 (0-5 档)
@@ -70,17 +70,18 @@ H_Max = 0
 ##          2 = 质量 (全分辨率); 面板"光流质量"按当前后端读写对应档位
 ## <True|False> DLSS 帧生成 (默认 False)
 ##          挂降噪之后: 每源帧产出 M 帧, 插值帧由 DLSS FG 模型合成,
-##          落在相邻两真实帧之间; 依赖 ngx\version.dll (dlssg_for_sm86),
+##          落在相邻两真实帧之间; 依赖 ngx\version.dll (dlssg_for_sm86
+##          0.3.x hook 代理, 自动档预载接管 DLSS-G),
 ##          初始化失败自动回退 1:1, 降噪不受影响
 ## <2-4> 整数, 插帧倍数 (默认 2): 每源帧产出 M 帧, 输出帧时长 = 源时长/M
 ##          24fps 源 x3 = 72fps, 显示端建议刷新率 >= 输出帧率
 ##          输出帧数/节奏随创建档位定格; 面板改档位/开关会自动触发 mpv
 ##          原地重载即时生效 (需 mpv.conf 启用 input-ipc-server; 未启用时
 ##          关/降档退化为会话内复制真实帧, 升档需手动 seek)
-## <0-3> 整数, FG 路由 (默认 0): 0 = 自动 (官方优先, 不可用回落代理 SM86),
-##          1 = SM86 (RTX 30 系走代理), 2 = SM75 (RTX 20 系走代理),
-##          3 = 官方 NGX (RTX 40/50 系, 30/20 系被拒载不回落)
-##          插件自动把路由写入 ngx\dlssg_sm86.ini (无需手动改文件);
+## <0-1> 整数, FG 路由 (默认 0): 0 = 自动 (预载 dlssg_for_sm86 0.3.x hook
+##          代理, RTX 30/20 系由其接管 DLSS-G, 仍走官方签名链),
+##          1 = 纯官方 (不预载代理, 直连官方运行时; RTX 40/50,
+##          30/20 系被拒载不回落)
 ##          进程级, 切换后重启 mpv 生效; 面板保存的设置优先
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低

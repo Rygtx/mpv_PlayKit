@@ -46,9 +46,9 @@ For general mpv tweaks from upstream (configuration guides, mpv-lazy usage, etc.
 | `vs-plugins\vs_dlssnr.dll` | VapourSynth API4 plugin (loaded automatically by mpv-lazy) |
 | `vs-plugins\dlssnr_panel.exe` | Standalone ImGui tuning panel (optional, launched automatically when the filter loads) |
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR model (must reside in the `ngx\` subdirectory; the plugin resolves it by this relative path; taken from the RenoDX project) |
-| `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, RTX 40/50; selectable via "FG route") |
-| `vs-plugins\ngx\version.dll` | DLSS frame-generation proxy (dlssg_for_sm86, RTX 30/20; self-signed) |
-| `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy config (Router written automatically by the panel's "FG route" option) |
+| `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, official-chain carrier; selectable via "FG route") |
+| `vs-plugins\ngx\version.dll` | DLSS frame-generation hook proxy 0.3.x ([dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0, RTX 30/20; self-signed; intercepts the `nvngx_dlssg.dll` load and swaps in its embedded runtime) |
+| `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy factory config (shipped as-is; the plugin no longer writes it) |
 | `portable_config\vs\DLSSNR_NV.vpy` | Filter script (parameters in the table below) |
 
 ## Installation (existing mpv-lazy)
@@ -70,7 +70,7 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
   - Parameter changes take effect in real time; **"Save settings"** writes to `vs-plugins\dlssnr_ui.ini` and applies automatically on next filter load; **"Reset defaults"** restores factory parameters
   - **ini takes precedence over vpy parameters**; delete `dlssnr_ui.ini` to restore script defaults
   - Optical-flow quality dropdown (0–5) and the "optical flow follows scaling" switch are live-adjustable; when optical flow is unavailable the panel shows "degraded to zero guidance"
-  - **Diagnostics tab**: the single home for monitoring — the tuning tabs stay clean. Session facts (requested vs actual: optical flow degraded to zero guidance, effective FG route off / official NGX / proxy SM86 / proxy SM75 / duplicate-frames with the failure reason, panel multiplier above the session cap — all highlighted in red; **which backend "auto" actually picked is shown here, no log digging**) plus queueing details (slot-pool wait / NGX serialize wait / optical-flow gate skip·expired·reset counters) plus the **"debug view" dropdown** (diff ×20 grayscale: white = big change, flat gray = untouched; optical flow = direction → hue, brightness = speed, black = no motion data) and the **"write performance log" switch** (controls `dlssnr_timing.log`). No red on the page = the plugin is working
+  - **Diagnostics tab**: the single home for monitoring — the tuning tabs stay clean. Session facts (requested vs actual: optical flow degraded to zero guidance, effective FG route off / official NGX (0.3.x proxy takeover) / official NGX direct / duplicate-frames with the failure reason, panel multiplier above the session cap — all highlighted in red; **which backend "auto" actually picked is shown here, no log digging**) plus queueing details (slot-pool wait / NGX serialize wait / optical-flow gate skip·expired·reset counters) plus the **"debug view" dropdown** (diff ×20 grayscale: white = big change, flat gray = untouched; optical flow = direction → hue, brightness = speed, black = no motion data) and the **"write performance log" switch** (controls `dlssnr_timing.log`). No red on the page = the plugin is working
   - Processing-time timeline chart (gpu / optical flow / inference segments)
   - The panel exits automatically when the filter is turned off / mpv exits
 
@@ -91,9 +91,9 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 | `Residual_Multiplier` | 1.0–2.0 | 1.0 | Residual multiplier, compensating detail together with internal resolution scaling |
 | `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA optical-flow guidance level (0 = zero guidance; 1–5 use hardware optical flow to reduce motion-scene temporal artifacts; higher is more accurate but slower) |
 | `Nvof_Follow_Scaling` | True/False | False | Optical-flow input follows internal downsampling (requires Scaling_Enabled; greatly reduces optical-flow engine load at a slight motion-accuracy cost) |
-| `Fg_Enabled` | True/False | False | DLSS frame generation (chained after denoise, output fps ×2–×4; requires `ngx\version.dll`, falls back to 1:1 on init failure) |
+| `Fg_Enabled` | True/False | False | DLSS frame generation (chained after denoise, output fps ×2–×4; auto mode requires `ngx\version.dll` (dlssg_for_sm86 ≥0.3.0), falls back to 1:1 on init failure) |
 | `Fg_Multiplier` | 2–4 | 2 | Interpolation multiplier (output frame count/pacing is fixed per session; panel changes auto-trigger an in-place mpv reload via `input-ipc-server`; without IPC, off/down-grade falls back to in-session real-frame duplication and up-grade needs a manual seek; 24fps ×3 = 72fps) |
-| `Fg_Route` | 0–3 | 0 | FG route (0 = auto, official first with SM86 proxy fallback; 1 = SM86/RTX 30 via proxy; 2 = SM75/RTX 20 via proxy; 3 = official NGX/RTX 40/50, no fallback when rejected. Process-level, mpv restart required after switching) |
+| `Fg_Route` | 0–1 | 0 | FG route (0 = auto, preloads the dlssg_for_sm86 0.3.x hook proxy — RTX 30/20 get DLSS-G delivered through it while still driving the official signed chain; 1 = pure official, no preload, straight to the official runtime/RTX 40/50, no fallback when rejected on 30/20. Process-level, mpv restart required after switching. **From v20 the 0–3 range collapses to two gears: legacy ini/vpy 1/2 map to auto, 3 to pure official**) |
 | `H_Max` | integer | 0 | Output height cap (sources above it skip processing; 0 = unlimited) |
 
 Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 1); lowering levels does not save much frame time (NGX fixed cost dominates) and mainly affects high-frequency detail — 50–75% is recommended for 1080p content, 25% only for extreme power-saving scenarios; for 4K sources pair with `Input_Resolution = 50`. 4K full-resolution (res=100%) inference is about 200ms/frame — a physical ceiling, not stuttering.
@@ -107,7 +107,7 @@ Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 
 | `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | Meaningless (processing happens at source size when scaling is off) |
 | Frame generation `Fg_Enabled` | ① **Motion_Vector_Quality ≥ 1** (zero guidance has no real motion field) ② a matching runtime under `ngx\` (official `nvngx_dlssg.dll` or proxy `version.dll`) | With zero guidance every interpolated frame degrades to a duplicated real frame (switching it on accomplishes nothing); missing/rejected runtime falls back to 1:1, denoise unaffected |
 | FG multiplier/switch auto-reload | mpv.conf `input-ipc-server` (enabled by default in the shipped config) | Off/down-grade degrades to in-session real-frame duplication; up-grade needs a manual seek |
-| `Fg_Route` pinned (non-auto) | The matching runtime must exist (SM86/SM75 → `version.dll`; official → `nvngx_dlssg.dll`) | Official route rejected by the architecture gate does **not** fall back — FG simply turns off |
+| `Fg_Route` pure-official gear | `nvngx_dlssg.dll` exists and the hardware is in the official support range (RTX 40/50) | On 30/20 the architecture gate rejects it (0xBAD0000B) with **no fallback** — FG simply turns off (`fg_detail` on the diagnostics page carries the reason) |
 | NR only off (`NR_Enabled = False`) | None (frame generation / optical flow work independently) | With frame generation **also** off → the whole filter initializes nothing at zero cost and every other parameter is moot |
 | DLSSNR filter as a whole | RTX GPU (Tensor Core) + `ngx\nvngx_dlssnr.dll` model + YUV420 8/10-bit SDR source | Any missing → automatic passthrough (normal playback, no enhancement) |
 | Panel stats/status area | Filter loaded | The panel can run alone to tweak and save the ini (applied on next load); stats area stays blank |
@@ -132,21 +132,21 @@ Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 
 The two AI features have different GPU requirements:
 
 - **DLSSNR denoise**: an official NVIDIA NGX feature, requires Tensor Core; all RTX cards (Turing+) are within the officially supported range, non-RTX unavailable
-- **DLSS frame generation**: dual backends — RTX 40/50 use the **official NGX branch** (Magpie-style: the NVIDIA-signed `nvngx_dlssg.dll` loaded through the shared NGX core + NVOF-generated motion vectors, no proxy, no self-signing); RTX 30/20 are refused by the official path and go through the [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) unofficial proxy (its own inference resources and PTX). A single panel control "FG route" covers everything: Auto (official first, SM86 proxy fallback) / SM86 (RTX 30) / SM75 (RTX 20) / official NGX (RTX 40/50) — process-level, mpv restart required after switching
+- **DLSS frame generation**: a single official NGX chain (Magpie-style: the NVIDIA-signed `nvngx_dlssg.dll` through the shared NGX core + NVOF-generated motion vectors); on RTX 30/20 the [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) **0.3.x hook proxy** delivers DLSS-G (the version.dll installs its hooks at LoadLibrary: intercepts the `nvngx_dlssg.dll` load and swaps in its embedded runtime, kernels auto-picked per physical architecture, tier 1 bit-identical to official). The panel "FG route" has two gears: Auto (preload the 0.3.x proxy) / Pure official (no preload, straight to the official runtime) — process-level, mpv restart required after switching
 
 | GPU | Architecture | DLSSNR denoise | DLSS frame gen |
 |---|---|---|---|
 | RTX 50 | Blackwell (SM120) | 🟡 Theoretical (official range, untested) | 🟡 Theoretical (official NGX branch, untested) |
 | RTX 40 | Ada (SM89) | 🟡 Theoretical (official range, untested) | 🟡 Theoretical (official NGX branch, untested) |
-| RTX 30 | Ampere (SM86) | ✅ **Verified** (RTX 3080) | ✅ **Verified** (RTX 3080, proxy SM86 route) |
-| RTX 20 | Turing (SM75) | 🟡 Theoretical (official range, untested) | 🟡 Theoretical (proxy SM75 route; PTX forward-tested only, physical Turing untested) |
+| RTX 30 | Ampere (SM86) | ✅ **Verified** (RTX 3080) | ✅ **Verified** (RTX 3080, 0.3.x proxy takeover of the official chain) |
+| RTX 20 | Turing (SM75) | 🟡 Theoretical (official range, untested) | 🟡 Theoretical (0.3.x proxy kernel family auto-picked per physical architecture; upstream 2080 Ti verified, not tested with this plugin) |
 | GTX / non-RTX | — | ❌ Unavailable (no Tensor Core) | ❌ Unavailable |
 
 Legend: ✅ verified · 🟡 theoretical (untested) · ❌ unavailable
 
 > - NVOF hardware optical-flow guidance (RTX Turing+) is natively supported across the line; on unsupported or non-NVIDIA cards it automatically falls back to zero guidance without blocking the feature
-> - The official NGX branch requires `nvngx_dlssg.dll` (NVIDIA-signed, included in the release package) next to the model DLL; RTX 3080 testing confirmed it is cleanly rejected by the architecture gate (Auto mode then falls back to the proxy, so RTX 30/20 are unaffected), and pinning "FG route" to official NGX skips that double probe
-> - DLSS frame generation on RTX 30/20 is an unofficial path: the proxy does not load the stock `nvngx_dlssg.dll`
+> - The official chain requires `nvngx_dlssg.dll` (NVIDIA-signed, included in the release package) next to the model DLL; Auto mode preloads the 0.3.x proxy before init (its hooks land before the capability query — one clean pass, no retry), while the "Pure official" gear skips the preload (on 30/20 the architecture gate rejects with 0xBAD0000B, FG off, `fg_detail` on the diagnostics page carries the reason)
+> - DLSS frame generation on RTX 30/20 is an unofficial path: it requires [dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0 (self-signed). 0.3.x is a hook proxy (embedded runtime, bit-identical to official; the 0.2.4 direct-drive contract has been removed — a stale version.dll deployment yields FG off with `fg_detail` reporting 0xBAD0000B, please upgrade)
 > - The verified baseline is the RTX 3080; other tiers are theoretical inferences — real-world test feedback is welcome
 
 ## Requirements

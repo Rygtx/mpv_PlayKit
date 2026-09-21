@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""FG 激活冒烟:fg_enabled=1 + proxy 已部署 → 输出帧数/时长语义 ×M。
+"""FG 激活冒烟:fg_enabled=1 + 官方链可用(自动档预载 0.3.x hook 代理)→ 输出帧数/时长语义 ×M。
 
 验证:vi 帧数 ×M(fpsNum 同步)、_DurationNum/_DurationDen 整数对 ×M
-(mpv vapoursynth 唯一认的节奏来源)、各索引帧可取。proxy 缺失(初始化
+(mpv vapoursynth 唯一认的节奏来源)、各索引帧可取。官方链不可用(初始化
 回退 1:1)时打印 SKIP —— 降级路径由 test_fg_fallback.py 覆盖。
 """
 import os
@@ -25,7 +25,7 @@ src = core.std.BlankClip(width=320, height=240, format=vs.YUV420P8, length=12, f
 ret = core.dlssnr.Enhance(src, fg_enabled=1, fg_multiplier=M, motion_vector_quality=0)
 
 if len(ret) == 12:
-    print("FG LIVE SKIP: proxy 未部署/未激活(1:1 回退);用 test_fg_fallback.py 覆盖降级")
+    print("FG LIVE SKIP: 官方链不可用/未激活(1:1 回退);用 test_fg_fallback.py 覆盖降级")
     sys.exit(0)
 
 assert len(ret) == 12 * M, f"帧数应 ×M({len(ret)} != {12 * M})"

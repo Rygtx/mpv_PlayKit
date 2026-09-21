@@ -99,7 +99,7 @@ struct AppState {
                              // "fxof q5 qual 1920x1080" = 23+1;与插件 _ofModeBuf 同尺寸)
     char fgState[16]{};      // SK_FG: on / dup / off / unavailable
     int fgMult = 0;          // SK_FG_MULT: 当前插帧倍数(未激活 = 0)
-    char fgRouteEff[16]{};   // SK_FG_ROUTE_EFFECTIVE: off/official/proxy-sm86/proxy-sm75/copy
+    char fgRouteEff[16]{};   // SK_FG_ROUTE_EFFECTIVE: off/official-hook/official/copy
     int fgMultCreate = 0;    // SK_FG_MULT_CREATE: 会话创建倍数(FG 未激活 = 0)
     char fgDetail[128]{};    // SK_FG_DETAIL: FG 最近一次初始化失败原因(成功 = 空)
     float slotWait = 0.0f;   // SK_SLOT_WAIT: 槽池等待 last(诊断页)
@@ -527,9 +527,8 @@ void ShowTip(const char *u8tip) noexcept {
 // SK_FG_ROUTE_EFFECTIVE → 中文标签(状态带与诊断页共用;off/空/未知 = 不显示)
 const char *FgRouteLabel(const char *v) noexcept {
     if (!v || !v[0]) return "";
-    if (std::strcmp(v, "official") == 0) return "官方 NGX";
-    if (std::strcmp(v, "proxy-sm86") == 0) return "代理 SM86";
-    if (std::strcmp(v, "proxy-sm75") == 0) return "代理 SM75";
+    if (std::strcmp(v, "official-hook") == 0) return "官方 NGX(0.3.x 代理接管)";
+    if (std::strcmp(v, "official") == 0) return "官方 NGX 直连";
     if (std::strcmp(v, "copy") == 0) return "未生效(复制帧)";
     return "";
 }
@@ -979,18 +978,18 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-    // FG 路由(整行;进程级,重启 mpv 生效;单档覆盖后端与内核架构)
+    // FG 路由(整行;进程级,重启 mpv 生效)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("FG 路由");
     if (ImGui::IsItemHovered())
-        ShowTip("帧生成后端:自动 = 官方优先(RTX 40/50),回落代理(30 系)。\n"
-                "SM86/SM75 = 固定走代理;官方 NGX = 固定官方档(拒载不回落)。\n"
+        ShowTip("自动 = 预载 0.3.x hook 代理(RTX 30/20 系由其接管 DLSS-G,\n"
+                "仍走官方签名链;需 ngx\\version.dll)。\n"
+                "纯官方 = 不预载代理,直连官方运行时(RTX 40/50)。\n"
                 "进程级,重启 mpv 生效。实际生效档在\"诊断\"页显示。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
-        const int items = 4;
-        const char *labels[items] = { "自动 (官方优先)", "SM86 (RTX 30 系)", "SM75 (RTX 20 系)",
-                                      "官方 NGX (RTX 40/50 系)" };
+        const int items = 2;
+        const char *labels[items] = { "自动 (预载 0.3.x 代理)", "纯官方 (不预载)" };
         int sel = std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax);
         ImGui::SetNextItemWidth(170 * s);
         if (ImGui::Combo("##fg_route", &sel, labels, items)) {
@@ -1109,7 +1108,7 @@ void DrawUi() noexcept {
                 if (!g_app.params.fgEnabled) {
                     std::snprintf(fgReq, sizeof(fgReq), "关");
                 } else {
-                    static const char *kRouteNames[] = { "自动(官方优先)", "SM86", "SM75", "官方 NGX" };
+                    static const char *kRouteNames[] = { "自动", "纯官方" };
                     std::snprintf(fgReq, sizeof(fgReq), "开 %dx,路由 %s",
                                   g_app.params.fgMultiplier,
                                   kRouteNames[std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax)]);

@@ -1,28 +1,25 @@
 #pragma once
-// DLSS 帧生成上下文 —— 双后端驱动 NGX DLSSG(Feature 11)eval 契约:
-//   Proxy      — dlssg_for_sm86 原生 proxy(version.dll),RTX 30/20 唯一路径
-//                (官方 DLSSG 在 Ampere/Turing 拒载)。LoadLibrary(用户自备
-//                DLL,进程级钉住)→ Init_Ext → 核心参数块 CreateFeature →
-//                槽命令列表上 EvaluateFeature。
-//   OfficialNgx — 官方签名 nvngx_dlssg.dll 经共享 NGX core 解析加载(RTX
-//                40/50,PORTING #8;Magpie DLSSFrameGenerator 同款):无
-//                proxy、无自签,SM89/SM120 cubin 由 NVIDIA 预编译。调用方
-//                以 GetCapabilityParameters 块传入,_params 必须来自
+// DLSS 帧生成上下文 —— 官方 NGX 链驱动 NGX DLSSG(Feature 11)eval 契约:
+//   OfficialNgx — 官方签名 nvngx_dlssg.dll 经共享 NGX core 解析加载(PORTING
+//                #8;Magpie DLSSFrameGenerator 同款):无自签直驱,SM89/SM120
+//                cubin 由 NVIDIA 预编译。调用方以 GetCapabilityParameters 块
+//                传入,_params 必须来自
 //                NVSDK_NGX_D3D12_GetCapabilityParameters(官方 DLSSG 的
 //                create/eval 块);能力键 FrameGeneration.Available 在本类
-//                Initialize 内预检,不可用即失败由调用方回落 proxy。
+//                Initialize 内预检,不可用即失败由调用方定夺。
+//   RTX 30/20 的 DLSS-G 由 dlssg_for_sm86 0.3.x hook 代理接管交付(部署侧
+//   version.dll,自动档预载):其 LoadLibrary 钩子拦截 nvngx_dlssg.dll 加载
+//   替换为内嵌运行库 + SM86 后端,fg_gate 钩子接答核心能力查询/
+//   CreateFeature —— 本类仍按官方链驱动,链路形态不变。0.2.4 直驱 proxy
+//   契约(Init_Ext + 专用参数块)已删除,不再兼容。
 // 与 NR snippet 同款集成形态;区别于 NR 的两点:
 //   1. 故障隔离 —— FG 的 SEH 走本类本地闩锁(_faulted),不上抛全局
 //      NgxRuntimeGuard:FG 崩溃只降级本功能(复制真实帧),绝不连带杀 NR。
-//   2. 参数契约 —— 设 proxy 声明的消费面(DLSSG.Backbuffer/MVecs/Depth/
-//      OutputInterpolated/Reset/MultiFrame*/MvecScale*/ClipToPrevClip/
-//      PrevClipToClip/DepthInverted/CmdQueue)+ 官方 eval 契约补全(Magpie
-//      optionalParams:五矩阵恒等/相机单位基座/jitter 0/可选资源 null;
-//      proxy 忽略未知键无害,官方 DLSSG 依赖这些键)。
-// 时序契约(README:输入 NSR / 输出 UAV,提交与同步归调用方):proxy 的
-// CUDA 互操作工作以 DLSSG.CmdQueue/D3D12 互操作语义与槽队列保序,插值
-// 输出的就绪由本槽 WaitFrame(fg 段栅栏)覆盖(与 NVOF densify 同款
-// "同队列 FIFO"论证);首个 eval 的输出异常由 VSDLSSNR_DUMP 诊断。
+//   2. 参数契约 —— 设官方 eval 契约全量(Magpie optionalParams:五矩阵恒等/
+//      相机单位基座/jitter 0/可选资源 null)。
+// 时序契约(README:输入 NSR / 输出 UAV,提交与同步归调用方):插值输出的
+// 就绪由本槽 WaitFrame(fg 段栅栏)覆盖(与 NVOF densify 同款"同队列 FIFO"
+// 论证);首个 eval 的输出异常由 VSDLSSNR_DUMP 诊断。
 
 #include "d3d12_context.h"
 #include <atomic>
@@ -34,37 +31,29 @@ namespace vsdlssnr {
 
 class DlssfgContext {
 public:
-    // FG 后端(见文件头说明)。Proxy = dlssg_for_sm86;OfficialNgx = 官方
-    // 签名 snippet 经共享 NGX core(调用方传 capability 块)。
-    enum class FgBackend { Proxy, OfficialNgx };
-
     DlssfgContext() = default;
     ~DlssfgContext();
     DlssfgContext(const DlssfgContext &) = delete;
     DlssfgContext &operator=(const DlssfgContext &) = delete;
 
-    // OfficialNgx:加载免除外的一切照旧(模块加载跳过,函数指针指向静态
-    // SDK;dllPath 仅作部署指纹日志)。Proxy:dllPath 为 version.dll,进程级
-    // 缓存,路径变化才重载;永不 FreeLibrary —— 与 nvofapi64.dll 同哲学)。
-    // params 为 NGX core 参数块(proxy 传 AllocateParameters 块,官方传
-    // GetCapabilityParameters 块;调用方拥有并负责销毁)。内部自取
-    // CtlMutex;调用方不得持有槽位(PoolHold 语义同 RecreateFeature)。
+    // 官方链初始化:dllPath(官方 snippet)仅作部署指纹日志,允许为空。
+    // params 为 NGX core 的 GetCapabilityParameters 块(调用方拥有并负责
+    // 销毁)。内部自取 CtlMutex;调用方不得持有槽位(PoolHold 语义同
+    // RecreateFeature)。
     bool Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
-                    const wchar_t *appDataPath, NVSDK_NGX_Parameter *params,
+                    NVSDK_NGX_Parameter *params,
                     int width, int height, DXGI_FORMAT backbufferFormat,
-                    FgBackend backend,
                     char *err, size_t errLen) noexcept;
 
-    // 预载 proxy 模块(经 FgModule 进程级缓存,后续 Proxy 路由命中缓存不再
-    // 重复 LoadLibrary)。0.3.x hook 型代理(dlssg_for_sm86 ≥0.3.0:内嵌
-    // 原厂运行库,LoadLibrary 即装钩接管宿主 NGX 调用,无 NGX 导出)靠它
-    // 让 official 路由过 DLSS-G 能力闸;0.2.4 型(native NGX 导出)预载
-    // 无副作用。返回预载后模块是否可用。
+    // 预载 hook 代理模块(0.3.x:LoadLibrary 即装钩,先于 DLSS-G 能力查询
+    // —— 时序铁律,见 dlssnr_context FG 段)。经 FgModule 进程级缓存,重复
+    // 调用路径相同即命中;永不 FreeLibrary —— 与 nvofapi64.dll 同哲学。
+    // 返回预载后模块是否可用。
     static bool PreloadProxyModule(const wchar_t *dllPath) noexcept;
 
-    // 缓存中的 proxy 模块是否 0.3.x hook 型(有 DlssgProxy_Role 查询导出、
-    // 无 NGX 直接驱动导出)。仅查已缓存模块 —— 调用点在 Proxy 分支失败后,
-    // 模块必已 LoadLibrary(导出检查失败也发生在 LoadLibrary 之后)。
+    // 缓存中的 proxy 模块是否 0.3.x hook 型(有 DlssgProxy_Role 查询导出;
+    // 仅查已缓存模块,未加载过 = false)。用于 fg_route_eff 定名
+    // (official-hook/official)—— 钩子进程级不可拆,与本次是否预载解耦。
     static bool CachedProxyIsHookStyle() noexcept;
 
     // 尺寸变化重建 feature(旧 handle 经 ReleaseFeature 退役;Release 失败
@@ -82,14 +71,9 @@ public:
 
     bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
 
-    // 面板/日志用后端名("official ngx" / "proxy")。
-    const char *BackendName() const noexcept {
-        return _backend == FgBackend::OfficialNgx ? "official ngx" : "proxy";
-    }
-
     // 每处理帧每插值槽一次(fmParallel 并发由内部互斥串行;GPU dispatch 仍
     // 随各槽命令列表重叠)。multiplier = 本源帧倍数 M(2-4),slotIndex =
-    // 插值槽 1..M-1(同源帧内必须按序调用 —— proxy 契约)。cl = 槽命令
+    // 插值槽 1..M-1(同源帧内必须按序调用 —— 官方 MFG 契约)。cl = 槽命令
     // 列表;资源状态契约:backbuffer/mvec/depth = NSR,interpOut = UAV
     // (调用方负责屏障)。reset=true 的 eval 属于重置帧,输出不消费。返回
     // false 时调用方降级复制真实帧;连续失败由本类闩锁(_ready=false)停用
@@ -110,9 +94,7 @@ private:
     template <typename Fn>
     bool SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept;
 
-    using InitExtFn = NVSDK_NGX_Result(NVSDK_CONV *)(
-        unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version,
-        const NVSDK_NGX_Parameter *);
+    // 函数指针 = 静态 SDK(nvsdk_ngx_s;官方链无模块加载)。
     using CreateFeatureFn = NVSDK_NGX_Result(NVSDK_CONV *)(
         ID3D12GraphicsCommandList *, NVSDK_NGX_Feature, NVSDK_NGX_Parameter *, NVSDK_NGX_Handle **);
     using EvaluateFeatureFn = NVSDK_NGX_Result(NVSDK_CONV *)(
@@ -123,11 +105,9 @@ private:
     D3D12Context *_d3d12 = nullptr;
     NVSDK_NGX_Parameter *_params = nullptr; // 借用;core 拥有
     NVSDK_NGX_Handle *_feature = nullptr;
-    InitExtFn _initExt = nullptr;       // 仅 Proxy 使用(OfficialNgx 为 null)
     CreateFeatureFn _createFeature = nullptr;
     EvaluateFeatureFn _evaluateFeature = nullptr;
     ReleaseFeatureFn _releaseFeature = nullptr;
-    FgBackend _backend = FgBackend::Proxy;
 
     std::mutex _mutex;            // eval + history + 计数器串行(fmParallel)
     std::atomic<bool> _ready{false};
