@@ -205,11 +205,8 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         return fail("nvof: no device");
     }
     // 适配器必须是 NVIDIA(与 Magpie 一致;非 NVIDIA 走零 guidance 回退)。
-    if (d3d12.Adapter()) {
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(d3d12.Adapter()->GetDesc1(&desc)) || desc.VendorId != 0x10DE) {
-            return fail("nvof: adapter is not NVIDIA; zero guidance");
-        }
+    if (d3d12.VendorId() != 0x10DE) {
+        return fail("nvof: adapter is not NVIDIA; zero guidance");
     }
 
     _module = GetNvofModule();
@@ -664,7 +661,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 // 后置位)。等待落位后再提交 densify —— 不用(也不可靠)队列
                 // 级 Wait:NVOF 的输出栅栏在队列 Wait 语义下可能永不满足。
                 // 输出栅栏超时 = 引擎状态不可信(僵尸 execute 会继续写
-                // 固定 flow 缓冲),会话立即作废,由 RebuildNvof 重建。
+                // 固定 flow 缓冲),会话立即作废,由 RebuildOf 重建。
                 // 临时探针:引擎输出完成 CPU 等待。
                 LARGE_INTEGER te0{}, te1{};
                 QueryPerformanceCounter(&te0);
@@ -733,7 +730,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 densifyPending = SUCCEEDED(_copyAllocator->Reset()) &&
                                  SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
                 if (densifyPending) {
-                    postExecute(_copyCommandList.Get());
+                    postExecute(_copyCommandList.Get(), cur);
                     densifyPending = SUCCEEDED(_copyCommandList->Close());
                 }
                 if (densifyPending) {

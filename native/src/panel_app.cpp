@@ -68,6 +68,9 @@ constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
 constexpr const char *kOfQualityNames[] = {
     "无", "性能", "均衡(推荐)", "质量", "高质量(高开销)", "最高质量(极高开销)"
 };
+// FFX 质量档位(独立三档,与上游 6 档解耦:1 = Performance 半分辨率,
+// 2 = Quality 全分辨率 —— 上游 1-2/3-5 在 FFX 内各只对应一种行为)
+constexpr const char *kFfxQualityNames[] = { "无", "性能 (1/2 分辨率)", "质量 (全分辨率)" };
 // 抗闪烁时域稳定器(上游 antiFlicker 0-4,文案对齐上游界面命名)
 constexpr const char *kAntiFlickerNames[] = {
     "无", "静态累积", "光流累积", "光流累积+", "低频时域重建"
@@ -96,8 +99,8 @@ struct AppState {
     char gpuName[128]{};
     char filterState[16]{};  // SK_FILTER_STATE: ok / nvof_zero / passthrough / ngx_faulted
     char stateDetail[160]{}; // SK_STATE_DETAIL: 死亡状态的原因串
-    char ofMode[28]{};       // SK_OF_MODE: off / zero / forward[+cost] / both[+cost] q<N> grid<G>
-                             // 最长 "forward+cost q5 grid4" = 22+1,28 防截断(与插件 _ofModeBuf 同尺寸)
+    char ofMode[40]{};       // SK_OF_MODE: off / zero / 后端能力串(最长
+                             // "fxof q5 qual 1920x1080" = 23+1;与插件 _ofModeBuf 同尺寸)
     char fgState[16]{};      // SK_FG: on / dup / off / unavailable
     int fgMult = 0;          // SK_FG_MULT: 当前插帧倍数(未激活 = 0)
     double fps = 0.0;
@@ -703,20 +706,63 @@ void DrawUi() noexcept {
     pairCombo("style", &DlssnrParams::style, 3, kStyleNames, 0);
     y += rowH;
 
-    // 光流质量(整行:档位文案长,半宽会截断)
+    // 光流后端(整行;创建时 —— 切档触发 OF 会话原位重建,下一帧生效,
+    // 无需 mpv 重启;显式档失败不跨后端回落)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("光流质量");
+    ImGui::TextUnformatted("光流后端");
     if (ImGui::IsItemHovered())
-        ShowTip("NVIDIA 光流引导,减轻运动场景的时域伪影;档位越高越精确也越耗时。\n"
-                "需 RTX Turing+,不支持时自动回退\"无\"。");
+        ShowTip("光流引擎:FFX(AMD FidelityFX 光流)= 默认,跨厂商通用\n"
+                "(需 D3D12 SM6.2 + WaveOps);NVOF = NVIDIA 专属引擎,可选。\n"
+                "切档下一帧生效,无需重启 mpv;质量档位选项随之变化。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
     {
-        int v = g_app.params.motionVectorQuality;
-        if (ImGui::Combo("##motion_vector_quality", &v, kOfQualityNames, 6)) {
-            g_app.params.motionVectorQuality = v;
+        const int items = 2;
+        const char *labels[items] = { "FFX (AMD 光流,默认)", "NVOF (NVIDIA 引擎)" };
+        int sel = std::clamp(g_app.params.ofBackend, kOfBackendMin, kOfBackendMax);
+        if (ImGui::Combo("##of_backend", &sel, labels, items)) {
+            g_app.params.ofBackend = sel;
             g_app.liveDirty = true;
         }
+    }
+    y += rowH;
+
+    // 光流质量(整行:档位文案长,半宽会截断;选项随后端变化)
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
+    ImGui::TextUnformatted("光流质量");
+    if (ImGui::IsItemHovered()) {
+        // 档位文案/选项随后端:FFX = 独立三档(0 无/1 性能/2 质量);
+        // NVOF = 上游 6 档。
+        const int ofBackend = std::clamp(g_app.params.ofBackend, kOfBackendMin, kOfBackendMax);
+        if (ofBackend == kOfBackendFfx) {
+            ShowTip("AMD FidelityFX 光流(跨厂商):性能 = 光流半分辨率(更快),\n"
+                    "质量 = 全分辨率(更精)。");
+        } else {
+            ShowTip("NVIDIA 光流引导,减轻运动场景的时域伪影;档位越高越精确也越耗时。\n"
+                    "需 RTX Turing+,不支持时自动回退\"无\"。");
+        }
+    }
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
+    ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
+    {
+        // 单下拉双字段:按当前后端读写对应档位(NVOF→motionVectorQuality
+        // 0-5 六档;FFX→ffxQuality 0-2 三档)。
+        const int ofBackend = std::clamp(g_app.params.ofBackend, kOfBackendMin, kOfBackendMax);
+        bool changed = false;
+        if (ofBackend == kOfBackendFfx) {
+            int sel = std::clamp(g_app.params.ffxQuality, kFfxQualityMin, kFfxQualityMax);
+            if (ImGui::Combo("##motion_vector_quality", &sel, kFfxQualityNames, 3)) {
+                g_app.params.ffxQuality = sel;
+                changed = true;
+            }
+        } else { // nvof:上游 0-5
+            int v = g_app.params.motionVectorQuality;
+            if (ImGui::Combo("##motion_vector_quality", &v, kOfQualityNames, 6)) {
+                g_app.params.motionVectorQuality = v;
+                changed = true;
+            }
+        }
+        if (changed) g_app.liveDirty = true;
     }
     y += rowH;
 

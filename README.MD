@@ -12,7 +12,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 
 **vs_dlssnr** — 把 Magpie 的 DLSSNR(NVIDIA DLSS SDK 310.9.0 的 AI 视频增强,NGX Feature 18)移植为 VapourSynth API4 原生插件接入 mpv:
 
-- 纯 D3D12 实现;默认零 guidance 单帧模式,可选 **NVOF 硬件光流引导**(0–5 档,RTX Turing+;不支持时自动回退零 guidance)
+- 纯 D3D12 实现;默认零 guidance 单帧模式,可选 **硬件光流引导**(0–5 档;FFX = AMD FidelityFX 跨厂商通用,默认 / NVOF = NVIDIA 引擎,面板切换)
 - **YUV 原生**:直接处理 YUV420P8/P10、输出同格式,CPU 侧零像素转换(纯行拷贝);色彩矩阵/范围按源帧属性(_Matrix/_ColorRange,709/601 + limited/full)处理,缺省 709 limited
 - 同分辨率处理(非超分)
 - 静态 NGX core + snippet 直连 + IAT hook,完整复刻 Magpie 调用链
@@ -89,9 +89,11 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Scaling_Enabled` | True/False | True | 残差管线总开关;False = 彻底关闭(不建中间纹理,按源尺寸直接处理) |
 | `Input_Resolution` | 25–100 | 100 | NGX 内部推理分辨率占源尺寸的百分比,残差重建恢复到源分辨率 |
 | `Residual_Multiplier` | 1.0–2.0 | 1.0 | 残差乘数,配合内部分辨率缩放补偿细节 |
-| `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA 光流引导档位(0 = 零 guidance;1–5 用硬件光流减轻运动场景时域伪影,档位越高越精确也越耗时) |
+| `Motion_Vector_Quality` | 0–5 | 0 | NVOF 光流引导档位(0 = 零 guidance;1–5 用硬件光流减轻运动场景时域伪影,档位越高越精确也越耗时)。仅后端 = NVOF 时消费 |
+| `Ffx_Quality` | 0–2 | 0 | FFX 光流引导档位(0 = 零 guidance;1 = 性能/OF 半分辨率;2 = 质量/全分辨率)。仅后端 = FFX(默认)时消费。两字段独立;面板"光流质量"单下拉按当前后端读写对应档位 |
 | `Nvof_Follow_Scaling` | True/False | False | 光流输入跟随内部降采样(需 Scaling_Enabled;大幅降低光流引擎占用,运动精度略降) |
 | `Anti_Flicker` | 0–4 | 0 | 抗闪烁时域稳定器(上游 Magpie v0.6.8):对降噪改动做运动补偿时域累积,减轻画面明暗/结构的逐帧抖动。0 = 无;1 = 静态累积;2 = 光流累积;3 = 光流累积+;4 = 低频时域重建。单 pass 即生效;2–4 建议光流质量 ≥ 1(无光流自动退化静态验证);切换档位短暂重建(毫秒级) |
+| `Of_Backend` | 0–1 | 0 | 光流后端(0 = FFX/AMD FidelityFX,跨厂商通用,默认;1 = NVOF/NVIDIA 专属引擎)。切换只影响下一次光流会话建立(下一帧/seek 生效) |
 | `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×4;依赖 `ngx\version.dll`,初始化失败自动回退 1:1) |
 | `Fg_Multiplier` | 2–4 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps) |
 | `Fg_Route` | 0–3 | 0 | FG 路由(0 = 自动,官方优先回落代理 SM86;1 = SM86/RTX 30 系走代理;2 = SM75/RTX 20 系走代理;3 = 官方 NGX/RTX 40/50 系,被拒载不回落。进程级,重启 mpv 生效) |
@@ -103,7 +105,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 
 | 功能 | 依赖 | 不满足时 |
 |---|---|---|
-| 光流引导 1–5 档 | RTX Turing+ 显卡 | 自动回退零 guidance,不挡其他功能 |
+| 光流引导 1–5 档 | FFX:D3D12 SM6.2 + WaveOps + R16G16_SINT UAV(跨厂商);NVOF:RTX Turing+ | 会话建立失败自动回退零 guidance,不挡其他功能 |
 | 光流跟随降采样 | `Scaling_Enabled = True`;**帧生成激活时被强制忽略**(帧生成要求源尺寸运动场) | 开关无效,光流按源尺寸计算 |
 | 抗闪烁模式 2–4(光流累积/累积+/低频时域重建) | 光流质量 ≥ 1(运动补偿需要真运动场) | 自动退化为静态验证(等效模式 1 的无光流路径),不挡其他功能 |
 | `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | 无意义(关闭缩放按源尺寸直接处理) |
@@ -146,7 +148,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 
 图例:✅ 已实测可用 · 🟡 理论上支持(未实测) · ❌ 不可用
 
-> - NVOF 硬件光流引导(RTX Turing+)全系原生支持;不支持或非 N 卡时自动回退零 guidance,不挡功能
+> - NVOF 硬件光流引导(RTX Turing+)全系原生支持,面板"光流后端"可选;FFX(默认)跨厂商通用,不支持时自动回退零 guidance,不挡功能
 > - 官方 NGX 分支要求 `nvngx_dlssg.dll`(NVIDIA 签名,发行包已含)与模型 DLL 同目录;3080 实测确认其被架构门禁正常拒载(自动档随后回落 proxy,不影响 30/20 系),面板"FG 路由"固定官方档可跳过该双探
 > - RTX 30/20 系的 DLSS 插帧属于破解路径:proxy 不加载原厂 `nvngx_dlssg.dll`
 > - 实测基线为 RTX 3080;其余档位为理论推断,欢迎反馈实测结果

@@ -1,6 +1,8 @@
 // Ported from Magpie experimental DLSSNRFilter.cpp / NgxD3D12Core.cpp (see header).
 #include "dlssnr_context.h"
+#include "ffxof_context.h"
 #include "ngx_runtime_guard.h"
+#include "nvof_context.h"
 #include "panel_ipc.h"
 
 #include <algorithm>
@@ -705,32 +707,38 @@ bool DlssnrContext::Initialize(
         }
     }
 
-    // 4b) NVOF 光流会话(PORTING #6):quality > 0 时建立;失败优雅回退零
-    // guidance(记 _nvofFailed,不拖垮整个滤镜)。冷初始化单线程、槽池空闲,
-    // 满足 NvofContext::Initialize 的 PoolHold 约束。
+    // 4b) 光流会话(of_backend 单一后端,默认 FFX):quality > 0 时建立;
+    // 失败优雅回退零 guidance(记 _nvofFailed,不拖垮整个滤镜)。冷初始化
+    // 单线程、槽池空闲,满足会话的 PoolHold 约束。档位按后端取对应字段
+    // (NVOF→motionVectorQuality,FFX→ffxQuality)。
     {
-        const int ofq = std::clamp(_shared->Snapshot().motionVectorQuality, kOfQualityMin, kOfQualityMax);
+        const DlssnrParams snap = _shared->Snapshot();
+        const int backendReq =
+            std::clamp(snap.ofBackend, kOfBackendMin, kOfBackendMax);
+        const int ofq = ResolveOfQuality(snap); // clamp 在 helper 内(按后端值域)
         _curOfQuality = ofq;
         _nvofFailed = false;
         {
             char msg[96];
-            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: init of=%d", ofq);
+            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: init of=%d backend=%d",
+                          ofq, backendReq);
             TimingStatusLine(msg);
         }
         if (ofq > 0) {
-            char nvofErr[160]{};
-            _nvof = std::make_unique<NvofContext>();
-            if (_nvof->Initialize(*_d3d12, _width, _height, ofq, nvofErr, sizeof(nvofErr))) {
+            char ofErr[160]{};
+            _ofBackend = CreateOfBackend(ofq, _width, _height, ofErr, sizeof(ofErr));
+            if (_ofBackend) {
+                _curOfBackend = backendReq;
                 char msg[160];
-                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: nvof session created quality=%d %dx%d",
-                              ofq, _width, _height);
+                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: of session created backend=%d quality=%d %dx%d",
+                              _curOfBackend, ofq, _width, _height);
                 DbgLine(msg);
                 TimingLog(msg);
             } else {
                 _nvofFailed = true;
                 char msg[288];
                 std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: nvof init failed (%s); zero guidance", nvofErr);
+                              "DLSSNR STATUS: of init failed (%s); zero guidance", ofErr);
                 DbgLine(msg);
                 TimingLog(msg);
             }
@@ -866,28 +874,28 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
                 TimingStatusLine(msg);
             }
         }
-        // NVOF 会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildNvof
-        // —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见 _retiredNvof
+        // 光流会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildOf
+        // —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见 _retiredOf
         // 注释),失败降级零 guidance,不致命。会话输入尺寸遵循 follow 语义
         // (scalingEnabled/resPercent 是本次重建的目标态,内部尺寸由参数
         // 直推,不依赖尚未执行的 RebuildScaling)。
-        if (_nvof && _curOfQuality > 0 && !_nvofFailed) {
+        if (_ofBackend && _curOfQuality > 0 && !_nvofFailed) {
             const DlssnrParams sp = _shared->Snapshot();
             // FG 激活时 MVecs 契约要求源尺寸稠密运动 —— follow 被忽略。
             const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled && !(_fg && _fg->Enabled());
             int iw = _width, ih = _height;
             if (foll) InternalSize(_width, _height, resPercent, iw, ih);
-            auto next = std::make_unique<NvofContext>();
-            char nvofErr[160]{};
-            if (next->Initialize(*_d3d12, iw, ih, _curOfQuality,
-                                 nvofErr, sizeof(nvofErr))) {
-                _retiredNvof.push_back(std::move(_nvof));
-                _nvof = std::move(next);
+            char ofErr[160]{};
+            auto next = CreateOfBackend(_curOfQuality, iw, ih, ofErr, sizeof(ofErr));
+            if (next) {
+                _retiredOf.push_back(std::move(_ofBackend));
+                _ofBackend = std::move(next);
+                _curOfBackend = std::clamp(sp.ofBackend, kOfBackendMin, kOfBackendMax);
             } else {
                 _nvofFailed = true;
                 char msg[288];
                 std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: nvof resize failed (%s); zero guidance", nvofErr);
+                              "DLSSNR STATUS: of resize failed (%s); zero guidance", ofErr);
                 DbgLine(msg);
                 TimingLog(msg);
             }
@@ -978,78 +986,101 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     return true;
 }
 
-bool DlssnrContext::RebuildNvof(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept {
-    // NVOF 会话重建(quality 或会话输入尺寸变化;follow 模式下会话输入 =
-    // 内部尺寸,由调用方传入 dstW/dstH)。只重建光流会话,NGX feature 不动。
-    // 内部自取 PoolHold(槽池封死满足 NvofContext 的调用约束)——因此
-    // 绝不能在已持有 PoolHold 的路径上调用(RecreateFeature 的尺寸重建
+std::unique_ptr<IOpticalFlowBackend> DlssnrContext::CreateOfBackend(
+    int q, int dstW, int dstH, char *err, size_t errLen) noexcept {
+    // of_backend = 单一后端(用户裁定 2026-09-21:默认 FFX,跨厂商通用;
+    // 上游 Magpie 同款 RTX 5070 Ti 上 AMD OF 实测有流)。仅 1 = nvof 时
+    // 走 NVOF(NVOF 引擎本身 NVIDIA 专属,内部厂商门会拦截)。失败 =
+    // 零 guidance,不跨后端回落(对齐 fg_route 先例:行为可预测)。
+    const int backendReq =
+        std::clamp(_shared->Snapshot().ofBackend, kOfBackendMin, kOfBackendMax);
+    if (backendReq == kOfBackendNvof) {
+        auto b = std::make_unique<NvofContext>();
+        if (!b->Initialize(*_d3d12, dstW, dstH, q, err, errLen)) return nullptr;
+        return b;
+    }
+    auto b = std::make_unique<FxofContext>();
+    if (!b->Initialize(*_d3d12, dstW, dstH, q, err, errLen)) return nullptr;
+    return b;
+}
+
+bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept {
+    // 光流会话重建(quality / of_backend / 会话输入尺寸变化;follow 模式下
+    // 会话输入 = 内部尺寸,由调用方传入 dstW/dstH)。只重建光流会话,NGX
+    // feature 不动。内部自取 PoolHold(槽池封死满足会话的调用约束)——
+    // 因此绝不能在已持有 PoolHold 的路径上调用(RecreateFeature 的尺寸重建
     // 内联处理,不走这里)。调用方必须尚未持有槽位(ProcessFrame 在
     // AcquireSlot 之前消费本请求,与 ConsumeRebuild 同款)。
     //
     // _nvofMutex:fmParallel 下多个帧线程会同时看到同一档位变化并并发进入
-    // (实测并发重建互相踩踏挂死);锁内复查 _curOfQuality 与尺寸,后来者
-    // 直接跳过。
+    // (实测并发重建互相踩踏挂死);锁内复查 _curOfQuality/_curOfBackend 与
+    // 尺寸,后来者直接跳过。
     std::lock_guard<std::mutex> switchLock(_nvofMutex);
+    // 调用方传入的档位已经 ResolveOfQuality 按后端值域 clamp;此处宽 clamp
+    // 仅作双保险(FFX 的 2 也在 0-5 内,不受影响)。
     const int q = std::clamp(quality, kOfQualityMin, kOfQualityMax);
-    if (q == _curOfQuality && !_nvofFailed && _nvof &&
-        _nvof->Width() == dstW && _nvof->Height() == dstH) return true;
+    const int backendReq =
+        std::clamp(_shared->Snapshot().ofBackend, kOfBackendMin, kOfBackendMax);
+    if (q == _curOfQuality && backendReq == _curOfBackend && !_nvofFailed && _ofBackend &&
+        _ofBackend->Width() == dstW && _ofBackend->Height() == dstH) return true;
     {
         D3D12Context::PoolHold pool(*_d3d12);
         if (q == 0) {
-            // 保留会话仅停用:实测 nvOFDestroy 后进程内继续 GPU 工作会触发
-            // 驱动内部访问违例(nvwgf2umx,2026-09-07);空闲会话无 GPU 开销,
-            // 与热上下文同哲学,进程退出统一回收。
+            // 保留会话仅停用:后端销毁不可靠(NVOF 引擎 destroy 实测崩溃,
+            // FFX 首期同策略走 _retiredOf);空闲会话无 GPU 开销,与热上下文
+            // 同哲学,进程退出统一回收。
             _nvofFailed = false;
             _curOfQuality = 0;
-            TimingStatusLine("DLSSNR STATUS: nvof disabled (quality=0; session kept)");
-        } else if (!_nvof || _nvofFailed ||
-                   _nvof->Quality() != q || _nvof->Width() != dstW || _nvof->Height() != dstH) {
-            // 先建新会话再弃旧(旧会话仅弃引用,不调用 nvOFDestroy —— 同上,
-            // 销毁后继续 GPU 工作不可靠)。弃旧的 GPU 资源随 PoolHold 排空
-            // 后不再被引用,纹理显存由驱动按引用回收(对象随进程生存)。
-            auto next = std::make_unique<NvofContext>();
-            char nvofErr[160]{};
-            if (next->Initialize(*_d3d12, dstW, dstH, q, nvofErr, sizeof(nvofErr))) {
-                if (_nvof) _retiredNvof.push_back(std::move(_nvof)); // 退役,不销毁
-                _nvof = std::move(next);
+            TimingStatusLine("DLSSNR STATUS: of disabled (quality=0; session kept)");
+        } else if (!_ofBackend || _nvofFailed ||
+                   _ofBackend->Quality() != q || _ofBackend->Width() != dstW ||
+                   _ofBackend->Height() != dstH || backendReq != _curOfBackend) {
+            // 先建新会话再弃旧(旧会话仅弃引用,不销毁 —— 见 _retiredOf 注释)。
+            // 弃旧的 GPU 资源随 PoolHold 排空后不再被引用,纹理显存由驱动
+            // 按引用回收(对象随进程生存)。
+            auto next = CreateOfBackend(q, dstW, dstH, err, errLen);
+            if (next) {
+                if (_ofBackend) _retiredOf.push_back(std::move(_ofBackend)); // 退役,不销毁
+                _ofBackend = std::move(next);
                 _nvofFailed = false;
                 _curOfQuality = q;
+                _curOfBackend = backendReq;
             } else {
                 _nvofFailed = true;
                 _curOfQuality = q;
+                _curOfBackend = backendReq;
                 char msg[288];
                 std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: nvof init failed quality=%d (%s); zero guidance",
-                              q, nvofErr);
+                              "DLSSNR STATUS: of init failed backend=%d quality=%d (%s); zero guidance",
+                              backendReq, q, err && errLen ? err : "");
                 DbgLine(msg);
                 TimingLog(msg);
-                if (err && errLen) std::snprintf(err, errLen, "%s", nvofErr);
                 return false; // 调用方决定是否视为致命(帧路径上不致命)
             }
         } else {
             // 复用保留的会话(q=0 期间停用):帧序门与历史都已在停用期冻结,
             // 重置让下一帧重新播种,避免旧参考帧产生一次错误流。停用期的
-            // 尺寸/档位变化由上方的条件分支兜住(尺寸不符走重建)。
-            _nvof->ResetHistory();
+            // 尺寸/档位/后端变化由上方的条件分支兜住。
+            _ofBackend->ResetHistory();
             _nvofFailed = false;
             _curOfQuality = q;
         }
     }
-    if (_nvof && _nvof->Enabled()) {
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: nvof rebuilt quality=%d %dx%d",
-                      _curOfQuality, dstW, dstH);
+    if (_ofBackend && _ofBackend->Enabled()) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: of rebuilt backend=%d quality=%d %dx%d",
+                      _curOfBackend, _curOfQuality, dstW, dstH);
         DbgLine(msg);
         TimingLog(msg);
     }
-    return _nvof && _nvof->Enabled();
+    return _ofBackend && _ofBackend->Enabled();
 }
 
 void DlssnrContext::ResetNvofHistory() noexcept {
     // seek = 新时间线:流历史作废,下一帧重新播种(清零发布 + NGX PARAM_RESET;
     // FG 下一帧 eval 带 DLSSG.Reset,该帧插值输出降级复制)。会话本身保留
     // (热上下文跨 seek 存活)。
-    if (_nvof) _nvof->ResetHistory();
+    if (_ofBackend) _ofBackend->ResetHistory();
     if (_fg) _fg->ResetHistory();
 }
 
@@ -1082,16 +1113,19 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         ResetNvofHistory();
         // 会话输入尺寸同步(follow = 开关 + scaling 状态 + FG 未激活;热路
         // 径下内部尺寸未变,除非 ini/payload 同时带了 res% 变化 —— 那会走
-        // 下方重建分支)。
+        // 下方重建分支)。档位按后端取对应字段。
         const bool fgHot = _fg && _fg->Enabled();
         const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgHot;
         const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
         const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
-        if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax);
-            ofq != _curOfQuality || (ofq > 0 && _nvof &&
-                (_nvof->Width() != nvW || _nvof->Height() != nvH)) ||
+        const int backendReq =
+            std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
+        const int ofq = ResolveOfQuality(p); // clamp 在 helper 内(按后端值域)
+        if (ofq != _curOfQuality || backendReq != _curOfBackend ||
+            (ofq > 0 && _ofBackend &&
+                (_ofBackend->Width() != nvW || _ofBackend->Height() != nvH)) ||
             (ofq > 0 && _nvofFailed)) {
-            RebuildNvof(ofq, nvW, nvH, err, errLen); // 失败仅降级零 guidance,热复用不受影响
+            RebuildOf(ofq, nvW, nvH, err, errLen); // 失败仅降级零 guidance,热复用不受影响
         }
         // 抗闪烁模式热同步(创建时单线程,直接重建;换 seek 后新实例的
         // ini/payload 模式与常驻资源对齐)。历史随纹理作废 —— 下帧播种。
@@ -1129,10 +1163,13 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgHot;
         const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
         const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
-        if (int ofq = std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax);
-            ofq != _curOfQuality || (ofq > 0 && _nvof &&
-                (_nvof->Width() != nvW || _nvof->Height() != nvH)) || (ofq > 0 && _nvofFailed)) {
-            RebuildNvof(ofq, nvW, nvH, err, errLen);
+        const int backendReq =
+            std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
+        const int ofq = ResolveOfQuality(p); // clamp 在 helper 内(按后端值域)
+        if (ofq != _curOfQuality || backendReq != _curOfBackend ||
+            (ofq > 0 && _ofBackend &&
+                (_ofBackend->Width() != nvW || _ofBackend->Height() != nvH)) || (ofq > 0 && _nvofFailed)) {
+            RebuildOf(ofq, nvW, nvH, err, errLen);
         }
     }
     return nvofOk;
@@ -1191,8 +1228,8 @@ bool DlssnrContext::ProcessFrame(
         }
     }
     const DlssnrParams frameParams = _shared->Snapshot();
-    // NVOF 档位/会话输入尺寸同步(只重建光流会话,不动 NGX feature)。在
-    // AcquireSlot 之前消费:RebuildNvof 要封池排空。失败只降级零 guidance,
+    // 光流档位/后端/会话输入尺寸同步(只重建光流会话,不动 NGX feature)。
+    // 在 AcquireSlot 之前消费:RebuildOf 要封池排空。失败只降级零 guidance,
     // 帧继续。会话输入尺寸 = follow(开关 + scaling 启用 + FG 未激活)?
     // 内部尺寸 : 源尺寸 —— FG 的 MVecs 契约要求与 backbuffer 同尺寸稠密
     // 运动场,FG 激活时 follow 被强制忽略。ConsumeRebuild 已在上文跑过,
@@ -1206,11 +1243,15 @@ bool DlssnrContext::ProcessFrame(
     const bool nvofFollow = frameParams.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgGateLive;
     const int nvDstW = nvofFollow ? _d3d12->InternalWidth() : width;
     const int nvDstH = nvofFollow ? _d3d12->InternalHeight() : height;
-    if (const int ofq = std::clamp(frameParams.motionVectorQuality, kOfQualityMin, kOfQualityMax);
-        ofq != _curOfQuality ||
-        (ofq > 0 && _nvof && (_nvof->Width() != nvDstW || _nvof->Height() != nvDstH))) {
+    // 档位按后端取对应字段(NVOF→motionVectorQuality,FFX→ffxQuality)。
+    const int ofBackendReq =
+        std::clamp(frameParams.ofBackend, kOfBackendMin, kOfBackendMax);
+    const int ofq = ResolveOfQuality(frameParams); // clamp 在 helper 内(按后端值域)
+    if (ofq != _curOfQuality ||
+        ofBackendReq != _curOfBackend ||
+        (ofq > 0 && _ofBackend && (_ofBackend->Width() != nvDstW || _ofBackend->Height() != nvDstH))) {
         char nvofErr[160]{};
-        RebuildNvof(ofq, nvDstW, nvDstH, nvofErr, sizeof(nvofErr));
+        RebuildOf(ofq, nvDstW, nvDstH, nvofErr, sizeof(nvofErr));
     }
     // 抗闪烁模式逐帧同步(live 参数):PoolHold 封池重建时域资源(毫秒级
     // 纹理分配,不动 NGX feature)。失败降级 0,模式仍可再切。PoolHold 保证
@@ -1311,30 +1352,35 @@ bool DlssnrContext::ProcessFrame(
     // fgRan = 本帧向 proxy 提交过 eval(含播种;dump 判定用)。
     int fgEvaluatedCount = 0;
     bool fgRan = false;
-    if (!skipEval && _nvof && _nvof->Enabled() && _curOfQuality > 0) {
-        const uint32_t gs = _nvof->GridSize();
-        // 流场网格随会话输入尺寸(follow 模式 = 内部尺寸);densify 的
-        // MotionScale 把流向量从会话输入像素单位换算回源像素单位。
-        const uint32_t nvW = static_cast<uint32_t>(_nvof->Width());
-        const uint32_t nvH = static_cast<uint32_t>(_nvof->Height());
-        const uint32_t flowW = (nvW + gs - 1) / gs;
-        const uint32_t flowH = (nvH + gs - 1) / gs;
+    if (!skipEval && _ofBackend && _ofBackend->Enabled() && _curOfQuality > 0) {
+        // 会话输入尺寸(follow 模式 = 内部尺寸);densify 的向量换算把流
+        // 向量从会话输入像素单位换算回源像素单位(NVOF MotionScale /
+        // FFX VectorScale,语义见各分支)。
+        const uint32_t nvW = static_cast<uint32_t>(_ofBackend->Width());
+        const uint32_t nvH = static_cast<uint32_t>(_ofBackend->Height());
         const float msX = nvW != static_cast<uint32_t>(width)
                               ? static_cast<float>(width) / static_cast<float>(nvW) : 1.0f;
         const float msY = nvH != static_cast<uint32_t>(height)
                               ? static_cast<float>(height) / static_cast<float>(nvH) : 1.0f;
-        const bool hasBwd = _nvof->Bidirectional();
-        const bool hasCost = _nvof->CostEnabled();
         // follow 内部管线(会话输入 = 内部尺寸 ≠ 源):densify 直接产出
         // NGX 缩放消费纹理 reducedMotion/reducedConfidence,跳过“densify
-        // 到源尺寸 → guidance 降采样缩回内部”的放大-缩小 pass。流向量保持
-        // 会话像素单位 = 内部像素单位(NGX 契约 MVecScale=1),MotionScale
-        // 恒 (1,1)。
+        // 到源尺寸 → guidance 降采样缩回内部”的放大-缩小 pass。
         densifyInternal =
             nvW != static_cast<uint32_t>(width) || nvH != static_cast<uint32_t>(height);
-        NvofContext::PostExecuteFn post =
-            [this, &slot, flowW, flowH, gs, hasCost, hasBwd, msX, msY, densifyInternal,
-             nvW, nvH, width, height](ID3D12GraphicsCommandList *cl) {
+        const int ofKind = _ofBackend->Kind();
+        OfPostExecuteFn post;
+        OfPostCopyFn postCopy;
+        if (ofKind == kOfBackendNvof) {
+            // ---- NVOF:网格流(1/32 像素定点)densify(原 PORTING #6 路径)----
+            NvofContext *nv = static_cast<NvofContext *>(_ofBackend.get());
+            const uint32_t gs = nv->GridSize();
+            const uint32_t flowW = (nvW + gs - 1) / gs;
+            const uint32_t flowH = (nvH + gs - 1) / gs;
+            const bool hasBwd = nv->Bidirectional();
+            const bool hasCost = nv->CostEnabled();
+            post = [this, &slot, flowW, flowH, gs, hasCost, hasBwd, msX, msY, densifyInternal,
+                    nvW, nvH, width, height](ID3D12GraphicsCommandList *cl, int inputIndex) {
+                (void)inputIndex;
                 ID3D12Resource *dstMotion = densifyInternal ? slot->reducedMotion.Get()
                                                             : slot->motion.Get();
                 ID3D12Resource *dstConf = densifyInternal ? slot->reducedConfidence.Get()
@@ -1359,15 +1405,10 @@ bool DlssnrContext::ProcessFrame(
                 };
                 cl->ResourceBarrier(2, g2);
             };
-        // YUV 原生:postCopy 恒设 —— 回调在 nvof CL 第一次提交上记录
-        // YUV→RGB 转换(yuvUpload→yuvIn 拷贝 + dispatch → inputColor NSR),
-        // follow(densifyInternal)时追加 RecordNvofDownsample 直写注册输入
-        // 纹理;非 follow 由 StageFrame 随后做 inputColor→_input[cur] 纹理
-        // 拷贝。原 CPU 双线性(~2-4ms@4K)与 WC 内存读坑、WaitCopyIdle 覆写
-        // 排空负担一并成为历史;CopyDrainGuard 仍守护 early-return 撕裂
-        // (yuvUpload 是 per-slot 资源,nvof CL 在读它)。
-        NvofContext::PostCopyFn postCopy =
-            [this, &slot, nvW, nvH, densifyInternal, matrix, range](ID3D12GraphicsCommandList *cl, int inputIndex) {
+            // YUV 原生:postCopy 恒设 —— 回调在 nvof CL 第一次提交上记录
+            // YUV→RGB 转换,follow 时追加 RecordNvofDownsample 直写注册输入
+            // 纹理;非 follow 由 StageFrame 随后做整帧纹理拷贝。
+            postCopy = [this, &slot, nvW, nvH, densifyInternal, matrix, range](ID3D12GraphicsCommandList *cl, int inputIndex) {
                 _d3d12->RecordConvertInput(*cl, *slot, matrix, range,
                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 if (densifyInternal) {
@@ -1376,26 +1417,68 @@ bool DlssnrContext::ProcessFrame(
                                                  inputIndex);
                 }
             };
-        const NvofContext::StageResult st =
-            _nvof->StageFrame(n, _d3d12->InputColor(*slot), post, postCopy, densifyInternal);
+        } else { // kOfBackendFfx(Kind() 只产出 nvof/ffx 两种)
+            // ---- FFX(AMD FidelityFX OF):Prepare 在 postCopy 内紧随转换,
+            // densify 读稀疏流(1/8 OF extent,R16G16_SINT,单位 = OF extent
+            // 像素),VectorScale = dense/OF。----
+            FxofContext *fx = static_cast<FxofContext *>(_ofBackend.get());
+            const uint32_t ofW = fx->OfWidth(), ofH = fx->OfHeight();
+            const uint32_t spW = fx->SparseWidth(), spH = fx->SparseHeight();
+            post = [this, &slot, ofW, ofH, spW, spH, densifyInternal,
+                    nvW, nvH, width, height](ID3D12GraphicsCommandList *cl, int inputIndex) {
+                (void)inputIndex;
+                ID3D12Resource *dstMotion = densifyInternal ? slot->reducedMotion.Get()
+                                                            : slot->motion.Get();
+                ID3D12Resource *dstConf = densifyInternal ? slot->reducedConfidence.Get()
+                                                          : slot->confidence.Get();
+                D3D12_RESOURCE_BARRIER g1[2]{
+                    Transition(dstMotion, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    Transition(dstConf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                };
+                cl->ResourceBarrier(2, g1);
+                const uint32_t denseW = densifyInternal ? nvW : static_cast<uint32_t>(width);
+                const uint32_t denseH = densifyInternal ? nvH : static_cast<uint32_t>(height);
+                _d3d12->RecordFfxDensify(*cl, *slot, denseW, denseH, ofW, ofH, spW, spH,
+                                         static_cast<float>(denseW) / static_cast<float>(ofW),
+                                         static_cast<float>(denseH) / static_cast<float>(ofH),
+                                         densifyInternal ? 20u : 12u,
+                                         densifyInternal ? 21u : 13u);
+                D3D12_RESOURCE_BARRIER g2[2]{
+                    Transition(dstMotion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    Transition(dstConf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                };
+                cl->ResourceBarrier(2, g2);
+            };
+            postCopy = [this, &slot, ofW, ofH, width, height, matrix, range](ID3D12GraphicsCommandList *cl, int inputIndex) {
+                (void)inputIndex;
+                _d3d12->RecordConvertInput(*cl, *slot, matrix, range,
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                // Prepare 紧随转换(box 平均下采样写 ffxInput;FFX 无
+                // ping-pong 输入,Quality/Performance 的 OF extent 由会话定)。
+                _d3d12->RecordFfxPrepare(*cl, *slot, static_cast<uint32_t>(width),
+                                         static_cast<uint32_t>(height), ofW, ofH);
+            };
+        }
+        const OfStageResult st =
+            _ofBackend->StageFrame(n, _d3d12->InputColor(*slot), post, postCopy, densifyInternal);
         nvofHistoryReset = st.historyReset;
-        nvofMs = _nvof->LastStageMs();
+        nvofMs = _ofBackend->LastStageMs();
         realMotion = st.waitFenceValue != 0;
         nvofInputIndex = st.inputIndex;
     }
     // 3 连败停用(会话内部闩锁)在帧线程侧只发现不重试,防风暴;
     // Rebind/换档时经 _nvofFailed 条目重试一次。
-    if (_curOfQuality > 0 && _nvof && !_nvof->Enabled() && !_nvofFailed) {
+    if (_curOfQuality > 0 && _ofBackend && !_ofBackend->Enabled() && !_nvofFailed) {
         _nvofFailed = true;
-        TimingStatusLine("DLSSNR STATUS: nvof disabled (exhausted); zero guidance until rebind");
+        TimingStatusLine("DLSSNR STATUS: of disabled (exhausted); zero guidance until rebind");
     }
     // early-return 路径释放槽位前排空在途拷贝(宿主复用 upload 缓冲;
-    // 正常路径已被 execute 栅栏覆盖,no-op)。
+    // 正常路径已被 execute/完成栅栏覆盖,no-op)。
     struct CopyDrainGuard {
-        NvofContext *n;
+        IOpticalFlowBackend *b;
         bool on;
-        ~CopyDrainGuard() { if (n && on) n->WaitCopyIdle(); }
-    } drainGuard{ _nvof.get(), _nvof && _curOfQuality > 0 };
+        ~CopyDrainGuard() { if (b && on) b->WaitCopyIdle(); }
+    } drainGuard{ _ofBackend.get(), _ofBackend && _curOfQuality > 0 };
 
     if (ProbeEnabled()) TimingStatusLine("PROBE: post-stage"); // 临时探针(VSDLSSNR_PROBE=1)
     if (!_d3d12->BeginFrameRecording(*slot)) {
@@ -1921,7 +2004,17 @@ bool DlssnrContext::ProcessFrame(
                           realMotion ? 1 : 0, _curOfQuality);
             TimingStatusLine(probe);
         }
-        if (dumpEnabled && realMotion && !dumpedMotion.load(std::memory_order_relaxed)) {
+        // VSDLSSNR_DUMP_SKIP=N:跳过前 N 个真运动帧再 dump(warmup 帧
+        // 的流场未成熟,FFX/NVOF A/B 对照用)。
+        static std::atomic<int> realCount{ 0 };
+        const int myIdx = realMotion ? realCount.fetch_add(1, std::memory_order_relaxed) : -1;
+        static const int dumpSkip = [] {
+            char b[16]{};
+            GetEnvironmentVariableA("VSDLSSNR_DUMP_SKIP", b, sizeof(b) - 1);
+            return b[0] ? std::atoi(b) : 0;
+        }();
+        if (dumpEnabled && realMotion && myIdx >= dumpSkip &&
+            !dumpedMotion.load(std::memory_order_relaxed)) {
             static std::mutex dumpMotionMutex;
             std::lock_guard<std::mutex> dumpLock(dumpMotionMutex);
             if (!dumpedMotion.exchange(true)) {
@@ -1947,20 +2040,40 @@ bool DlssnrContext::ProcessFrame(
                     }
                     if (!motionDumped) TimingStatusLine("DLSSNR STATUS: motion dump FAILED");
                     else TimingStatusLine("DLSSNR STATUS: motion dump OK"); // 临时探针
-                    if (_nvof && _nvof->FlowForward()) {
-                        const uint32_t gs = _nvof->GridSize();
+                    if (_ofBackend && _ofBackend->Kind() == kOfBackendNvof &&
+                        static_cast<NvofContext *>(_ofBackend.get())->FlowForward()) {
+                        NvofContext *nv = static_cast<NvofContext *>(_ofBackend.get());
+                        const uint32_t gs = nv->GridSize();
                         // flow 网格按会话输入尺寸(follow 模式 = 内部尺寸,
                         // 与 StageFrame 调用点的 flowW/H 同款公式),不是源
                         // 尺寸 —— 曾按源宽算 dump 维度,与纹理不符。
-                        const uint32_t nw = static_cast<uint32_t>(_nvof->Width());
-                        const uint32_t nh = static_cast<uint32_t>(_nvof->Height());
+                        const uint32_t nw = static_cast<uint32_t>(nv->Width());
+                        const uint32_t nh = static_cast<uint32_t>(nv->Height());
                         const uint32_t fw = (nw + gs - 1) / gs;
                         const uint32_t fh = (nh + gs - 1) / gs;
                         const bool flowOk = _d3d12->DumpTextureToFile(
-                            _nvof->FlowForward(), static_cast<int>(fw),
+                            nv->FlowForward(), static_cast<int>(fw),
                             static_cast<int>(fh), (base / L"dump_flow.bin").c_str(),
                             DXGI_FORMAT_R16G16_SINT);
                         if (!flowOk) TimingStatusLine("DLSSNR STATUS: flow dump FAILED");
+                    } else if (_ofBackend && _ofBackend->Kind() == kOfBackendFfx) {
+                        // FFX 中间场:_ffxInput(R8G8B8A8 逻辑 RGBA 直写) +
+                        // 稀疏流(R16G16_SINT,1/8 OF extent)。
+                        auto *fx = static_cast<FxofContext *>(_ofBackend.get());
+                        if (!_d3d12->DumpTextureToFile(
+                                fx->FfxInput(), static_cast<int>(fx->OfWidth()),
+                                static_cast<int>(fx->OfHeight()),
+                                (base / L"dump_fxof_input.bin").c_str(),
+                                DXGI_FORMAT_R8G8B8A8_UNORM)) {
+                            TimingStatusLine("DLSSNR STATUS: fxof input dump FAILED");
+                        }
+                        if (!_d3d12->DumpTextureToFile(
+                                fx->SparseFlow(), static_cast<int>(fx->SparseWidth()),
+                                static_cast<int>(fx->SparseHeight()),
+                                (base / L"dump_fxof_sparse.bin").c_str(),
+                                DXGI_FORMAT_R16G16_SINT)) {
+                            TimingStatusLine("DLSSNR STATUS: fxof sparse dump FAILED");
+                        }
                     }
                 }
             }
@@ -2007,9 +2120,9 @@ bool DlssnrContext::ProcessFrame(
                     // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):
                     // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
                     // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
-                    if (_nvof && nvofInputIndex >= 0) {
-                        dumpOrLog(_nvof->InputTexture(nvofInputIndex),
-                                  _nvof->Width(), _nvof->Height(),
+                    if (_ofBackend && nvofInputIndex >= 0) {
+                        dumpOrLog(_ofBackend->InputTexture(nvofInputIndex),
+                                  _ofBackend->Width(), _ofBackend->Height(),
                                   L"dump_nvof_input.bin", kColorDump);
                     }
                     if (scaling) {
@@ -2114,15 +2227,19 @@ bool DlssnrContext::ProcessFrame(
                 const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
                 const double slotEma = TimingWindow::Ema(g_timing.slotW, g_timing.count);
                 const double lockEma = TimingWindow::Ema(g_timing.lockW, g_timing.count);
+                // 门细分探针为 NvofContext 专属(其它后端无引擎等待)。
+                NvofContext *nvProbe =
+                    (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
+                        ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
                 snprintf(line, sizeof(line),
                          "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f unpack=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f | res=%d%% of=%d %dx%d f=%d fps=%.0f",
                          gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
-                         _nvof ? _nvof->LastGateWaitMs() : 0.0,
-                         _nvof ? _nvof->LastCpyWaitMs() : 0.0,
-                         _nvof ? _nvof->LastExeWaitMs() : 0.0,
-                         _nvof ? _nvof->GateSkips() : 0u,
-                         _nvof ? _nvof->GateExpired() : 0u,
-                         _nvof ? _nvof->ResetCount() : 0u,
+                         nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
+                         nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
+                         nvProbe ? nvProbe->LastExeWaitMs() : 0.0,
+                         nvProbe ? nvProbe->GateSkips() : 0u,
+                         nvProbe ? nvProbe->GateExpired() : 0u,
+                         nvProbe ? nvProbe->ResetCount() : 0u,
                          evalCpuEma, fgLast, unpackEma,
                          slotEma, g_timing.slotW[lastIdx],
                          lockEma, g_timing.lockW[lastIdx],
@@ -2218,10 +2335,10 @@ void DlssnrContext::Shutdown() noexcept {
         TimingLog(msg);
     }
     // NVOF 会话:不调用 nvOFDestroy(销毁后继续进程存活期的 GPU 工作
-    // 会触发驱动访问违例,见 _retiredNvof 注释)—— 弃引用,随进程退出
+    // 会触发驱动访问违例,见 _retiredOf 注释)—— 弃引用,随进程退出
     // 由 OS 回收。宿主重启才是真实的生命周期终点。
-    if (_nvof) {
-        _nvof.release();
+    if (_ofBackend) {
+        _ofBackend.release();
         _curOfQuality = 0;
         _nvofFailed = false;
     }

@@ -669,6 +669,9 @@ static void VS_CC DlssnrCreate(
     ApplyFlagArg(in, vsapi, "scaling_enabled", initial.scalingEnabled);
     // NVOF 光流质量 0-5(0 = 零 guidance);>0 且驱动支持时启用真运动矢量
     ApplyIntArg(in, vsapi, "motion_vector_quality", initial.motionVectorQuality, kOfQualityMin, kOfQualityMax);
+    // FFX 光流质量 0-2(0 = 无;1 = 性能,2 = 质量;两后端档位分字段,
+    // 面板单下拉按当前后端读写)
+    ApplyIntArg(in, vsapi, "ffx_quality", initial.ffxQuality, kFfxQualityMin, kFfxQualityMax);
     // 光流输入跟随内部降采样(scaling 启用时 NVOF 按内部尺寸计算)
     ApplyFlagArg(in, vsapi, "nvof_follow_scaling", initial.nvofFollowScaling);
     // 抗闪烁时域稳定器 0-4(live 参数):对 NR 残差做运动补偿历史累积,
@@ -683,6 +686,7 @@ static void VS_CC DlssnrCreate(
     // FG 路由 0=自动/1=SM86/2=SM75/3=仅官方(进程级,重启生效;单字段合并
     // 原 Router+Backend —— 后端由硬件决定,自动档总能选对)
     ApplyIntArg(in, vsapi, "fg_route", initial.fgRoute, kFgRouteMin, kFgRouteMax);
+    ApplyIntArg(in, vsapi, "of_backend", initial.ofBackend, kOfBackendMin, kOfBackendMax);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
@@ -694,12 +698,13 @@ static void VS_CC DlssnrCreate(
     // "参数没生效/拖进度条回去了"类问题(#37)一行定位:ini/payload 哪层
     // 参与了、create-time 三元组最终是什么,一眼可查。
     {
-        char msg[256];
+        char msg[288];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d follow=%d af=%d fg=%d mult=%d route=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d af=%d fg=%d mult=%d route=%d",
                       d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
+                      initial.ffxQuality,
                       initial.nvofFollowScaling ? 1 : 0, initial.antiFlicker,
                       initial.fgEnabled ? 1 : 0,
                       initial.fgMultiplier, initial.fgRoute);
@@ -951,11 +956,13 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "scaling_enabled:int:opt;"
         "input_resolution:int:opt;"
         "motion_vector_quality:int:opt;"
+        "ffx_quality:int:opt;"
         "nvof_follow_scaling:int:opt;"
         "anti_flicker:int:opt;"
         "fg_enabled:int:opt;"
         "fg_multiplier:int:opt;"
         "fg_route:int:opt;"
+        "of_backend:int:opt;"
         "fg_dll:data:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);

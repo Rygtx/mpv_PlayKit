@@ -107,6 +107,37 @@ void D3D12Context::SetErr(char *err, size_t errLen, HRESULT hr, const char *what
     }
 }
 
+void D3D12Context::DebugDumpInfoQueue(char *buf, size_t len) const noexcept {
+    if (!buf || !len) return;
+    buf[0] = '\0';
+    if (!_infoQueue) {
+        std::snprintf(buf, len, "(infoqueue off)");
+        return;
+    }
+    // 只取 ERROR/CORRUPTION(warning 会淹没缓冲,如 [820] 无 clear value)。
+    D3D12_INFO_QUEUE_FILTER filter{};
+    D3D12_MESSAGE_SEVERITY deny[2] = { D3D12_MESSAGE_SEVERITY_INFO,
+                                       D3D12_MESSAGE_SEVERITY_WARNING };
+    filter.DenyList.NumSeverities = 2;
+    filter.DenyList.pSeverityList = deny;
+    _infoQueue->PushRetrievalFilter(&filter);
+    size_t n = 0;
+    const UINT64 count = _infoQueue->GetNumStoredMessages();
+    for (UINT64 i = 0; i < count && n + 2 < len; ++i) {
+        SIZE_T size = 0;
+        if (FAILED(_infoQueue->GetMessage(i, nullptr, &size)) || !size) continue;
+        auto *msg = static_cast<D3D12_MESSAGE *>(std::malloc(size));
+        if (!msg) break;
+        if (SUCCEEDED(_infoQueue->GetMessage(i, msg, &size))) {
+            n += static_cast<size_t>(std::snprintf(buf + n, len - n, "[%llu]%s",
+                static_cast<unsigned long long>(msg->ID), msg->pDescription));
+        }
+        std::free(msg);
+    }
+    _infoQueue->ClearStoredMessages();
+    _infoQueue->PopRetrievalFilter();
+}
+
 bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
     // Optional debug layer (VSDLSSNR_D3D12_DEBUG=1): capture InfoQueue messages
     // so D3D12 validation errors surface in our error strings.
@@ -162,6 +193,8 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
     // remember the adapter the device actually landed on (for GPU name etc.)
     if (adapter) {
         adapter.As(&_adapter);
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(_adapter->GetDesc1(&desc))) _vendorId = desc.VendorId;
     }
     if (_debug) {
         _device.As(&_infoQueue);
@@ -774,7 +807,7 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         // inputColor/outputColor 占位视图,RebuildTemporal 覆盖写入)。
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 49;
+        heapDesc.NumDescriptors = 51; // 0-48 原有 + 49/50(FFX OF 后端)
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -1655,6 +1688,70 @@ void NvofDownsample(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// ---- AMD 光流后端(FFX)----
+// FFX Prepare(Magpie PREPARE_INPUT_HLSL 移植):box 平均下采样到 OF extent。
+// FFX 契约输入为 R8G8B8A8(内部 luma 提取按 RGBA 序)。inputColor 是 BGRA8
+// 但 typed SRV Load 返回**逻辑 RGBA**(项目惯例,见 NVOF_DOWNSAMPLE_HLSL
+// 注释)—— 直接写 float4 即可,无需换序(首版误加 .zyxw 反而转反通道,
+// dump_fxof_input 与 dump_input 逐字节对照实锤)。
+constexpr char FFX_PREPARE_HLSL[] = R"(
+Texture2D<float4> Source : register(t0);
+RWTexture2D<float4> Target : register(u0);
+cbuffer Params : register(b0) { uint2 SourceExtent; uint2 TargetExtent; };
+[numthreads(8, 8, 1)]
+void Prepare(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= TargetExtent)) return;
+    uint2 begin = tid.xy * SourceExtent / TargetExtent;
+    uint2 end = max(begin + 1, (tid.xy + 1) * SourceExtent / TargetExtent);
+    end = min(end, SourceExtent);
+    float4 value = 0;
+    uint count = 0;
+    for (uint y = begin.y; y < end.y; ++y) {
+        for (uint x = begin.x; x < end.x; ++x) {
+            value += Source.Load(int3(uint2(x, y), 0));
+            ++count;
+        }
+    }
+    // SRV 已是逻辑 RGBA(R8G8B8A8 目标直写)。
+    Target[tid.xy] = value / max(count, 1);
+}
+)";
+
+// FFX densify(Magpie DENSIFY_HLSL 原样):1/8 分辨率稀疏流(R16G16_SINT,
+// 单位 = OF extent 像素)双线性上采样到稠密运动 + 恒定置信度 0.65
+// (FidelityFX OF 不暴露置信度面,Magpie 诚实保守基线)。
+constexpr char FFX_DENSIFY_HLSL[] = R"(
+Texture2D<int2> SparseFlow : register(t0);
+RWTexture2D<float2> DenseMotion : register(u0);
+RWTexture2D<float> DenseConfidence : register(u1);
+cbuffer Params : register(b0) {
+    uint2 SourceExtent;
+    uint2 OpticalFlowExtent;
+    uint2 SparseExtent;
+    float2 VectorScale;
+};
+int2 LoadFlow(int2 p) {
+    p = clamp(p, int2(0, 0), int2(SparseExtent) - 1);
+    return SparseFlow.Load(int3(p, 0));
+}
+[numthreads(8, 8, 1)]
+void Densify(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= SourceExtent)) return;
+    float2 opticalPixel = (float2(tid.xy) + 0.5) *
+        (float2(OpticalFlowExtent) / float2(SourceExtent));
+    float2 sparsePos = opticalPixel / 8.0 - 0.5;
+    int2 p0 = int2(floor(sparsePos));
+    float2 f = frac(sparsePos);
+    float2 a = float2(LoadFlow(p0));
+    float2 b = float2(LoadFlow(p0 + int2(1, 0)));
+    float2 c = float2(LoadFlow(p0 + int2(0, 1)));
+    float2 d = float2(LoadFlow(p0 + int2(1, 1)));
+    DenseMotion[tid.xy] = lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y) *
+        VectorScale;
+    DenseConfidence[tid.xy] = 0.65;
+}
+)";
+
 // 差异调试视图(面板"差异调试 ×20",OptiScaler DLSSNR fork 的 DebugView=3
 // 同语义):|NR输出 − 原帧| 逐通道最大差 × 放大系数的灰度图 —— 白 = 改动
 // 大,一片灰 = 模型没动画面。两输入同为 BGRA8 的 typed SRV(逻辑 RGBA,
@@ -2060,6 +2157,80 @@ void BgraToYuvChroma(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// AMD 光流后端通用 cs_5_0 PSO 构造:1 个 32 位常量根参数(b0,numConsts)
+// + nSrv 个独立 t 表 + nUav 个独立 u 表(与 densify/nvof downsample 同构;
+// 独立表参数,同表重叠 range 禁忌)。FFX 的两个 PSO 全走这里 ——
+// 无 WaveOps 依赖(cs_5_0),FFX 自身 7 pass 是 SM6.2 预编译 blob 不经本编译器。
+bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
+                 UINT numConsts, UINT srvCount, UINT uavCount,
+                 ID3D12RootSignature **rs, ID3D12PipelineState **pso,
+                 const char *label, char *err, size_t errLen) noexcept {
+    // err 直写(本 helper 是自由函数,SetErr 是 D3D12Context 成员)。
+    auto fail = [&](const char *what) {
+        if (err && errLen) std::snprintf(err, errLen, "%s: %s", label, what);
+        return false;
+    };
+    D3D12_DESCRIPTOR_RANGE srvRanges[2]{};
+    for (UINT i = 0; i < srvCount; ++i) {
+        srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRanges[i].NumDescriptors = 1;
+        srvRanges[i].BaseShaderRegister = i;
+        srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
+    }
+    D3D12_DESCRIPTOR_RANGE uavRanges[2]{};
+    for (UINT i = 0; i < uavCount; ++i) {
+        uavRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRanges[i].NumDescriptors = 1;
+        uavRanges[i].BaseShaderRegister = i;
+        uavRanges[i].OffsetInDescriptorsFromTableStart = 0;
+    }
+    D3D12_ROOT_PARAMETER params[5]{};
+    UINT n = 0;
+    params[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    params[n].Constants.ShaderRegister = 0;
+    params[n].Constants.Num32BitValues = numConsts;
+    params[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    ++n;
+    for (UINT i = 0; i < srvCount; ++i, ++n) {
+        params[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[n].DescriptorTable.NumDescriptorRanges = 1;
+        params[n].DescriptorTable.pDescriptorRanges = &srvRanges[i];
+        params[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    for (UINT i = 0; i < uavCount; ++i, ++n) {
+        params[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[n].DescriptorTable.NumDescriptorRanges = 1;
+        params[n].DescriptorTable.pDescriptorRanges = &uavRanges[i];
+        params[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = n;
+    rsDesc.pParameters = params;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    ComPtr<ID3DBlob> rsBlob, rsErr;
+    if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                           rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
+        return fail("SerializeRootSignature failed");
+    }
+    if (FAILED(device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+                                           rsBlob->GetBufferSize(), IID_PPV_ARGS(rs)))) {
+        return fail("CreateRootSignature failed");
+    }
+    ComPtr<ID3DBlob> code, csErr;
+    if (FAILED(D3DCompile(hlsl, strlen(hlsl), nullptr, nullptr, nullptr, entry, "cs_5_0",
+                          0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
+        return fail(csErr ? static_cast<const char *>(csErr->GetBufferPointer())
+                          : "D3DCompile failed");
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+    psoDesc.pRootSignature = *rs;
+    psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
+    if (FAILED(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(pso)))) {
+        return fail("CreateComputePipelineState failed");
+    }
+    return true;
+}
+
 } // namespace
 
 bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
@@ -2397,6 +2568,18 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             return false;
         }
         if (ProbeEnabled()) TimingStatusLine("PROBE: pso nvofds done");
+    }
+    // AMD 光流后端 PSO(FFX Prepare/Densify)。仅 of_backend 选择 ffx 时才
+    // 被消费;构造失败 = 初始化失败(与其它 PSO 同语义,不静默降级)。
+    {
+        if (!CreateOfPso(_device.Get(), FFX_PREPARE_HLSL, "Prepare", 4, 1, 1,
+                         _rsFfxPrepare.GetAddressOf(), _psoFfxPrepare.GetAddressOf(),
+                         "ffx prepare", err, errLen) ||
+            !CreateOfPso(_device.Get(), FFX_DENSIFY_HLSL, "Densify", 8, 1, 2,
+                         _rsFfxDensify.GetAddressOf(), _psoFfxDensify.GetAddressOf(),
+                         "ffx densify", err, errLen)) {
+            return false;
+        }
     }
     // 差异调试视图:b0 4 常量 + t0/t1 两张 SRV 表(input/output)+ u0 一张
     // UAV 表(共享 _debugDiff)。SRV 各自独立表参数(同表重叠 range 禁忌
@@ -3307,6 +3490,84 @@ void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameS
     cl->SetComputeRootDescriptorTable(2, gpu(23 + inputIndex)); // u0 NvofInput[cur]
     cl->Dispatch((static_cast<UINT>(dstW) + 7) / 8,
                  (static_cast<UINT>(dstH) + 7) / 8, 1);
+}
+
+// ---------------------------------------------------------------------------
+// AMD 光流后端(FFX;PSO 录制助手,由 ffxof context 编排)
+// ---------------------------------------------------------------------------
+
+bool D3D12Context::BindOfResources(ID3D12Resource *ffxInput, ID3D12Resource *ffxSparse) noexcept {
+    // 每槽堆写一份;会话纹理由 context 持有、销毁走退役名单,视图内容在
+    // 纹理存活期内有效。调用方保证只在会话建立时调用(PoolHold 内)。
+    if (!_device) return false;
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    for (int i = 0; i < kSlotCount; ++i) {
+        if (!_slots[i].srvUavHeap) return false;
+        const D3D12_CPU_DESCRIPTOR_HANDLE slotBase =
+            _slots[i].srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        auto h = [&](UINT d) {
+            return D3D12_CPU_DESCRIPTOR_HANDLE{ slotBase.ptr + static_cast<SIZE_T>(d * inc) };
+        };
+        if (ffxInput) _device->CreateUnorderedAccessView(ffxInput, nullptr, nullptr, h(49));
+        if (ffxSparse) _device->CreateShaderResourceView(ffxSparse, nullptr, h(50));
+    }
+    return true;
+}
+
+void D3D12Context::RecordFfxPrepare(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                    uint32_t srcW, uint32_t srcH,
+                                    uint32_t dstW, uint32_t dstH) noexcept {
+    // inputColor(槽 0 SRV,BGRA8)→ ffxInput(49,R8G8B8A8):box 平均 + 换序。
+    // inputColor 处于 NSR(convert 产出),ffxInput 的 UAV 态由调用方管理。
+    ID3D12GraphicsCommandList *cl = &clRef;
+    cl->SetComputeRootSignature(_rsFfxPrepare.Get());
+    cl->SetPipelineState(_psoFfxPrepare.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+
+    const UINT srcWH[2]{ srcW, srcH };
+    const UINT dstWH[2]{ dstW, dstH };
+    cl->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
+    cl->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
+    cl->SetComputeRootDescriptorTable(1, gpu(0));  // t0 inputColor(NSR)
+    cl->SetComputeRootDescriptorTable(2, gpu(49)); // u0 ffxInput
+    cl->Dispatch((dstW + 7) / 8, (dstH + 7) / 8, 1);
+}
+
+void D3D12Context::RecordFfxDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                    uint32_t denseW, uint32_t denseH,
+                                    uint32_t ofW, uint32_t ofH,
+                                    uint32_t sparseW, uint32_t sparseH,
+                                    float scaleX, float scaleY,
+                                    UINT uavMotion, UINT uavConfidence) noexcept {
+    // 稀疏流(50)→ 稠密运动 + 置信度。SourceExtent = 稠密目标尺寸
+    // (dispatch 范围);VectorScale = dense/OF(源尺寸管线 = 源/OF,
+    // follow 内部管线 = 会话/OF)。motion/confidence 的 UAV 态转移由
+    // 调用方(postExecute lambda)负责,与 NVOF densify 同契约。
+    ID3D12GraphicsCommandList *cl = &clRef;
+    cl->SetComputeRootSignature(_rsFfxDensify.Get());
+    cl->SetPipelineState(_psoFfxDensify.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+
+    const UINT srcWH[2]{ denseW, denseH };
+    const UINT ofWH[2]{ ofW, ofH };
+    const UINT spWH[2]{ sparseW, sparseH };
+    cl->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
+    cl->SetComputeRoot32BitConstants(0, 2, ofWH, 2);
+    cl->SetComputeRoot32BitConstants(0, 2, spWH, 4);
+    const float scale[2]{ scaleX, scaleY };
+    cl->SetComputeRoot32BitConstants(0, 2, scale, 6);
+    cl->SetComputeRootDescriptorTable(1, gpu(50));            // t0 sparseFlow
+    cl->SetComputeRootDescriptorTable(2, gpu(uavMotion));     // u0 DenseMotion
+    cl->SetComputeRootDescriptorTable(3, gpu(uavConfidence)); // u1 DenseConfidence
+    cl->Dispatch((denseW + 7) / 8, (denseH + 7) / 8, 1);
 }
 
 void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,

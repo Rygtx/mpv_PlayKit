@@ -4,7 +4,7 @@
 ###       vs-plugins\ngx\version.dll (DLSS FG 原生代理, dlssg_for_sm86; 帧生成可选, 用户自备)
 ###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
 ### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18)
-###       处理为同分辨率 (非超分); 默认零 guidance, 可选 NVOF 硬件光流引导 (0-5 档)
+###       处理为同分辨率 (非超分); 默认零 guidance, 可选硬件光流引导 (0-5 档)
 ###       DLSS 帧生成 (可选): 挂降噪之后, 输出帧率 x2 (插值帧由 DLSS FG 模型合成);
 ###       需要光流引导 (Motion_Vector_Quality > 0) 才有意义, 否则插值帧 = 复制真实帧
 ###       YUV 原生: 直接吃 YUV420P8/P10 吐同格式, 无 CPU 格式往返;
@@ -31,7 +31,9 @@ Scaling_Enabled = True
 Input_Resolution = 100
 Residual_Multiplier = 1.0
 Motion_Vector_Quality = 0
+Ffx_Quality = 0
 Nvof_Follow_Scaling = False
+Of_Backend = 0
 Anti_Flicker = 0
 Fg_Enabled = False
 Fg_Multiplier = 2
@@ -56,12 +58,17 @@ H_Max = 0
 ##          但 NGX 固定成本主导, 实测帧耗差异有限
 ##          注意 100% 仍走残差通道 (Magpie 行为), residual_multiplier > 1 时增强细节
 ## <1-2> 浮点, 残差乘数 (默认 1.0), 配合内部分辨率缩放使用
-## <0-5> 整数, NVIDIA 光流 (真运动矢量) 引导档位 (默认 0)
+## <0-5> 整数, NVOF 光流 (真运动矢量) 引导档位 (默认 0; 仅后端 = NVOF 时消费)
 ##          0 = 无 (零 guidance); 1-5 用硬件光流减轻运动场景的时域伪影
-##          需要 NVIDIA Turing+; 不支持时自动回退零 guidance
+##          后端: FFX (AMD FidelityFX, 跨厂商通用, 默认, 档位见 Ffx_Quality) /
+##          NVOF (NVIDIA Turing+, 面板"光流后端"切换)
 ##          播放中可在面板实时切换 (只重建光流会话, 毫秒级)
 ##          帧生成开启时建议 >= 2 (Balanced): 光流是插值帧的运动来源
 ## <True|False> 光流输入跟随内部降采样 (默认 False); 帧生成激活时被忽略
+## <0-1> 整数, 光流后端 (默认 0): 0 = FFX (AMD FidelityFX, 跨厂商通用);
+##          1 = NVOF (NVIDIA 专属引擎); 面板"光流后端"同步此值
+## <0-2> 整数, FFX 光流档位 (默认 0): 0 = 无; 1 = 性能 (半分辨率),
+##          2 = 质量 (全分辨率); 面板"光流质量"按当前后端读写对应档位
 ## <0-4> 整数, 抗闪烁时域稳定器 (默认 0): 对降噪改动做时域累积,
 ##          减轻画面明暗/结构的逐帧抖动 (上游 Magpie v0.6.8 antiFlicker)
 ##          0 = 无; 1 = 静态累积; 2 = 光流累积; 3 = 光流累积+; 4 = 低频时域重建
@@ -123,7 +130,9 @@ else :
 		input_resolution = Input_Resolution,
 		residual_multiplier = Residual_Multiplier,
 		motion_vector_quality = Motion_Vector_Quality,
+		ffx_quality = Ffx_Quality,
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
+		of_backend = Of_Backend,
 		anti_flicker = Anti_Flicker,
 		fg_enabled = int(Fg_Enabled),
 		fg_multiplier = Fg_Multiplier,

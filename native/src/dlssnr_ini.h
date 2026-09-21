@@ -44,10 +44,12 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeX100(L"shadow_structure_x100", p.shadowStructureMultiplier);
     writeX100(L"reflection_glow_x100", p.reflectionGlowMultiplier);
     writeInt(L"motion_vector_quality", std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax));
+    writeInt(L"ffx_quality", std::clamp(p.ffxQuality, kFfxQualityMin, kFfxQualityMax));
     writeInt(L"nvof_follow_scaling", p.nvofFollowScaling ? 1 : 0);
     writeInt(L"fg_enabled", p.fgEnabled ? 1 : 0);
     writeInt(L"fg_multiplier", std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax));
     writeInt(L"fg_route", std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax));
+    writeInt(L"of_backend", std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax));
     writeInt(L"anti_flicker", std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax));
     writeInt(L"saved", 1);
     return ok;
@@ -89,10 +91,12 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.shadowStructureMultiplier = readX100(L"shadow_structure_x100", p.shadowStructureMultiplier, kResidualFineMin, kResidualFineMax);
     p.reflectionGlowMultiplier = readX100(L"reflection_glow_x100", p.reflectionGlowMultiplier, kResidualFineMin, kResidualFineMax);
     p.motionVectorQuality = std::clamp(readInt(L"motion_vector_quality", p.motionVectorQuality), kOfQualityMin, kOfQualityMax);
+    p.ffxQuality = std::clamp(readInt(L"ffx_quality", p.ffxQuality), kFfxQualityMin, kFfxQualityMax);
     p.nvofFollowScaling = readInt(L"nvof_follow_scaling", p.nvofFollowScaling) != 0;
     p.fgEnabled = readInt(L"fg_enabled", p.fgEnabled) != 0;
     p.fgMultiplier = std::clamp(readInt(L"fg_multiplier", p.fgMultiplier), kFgMultMin, kFgMultMax);
     p.fgRoute = std::clamp(readInt(L"fg_route", p.fgRoute), kFgRouteMin, kFgRouteMax);
+    p.ofBackend = std::clamp(readInt(L"of_backend", p.ofBackend), kOfBackendMin, kOfBackendMax);
     p.antiFlicker = std::clamp(readInt(L"anti_flicker", p.antiFlicker), kAntiFlickerMin, kAntiFlickerMax);
     return true;
 }

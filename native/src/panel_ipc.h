@@ -36,10 +36,16 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // |NR改动|×20 灰度图)并退役 uiCorrection(视频管线无 UI 图层,模型端结构性
 // no-op —— 字段保留占位防布局漂移,写入恒 1,面板不再暴露);
 // v14 adds antiFlicker(抗闪烁时域稳定器 0-4,live —— 结构体增长,新旧混跑
-// 按 magic 拒读)。
+// 按 magic 拒读); v15 adds ofBackend(光流后端,切档下一帧生效,无需
+// mpv 重启 —— 结构体增长,新旧混跑按 magic 拒读); v16 reinterprets
+// ofBackend 为 0=ffx(默认)/1=nvof(原 auto 厂商排序档移除 —— FFX 跨厂商
+// 通用,用户裁定 2026-09-21;字段宽度不变,值域收缩,无偏移漂移,但
+// 新旧面板/插件混跑时 0/1/2 语义错位,仍按 magic 拒读保护); v17 adds
+// ffxQuality(FFX 光流档位 0-2,live —— 两后端档位分字段,面板单下拉按
+// 当前后端读写;结构体增长,新旧混跑按 magic 拒读)。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x454C5344u; // "DSLE" (v14, 版本位走 hex:9 之后是 A/B/C/D/E)
+constexpr uint32_t PAYLOAD_MAGIC = 0x484C5344u; // "DSLH" (v17, 版本位走 hex:9 之后是 A/B/C/D/E/F)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -64,7 +70,8 @@ struct PanelPayload {
     int32_t scalingEnabled;      // 0 = ignore inputResolution (treat as 100)
     int32_t saveRequest;         // panel "保存设置" press (applied once per seq)
     int32_t logEnabled;          // perf log toggle state
-    int32_t motionVectorQuality; // 0-5 (0 = 无光流)
+    int32_t motionVectorQuality; // 0-5 NVOF 档位(0 = 无光流;live)
+    int32_t ffxQuality;          // 0-2 FFX 档位(0 = 无;1 性能,2 质量;live)
     int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
     int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,会话内有效密度 = min(此值, 创建倍数))
@@ -72,6 +79,7 @@ struct PanelPayload {
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
     int32_t debugView;           // 0/1 差异调试 ×20 视图(v13;live,不持久化)
     int32_t antiFlicker;         // 0-4 抗闪烁时域稳定器(v14;live)
+    int32_t ofBackend;           // 0-1 光流后端(v16;0=ffx 默认 1=nvof;切档下一帧生效)
 };
 #pragma pack(pop)
 
@@ -99,11 +107,13 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.shadowStructureMultiplier = std::clamp(pl.shadowStructure, kResidualFineMin, kResidualFineMax);
     p.reflectionGlowMultiplier = std::clamp(pl.reflectionGlow, kResidualFineMin, kResidualFineMax);
     p.motionVectorQuality = std::clamp(pl.motionVectorQuality, kOfQualityMin, kOfQualityMax);
+    p.ffxQuality = std::clamp(pl.ffxQuality, kFfxQualityMin, kFfxQualityMax);
     p.nvofFollowScaling = pl.nvofFollowScaling != 0;
     p.fgEnabled = pl.fgEnabled != 0;
     p.fgMultiplier = std::clamp(pl.fgMultiplier, kFgMultMin, kFgMultMax);
     p.debugView = pl.debugView != 0;
     p.antiFlicker = std::clamp(pl.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
+    p.ofBackend = std::clamp(pl.ofBackend, kOfBackendMin, kOfBackendMax);
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
@@ -139,12 +149,14 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.shadowStructure = p.shadowStructureMultiplier;
     pl.reflectionGlow = p.reflectionGlowMultiplier;
     pl.motionVectorQuality = p.motionVectorQuality;
+    pl.ffxQuality = p.ffxQuality;
     pl.nvofFollowScaling = p.nvofFollowScaling ? 1 : 0;
     pl.fgEnabled = p.fgEnabled ? 1 : 0;
     pl.fgMultiplier = std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax);
     pl.fgRoute = std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
     pl.debugView = p.debugView ? 1 : 0;
     pl.antiFlicker = std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
+    pl.ofBackend = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
     return pl;
 }
 

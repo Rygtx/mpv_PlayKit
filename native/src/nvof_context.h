@@ -34,27 +34,29 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <windows.h>
 
 #include <nvOpticalFlowD3D12.h> // vendor/nvof(fetch-deps.ps1),含 nvOpticalFlowCommon.h
 
+#include "of_backend.h" // IOpticalFlowBackend + OfStageResult/回调(上移共享)
+
 namespace vsdlssnr {
 
 class D3D12Context;
 
-class NvofContext {
+class NvofContext final : public IOpticalFlowBackend {
 public:
-    struct StageResult {
-        uint64_t waitFenceValue = 0; // 槽提交需等待的 done 栅栏值(0 = 无;现状恒 0,execute 已 CPU 等待)
-        bool publishZero = false;    // 本帧清零 per-slot motion/confidence
-        bool historyReset = false;   // 本帧对 NGX 置 PARAM_RESET
-        int inputIndex = -1;         // 本帧写入的输入 ping-pong 槽位(dump 用)
-    };
+    // 类型别名:原类内定义上移到 of_backend.h(接口共享);保持
+    // NvofContext::StageResult 等既有引用点零改动。
+    using StageResult = OfStageResult;
+    using PostExecuteFn = OfPostExecuteFn;
+    using PostCopyFn = OfPostCopyFn;
 
     NvofContext() = default;
-    ~NvofContext();
+    ~NvofContext() override;
     NvofContext(const NvofContext &) = delete;
     NvofContext &operator=(const NvofContext &) = delete;
 
@@ -62,14 +64,14 @@ public:
     // (槽池封死):in-flight 命令列表不得引用注册纹理,门也必然空闲
     // (门只被持有槽位的帧线程进入)。
     bool Initialize(D3D12Context &d3d12, int width, int height, int quality,
-                    char *err, size_t errLen) noexcept;
+                    char *err, size_t errLen) noexcept override;
     // 释放会话 + 卸载驱动 DLL。PoolHold 约束同上。
-    void Finalize() noexcept;
+    void Finalize() noexcept override;
 
-    bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
-    int Quality() const noexcept { return _quality; }
-    int Width() const noexcept { return _width; }
-    int Height() const noexcept { return _height; }
+    bool Enabled() const noexcept override { return _ready.load(std::memory_order_acquire); }
+    int Quality() const noexcept override { return _quality; }
+    int Width() const noexcept override { return _width; }
+    int Height() const noexcept override { return _height; }
 
     // 注册纹理(会话存活期有效);供 D3D12Context 在槽描述符堆上建 SRV。
     ID3D12Resource *FlowForward() const noexcept { return _flow[0].Get(); }
@@ -79,18 +81,27 @@ public:
         return _bidirectional && _costEnabled ? _cost[1].Get() : nullptr;
     }
     // 注册输入纹理(ping-pong,诊断 dump 用;index 0/1)。
-    ID3D12Resource *InputTexture(int index) const noexcept { return _input[index].Get(); }
+    ID3D12Resource *InputTexture(int index) const noexcept override { return _input[index].Get(); }
     // densify 的 cbuffer 旗标与槽提交的栅栏等待目标。
     uint32_t GridSize() const noexcept { return _gridSize; }
     bool Bidirectional() const noexcept { return _bidirectional; }
     bool CostEnabled() const noexcept { return _costEnabled; }
     ID3D12Fence *DoneFence() const noexcept { return _doneFence.Get(); }
+    // SK_OF_MODE 能力段(实际模式,逐级回退的可见反馈)。
+    const char *ModeString(char *buf, size_t len) noexcept override {
+        std::snprintf(buf, len, "%s q%d grid%u",
+                      _bidirectional ? (_costEnabled ? "both+cost" : "both")
+                                     : (_costEnabled ? "forward+cost" : "forward"),
+                      _quality, _gridSize);
+        return buf;
+    }
+    int Kind() const noexcept override { return kOfBackendNvof; }
 
     // 历史失效(seek = 新滤镜实例):下一帧重新播种(清零发布,不 execute)。
     // 同时复位帧序门 —— 新时间线的帧号与旧时间线无关,不清会让新帧被判
     // 迟到帧。零等待门下乱序/大跳均自愈(播种一次即恢复),此复位只服务
     // "门内残留旧时间线状态"的场景。
-    void ResetHistory() noexcept {
+    void ResetHistory() noexcept override {
         std::lock_guard<std::mutex> lock(_gateMutex);
         _historyValid = false;
         _nextSeq = -1;
@@ -113,15 +124,13 @@ public:
     // inputIndex 保持 -1 —— 调用方据此在槽 CL 上补做转换
     // (convertedOnNvof = inputIndex >= 0)。copyOk=false 同样 -1。
     // 回调签名 (cl, cur):cur 为本帧输入槽位(0/1,UAV 描述符 23/24)。
-    using PostExecuteFn = std::function<void(ID3D12GraphicsCommandList *cl)>;
-    using PostCopyFn = std::function<void(ID3D12GraphicsCommandList *cl, int inputIndex)>;
-    StageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
-                           const PostExecuteFn &postExecute,
-                           const PostCopyFn &postCopy, bool inputWrittenByPostCopy) noexcept;
+    OfStageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
+                             const OfPostExecuteFn &postExecute,
+                             const OfPostCopyFn &postCopy, bool inputWrittenByPostCopy) noexcept override;
 
     // 本帧 NVOF 拷贝的完成等待(early-return 路径释放槽位前调用,防宿主
     // 复用 upload 缓冲撕裂在途拷贝;正常路径已被 execute 栅栏覆盖,no-op)。
-    void WaitCopyIdle() noexcept;
+    void WaitCopyIdle() noexcept override;
 
 private:
     // 栅栏值到达等待:循环检查完成值(共享 auto-reset 事件的唤醒可能被
@@ -132,7 +141,7 @@ private:
 public:
 
     // 最近一次 StageFrame 的 CPU 耗时(门等待 + 拷贝提交 + execute 调用),ms。
-    double LastStageMs() const noexcept { return _lastStageMs; }
+    double LastStageMs() const noexcept override { return _lastStageMs; }
 
     // ---- 临时探针(定位 seek 后持续掉帧,验证后删除)----
     // StageFrame 内三段 CPU 等待细分 + 门异常事件累计。

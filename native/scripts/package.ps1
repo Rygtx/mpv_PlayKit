@@ -50,6 +50,12 @@ Copy-Item $fgDll      (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $fgIni      (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $fgOfficial (Join-Path $stage "vs-plugins\ngx")
 
+# --- 第三方许可:AMD FidelityFX SDK(MIT,静态编入 vs_dlssnr.dll 的 OF 后端)---
+$ffxNotice = Join-Path $native "vendor\fidelityfx\3rdpartynotice.md"
+if (Test-Path $ffxNotice) {
+    Copy-Item $ffxNotice (Join-Path $stage "AMD-FidelityFX-SDK-THIRD-PARTY.md")
+}
+
 # --- 安装说明 ---
 $readme = Join-Path $stage "安装说明.txt"
 @"
@@ -85,6 +91,10 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   RTX 40/50 系: 经官方运行时 nvngx_dlssg.dll (NVIDIA 签名, 无需 proxy; 面板 "FG 路由" 可固定官方档);
   RTX 30/20 系: 经 dlssg_for_sm86 代理 version.dll (面板 "FG 路由" 切换: 自动/SM86/SM75/官方 NGX, 默认 SM86, RTX 20 系选 SM75, 重启 mpv 生效);
   自动档初始化失败自动回退 1:1 (显式档不跨后端回退), 降噪不受影响; 建议配合面板光流质量 >= 2 使用
+光流后端 (面板 "光流后端", 默认 FFX)
+  FFX (AMD FidelityFX 光流) = 默认, 跨厂商通用 (需 D3D12 SM6.2 + WaveOps);
+  NVOF (NVIDIA 专属引擎) = 可选。切档下一帧生效 (无需重启), 质量档位选项
+  随后端变化 (FFX = 性能/质量两档)
 
 要求: RTX 显卡
 本包不含 mpv.exe 与 VapourSynth 运行时, 请使用官方 mpv-lazy 发行包

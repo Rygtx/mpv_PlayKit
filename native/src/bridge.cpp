@@ -113,12 +113,12 @@ bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept {
             // 探针:采纳了面板哪一版 payload(#37"seek 后参数回退"的
             // 决定性证据 —— 采纳失败时这行缺失,配合 create params 行
             // 立刻看出 fallback 到了 ini 值)。
-            char msg[192];
+            char msg[224];
             std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: adopt payload seq=%u preset=%d res=%d%% scaling=%d of=%d follow=%d",
+                          "DLSSNR STATUS: adopt payload seq=%u preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d",
                           snap.seq, p.preset, p.inputResolutionPercent,
                           p.scalingEnabled ? 1 : 0, p.motionVectorQuality,
-                          p.nvofFollowScaling ? 1 : 0);
+                          p.ffxQuality, p.nvofFollowScaling ? 1 : 0);
             TimingStatusLine(msg);
         }
     } else {
@@ -151,12 +151,12 @@ void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
     // 操作时间对齐后,"滑块动了没生效"可以直接看出是没写进来(seq 没动)、
     // 被 clamp、还是到了 SharedParams 之后才丢。
     {
-        char msg[224];
+        char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: bridge apply seq=%u gen=%u preset=%d res=%d%% scaling=%d of=%d follow=%d save=%d log=%d",
+                      "DLSSNR STATUS: bridge apply seq=%u gen=%u preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d save=%d log=%d",
                       static_cast<unsigned>(pl.seq), static_cast<unsigned>(pl.generation),
                       pl.preset, pl.inputResolution, pl.scalingEnabled,
-                      pl.motionVectorQuality, pl.nvofFollowScaling,
+                      pl.motionVectorQuality, pl.ffxQuality, pl.nvofFollowScaling,
                       pl.saveRequest, pl.logEnabled);
         TimingStatusLine(msg);
     }

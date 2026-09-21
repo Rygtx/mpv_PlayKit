@@ -61,6 +61,98 @@ foreach ($h in @("nvOpticalFlowCommon.h", "nvOpticalFlowD3D12.h", "nvOpticalFlow
     Fetch "https://raw.githubusercontent.com/mbucchia/Optical-Flow-SDK/main/NvOFInterface/$h" (Join-Path $nvofDir $h)
 }
 
+# --- FidelityFX SDK v2.3.0(AMD 光流后端 FxofContext;裁剪子集,vendor 不入库
+#     可重建,仿 vendor/nvof 惯例)。API 面与 Magpie AmdOpticalFlowProvider
+#     所用一致(ffx_api 新 C 接口,FSR3 3.x 时代):下载 → 解压 → 裁剪 →
+#     断言(头文件 API 符号 + 7 个 pass shader 齐全),任何一步失败即 throw,
+#     防止半成品 vendor 毒化构建。---
+$ffxDir = Join-Path $root "vendor\fidelityfx"
+if (-not (Test-Path (Join-Path $ffxDir "api\include\ffx_api.h"))) {
+    $zip = Join-Path $env:TEMP "FidelityFX-SDK-v2.3.0.zip"
+    Fetch "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/zip/refs/tags/v2.3.0" $zip
+    $extract = Join-Path $env:TEMP "ffx-sdk-extract"
+    if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+    New-Item -ItemType Directory -Force $extract | Out-Null
+    Expand-Archive $zip $extract -Force
+    $sdkRoot = Get-ChildItem $extract -Directory | Select-Object -First 1
+    if (-not $sdkRoot) { throw "FidelityFX SDK zip layout unexpected" }
+    $kit = Join-Path $sdkRoot.FullName "Kits\FidelityFX"
+    # 裁剪:只留 OF 编译闭包(api 头/内部实现+gpu 头、dx12 backend、fsr3 OF
+    # 头/gpu 头/OF 源码与 shader)。frameinterpolation 等无关组件不进 vendor。
+    $map = @(
+        @{ src = "api\include";  dst = "api\include" },
+        @{ src = "api\internal"; dst = "api\internal" },
+        @{ src = "backend\dx12"; dst = "backend\dx12" },
+        @{ src = "framegeneration\fsr3\include"; dst = "framegeneration\fsr3\include" }
+    )
+    foreach ($m in $map) {
+        $from = Join-Path $kit $m.src
+        $to = Join-Path $ffxDir $m.dst
+        if (-not (Test-Path $from)) { throw "FidelityFX SDK trim: missing $m.src" }
+        New-Item -ItemType Directory -Force $to | Out-Null
+        Copy-Item "$from\*" $to -Recurse -Force
+    }
+    foreach ($f in @("ffx_opticalflow.cpp", "ffx_opticalflow_private.h",
+                     "ffx_opticalflow_shaderblobs.cpp", "ffx_opticalflow_shaderblobs.h")) {
+        $from = Join-Path $kit "framegeneration\fsr3\internal\$f"
+        if (-not (Test-Path $from)) { throw "FidelityFX SDK trim: missing $f" }
+        $to = Join-Path $ffxDir "framegeneration\fsr3\internal"
+        New-Item -ItemType Directory -Force $to | Out-Null
+        Copy-Item $from $to -Force
+    }
+    $shaderDst = Join-Path $ffxDir "framegeneration\fsr3\internal\shaders"
+    New-Item -ItemType Directory -Force $shaderDst | Out-Null
+    Copy-Item (Join-Path $kit "framegeneration\fsr3\internal\shaders\ffx_opticalflow_*.hlsl") $shaderDst -Force
+    # 仓库根无 LICENSE 文件,MIT 许可文本与第三方声明都在 3rdpartynotice.md。
+    $notice = Join-Path $sdkRoot.FullName "3rdpartynotice.md"
+    if (Test-Path $notice) { Copy-Item $notice $ffxDir -Force }
+    Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    # 断言 1:API 面(Magpie AmdOpticalFlowProvider 依赖的符号逐个在位)。
+    $ofHeader = Join-Path $ffxDir "framegeneration\fsr3\include\ffx_opticalflow.h"
+    $apiText = Get-Content $ofHeader -Raw
+    foreach ($sym in @("FfxOpticalflowContextDescription", "FFX_OPTICALFLOW_CONTEXT_COUNT",
+                       "ffxOpticalflowGetSharedResourceDescriptions", "ffxOpticalflowContextDispatch",
+                       "backbufferTransferFunction", "minMaxLuminance")) {
+        if ($apiText -notmatch [regex]::Escape($sym)) { throw "FidelityFX SDK assert: $sym missing from ffx_opticalflow.h" }
+    }
+    # 断言 2:7 个 pass shader(Generate 脚本硬编码清单,缺一即显式失败)。
+    $passes = @(
+        "ffx_opticalflow_compute_luminance_pyramid_pass",
+        "ffx_opticalflow_compute_optical_flow_advanced_pass_v5",
+        "ffx_opticalflow_compute_scd_divergence_pass",
+        "ffx_opticalflow_filter_optical_flow_pass_v5",
+        "ffx_opticalflow_generate_scd_histogram_pass",
+        "ffx_opticalflow_prepare_luma_pass",
+        "ffx_opticalflow_scale_optical_flow_advanced_pass_v5"
+    )
+    foreach ($p in $passes) {
+        if (-not (Test-Path (Join-Path $shaderDst "$p.hlsl"))) { throw "FidelityFX SDK assert: shader $p.hlsl missing" }
+    }
+    Write-Host "FidelityFX SDK v2.3.0 trimmed to $ffxDir"
+}
+
+# --- pix3.h(FidelityFX 的 ffx_dx12.cpp 无条件 #include;SDK zip 不带。
+#     官方发行渠道是 WinPixEventRuntime NuGet 包(MIT),解出头文件链)---
+$pixDir = Join-Path $root "vendor\fidelityfx\include"
+if (-not (Test-Path (Join-Path $pixDir "pix3.h"))) {
+    New-Item -ItemType Directory -Force $pixDir | Out-Null
+    $pkg = Join-Path $env:TEMP "WinPixEventRuntime.nupkg"
+    Fetch "https://www.nuget.org/api/v2/package/WinPixEventRuntime/" $pkg
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $pkgZip = [System.IO.Compression.ZipFile]::OpenRead($pkg)
+    try {
+        $entries = $pkgZip.Entries | Where-Object { $_.FullName -like "Include/WinPixEventRuntime/*" }
+        if (-not $entries) { throw "WinPixEventRuntime nupkg layout unexpected" }
+        foreach ($e in $entries) {
+            $dst = Join-Path $pixDir ([System.IO.Path]::GetFileName($e.FullName))
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dst, $true)
+        }
+    } finally { $pkgZip.Dispose() }
+    Remove-Item $pkg -Force -ErrorAction SilentlyContinue
+    Write-Host "pix3 headers: $pixDir"
+}
+
 # --- Dear ImGui (independent panel UI), unpacked to dependencies\imgui ---
 $imguiDir = Join-Path $root "dependencies\imgui"
 if (-not (Test-Path (Join-Path $imguiDir "imgui.h"))) {

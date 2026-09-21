@@ -19,16 +19,74 @@ endif ()
 if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvof/nvOpticalFlowD3D12.h")
     message(FATAL_ERROR "NVOF headers missing: run scripts/fetch-deps.ps1 to populate vendor/nvof")
 endif ()
+# FidelityFX SDK 裁剪子集(vendor/fidelityfx,fetch-deps.ps1 下载裁剪)——
+# AMD 光流后端(FxofContext)。断言在 fetch 侧,这里只查关键入口头。
+if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/api/include/ffx_api.h")
+    message(FATAL_ERROR "FidelityFX SDK missing: run scripts/fetch-deps.ps1 to populate vendor/fidelityfx")
+endif ()
+
+# --- FidelityFX Optical Flow shader blobs(7 pass × HDR0/1 = 28 头)---
+# 预编译脚本近乎原样移植自 Magpie;产物进构建目录不入库,指纹 stamp 使
+# 增量构建自跳。dxc 取 Windows SDK(vinstall vcvars 会设置 WindowsSdkDir)。
+set(FFX_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/fidelityfx")
+set(FFX_PASSES
+    ffx_opticalflow_compute_luminance_pyramid_pass
+    ffx_opticalflow_compute_optical_flow_advanced_pass_v5
+    ffx_opticalflow_compute_scd_divergence_pass
+    ffx_opticalflow_filter_optical_flow_pass_v5
+    ffx_opticalflow_generate_scd_histogram_pass
+    ffx_opticalflow_prepare_luma_pass
+    ffx_opticalflow_scale_optical_flow_advanced_pass_v5)
+set(FFX_GEN_HEADERS "")
+foreach (_pass IN LISTS FFX_PASSES)
+    foreach (_suffix IN ITEMS "" "_wave64" "_16bit" "_wave64_16bit")
+        list(APPEND FFX_GEN_HEADERS "${FFX_GEN_DIR}/${_pass}${_suffix}_permutations.h")
+    endforeach ()
+endforeach ()
+find_program(FFX_DXC_PATH dxc.exe HINTS
+    "$ENV{WindowsSdkDir}bin/$ENV{WindowsSDKVersion}x64"
+    "$ENV{WindowsSdkDir}bin/x64")
+if (NOT FFX_DXC_PATH)
+    file(GLOB _ffx_dxc_candidates "C:/Program Files (x86)/Windows Kits/10/bin/*/x64/dxc.exe")
+    list(SORT _ffx_dxc_candidates ORDER DESCENDING)
+    list(GET _ffx_dxc_candidates 0 FFX_DXC_PATH)
+endif ()
+if (NOT FFX_DXC_PATH)
+    message(FATAL_ERROR "dxc.exe not found (Windows SDK bin\\<ver>\\x64); FidelityFX OF blobs cannot be generated")
+endif ()
+message(STATUS "FidelityFX OF dxc: ${FFX_DXC_PATH}")
+add_custom_command(
+    OUTPUT "${FFX_GEN_DIR}/generation.json"
+    BYPRODUCTS ${FFX_GEN_HEADERS}
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${FFX_GEN_DIR}"
+    COMMAND powershell -NoProfile -ExecutionPolicy Bypass -File
+            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Generate-FidelityFXOpticalFlowShaders.ps1"
+            -SdkDirectory "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx"
+            -OutputDirectory "${FFX_GEN_DIR}"
+            -DxcPath "${FFX_DXC_PATH}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Generate-FidelityFXOpticalFlowShaders.ps1"
+    VERBATIM)
+add_custom_target(ffx_of_blobs DEPENDS "${FFX_GEN_DIR}/generation.json")
 
 add_library(vs_dlssnr SHARED
     src/plugin.cpp
     src/dlssnr_context.cpp
     src/dlssfg_context.cpp
     src/nvof_context.cpp
+    src/ffxof_context.cpp        # AMD FidelityFX OF 会话(of_backend=0,默认)
     src/iat_hook.cpp
     src/d3d12_context.cpp
     src/bridge.cpp
     src/plugin.rc             # 版本信息 (build/version.h 由 CMake configure 注入)
+    # --- FidelityFX Optical Flow(AMD 光流后端的 SDK 闭包;编译集 =
+    # Magpie Magpie.Core.vcxproj L256-280 同款 6 cpp)---
+    vendor/fidelityfx/api/internal/ffx_assert.cpp
+    vendor/fidelityfx/api/internal/ffx_message.cpp
+    vendor/fidelityfx/api/internal/ffx_object_management.cpp
+    vendor/fidelityfx/backend/dx12/ffx_backends_dx12.cpp
+    vendor/fidelityfx/backend/dx12/ffx_dx12.cpp
+    vendor/fidelityfx/framegeneration/fsr3/internal/ffx_opticalflow.cpp
+    vendor/fidelityfx/framegeneration/fsr3/internal/ffx_opticalflow_shaderblobs.cpp
 )
 
 target_include_directories(vs_dlssnr PRIVATE
@@ -36,7 +94,32 @@ target_include_directories(vs_dlssnr PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvof"
     "${DEP_DIR}/ngx/include"
     "${DEP_DIR}/vapoursynth/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/api/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/api/internal"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/backend/dx12"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/framegeneration/fsr3/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/framegeneration/fsr3/internal"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/include"
+    "${FFX_GEN_DIR}"
 )
+# SDK 源码的警告豁免与 min/max 宏隔离(Magpie 全局 NOMINMAX 同款;
+# ffx_dx12.cpp 的 std::max 与 windows.h 宏冲突)。
+set_source_files_properties(
+    vendor/fidelityfx/api/internal/ffx_assert.cpp
+    vendor/fidelityfx/api/internal/ffx_message.cpp
+    vendor/fidelityfx/api/internal/ffx_object_management.cpp
+    vendor/fidelityfx/backend/dx12/ffx_backends_dx12.cpp
+    vendor/fidelityfx/backend/dx12/ffx_dx12.cpp
+    vendor/fidelityfx/framegeneration/fsr3/internal/ffx_opticalflow.cpp
+    vendor/fidelityfx/framegeneration/fsr3/internal/ffx_opticalflow_shaderblobs.cpp
+    PROPERTIES COMPILE_OPTIONS "/DNOMINMAX")
+set_source_files_properties(
+    vendor/fidelityfx/framegeneration/fsr3/internal/ffx_opticalflow.cpp
+    APPEND PROPERTY COMPILE_OPTIONS "/wd4505")
+set_source_files_properties(
+    vendor/fidelityfx/framegeneration/fsr3/internal/ffx_opticalflow_shaderblobs.cpp
+    APPEND PROPERTY COMPILE_OPTIONS "/wd4201")
+add_dependencies(vs_dlssnr ffx_of_blobs)
 
 # Static NGX core (Init_with_ProjectID / AllocateParameters), Magpie-style layout
 target_link_libraries(vs_dlssnr PRIVATE

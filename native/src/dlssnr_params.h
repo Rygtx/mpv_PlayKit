@@ -1,6 +1,7 @@
 #pragma once
 // User-facing parameters, mapped 1:1 onto Magpie's DLSSNR_AI_Filter.hlsl surface
 // (see Magpie experimental src/Effects/DLSSNR/DLSSNR_AI_Filter.hlsl).
+#include <algorithm>
 
 // Documented parameter ranges — the single authority. Every std::clamp on
 // these params (vpy args, dlssnr_ui.ini values, panel payload, internal
@@ -18,6 +19,10 @@ inline constexpr float kResidualMultMin = 1.0f, kResidualMultMax = 2.0f;
 inline constexpr float kResidualFineMin = 0.0f, kResidualFineMax = 2.0f;
 // NVOF 光流质量(上游 motionVectorQuality,0-5;0 = 无光流,保持零 guidance)
 inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
+// FFX 光流质量(0-2;0 = 无光流,1 = 性能/OF extent 半分辨率,2 = 质量/
+// 全分辨率。上游 motionVectorQuality 的 1-2/3-5 在 FFX 内各只对应一种
+// 行为,收敛为独立三档 —— 不留冗余档位)
+inline constexpr int kFfxQualityMin = 0, kFfxQualityMax = 2;
 // 抗闪烁时域稳定器(上游 antiFlicker,v0.6.8 093efe21/55d4cc38;live 参数):
 //   0 = 无  1 = 静态累积(稳定区域检测 + 自适应 EMA,无光流)
 //   2 = 光流累积(重投影 + 输入验证 + 自适应 EMA,需光流质量 ≥ 1)
@@ -45,6 +50,16 @@ inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
 inline constexpr int kFgRouteMin = 0, kFgRouteMax = 3;
 inline constexpr int kFgRouteAuto = 0, kFgRouteProxySm86 = 1,
                      kFgRouteProxySm75 = 2, kFgRouteOfficial = 3;
+// 光流后端(0-1,创建时 —— 会话重建/seek 生效,面板热改 = 下一帧):
+//   0 = ffx(默认;AMD FidelityFX Optical Flow,FSR3 SDK 金字塔+块匹配;
+//       跨厂商通用,需 D3D12 SM6.2 + WaveOps + R16G16_SINT UAV;上游 Magpie
+//       在 RTX 5070 Ti 上同款实测有流,用户裁定 2026-09-21 免选默认)
+//   1 = nvof(NVIDIA NVOF 引擎,可选;非 NVIDIA 卡会话必败 → 零 guidance,
+//       不跨后端回落,对齐 fg_route 钉档先例:行为可预测)
+// (原 auto 厂商排序档与 halfres 兜底已移除,不兼容旧 INI —— 越界值经
+//  clamp 落 1 = nvof。)
+inline constexpr int kOfBackendMin = 0, kOfBackendMax = 1;
+inline constexpr int kOfBackendFfx = 0, kOfBackendNvof = 1;
 
 struct DlssnrParams {
     // NR 总开关(0/1,默认 1)—— 只关降噪,不影响补帧/光流:
@@ -84,10 +99,14 @@ struct DlssnrParams {
     float residualLightness = 1.0f;
     float shadowStructureMultiplier = 1.0f;
     float reflectionGlowMultiplier = 1.0f;
-    // NVOF 光流质量(0=无 → 静态零 guidance;1-5 → NVOF 会话档位,
-    // 上游 NvidiaOpticalFlowQuality)。切换只重建 NVOF 会话(PoolHold 内,
-    // 毫秒级),不动 NGX feature;非 NVIDIA/驱动缺 OF 时优雅回退零 guidance。
-    int motionVectorQuality = 0;
+    // 光流质量(0=无 → 静态零 guidance;两后端档位各自独立):
+    //   motionVectorQuality:NVOF,1-5 = 上游 NvidiaOpticalFlowQuality 五档
+    //   ffxQuality:FFX,1 = 性能(OF extent 半分辨率),2 = 质量(全分辨率)
+    // 面板"光流质量"下拉按当前后端读写对应字段(单控件双值)。切换只重建
+    // OF 会话(PoolHold 内,毫秒级),不动 NGX feature;会话建立失败优雅
+    // 回退零 guidance。
+    int motionVectorQuality = 0;  // NVOF 档位(0-5)
+    int ffxQuality = 0;           // FFX 档位(0=无,1=性能,2=质量)
     // NVOF 输入跟随降采样(0/1,live 参数):开启且 scaling 启用时,NVOF
     // 会话按内部尺寸建立,输入由 GPU compute 从本帧 upload 双线性降采样
     // 直写注册纹理(nvof CL 第一次提交,替代整块拷贝)—— 引擎成本
@@ -119,6 +138,9 @@ struct DlssnrParams {
     // DLSS 帧生成路由(0=自动 官方优先回落 proxy,1=SM86,2=SM75,3=仅官方
     // NGX;进程级,重启 mpv 生效):见 kFgRouteMin 注释。
     int fgRoute = 0;
+    // 光流后端(0=ffx 1=nvof,创建时,下一帧生效):见 kOfBackendMin 注释。
+    // 切换只影响下一次光流会话建立,不改 NGX feature。
+    int ofBackend = 0;
     // 差异调试视图(0/1,live 参数,**不持久化**):1 = 输出被替换为
     // |NR改动|×20 的灰度图 —— 白 = 改动大,一片灰 = 模型没动画面
     // (OptiScaler DLSSNR fork 的 DebugView=3 同语义,回应"看不出参数
@@ -137,4 +159,13 @@ inline bool CreateParamsChanged(const DlssnrParams &pending, const DlssnrParams 
     if (pending.scalingEnabled != cur.scalingEnabled) return true;
     return pending.scalingEnabled != 0 &&
            pending.inputResolutionPercent != cur.inputResolutionPercent;
+}
+
+// 光流档位解析:按 ofBackend 取对应字段(NVOF→motionVectorQuality 0-5,
+// FFX→ffxQuality 0-2)。单一下拉双字段的唯一裁决点 —— 冷初始化 4b、
+// Rebind、ProcessFrame 逐帧同步三处共用,语义漂移即编译错误。
+inline int ResolveOfQuality(const DlssnrParams &p) noexcept {
+    return std::clamp(p.ofBackend == kOfBackendFfx ? p.ffxQuality : p.motionVectorQuality,
+                      p.ofBackend == kOfBackendFfx ? kFfxQualityMin : kOfQualityMin,
+                      p.ofBackend == kOfBackendFfx ? kFfxQualityMax : kOfQualityMax);
 }

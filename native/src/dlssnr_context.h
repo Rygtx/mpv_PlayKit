@@ -9,7 +9,7 @@
 #include "dlssfg_context.h"
 #include "dlssnr_params.h"
 #include "iat_hook.h"
-#include "nvof_context.h"
+#include "of_backend.h" // 光流后端接口(NvofContext/FxofContext 在 cpp 内具化)
 #include "shared_params.h"
 #include <atomic>
 #include <cstdio>
@@ -61,11 +61,13 @@ public:
     bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
                          int newWidth = -1, int newHeight = -1, int newDepth = -1) noexcept;
 
-    // NVOF 会话重建(quality 变化)。只重建光流会话(PoolHold 内,
-    // 毫秒级),NGX feature 不动。quality == 0 时销毁会话回退零 guidance;
-    // 会话建立失败时优雅降级(记档位防逐帧重试风暴)。内部自取 PoolHold:
-    // 调用方必须尚未持有槽位,且不得已在 PoolHold 之中。
-    bool RebuildNvof(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept;
+    // 光流会话重建(quality / of_backend / 会话输入尺寸变化)。只重建光流
+    // 会话(PoolHold 内,毫秒级),NGX feature 不动。quality == 0 时停用会话
+    // 回退零 guidance;会话建立失败时优雅降级(记档位防逐帧重试风暴)。
+    // quality = 调用方按 ofBackend 预解析的档位(NVOF→motionVectorQuality,
+    // FFX→ffxQuality)。内部自取 PoolHold:调用方必须尚未持有槽位,且不得
+    // 已在 PoolHold 之中。
+    bool RebuildOf(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept;
     // 光流历史失效(seek = 新时间线)。热 Rebind 上调用;下一帧重新播种。
     void ResetNvofHistory() noexcept;
 
@@ -117,20 +119,21 @@ private:
     // 串,内部消毒)。发布即替换共享内存里的旧统计 body —— 帧已不再成功,
     // tick 停摆,不替换面板就会一直显示冻结的"NGX 延迟"。
     void PublishDeadState(const char *state, const char *detail) noexcept;
-    // NVOF 实际模式串(SK_OF_MODE):档位关闭 = "off",会话死亡 = "zero",
-    // 存活 = 能力组合 + 当前档位/网格("both+cost q2 grid4")——能力在同
-    // 一块 GPU 上不随档位变化,档位/网格才是切档可见的反馈。tick 与
-    // Initialize 的 stats 发布共用。
-    char _ofModeBuf[28] = "";
+    // 光流后端构造(of_backend 单一后端,默认 FFX;失败不跨后端回落 ——
+    // 对齐 fg_route 先例:行为可预测)。
+    // q > 0;err 带最后一个失败原因(冷初始化 4b 与 RebuildOf 共用)。
+    std::unique_ptr<IOpticalFlowBackend> CreateOfBackend(int q, int dstW, int dstH,
+                                                         char *err, size_t errLen) noexcept;
+    // OF 实际模式串(SK_OF_MODE):档位关闭 = "off",会话死亡 = "zero",
+    // 存活 = backend 能力段(NvofContext "both+cost q2 grid4" /
+    // FxofContext "fxof q3 qual 1920x1080")
+    // —— 能力在同一块 GPU 上不随档位变化,档位才是切档可见的反馈。
+    // tick 与 Initialize 的 stats 发布共用。
+    char _ofModeBuf[40] = "";
     const char *OfModeString() noexcept {
         if (_curOfQuality <= 0) return "off";
-        if (!_nvof || !_nvof->Enabled()) return "zero";
-        std::snprintf(_ofModeBuf, sizeof(_ofModeBuf), "%s q%d grid%u",
-                      _nvof->Bidirectional()
-                          ? (_nvof->CostEnabled() ? "both+cost" : "both")
-                          : (_nvof->CostEnabled() ? "forward+cost" : "forward"),
-                      _curOfQuality, _nvof->GridSize());
-        return _ofModeBuf;
+        if (!_ofBackend || !_ofBackend->Enabled()) return "zero";
+        return _ofBackend->ModeString(_ofModeBuf, sizeof(_ofModeBuf));
     }
 
     D3D12Context *_d3d12 = nullptr;
@@ -172,16 +175,20 @@ private:
     int _curPreset = -1;
     int _curRes = -1;
     bool _curScaling = false;
-    // NVOF 光流会话(PORTING #6)。_curOfQuality = 当前生效档位(0 = 零
-    // guidance);_nvofFailed = 会话建立失败或连续失败停用(回退零 guidance,
-    // Rebind/换档时重试)。_nvofMutex 串行化 RebuildNvof:fmParallel 下多个
-    // 帧线程会同时看到同一档位变化,不加锁会并发重建互相踩踏。
-    std::unique_ptr<NvofContext> _nvof;
-    // 退役会话:实测 nvOFDestroy + 资源释放后继续 GPU 工作会触发驱动内部
-    // 访问违例(nvwgf2umx,2026-09-07),换档/换尺寸的旧会话转入此名单
-    // 存活到进程退出(热上下文哲学;每会话约 2×W×H×4B 显存)。
-    std::vector<std::unique_ptr<NvofContext>> _retiredNvof;
+    // 光流会话(of_backend 选择后端:kOfBackendNvof/Ffx)。
+    // _curOfQuality = 当前生效档位(0 = 零 guidance;语义随后端 —— NVOF
+    // 1-5 / FFX 1=性能 2=质量,取自已激活后端对应字段);_nvofFailed =
+    // 会话建立失败或连续失败停用(回退零 guidance,Rebind/换档时重试)。
+    // _nvofMutex 串行化 RebuildOf:fmParallel 下多个帧线程会同时看到同一
+    // 档位变化,不加锁会并发重建互相踩踏。
+    std::unique_ptr<IOpticalFlowBackend> _ofBackend;
+    // 退役会话:销毁不安全(NVOF 引擎 destroy 实测崩溃;FFX 首期同策略,
+    // spike 验证 ffxOpticalflowContextDestroy 后再放开)的旧会话转入此名单
+    // 存活到进程退出(热上下文哲学;每会话约 2×W×H×4B 显存,FFX 另含内部
+    // 金字塔资源)。
+    std::vector<std::unique_ptr<IOpticalFlowBackend>> _retiredOf;
     int _curOfQuality = 0;
+    int _curOfBackend = 0; // 当前会话按 of_backend 参数构造时的请求值
     bool _nvofFailed = false;
     std::mutex _nvofMutex;
     // DLSS FG(挂 NR 之后):创建时 fgEnabled → 建 proxy 会话 + FG 槽资源

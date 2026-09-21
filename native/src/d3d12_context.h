@@ -155,6 +155,8 @@ struct FrameSlot {
     //   outputColor 占位视图)
     // 45=srvTempLow0 46=srvTempLow1 47=uavTempLow0 48=uavTempLow1
     //   (mode4 半分辨率残差/引导;关闭时 inputColor 占位视图)
+    // 49=uavFfxInput(FFX 会话输入,R8G8B8A8 OF extent;BindOfResources 填充)
+    // 50=srvFfxSparse(FFX 稀疏流 R16G16_SINT,densify 读)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 };
 
@@ -191,6 +193,10 @@ public:
                               char *err, size_t errLen) noexcept;
     bool FgSlots() const noexcept { return _fgSlots; }
 
+    // 诊断探针:把 InfoQueue 已存消息格式化进 buf(debug layer 开启时)。
+    // 非 SetErr 失败点(如命令列表 Close 失败)定位用。
+    void DebugDumpInfoQueue(char *buf, size_t len) const noexcept;
+
     // diagnostics: dump a texture's raw rows to a file (VSDLSSNR_DUMP);
     // format must match the resource (CopyTextureRegion has no cross-family
     // conversion). Uses the control path; caller holds CtlMutex.
@@ -205,6 +211,8 @@ public:
     // Drop the residual pipeline entirely (scaling disabled).
     void ClearScalingResources() noexcept;
     bool HasScaling() const noexcept { return _scalingReady; }
+    // 适配器 PCI VendorId(0x10DE=NVIDIA,0x1002=AMD;nvof 厂商门用)。
+    UINT VendorId() const noexcept { return _vendorId; }
     int InternalWidth() const noexcept { return _internalWidth; }
     int InternalHeight() const noexcept { return _internalHeight; }
 
@@ -259,6 +267,28 @@ public:
     // COMMON→UAV→COMMON 屏障。
     void RecordNvofDownsample(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                               int dstW, int dstH, int inputIndex) noexcept;
+
+    // ---- AMD 光流后端(FFX;PSO 全部在本类,context 只做编排)----
+    // 会话纹理视图写入每槽堆:FFX(uavFfxInput 49 / srvFfxSparse 50)。资源
+    // 为 null 的槽位不动(绝不写 NULL 描述符)。会话建立时调用(PoolHold 内)。
+    bool BindOfResources(ID3D12Resource *ffxInput, ID3D12Resource *ffxSparse) noexcept;
+    // FFX Prepare:inputColor(槽 0 SRV,BGRA8)box 平均下采样写 ffxInput
+    // (49,R8G8B8A8 OF extent;typed SRV 返回逻辑 RGBA,直写无需换序)。
+    // 录在 FFX 会话 copy CL(postCopy 之后、门内);调用方负责 ffxInput 的
+    // UAV 态屏障。
+    void RecordFfxPrepare(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                          uint32_t srcW, uint32_t srcH,
+                          uint32_t dstW, uint32_t dstH) noexcept;
+    // FFX densify:稀疏流(50,R16G16_SINT,sparseExtent,单位 = OF extent
+    // 像素)双线性上采样到 denseW×denseH,Magpie DENSIFY_HLSL 原样;向量
+    // 换算 scale = denseExtent/OF extent(源尺寸管线 = 源/OF,follow 内部
+    // 管线 = 会话/OF)。录在 FFX 会话 densify CL(postExecute 回调)。
+    void RecordFfxDensify(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                          uint32_t denseW, uint32_t denseH,
+                          uint32_t ofW, uint32_t ofH,
+                          uint32_t sparseW, uint32_t sparseH,
+                          float scaleX, float scaleY,
+                          UINT uavMotion, UINT uavConfidence) noexcept;
 
     // RAII: drain the pool (wait until every slot is released) and hold the
     // pool mutex, so AcquireSlot cannot hand out a slot while the holder
@@ -426,6 +456,7 @@ private:
 
     ComPtr<ID3D12Device> _device;
     ComPtr<IDXGIAdapter1> _adapter; // the adapter the device was created on
+    UINT _vendorId = 0;             // 该适配器的 PCI VendorId(0x10DE=NVIDIA,0x1002=AMD;nvof 厂商门用)
     ComPtr<ID3D12InfoQueue> _infoQueue;
     bool _debug = false;
     ComPtr<ID3D12CommandQueue> _queue;
@@ -502,6 +533,13 @@ private:
     ComPtr<ID3D12RootSignature> _rsConvertOut;
     ComPtr<ID3D12PipelineState> _psoConvertOutLuma;
     ComPtr<ID3D12PipelineState> _psoConvertOutChroma;
+
+    // AMD 光流后端 PSO(FFX Prepare/Densify;录制在各自会话 CL 上,
+    // d3d12_context.cpp 内嵌 HLSL 同款编译)。
+    ComPtr<ID3D12RootSignature> _rsFfxPrepare;
+    ComPtr<ID3D12PipelineState> _psoFfxPrepare;
+    ComPtr<ID3D12RootSignature> _rsFfxDensify;
+    ComPtr<ID3D12PipelineState> _psoFfxDensify;
 
     // frame slot pool
     static constexpr int kSlotCount = 3;
