@@ -852,6 +852,11 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         // CreateFrameResources 槽池循环前创建;每槽堆各持一份指向同一
         // 资源的视图,dispatch 只被本槽 CL 引用)。
         _device->CreateUnorderedAccessView(_debugDiff.Get(), nullptr, nullptr, slotHandle(34));
+        // 35:静态零运动纹理的 SRV(资源 = context 级 _motion,槽池循环前
+        // 创建,常驻 NSR)—— 光流场调试视图在无真运动帧(播种/OF 关)绑定
+        // 它:slot.motion 的内容在首 densify 前未定义,直接绑会显示假流;
+        // 零纹理保证"黑 = 无光流数据"的语义成立。
+        _device->CreateShaderResourceView(_motion.Get(), nullptr, slotHandle(35));
     }
     return true;
 }
@@ -1745,6 +1750,44 @@ void DebugDiffMain(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// 光流场调试视图(面板"调试视图 = 光流场"):稠密运动场可视化 —— 方向→
+// 色相(标准 HSV 环,红=右/绿=上/蓝=左/青=下),幅值→亮度,静止与无
+// 光流 = 黑。回应"光流到底有没有在流/方向对不对":一片黑 = 无运动数据
+// (OF 关/播种帧),彩色纹理 = 真运动场,颜色一致性 = 方向场正确性。
+// 输入为 densify 产物(motion 或 follow 内部管线的 reducedMotion,单位 =
+// 源像素 current-to-previous),R16G16_FLOAT 的 Texture2D<float2> SRV。
+constexpr char FLOW_VIEW_HLSL[] = R"(
+Texture2D<float2> FlowField : register(t0);
+RWTexture2D<float4> FlowView : register(u0);
+
+cbuffer FlowViewParams : register(b0) {
+    uint2 Extent;    // 运动场尺寸(follow 内部管线 = 内部尺寸,否则源尺寸)
+    uint2 OutExtent; // 输出尺寸(恒源尺寸;dispatch 边界)
+    float Scale;     // 幅值→亮度(0.125 = 8px/帧满亮)
+    uint Pad0;
+};
+
+[numthreads(8, 8, 1)]
+void FlowViewMain(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= OutExtent)) return;
+    // 最近邻取运动场 texel(方向不跨 texel 混合,单元值保真;follow 半
+    // 分辨率下呈块状属预期。dispatch 恒按输出尺寸,follow 内部场放大铺满,
+    // _debugDiff 无陈旧边缘)
+    const int2 p = min(int2((tid.xy * Extent) / OutExtent), int2(Extent) - 1);
+    const float2 v = FlowField[p];
+    const float mag = length(v);
+    if (mag < 0.05) {
+        // 死区:亚 0.05px 的噪声不渲染,黑 = 静止,保证"有没有流"一眼可判
+        FlowView[tid.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    const float hue = frac(atan2(v.y, v.x) * 0.15915494 + 1.0); // /2π
+    const float3 rgb =
+        saturate(abs(fmod(hue * 6.0 + float3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0);
+    FlowView[tid.xy] = float4(rgb * saturate(mag * Scale), 1.0);
+}
+)";
+
 // YUV→RGB(YUV 原生化):采样 Y/U/V 平面(色度双线性上采),按位深恢复
 // 整数采样字、按范围展开,矩阵求逆得 RGB,UAV 直写 inputColor。深度/矩阵/
 // 范围全在 root constants(C0/C1,由 YuvCoeffsFor 按 _bitDepth 推导)——
@@ -2354,6 +2397,63 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             return false;
         }
     }
+    // 光流场调试视图:b0 4 常量 + t0 一张 SRV 表(运动场,槽 10/18 按取材
+    // 二选一)+ u0 一张 UAV 表(共享 _debugDiff 中转)。
+    {
+        D3D12_DESCRIPTOR_RANGE srvRange{};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_DESCRIPTOR_RANGE uavRange{};
+        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        uavRange.NumDescriptors = 1;
+        uavRange.BaseShaderRegister = 0;
+        uavRange.OffsetInDescriptorsFromTableStart = 0;
+        D3D12_ROOT_PARAMETER params[3]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[0].Constants.ShaderRegister = 0;
+        params[0].Constants.Num32BitValues = 6; // extent(2)+outExtent(2)+scale(1)+pad(1)
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 1;
+        params[1].DescriptorTable.pDescriptorRanges = &srvRange;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[2].DescriptorTable.NumDescriptorRanges = 1;
+        params[2].DescriptorTable.pDescriptorRanges = &uavRange;
+        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+        rsDesc.NumParameters = 3;
+        rsDesc.pParameters = params;
+        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        ComPtr<ID3DBlob> rsBlob, rsErr;
+        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(flow view) failed");
+            return false;
+        }
+        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
+                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsFlowView.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateRootSignature(flow view) failed");
+            return false;
+        }
+        ComPtr<ID3DBlob> code, csErr;
+        if (FAILED(D3DCompile(FLOW_VIEW_HLSL, strlen(FLOW_VIEW_HLSL),
+                              nullptr, nullptr, nullptr, "FlowViewMain", "cs_5_0",
+                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(flow view) failed");
+            return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
+        psoDesc.pRootSignature = _rsFlowView.Get();
+        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
+        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoFlowView.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(flow view) failed");
+            return false;
+        }
+    }
     // YUV↔RGB 转换(YUV 原生化):convertIn = t0/t1/t2 三张 SRV 表(Y/U/V)
     // + u0 一张 UAV 表(inputColor)+ b0 10 常量;convertOut = t0 一张 SRV 表
     // (outputColor)+ u0/u1 两张 UAV 表(Y/U,V)+ b0 12 常量。深度/矩阵/
@@ -2836,6 +2936,61 @@ void D3D12Context::RecordDebugDiff(FrameSlot &slot) noexcept {
         Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST),
     };
     cl->ResourceBarrier(3, mid);
+    cl->CopyResource(slot.outputColor.Get(), _debugDiff.Get());
+    D3D12_RESOURCE_BARRIER post[2]{
+        Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    };
+    cl->ResourceBarrier(2, post);
+}
+
+void D3D12Context::RecordFlowView(FrameSlot &slot, bool useReduced, bool realMotion) noexcept {
+    // 光流场调试视图(契约见头文件)。dispatch 恒按源尺寸(OutExtent),
+    // 运动场 texel 在 shader 内最近邻映射 —— follow 内部场(半尺寸)也铺
+    // 满输出,_debugDiff 无陈旧边缘。dispatch 写共享 _debugDiff → COPY_
+    // SOURCE → 拷回 outputColor(与 RecordDebugDiff 同一条槽 CL 上原子成对;
+    // 本视图不读 outputColor,免去 UAV→NSR 往返,直接 UAV→COPY_DEST→UAV)。
+    ID3D12GraphicsCommandList *cl = slot.commandList.Get();
+    // t0 取材:真运动帧按管线取 slot 场(已 NSR);无真运动帧绑静态零
+    // 纹理(槽 35,常驻 NSR)—— 不碰 slot.motion(首 densify 前内容未定义)。
+    const UINT srvIndex = !realMotion ? 35u : (useReduced ? 18u : 10u);
+    cl->SetComputeRootSignature(_rsFlowView.Get());
+    cl->SetPipelineState(_psoFlowView.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+
+    // cbuffer 布局(与 FLOW_VIEW_HLSL 同步,三处同步铁律):
+    // extent@0 outExtent@2 scale@4 pad@5。
+    const UINT extent[2]{ realMotion && useReduced ? static_cast<UINT>(_internalWidth) : static_cast<UINT>(_width),
+                          realMotion && useReduced ? static_cast<UINT>(_internalHeight) : static_cast<UINT>(_height) };
+    const UINT outExtent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+    const float scale = 0.125f; // 8px/帧满亮
+    const UINT pad = 0u;
+    cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+    cl->SetComputeRoot32BitConstants(0, 2, outExtent, 2);
+    cl->SetComputeRoot32BitConstants(0, 1, &scale, 4);
+    cl->SetComputeRoot32BitConstants(0, 1, &pad, 5);
+
+    // 入态:debugDiff→UAV / output→COPY_DEST(运动场三路取材全部 NSR 常
+    // 驻或由 evaluate 消费链保持,无需屏障)。
+    D3D12_RESOURCE_BARRIER pre[2]{
+        Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST),
+    };
+    cl->ResourceBarrier(2, pre);
+    cl->SetComputeRootDescriptorTable(1, gpu(srvIndex));        // t0 运动场/零纹理
+    cl->SetComputeRootDescriptorTable(2, gpu(kUavDebugDiff));   // u0 debugDiff
+    cl->Dispatch((static_cast<UINT>(_width) + 7) / 8,
+                 (static_cast<UINT>(_height) + 7) / 8, 1);
+    // 出态:debugDiff → COPY_SOURCE 接拷贝 → 归位;真运动帧的 slot 场
+    // NSR 入、NSR 出,归位仍归 recordGuidancePark(本函数不动其状态)。
+    D3D12_RESOURCE_BARRIER mid[1]{
+        Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+    };
+    cl->ResourceBarrier(1, mid);
     cl->CopyResource(slot.outputColor.Get(), _debugDiff.Get());
     D3D12_RESOURCE_BARRIER post[2]{
         Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),

@@ -70,7 +70,8 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
   - Parameter changes take effect in real time; **"Save settings"** writes to `vs-plugins\dlssnr_ui.ini` and applies automatically on next filter load; **"Reset defaults"** restores factory parameters
   - **ini takes precedence over vpy parameters**; delete `dlssnr_ui.ini` to restore script defaults
   - Optical-flow quality dropdown (0–5) and the "optical flow follows scaling" switch are live-adjustable; when optical flow is unavailable the panel shows "degraded to zero guidance"
-  - Processing-time timeline chart (gpu / optical flow / inference segments); the "write performance log" switch controls `dlssnr_timing.log`
+  - **Diagnostics tab**: the single home for monitoring — the tuning tabs stay clean. Session facts (requested vs actual: optical flow degraded to zero guidance, effective FG route off / official NGX / proxy SM86 / proxy SM75 / duplicate-frames with the failure reason, panel multiplier above the session cap — all highlighted in red; **which backend "auto" actually picked is shown here, no log digging**) plus queueing details (slot-pool wait / NGX serialize wait / optical-flow gate skip·expired·reset counters) plus the **"debug view" dropdown** (diff ×20 grayscale: white = big change, flat gray = untouched; optical flow = direction → hue, brightness = speed, black = no motion data) and the **"write performance log" switch** (controls `dlssnr_timing.log`). No red on the page = the plugin is working
+  - Processing-time timeline chart (gpu / optical flow / inference segments)
   - The panel exits automatically when the filter is turned off / mpv exits
 
 ## Parameters (DLSSNR_NV.vpy)

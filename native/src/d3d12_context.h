@@ -139,6 +139,8 @@ struct FrameSlot {
     // 占位视图 —— 绝不写 NULL 描述符,见 14-17 注释)
     // 34=uavDebugDiff(共享差异调试纹理的 UAV,"差异调试 ×20" 视图写入目标;
     // 资源为 context 级单例,每槽堆各持一份视图)
+    // 35=srvZeroMotion(静态零运动纹理的 SRV,光流场视图无真运动帧绑定;
+    // 资源为 context 级单例 _motion,常驻 NSR)
     // 49=uavFfxInput(FFX 会话输入,R8G8B8A8 OF extent;BindOfResources 填充)
     // 50=srvFfxSparse(FFX 稀疏流 R16G16_SINT,densify 读)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
@@ -341,6 +343,20 @@ public:
     // _debugDiff 为 context 级共享单纹理:dispatch+copyback 在同一条槽 CL
     // 上原子成对,队列按提交序串行,并发帧的记录对不交错。
     void RecordDebugDiff(FrameSlot &slot) noexcept;
+    // 光流场调试视图(面板"调试视图=光流场"):稠密运动场(R16G16_FLOAT,
+    // 像素单位)方向→色相(HSV 环:红=右、绿=上、蓝=左…),幅值→亮度,
+    // 静止/无光流 = 黑。复用 _debugDiff 中转拷回 outputColor(契约同
+    // RecordDebugDiff,但 outputColor 无需 NSR 化 —— 本视图不读它)。
+    //   realMotion: true = 读真运动场 —— useReduced 决定源尺寸 slot.motion
+    //               (NSR,槽 10)或 follow 内部场 slot.reducedMotion(NSR,
+    //               槽 18;调用点保证 HasScaling)。状态由 evaluate 消费链
+    //               保持,归位仍归 recordGuidancePark(本函数不动)。
+    //               false = 绑静态零纹理(槽 35,常驻 NSR):slot.motion
+    //               在首 densify 前内容未定义,绑它会把陈旧数据当真流显示
+    //               —— 零纹理保证"黑 = 无光流数据"的语义成立,无需屏障。
+    //   dispatch 恒按源尺寸,运动场 texel 在 shader 内最近邻映射(follow
+    //   半尺寸场放大铺满,_debugDiff 无陈旧边缘)。
+    void RecordFlowView(FrameSlot &slot, bool useReduced, bool realMotion) noexcept;
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
@@ -461,6 +477,10 @@ private:
     // (extent 2 + 放大系数 1 + pad 1)。
     ComPtr<ID3D12RootSignature> _rsDebugDiff;
     ComPtr<ID3D12PipelineState> _psoDebugDiff;
+    // 光流场调试视图:1 SRV(motion 或 reducedMotion)+ 1 UAV(debugDiff)
+    // + 4 常量(extent 2 + 幅值→亮度比例 1 + pad 1)。
+    ComPtr<ID3D12RootSignature> _rsFlowView;
+    ComPtr<ID3D12PipelineState> _psoFlowView;
     // 差异调试中间纹理(W×H BGRA8,UAV):dispatch 写差值 → 同 CL 拷回
     // outputColor(RGBA8 无 UAV load,读写同纹理非法,必须中转)。
     ComPtr<ID3D12Resource> _debugDiff;

@@ -99,6 +99,14 @@ struct AppState {
                              // "fxof q5 qual 1920x1080" = 23+1;与插件 _ofModeBuf 同尺寸)
     char fgState[16]{};      // SK_FG: on / dup / off / unavailable
     int fgMult = 0;          // SK_FG_MULT: 当前插帧倍数(未激活 = 0)
+    char fgRouteEff[16]{};   // SK_FG_ROUTE_EFFECTIVE: off/official/proxy-sm86/proxy-sm75/copy
+    int fgMultCreate = 0;    // SK_FG_MULT_CREATE: 会话创建倍数(FG 未激活 = 0)
+    char fgDetail[128]{};    // SK_FG_DETAIL: FG 最近一次初始化失败原因(成功 = 空)
+    float slotWait = 0.0f;   // SK_SLOT_WAIT: 槽池等待 last(诊断页)
+    float lockWait = 0.0f;   // SK_LOCK_WAIT: evaluate 互斥等待 last(诊断页)
+    int gateSkips = 0;       // SK_GATE_SKIPS: 光流帧序门跳帧累计(诊断页)
+    int gateExpired = 0;     // SK_GATE_EXPIRED: 过期帧累计(诊断页)
+    int gateResets = 0;      // SK_GATE_RESETS: 历史重置累计(诊断页)
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
     float segFg = 0.0f;
@@ -311,7 +319,8 @@ void LoadIni() noexcept {
     // (independent of the saved profile)
     g_app.timingLog = GetPrivateProfileIntW(L"panel", L"log", 1, path) != 0;
     g_app.advancedOpen = GetPrivateProfileIntW(L"panel", L"advanced", 0, path) != 0;
-    g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 1u));
+    // 页签:0=降噪增强 1=帧生成 2=诊断
+    g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 2u));
     LoadDlssnrIni(g_app.params, path);
 }
 
@@ -350,13 +359,20 @@ void LoadStats() noexcept {
     if (!m) {
         g_app.statsDirty = g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0 ||
                            g_app.filterState[0] != 0 || g_app.stateDetail[0] != 0 ||
-                           g_app.ofMode[0] != 0 || g_app.fgState[0] != 0;
+                           g_app.ofMode[0] != 0 || g_app.fgState[0] != 0 ||
+                           g_app.fgRouteEff[0] != 0 || g_app.fgDetail[0] != 0;
         g_app.statsBig[0] = 0;
         g_app.statsRes[0] = 0;
         g_app.filterState[0] = 0;
         g_app.stateDetail[0] = 0;
         g_app.ofMode[0] = 0;
         g_app.fgState[0] = 0;
+        g_app.fgRouteEff[0] = 0;
+        g_app.fgDetail[0] = 0;
+        g_app.fgMult = 0;
+        g_app.fgMultCreate = 0;
+        g_app.slotWait = g_app.lockWait = 0.0f;
+        g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
         return;
     }
     // Seq-gated snapshot (protocol mirrors PublishStatsJson): a copy whose
@@ -387,6 +403,18 @@ void LoadStats() noexcept {
     if (!JsonGetString(body, SK_FG, g_app.fgState, sizeof(g_app.fgState)))
         g_app.fgState[0] = 0;
     g_app.fgMult = JsonGetInt(body, SK_FG_MULT, 0);
+    // FG 实际路由/创建倍数/失败原因 + 排队细分(缺键即清:死亡 body 不带
+    // 这些键,残留旧值会让状态行说谎 —— 与 filter_state 同款规则)。
+    if (!JsonGetString(body, SK_FG_ROUTE_EFFECTIVE, g_app.fgRouteEff, sizeof(g_app.fgRouteEff)))
+        g_app.fgRouteEff[0] = 0;
+    g_app.fgMultCreate = JsonGetInt(body, SK_FG_MULT_CREATE, 0);
+    if (!JsonGetString(body, SK_FG_DETAIL, g_app.fgDetail, sizeof(g_app.fgDetail)))
+        g_app.fgDetail[0] = 0;
+    g_app.slotWait = static_cast<float>(JsonGetFloat(body, SK_SLOT_WAIT, 0));
+    g_app.lockWait = static_cast<float>(JsonGetFloat(body, SK_LOCK_WAIT, 0));
+    g_app.gateSkips = JsonGetInt(body, SK_GATE_SKIPS, 0);
+    g_app.gateExpired = JsonGetInt(body, SK_GATE_EXPIRED, 0);
+    g_app.gateResets = JsonGetInt(body, SK_GATE_RESETS, 0);
     if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
         // The hang payload has no gpu_last, so the gate below would keep
         // showing frozen pre-hang stats forever; surface it — with the
@@ -401,6 +429,12 @@ void LoadStats() noexcept {
         g_app.stateDetail[0] = 0;
         g_app.ofMode[0] = 0;
         g_app.fgState[0] = 0;
+        g_app.fgRouteEff[0] = 0;
+        g_app.fgDetail[0] = 0;
+        g_app.fgMult = 0;
+        g_app.fgMultCreate = 0;
+        g_app.slotWait = g_app.lockWait = 0.0f;
+        g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
     } else {
         const double gpuLast = JsonGetFloat(body, SK_GPU_LAST, -1);
         if (gpuLast >= 0) {
@@ -449,6 +483,12 @@ void LoadStats() noexcept {
             g_app.segFg = 0.0f;
             g_app.hasSegments = false;
             g_app.fps = 0.0;
+            g_app.fgRouteEff[0] = 0;
+            g_app.fgDetail[0] = 0;
+            g_app.fgMult = 0;
+            g_app.fgMultCreate = 0;
+            g_app.slotWait = g_app.lockWait = 0.0f;
+            g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
         }
     }
     g_app.statsDirty = memcmp(before.statsBig, g_app.statsBig, sizeof(g_app.statsBig)) != 0 ||
@@ -458,6 +498,13 @@ void LoadStats() noexcept {
                        memcmp(before.stateDetail, g_app.stateDetail, sizeof(g_app.stateDetail)) != 0 ||
                        memcmp(before.ofMode, g_app.ofMode, sizeof(g_app.ofMode)) != 0 ||
                        memcmp(before.fgState, g_app.fgState, sizeof(g_app.fgState)) != 0 ||
+                       memcmp(before.fgRouteEff, g_app.fgRouteEff, sizeof(g_app.fgRouteEff)) != 0 ||
+                       memcmp(before.fgDetail, g_app.fgDetail, sizeof(g_app.fgDetail)) != 0 ||
+                       before.fgMult != g_app.fgMult || before.fgMultCreate != g_app.fgMultCreate ||
+                       before.slotWait != g_app.slotWait || before.lockWait != g_app.lockWait ||
+                       before.gateSkips != g_app.gateSkips ||
+                       before.gateExpired != g_app.gateExpired ||
+                       before.gateResets != g_app.gateResets ||
                        before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
                        before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
                        before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack ||
@@ -476,6 +523,21 @@ void ShowTip(const char *u8tip) noexcept {
     ImGui::PopTextWrapPos();
     ImGui::EndTooltip();
 }
+
+// SK_FG_ROUTE_EFFECTIVE → 中文标签(状态带与诊断页共用;off/空/未知 = 不显示)
+const char *FgRouteLabel(const char *v) noexcept {
+    if (!v || !v[0]) return "";
+    if (std::strcmp(v, "official") == 0) return "官方 NGX";
+    if (std::strcmp(v, "proxy-sm86") == 0) return "代理 SM86";
+    if (std::strcmp(v, "proxy-sm75") == 0) return "代理 SM75";
+    if (std::strcmp(v, "copy") == 0) return "未生效(复制帧)";
+    return "";
+}
+
+// 不一致红色(请求了但没在跑):状态带 / 帧生成页 / 诊断页共用。
+inline const ImVec4 kErrRed(1.0f, 0.42f, 0.42f, 1.0f);
+// 常规信息灰(状态带 FG 行/诊断页取值列)
+inline const ImVec4 kDimTxt(0.62f, 0.64f, 0.70f, 1.0f);
 
 void DrawUi() noexcept {
     ImGuiIO &io = ImGui::GetIO();
@@ -550,7 +612,8 @@ void DrawUi() noexcept {
         ImGui::TextDisabled("%s", g_app.statsRes);
     }
     // 滤镜状态行(SK_FILTER_STATE):这是降级/故障在面板上的唯一可见信号
-    // (GUI mpv 看不到日志,timing log 没人看)。空 = 正常。
+    // (GUI mpv 看不到日志,timing log 没人看)。空 = 正常。主面板保持
+    // 纯净调参体验:请求 vs 实际的分级红显集中在"诊断"页。
     {
         const ImVec4 warnCol(1.0f, 0.62f, 0.20f, 1.0f);
         const ImVec4 errCol(1.0f, 0.45f, 0.45f, 1.0f);
@@ -650,10 +713,11 @@ void DrawUi() noexcept {
     // 页签选择记忆落 ini([panel] page),与 advancedOpen 同款。
     auto savePagePref = [&](int p) {
         g_app.page = p;
-        wchar_t base[MAX_PATH], path[MAX_PATH];
+        wchar_t base[MAX_PATH], path[MAX_PATH], val[8];
         if (BasePath(base, MAX_PATH)) {
             swprintf_s(path, MAX_PATH, L"%s\\%s", base, INI_FILE);
-            WritePrivateProfileStringW(L"panel", L"page", p == 0 ? L"0" : L"1", path);
+            swprintf_s(val, 8, L"%d", p);
+            WritePrivateProfileStringW(L"panel", L"page", val, path);
         }
     };
 
@@ -862,7 +926,7 @@ void DrawUi() noexcept {
     y = ImGui::GetItemRectMax().y - wpos.y + 8 * s;
     if (advanced) drawSliderRows(kFineSliders);
 
-    // (自动蒙版 | 差异调试 ×20):NR 侧复选框一行
+    // 自动蒙版(整行;调试视图下拉已迁往"诊断"页 —— 调参页只留调参控件)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     {
         bool autoMask = g_app.params.useAutoMask != 0;
@@ -871,15 +935,6 @@ void DrawUi() noexcept {
             g_app.liveDirty = true;
         }
         if (ImGui::IsItemHovered()) ShowTip("自动蒙版。模型自动识别区域并区别处理。");
-        ImGui::SameLine(0, 24 * s);
-        bool dbgView = g_app.params.debugView != 0;
-        if (ImGui::Checkbox("差异调试 ×20", &dbgView)) {
-            g_app.params.debugView = dbgView ? 1 : 0;
-            g_app.liveDirty = true;
-        }
-        if (ImGui::IsItemHovered())
-            ShowTip("输出替换为 |NR改动|×20 的灰度图:白 = 改动大,一片灰 = 模型没动画面。\n"
-                    "用于确认模型/参数是否真的在起作用;仅当前会话有效,不写入保存设置。");
     }
     y += rowH;
 
@@ -930,7 +985,7 @@ void DrawUi() noexcept {
     if (ImGui::IsItemHovered())
         ShowTip("帧生成后端:自动 = 官方优先(RTX 40/50),回落代理(30 系)。\n"
                 "SM86/SM75 = 固定走代理;官方 NGX = 固定官方档(拒载不回落)。\n"
-                "进程级,重启 mpv 生效。");
+                "进程级,重启 mpv 生效。实际生效档在\"诊断\"页显示。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         const int items = 4;
@@ -952,6 +1007,163 @@ void DrawUi() noexcept {
 
             ImGui::EndTabItem();
         }
+
+        // --- 页:诊断(运行时事实 + 排队细分)。timing log 里才有的次级
+        // 数据搬到这里;"请求 vs 实际"不一致的行一律红 —— 全页无红 = 插件
+        // 正常工作。数据与 dlssnr_timing.log 的 perf/STATUS 行同源。---
+        if (ImGui::BeginTabItem("诊断", nullptr,
+                                (g_app.pageRestore && g_app.page == 2)
+                                    ? ImGuiTabItemFlags_SetSelected
+                                    : ImGuiTabItemFlags_None)) {
+            if (g_app.page != 2) savePagePref(2);
+            y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+
+            // ---- 调试与日志(从降噪增强页/全局行迁入:监控与诊断类控件
+            // 集中在本页,调参页只留调参控件)----
+            ImGui::TextUnformatted("—— 调试与日志 ——");
+            {
+                ImGui::TextUnformatted("调试视图");
+                if (ImGui::IsItemHovered())
+                    ShowTip("输出替换为调试图,仅当前会话有效,不写入保存设置:\n"
+                            "差异 ×20 = |NR改动|×20 灰度:白 = 改动大,一片灰 = 模型没动画面。\n"
+                            "光流场 = 运动可视化:方向→色相(红=右/绿=上/蓝=左),亮度=速度,\n"
+                            "一片黑 = 无运动数据(光流关/播种帧)。确认光流是否真的在流。");
+                ImGui::SameLine(0, 8 * s);
+                // 三态:关 / 差异 ×20 / 光流场(live,不持久化)
+                {
+                    const int items = 3;
+                    const char *labels[items] = { "关", "差异 ×20", "光流场" };
+                    int sel = std::clamp(g_app.params.debugView, 0, kDebugViewMax);
+                    ImGui::SetNextItemWidth(110 * s);
+                    if (ImGui::Combo("##debug_view", &sel, labels, items)) {
+                        g_app.params.debugView = sel;
+                        g_app.liveDirty = true;
+                    }
+                }
+                ImGui::SameLine(0, 24 * s);
+                bool logOn = g_app.timingLog;
+                if (ImGui::Checkbox("写入性能日志", &logOn)) {
+                    g_app.timingLog = logOn;
+                    wchar_t iniPath[MAX_PATH];
+                    if (BasePath(iniPath, MAX_PATH)) {
+                        wchar_t iniFile[MAX_PATH];
+                        swprintf_s(iniFile, L"%s\\%s", iniPath, INI_FILE);
+                        WritePrivateProfileStringW(L"panel", L"log", logOn ? L"1" : L"0", iniFile);
+                    }
+                    WritePayload(); // logEnabled included
+                    g_app.liveDirty = false;
+                }
+                if (ImGui::IsItemHovered())
+                    ShowTip("每秒追加一行性能统计到 mpv 同目录 dlssnr_timing.log;排查性能问题时附上该文件。");
+            }
+
+            ImGui::Spacing();
+            // ---- 会话事实:请求 vs 实际(不一致 = 红)----
+            ImGui::TextUnformatted("—— 会话 ——");
+            {
+                char stDesc[96] = "未加载滤镜";
+                bool stRed = false;
+                if (g_app.gpuName[0]) {
+                    if (std::strcmp(g_app.filterState, "passthrough") == 0) {
+                        const bool deliberate =
+                            std::strncmp(g_app.stateDetail, "NR off", 6) == 0 ||
+                            std::strncmp(g_app.stateDetail, "NR+FG disabled", 14) == 0;
+                        std::snprintf(stDesc, sizeof(stDesc), "直通(画面未增强)%s%s",
+                                      g_app.stateDetail[0] ? ": " : "", g_app.stateDetail);
+                        stRed = !deliberate;
+                    } else if (std::strcmp(g_app.filterState, "ngx_faulted") == 0) {
+                        std::snprintf(stDesc, sizeof(stDesc), "NGX 故障已停用%s%s",
+                                      g_app.stateDetail[0] ? ": " : "", g_app.stateDetail);
+                        stRed = true;
+                    } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
+                        std::snprintf(stDesc, sizeof(stDesc), "增强中,光流零 guidance");
+                        stRed = true;
+                    } else {
+                        // ok / 空(存活态由周期 tick 携带)
+                        std::snprintf(stDesc, sizeof(stDesc), "增强中(NGX 推理运行)%s",
+                                      g_app.params.nrEnabled ? "" : ";降噪已关(NR off,跳过评估)");
+                    }
+                }
+                ImGui::TextColored(stRed ? kErrRed : kDimTxt, "滤镜状态: %s", stDesc);
+
+                // 光流请求 vs 实际
+                char ofReq[64];
+                if (g_app.params.ofBackend == kOfBackendFfx) {
+                    std::snprintf(ofReq, sizeof(ofReq), "FFX %s",
+                                  g_app.params.ffxQuality == 0 ? "无"
+                                  : g_app.params.ffxQuality == 1 ? "性能(1/2 分辨率)" : "质量(全分辨率)");
+                } else {
+                    std::snprintf(ofReq, sizeof(ofReq), "NVOF 质量 %d", g_app.params.motionVectorQuality);
+                }
+                const int ofqReq = std::clamp(g_app.params.ofBackend == kOfBackendFfx
+                                                  ? g_app.params.ffxQuality
+                                                  : g_app.params.motionVectorQuality,
+                                              0, kOfQualityMax);
+                const bool ofBroken = std::strcmp(g_app.ofMode, "zero") == 0 && ofqReq > 0;
+                ImGui::TextColored(ofBroken ? kErrRed : kDimTxt, "光流: 请求 %s | 实际 %s",
+                                   ofReq, g_app.ofMode[0] ? g_app.ofMode : "(未加载)");
+
+                // FG 请求 vs 实际路由
+                char fgReq[96];
+                if (!g_app.params.fgEnabled) {
+                    std::snprintf(fgReq, sizeof(fgReq), "关");
+                } else {
+                    static const char *kRouteNames[] = { "自动(官方优先)", "SM86", "SM75", "官方 NGX" };
+                    std::snprintf(fgReq, sizeof(fgReq), "开 %dx,路由 %s",
+                                  g_app.params.fgMultiplier,
+                                  kRouteNames[std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax)]);
+                }
+                const bool fgBroken = g_app.params.fgEnabled != 0 &&
+                                      (std::strcmp(g_app.fgState, "unavailable") == 0 ||
+                                       std::strcmp(g_app.fgRouteEff, "copy") == 0);
+                char fgEff[160];
+                if (!g_app.fgRouteEff[0]) {
+                    std::snprintf(fgEff, sizeof(fgEff), "(未加载)");
+                } else if (std::strcmp(g_app.fgRouteEff, "off") == 0) {
+                    std::snprintf(fgEff, sizeof(fgEff), "未开启");
+                } else {
+                    const char *rl = FgRouteLabel(g_app.fgRouteEff);
+                    std::snprintf(fgEff, sizeof(fgEff), "%s%s%s", rl[0] ? rl : g_app.fgRouteEff,
+                                  g_app.fgDetail[0] ? " —— " : "", g_app.fgDetail);
+                }
+                ImGui::TextColored(fgBroken ? kErrRed : kDimTxt, "帧生成: 请求 %s | 实际 %s",
+                                   fgReq, fgEff);
+
+                // 创建倍数 vs live 倍数
+                if (g_app.params.fgEnabled && g_app.fgMultCreate > 0) {
+                    const bool multClipped = g_app.params.fgMultiplier > g_app.fgMultCreate;
+                    ImGui::TextColored(multClipped ? kErrRed : kDimTxt,
+                                       "FG 倍数: 会话创建 %dx | 面板 %dx%s",
+                                       g_app.fgMultCreate, g_app.params.fgMultiplier,
+                                       multClipped ? "(超出部分需重载生效)" : "");
+                }
+            }
+            // 处理分辨率(读 stats 缓存的六段之外字段:LoadStats 已存在
+            // internal_w/h 到 statsRes 展示串;此处直接从共享内存的解析结果
+            // 复述 —— 分辨率信息主面板已有,诊断页仅回显会话事实)
+            ImGui::TextDisabled("分辨率: %s", g_app.statsRes[0] ? g_app.statsRes : "(未加载)");
+
+            ImGui::Spacing();
+            ImGui::TextUnformatted("—— 排队细分(每帧 last)——");
+            ImGui::Text("%s: %.2f ms", "槽池等待", g_app.slotWait);
+            if (ImGui::IsItemHovered())
+                ShowTip("3 槽全在飞时帧线程等槽的时长。此值大而 GPU 段正常 = GPU 超容量;\n两者都小而帧率低 = 宿主侧没来帧(与 perf 行 slot= 同源)。");
+            ImGui::Text("%s: %.2f ms", "NGX 串行等待", g_app.lockWait);
+            if (ImGui::IsItemHovered())
+                ShowTip("evaluate 互斥排队(NGX feature 单例的 CPU 侧串行)。并发槽互相\n等待的时长;与 eval_cpu 互斥等待部分重叠,perf 行 lock= 同源。");
+            ImGui::Text("光流门: 跳帧 %d / 过期 %d / 重置 %d", g_app.gateSkips, g_app.gateExpired, g_app.gateResets);
+            if (ImGui::IsItemHovered())
+                ShowTip("光流帧序门累计:跳帧 = 缺口超时播种,过期 = 迟到帧播种,重置 =\nseek/显式复位。seek 后重置数增加属正常;持续增长 = 时序异常\n(与 perf 行 s/x/r 同源)。FFX 后端无引擎探针,数值恒 0。");
+
+            ImGui::Spacing();
+            ImGui::TextDisabled("全页无红 = 插件正常工作。红色 = 与面板请求不一致。\n"
+                                "本页数据与 dlssnr_timing.log 的 perf/STATUS 行同源,更细的\n"
+                                "历史(EMA/p99/门细分)仍以日志为准。");
+            y = ImGui::GetCursorPosY() - wpos.y + 4 * s;
+
+            ImGui::EndTabItem();
+        }
         ImGui::EndTabBar();
         // 一次性恢复已消费(SetSelected 的排队焦点在下一帧 TabBarLayout 落
         // 地),此后页签选择完全由用户点击驱动。
@@ -959,27 +1171,9 @@ void DrawUi() noexcept {
     }
     y += 8 * s;
 
-    // --- 全局行:性能日志 + 保存/重置(不随页签切换) ---
+    // --- 全局行:保存/重置(性能日志开关已迁往"诊断"页)---
     dl->AddLine(ImVec2(wpos.x + marginX, wpos.y + y), ImVec2(wpos.x + wsize.x - marginX, wpos.y + y), IM_COL32(58, 62, 78, 255));
     y += 14 * s;
-
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-    {
-        bool logOn = g_app.timingLog;
-        if (ImGui::Checkbox("写入性能日志", &logOn)) {
-            g_app.timingLog = logOn;
-            wchar_t iniPath[MAX_PATH];
-            if (BasePath(iniPath, MAX_PATH)) {
-                wchar_t iniFile[MAX_PATH];
-                swprintf_s(iniFile, L"%s\\%s", iniPath, INI_FILE);
-                WritePrivateProfileStringW(L"panel", L"log", logOn ? L"1" : L"0", iniFile);
-            }
-            WritePayload(); // logEnabled included
-            g_app.liveDirty = false;
-        }
-        if (ImGui::IsItemHovered()) ShowTip("每秒追加一行性能统计到 mpv 同目录 dlssnr_timing.log;排查性能问题时附上该文件。");
-    }
-    y += rowH;
 
     y += 8 * s;
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));

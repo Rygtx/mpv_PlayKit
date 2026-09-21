@@ -27,6 +27,9 @@ inline constexpr int kFfxQualityMin = 0, kFfxQualityMax = 2;
 // live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
 // 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
 inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
+// 调试视图(live,不持久化):0 = 关,1 = 差异 ×20(|NR改动|×20 灰度),
+// 2 = 光流场(方向→色相、幅值→亮度;排查"光流有没有流/方向对不对")。
+inline constexpr int kDebugViewMax = 2;
 // DLSS 帧生成路由(0-3,单字段合并原 Router+Backend 两概念)。
 //   0 = 自动:官方优先,不可用回落 proxy(回落路由 SM86 —— proxy 无架构
 //       自动探测,RTX 20 系请显式选 SM75)
@@ -126,10 +129,11 @@ struct DlssnrParams {
     // 光流后端(0=ffx 1=nvof,创建时,下一帧生效):见 kOfBackendMin 注释。
     // 切换只影响下一次光流会话建立,不改 NGX feature。
     int ofBackend = 0;
-    // 差异调试视图(0/1,live 参数,**不持久化**):1 = 输出被替换为
-    // |NR改动|×20 的灰度图 —— 白 = 改动大,一片灰 = 模型没动画面
-    // (OptiScaler DLSSNR fork 的 DebugView=3 同语义,回应"看不出参数
-    // 有没有效果")。面板"差异调试 ×20"开关,仅当前会话有效。
+    // 调试视图(0-2,live 参数,**不持久化**):1 = 输出替换为 |NR改动|×20
+    // 的灰度图 —— 白 = 改动大,一片灰 = 模型没动画面(OptiScaler DLSSNR fork
+    // 的 DebugView=3 同语义);2 = 输出替换为光流场可视化 —— 方向→色相、
+    // 幅值→亮度,黑 = 无运动/无光流(回应"看不出参数有没有效果"与
+    // "光流到底有没有在流")。面板"调试视图"下拉,仅当前会话有效。
     int debugView = 0;
 };
 

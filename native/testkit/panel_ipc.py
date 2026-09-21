@@ -13,8 +13,8 @@ panel_ipc.h 是唯一权威;本文件是测试用的字节级镜像 —— 改�
 import ctypes
 import struct
 
-PAYLOAD_SIZE = 512
-PAYLOAD_MAGIC = 0x444C5344  # "DSLD" (v13, 版本位走 hex: 9 之后是 A/B/C/D)
+PAYLOAD_SIZE = 1024
+PAYLOAD_MAGIC = 0x4A4C5344  # "DSLJ" (v19, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"

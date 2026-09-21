@@ -136,6 +136,22 @@ private:
         return _ofBackend->ModeString(_ofModeBuf, sizeof(_ofModeBuf));
     }
 
+    // ---- FG 会话级事实(stats 通道 SK_FG_ROUTE_EFFECTIVE / SK_FG_MULT_CREATE
+    // / SK_FG_DETAIL 的数据源;"auto 档到底走了谁 / 为什么没插帧"不再翻
+    // timing log)----
+    // 实际生效路由:off(FG 未请求)/ official / proxy-sm86 / proxy-sm75 /
+    // copy(请求了但初始化失败 → 复制帧)。Initialize 的 FG 段一次性定值,
+    // 此后只读(路由进程级,会话内不变;运行期 eval 失败闩停由 SK_FG=
+    // unavailable 表达,路由值保留"最后是谁在跑"的的事实)。
+    char _fgRouteEff[16] = "off";
+    // 最近一次 FG 初始化失败原因(消毒串;成功路径清空)。失败通常发生在
+    // 会话创建期,不会有逐帧更新 —— 常规 tick 恒定携带,死亡态 body 缺键
+    // 时面板自行清空。
+    char _fgDetail[128] = "";
+    // 创建倍数 M0(plugin.cpp 侧 vi.fps/帧数契约的同一值;FG 未激活 = 0)。
+    // live 倍数 > M0 的面板档位本会话无槽可填 —— 面板据此红显"需重建"。
+    int _fgCreateMult = 0;
+
     D3D12Context *_d3d12 = nullptr;
     NVSDK_NGX_Parameter *_parameters = nullptr;
     NVSDK_NGX_Handle *_feature = nullptr;

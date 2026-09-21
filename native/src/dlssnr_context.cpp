@@ -599,6 +599,13 @@ bool DlssnrContext::Initialize(
     // 完成);sticky —— 尺寸重建(RecreateFeature)沿用本旗标,面板运行中
     // 改变只影响逐帧 eval 门,不重建槽资源。
     _fgRequested = _shared->Snapshot().fgEnabled != 0;
+    // FG 会话级事实初值:请求了 = 暂记 copy(初始化成功会被下文改写成
+    // 实际路由);没请求 = off。失败原因串在此段内逐路径覆写。
+    _fgCreateMult = _fgRequested
+                        ? std::clamp(_shared->Snapshot().fgMultiplier, kFgMultMin, kFgMultMax)
+                        : 0;
+    std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s", _fgRequested ? "copy" : "off");
+    _fgDetail[0] = '\0';
     if (!_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested, err, errLen)) return failWithExistingErr();
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
@@ -648,6 +655,7 @@ bool DlssnrContext::Initialize(
                                     DlssfgContext::FgBackend::OfficialNgx,
                                     fgErr, sizeof(fgErr))) {
                     fgUp = true;
+                    std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "official");
                 } else {
                     char msg[352];
                     std::snprintf(msg, sizeof(msg),
@@ -657,6 +665,7 @@ bool DlssnrContext::Initialize(
                                                               : "trying proxy");
                     DbgLine(msg);
                     TimingStatusLine(msg);
+                    SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
                     _fg.reset();
                     // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
                     // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
@@ -666,6 +675,7 @@ bool DlssnrContext::Initialize(
                 TimingStatusLine(fgRoute == kFgRouteOfficial
                                      ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
                                      : "DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
+                std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
             }
         }
         if (!fgUp && fgRoute != kFgRouteOfficial && fgDllPath && fgDllPath[0]) {
@@ -679,17 +689,23 @@ bool DlssnrContext::Initialize(
                                     DlssfgContext::FgBackend::Proxy,
                                     fgErr, sizeof(fgErr))) {
                     fgUp = true;
+                    // proxy 内核档 = 本次创建前写入 dlssg_sm86.ini 的 Router 键
+                    // (SyncProxyRouterIni;proxy 按它选 SM86/SM75 内核)。
+                    std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
+                                  fgRoute == kFgRouteProxySm75 ? "proxy-sm75" : "proxy-sm86");
                 } else {
                     char msg[352];
                     std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg init failed (%s); 1:1 output",
                                   fgErr);
                     DbgLine(msg);
                     TimingStatusLine(msg);
+                    SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
                     _fg.reset();
                     _fgParams = nullptr;
                 }
             } else {
                 TimingStatusLine("DLSSNR STATUS: dlssfg core parameter block FAILED; 1:1 output");
+                std::snprintf(_fgDetail, sizeof(_fgDetail), "core parameter block failed");
             }
         }
         if (!fgUp) {
@@ -698,12 +714,15 @@ bool DlssnrContext::Initialize(
             if (fgRoute == kFgRouteOfficial && !officialDll[0]) {
                 TimingStatusLine(
                     "DLSSNR STATUS: dlssfg route pinned official but nvngx_dlssg.dll missing; 1:1 output");
+                std::snprintf(_fgDetail, sizeof(_fgDetail), "nvngx_dlssg.dll missing");
             } else if ((fgRoute == kFgRouteProxySm86 || fgRoute == kFgRouteProxySm75) &&
                        !(fgDllPath && fgDllPath[0])) {
                 TimingStatusLine(
                     "DLSSNR STATUS: dlssfg route pinned proxy but version.dll missing; 1:1 output");
+                std::snprintf(_fgDetail, sizeof(_fgDetail), "version.dll (proxy) missing");
             }
             _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
+            _fgCreateMult = 0;    // 未激活:面板倍数 mismatch 判定归零
         }
     }
 
@@ -757,13 +776,17 @@ bool DlssnrContext::Initialize(
             WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
                                 _gpuNameUtf8, sizeof(_gpuNameUtf8), nullptr, nullptr);
         }
-        char body[288];
+        char body[512];
         std::snprintf(body, sizeof(body),
                       "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d,"
-                      "\"%s\":\"%s\",\"%s\":\"%s\"}",
+                      "\"%s\":\"%s\",\"%s\":\"%s\","
+                      "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\"}",
                       _gpuNameUtf8, _width, _height,
                       SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
-                      SK_OF_MODE, OfModeString());
+                      SK_OF_MODE, OfModeString(),
+                      SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
+                      SK_FG_MULT_CREATE, _fgCreateMult,
+                      SK_FG_DETAIL, _fgDetail);
         PublishStatsJson(body);
     }
 
@@ -1658,10 +1681,16 @@ bool DlssnrContext::ProcessFrame(
     }
     const bool fgOnFgCl = fgGateOpen && fgBeginOk;
 
-    // 差异调试视图(面板"差异调试 ×20"):|输出−输入|×20 灰度替换输出。
-    // 此处是三条路径(skipEval/nrOff/eval)帧末 outputColor=UAV 的唯一
-    // 公共插入点;FG 激活时插帧链会拿到调试图当 backbuffer(调试态可接受)。
-    if (frameParams.debugView != 0) {
+    // 调试视图(面板"调试视图"下拉):1 = |输出−输入|×20 灰度;2 = 光流场
+    // (方向→色相、幅值→亮度)。此处是三条路径(skipEval/nrOff/eval)帧末
+    // outputColor=UAV 的唯一公共插入点;FG 激活时插帧链会拿到调试图当
+    // backbuffer(调试态可接受)。光流场取材:真运动帧按管线取 slot 场
+    // (follow 内部管线 = reducedMotion,否则源尺寸 motion;均已 NSR),
+    // 播种/OF 关帧绑静态零纹理 —— 全黑 = 无光流数据,与差异视图
+    // "一片灰 = 没动"同款语义。
+    if (frameParams.debugView == 2) {
+        _d3d12->RecordFlowView(*slot, realMotion && densifyInternal, realMotion);
+    } else if (frameParams.debugView == 1) {
         _d3d12->RecordDebugDiff(*slot);
     }
     // 真实帧输出(base CL 收尾):outputColor 到达时 = UAV(evaluate 写/
@@ -2107,16 +2136,28 @@ bool DlssnrContext::ProcessFrame(
                 // fps = 1s 窗口帧入口计数,处理帧率 < 源帧率 = 宿主侧没来帧。
             }
         }
-        // stats 每帧发布(六段 last + 512B 共享内存写,开销可忽略):面板
+        // stats 每帧发布(六段 last + 共享内存写,开销可忽略):面板
         // "处理用时"随帧呼吸,不再按日志节流跳变。perf 行(磁盘 IO)按时间
         // 门 ≥1s 一行(与帧率无关)。Snapshot/FrameRateWindow 在锁外取
         // (各自持独立互斥,勿在 g_timingMutex 内叠锁)。
         {
-            char body[512];
+            // 排队细分 last(slot/lock 等待)与门累计:诊断页数据源。nvof
+            // 探针仅 NVOF 后端存在(FFX 无引擎等待,恒 0);指针读法与上方
+            // perf 行同款(仅读,换会话在 PoolHold 内,帧线程读不撕裂)。
+            const double slotWaitLast = ms(tSlot0, tSlot1, qpcFreq);
+            const double lockWaitLast = ms(tLock0, tLock1, qpcFreq);
+            NvofContext *nvStats =
+                (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
+                    ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
+            char body[960];
             // FG 状态:on = 本帧有真插值(附当前倍数);dup = 复制真实帧
             // (复位/零光流/面板关/降级);off = 本会话未激活;unavailable =
             // proxy 初始化或 eval 失败闩停(帧率仍 ×M,内容为复制帧)。
             // fg_mult = 当前倍数(面板显示 "3x" 用;未激活 = 0)。
+            // fg_route_eff = 实际生效路由(off/official/proxy-sm86/
+            // proxy-sm75/copy),fg_mult_create = 会话创建倍数 —— "auto 档
+            // 这次到底走了官方还是 proxy""4x 为什么只跑 2x"面板直读,不翻
+            // timing log。
             const char *fgState = !_fg ? "off"
                 : (!_fg->Enabled() ? "unavailable"
                                    : (fgEvaluatedCount > 0 ? "on" : "dup"));
@@ -2125,7 +2166,10 @@ bool DlssnrContext::ProcessFrame(
                      "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
-                     "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d}",
+                     "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d,"
+                     "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
+                     "\"%s\":%.2f,\"%s\":%.2f,"
+                     "\"%s\":%u,\"%s\":%u,\"%s\":%u}",
                      SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
                      SK_EVAL_CPU_LAST, evalCpuLast, SK_UNPACK_LAST, unpackLast,
                      SK_NVOF_LAST, nvofLast, SK_FG_LAST, fgLast,
@@ -2136,7 +2180,15 @@ bool DlssnrContext::ProcessFrame(
                      SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
                      SK_OF_MODE, OfModeString(),
                      SK_FG, fgState,
-                     SK_FG_MULT, fgM);
+                     SK_FG_MULT, fgM,
+                     SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
+                     SK_FG_MULT_CREATE, _fgCreateMult,
+                     SK_FG_DETAIL, _fgDetail,
+                     SK_SLOT_WAIT, slotWaitLast,
+                     SK_LOCK_WAIT, lockWaitLast,
+                     SK_GATE_SKIPS, nvStats ? nvStats->GateSkips() : 0u,
+                     SK_GATE_EXPIRED, nvStats ? nvStats->GateExpired() : 0u,
+                     SK_GATE_RESETS, nvStats ? nvStats->ResetCount() : 0u);
             PublishStatsJson(body);
         }
         if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)
