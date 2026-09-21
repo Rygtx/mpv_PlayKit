@@ -74,6 +74,30 @@ bool DlssfgSehCall(Fn &&fn, DWORD *sehCode) noexcept {
 
 } // namespace
 
+bool DlssfgContext::PreloadProxyModule(const wchar_t *dllPath) noexcept {
+    // 官方路由首败后的预载(0.3.x hook 型代理的能力闸解锁,调用点见
+    // dlssnr_context Initialize 的 official 两段式)。同缓存复用:后续
+    // proxy 路由尝试经路径比对直接命中,不重复 LoadLibrary。
+    if (!dllPath || !dllPath[0]) return false;
+    FgModuleCache &cache = FgModule();
+    if (cache.module && wcscmp(cache.path, dllPath) == 0) return true;
+    HMODULE mod = LoadLibraryExW(dllPath, nullptr,
+                                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                                     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!mod) return false;
+    cache.module = mod;
+    wcsncpy_s(cache.path, dllPath, _TRUNCATE);
+    return true;
+}
+
+bool DlssfgContext::CachedProxyIsHookStyle() noexcept {
+    // 0.3.x 起代理模式:内嵌原厂运行库,仅暴露 DlssgProxy_Name/Role 查询
+    // 导出(version 桩转发系统 version.dll);NGX 调用靠钩子接管,不经
+    // GetProcAddress 直接驱动 —— pinned proxy 档据此改走 official NGX 链。
+    HMODULE mod = FgModule().module;
+    return mod && GetProcAddress(mod, "DlssgProxy_Role") != nullptr;
+}
+
 DlssfgContext::~DlssfgContext() {
     // 故障后绝不重入 proxy(闩锁语义;模块/feature 泄漏给 OS 回收,与热
     // 上下文同哲学)。健康路径也只弃引用:ReleaseFeature 在 Rebuild 尺寸

@@ -55,6 +55,18 @@ public:
                     FgBackend backend,
                     char *err, size_t errLen) noexcept;
 
+    // 预载 proxy 模块(经 FgModule 进程级缓存,后续 Proxy 路由命中缓存不再
+    // 重复 LoadLibrary)。0.3.x hook 型代理(dlssg_for_sm86 ≥0.3.0:内嵌
+    // 原厂运行库,LoadLibrary 即装钩接管宿主 NGX 调用,无 NGX 导出)靠它
+    // 让 official 路由过 DLSS-G 能力闸;0.2.4 型(native NGX 导出)预载
+    // 无副作用。返回预载后模块是否可用。
+    static bool PreloadProxyModule(const wchar_t *dllPath) noexcept;
+
+    // 缓存中的 proxy 模块是否 0.3.x hook 型(有 DlssgProxy_Role 查询导出、
+    // 无 NGX 直接驱动导出)。仅查已缓存模块 —— 调用点在 Proxy 分支失败后,
+    // 模块必已 LoadLibrary(导出检查失败也发生在 LoadLibrary 之后)。
+    static bool CachedProxyIsHookStyle() noexcept;
+
     // 尺寸变化重建 feature(旧 handle 经 ReleaseFeature 退役;Release 失败
     // 即整体停用 —— 与 NR 的"Release 后不安全重试"同语义)。PoolHold 内调用。
     bool Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,

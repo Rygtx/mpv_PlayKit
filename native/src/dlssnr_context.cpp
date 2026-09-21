@@ -645,9 +645,32 @@ bool DlssnrContext::Initialize(
         }
         bool fgUp = false;
         if ((fgRoute == kFgRouteAuto || fgRoute == kFgRouteOfficial) && officialDll[0]) {
-            DWORD sehCode = 0;
-            const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
-            if (!sehCode && NVSDK_NGX_SUCCEED(pr) && _fgParams) {
+            // official 两段式(0.3.x hook 型代理的能力闸解锁):DLSS-G 能力
+            // 闸 = 核心按 NVAPI 读到的物理架构比对 snippet 声明最低架构,
+            // Ampere/20 系首次查询必拒(0xBAD0000B);而 dlssg_for_sm86
+            // 0.3.x 的 version.dll LoadLibrary 即装钩(内嵌原厂运行库接管
+            // 宿主 NGX 调用),同进程重查即过 —— 2026-09-21 实测:首建必败,
+            // 预载 proxy 后第二次创建 "dlssfg ready (official ngx)" 且真实
+            // 产帧(fg 段 3.5-3.9ms)。首败后预载 proxy 重试一次;0.2.4 型
+            // (native NGX 导出)预载无副作用,回落 proxy 路由行为不变。
+            for (int attempt = 0; attempt < 2 && !fgUp; ++attempt) {
+                if (attempt > 0) {
+                    if (!(fgDllPath && fgDllPath[0]) ||
+                        !DlssfgContext::PreloadProxyModule(fgDllPath)) {
+                        break; // 无 proxy 可预载:按首败结果走既有回落链
+                    }
+                    TimingStatusLine(
+                        "DLSSNR STATUS: dlssfg proxy preloaded; retrying official (hook-proxy capability unlock)");
+                }
+                DWORD sehCode = 0;
+                const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
+                if (sehCode || !NVSDK_NGX_SUCCEED(pr) || !_fgParams) {
+                    TimingStatusLine(fgRoute == kFgRouteOfficial
+                                         ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
+                                         : "DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
+                    std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
+                    break;
+                }
                 _fg = std::make_unique<DlssfgContext>();
                 char fgErr[256]{};
                 if (_fg->Initialize(*_d3d12, officialDll, _appDataPath, _fgParams,
@@ -656,13 +679,16 @@ bool DlssnrContext::Initialize(
                                     fgErr, sizeof(fgErr))) {
                     fgUp = true;
                     std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "official");
+                    _fgDetail[0] = '\0'; // 首败可能已写原因,重试成功即清
                 } else {
+                    const bool retryNext = attempt == 0 && fgDllPath && fgDllPath[0];
                     char msg[352];
                     std::snprintf(msg, sizeof(msg),
                                   "DLSSNR STATUS: dlssfg official init failed (%s); %s",
                                   fgErr,
-                                  fgRoute == kFgRouteOfficial ? "FG off (route pinned)"
-                                                              : "trying proxy");
+                                  retryNext ? "retrying after proxy preload"
+                                  : fgRoute == kFgRouteOfficial ? "FG off (route pinned)"
+                                                                : "trying proxy");
                     DbgLine(msg);
                     TimingStatusLine(msg);
                     SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
@@ -671,11 +697,6 @@ bool DlssnrContext::Initialize(
                     // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
                     _fgParams = nullptr;
                 }
-            } else {
-                TimingStatusLine(fgRoute == kFgRouteOfficial
-                                     ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
-                                     : "DLSSNR STATUS: dlssfg official capability block FAILED; trying proxy");
-                std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
             }
         }
         if (!fgUp && fgRoute != kFgRouteOfficial && fgDllPath && fgDllPath[0]) {
@@ -702,6 +723,40 @@ bool DlssnrContext::Initialize(
                     SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
                     _fg.reset();
                     _fgParams = nullptr;
+                    // 0.3.x hook 型代理(pinned proxy 档):无 NGX 直接驱动
+                    // 导出,契约不存在;但钩子已随本次 LoadLibrary 装好 ——
+                    // 借官方 NGX 链驱动一次(auto 档不经此路:official 两段
+                    // 式已带预载重试,避免第三次无效尝试)。
+                    if ((fgRoute == kFgRouteProxySm86 || fgRoute == kFgRouteProxySm75) &&
+                        officialDll[0] && DlssfgContext::CachedProxyIsHookStyle()) {
+                        TimingStatusLine(
+                            "DLSSNR STATUS: dlssfg hook proxy (0.3.x); driving via official NGX path");
+                        DWORD sehCode2 = 0;
+                        const NVSDK_NGX_Result pr2 =
+                            CoreGetCapabilityParametersSafely(&_fgParams, &sehCode2);
+                        if (!sehCode2 && NVSDK_NGX_SUCCEED(pr2) && _fgParams) {
+                            _fg = std::make_unique<DlssfgContext>();
+                            char fgErr2[256]{};
+                            if (_fg->Initialize(*_d3d12, officialDll, _appDataPath, _fgParams,
+                                                _width, _height, DXGI_FORMAT_B8G8R8A8_UNORM,
+                                                DlssfgContext::FgBackend::OfficialNgx,
+                                                fgErr2, sizeof(fgErr2))) {
+                                fgUp = true;
+                                std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "official");
+                                _fgDetail[0] = '\0';
+                            } else {
+                                char msg2[352];
+                                std::snprintf(msg2, sizeof(msg2),
+                                              "DLSSNR STATUS: dlssfg official via hook proxy failed (%s); 1:1 output",
+                                              fgErr2);
+                                DbgLine(msg2);
+                                TimingStatusLine(msg2);
+                                SanitizeJsonDetail(fgErr2, _fgDetail, sizeof(_fgDetail));
+                                _fg.reset();
+                                _fgParams = nullptr;
+                            }
+                        }
+                    }
                 }
             } else {
                 TimingStatusLine("DLSSNR STATUS: dlssfg core parameter block FAILED; 1:1 output");
