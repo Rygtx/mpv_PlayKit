@@ -78,7 +78,7 @@ public:
     // owned here, not by the glue layer. timingOut 非 NULL 时写入分段耗时
     // (毫秒,逗号分隔:pack,submit+gpu,unpack)
     // FG 多帧输出(fgDst* 非 NULL = 创建时 FG 激活):fgMultiplier = 本帧
-    // 倍数 M(2-4,调用方从参数快照取 —— 与输出帧数契约绑定,必须由调用
+    // 倍数 M(2-6,调用方从参数快照取 —— 与输出帧数契约绑定,必须由调用
     // 方定格),每源帧产出 1 真实 + M-1 插值帧。fgDst*/fgStrides 为扁平
     // 数组 [gen][plane](gen 0..M-2,元素 = gen*3+plane);fgGenOk 出参逐
     // 槽告知真插值/false = 复制真实帧(复位/零光流/面板关/eval 降级)。

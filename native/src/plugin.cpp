@@ -579,7 +579,7 @@ static void VS_CC DlssnrCreate(
     // 输出帧时长 = 源时长/M(mpv vapoursynth 契约),失败优雅回退 1:1。
     // 挂 DLSSNR 之后 —— backbuffer = NR 输出。
     ApplyFlagArg(in, vsapi, "fg_enabled", initial.fgEnabled);
-    // 插帧倍数 2-4(live 参数,源帧边界生效;创建值定 vi.fps 元数据)
+    // 插帧倍数 2-6(live 参数,源帧边界生效;创建值定 vi.fps 元数据)
     ApplyIntArg(in, vsapi, "fg_multiplier", initial.fgMultiplier, kFgMultMin, kFgMultMax);
     // FG 路由 0=自动(预载 0.3.x hook 代理)/1=纯官方(不预载;进程级,
     // 重启生效)

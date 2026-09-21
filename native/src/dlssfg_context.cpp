@@ -182,12 +182,14 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
             return fail(msg);
         }
     }
-    // MultiFrameCountMax(信息性;hook 代理 310.9 运行库可报 5 → 6X,面板
-    // 倍数上限仍 4)。
+    // MultiFrameCountMax = 运行库插值帧上限(代理 ini MaxGeneratedFrames 钳定;
+    // 310.9 出厂 3 → 4X,面板改 5x/6x 时写 4/5)。超出上限的插值槽不提交
+    // eval(调用方降级复制真实帧)—— 5x/6x 刚选、未重启 mpv 时发生。
     {
         unsigned int maxGen = 0;
         if (_params->Get(NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &maxGen) ==
             NVSDK_NGX_Result_Success) {
+            _maxGen = std::clamp(static_cast<int>(maxGen), 1, kFgMultMax - 1);
             char msg[96];
             std::snprintf(msg, sizeof(msg),
                           "DLSSNR STATUS: dlssfg official maxGen=%u", maxGen);
@@ -323,6 +325,15 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
     std::lock_guard<std::mutex> lock(_mutex);
     if (!_ready.load(std::memory_order_acquire) || _faulted.load(std::memory_order_acquire)) {
         if (err && errLen) std::snprintf(err, errLen, "dlssfg: session dead");
+        return false;
+    }
+    if (slotIndex > _maxGen) {
+        // 超出运行库上限(5x/6x 刚选、代理 ini 未随重启生效时发生):
+        // 不提交 eval,调用方按失败降级复制真实帧。
+        if (err && errLen) {
+            std::snprintf(err, errLen, "dlssfg: slot %d beyond MaxGeneratedFrames cap (%d)",
+                          slotIndex, _maxGen);
+        }
         return false;
     }
     const bool carryReset = _needsReset || reset;

@@ -95,8 +95,8 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Ffx_Quality` | 0–2 | 0 | FFX 光流引导档位(0 = 零 guidance;1 = 性能/OF 半分辨率;2 = 质量/全分辨率)。仅后端 = FFX(默认)时消费。两字段独立;面板"光流质量"单下拉按当前后端读写对应档位 |
 | `Nvof_Follow_Scaling` | True/False | False | 光流输入跟随内部降采样(需 Scaling_Enabled;大幅降低光流引擎占用,运动精度略降) |
 | `Of_Backend` | 0–1 | 0 | 光流后端(0 = FFX/AMD FidelityFX,跨厂商通用,默认;1 = NVOF/NVIDIA 专属引擎)。切换只影响下一次光流会话建立(下一帧/seek 生效) |
-| `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×4;自动档依赖 `ngx\version.dll`(dlssg_for_sm86 ≥0.3.0),初始化失败自动回退 1:1) |
-| `Fg_Multiplier` | 2–4 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps) |
+| `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×6;自动档依赖 `ngx\version.dll`(dlssg_for_sm86 ≥0.3.0),初始化失败自动回退 1:1) |
+| `Fg_Multiplier` | 2–6 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps)。**5x/6x**:面板自动写代理 ini `MaxGeneratedFrames = M-1`,首次选择需重启 mpv 完整生效,未重启时超限插槽退化为复制真实帧;输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率) |
 | `Fg_Route` | 0–1 | 0 | FG 路由(0 = 自动,预载 dlssg_for_sm86 0.3.x hook 代理——RTX 30/20 系由其接管 DLSS-G,仍走官方签名链;1 = 纯官方,不预载,直连官方运行时/RTX 40/50 系,30/20 系被拒载不回落。进程级,重启 mpv 生效;v20 起不兼容旧值,存量 1–3 按越界归 1,升级后在面板选回自动) |
 | `H_Max` | 整数 | 0 | 输出高度限制(源超过该值跳过处理;0 = 不限制) |
 

@@ -29,7 +29,7 @@ constexpr uint32_t PAYLOAD_SIZE = 1024;
 // default values); v5 adds motionVectorQuality (NVOF 光流质量 0-5); v6 adds
 // nvofFollowScaling (光流输入跟随内部降采样); v7 adds fgEnabled (DLSS 帧生成,
 // 占用原 reserved[0] —— 布局不变,老面板写 0 = 关); v8 adds fgMultiplier
-// (插帧倍数 2-4,live,源帧边界生效 —— 结构体增长,新旧混跑按 magic 拒读);
+// (插帧倍数 2-6,live,源帧边界生效 —— 结构体增长,新旧混跑按 magic 拒读);
 // v9 adds fgRouter (FG 路由 0=SM86/1=SM75,进程级,重启 mpv 生效); v10 adds
 // fgBackend (FG 后端 0=自动/1=官方 NGX/2=代理,下个 seek 生效); v11 adds
 // nrEnabled (NR 总开关 0/1,默认 1;0 = 跳过降噪推理,补帧/光流不受影响);
@@ -80,7 +80,7 @@ struct PanelPayload {
     int32_t ffxQuality;          // 0-2 FFX 档位(0 = 无;1 性能,2 质量;live)
     int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
-    int32_t fgMultiplier;        // 2-4 插帧倍数(v8;live,会话内有效密度 = min(此值, 创建倍数))
+    int32_t fgMultiplier;        // 2-6 插帧倍数(v8;live,会话内有效密度 = min(此值, 创建倍数))
     int32_t fgRoute;             // 0-1 FG 路由(v12;v20 两档化:0=自动预载 0.3.x 代理,1=纯官方,重启生效)
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
     int32_t debugView;           // 0-2 调试视图(v13;v19 起含光流场;live,不持久化)
@@ -215,7 +215,7 @@ inline constexpr const char *SK_OF_MODE = "of_mode";
 // DLSS 帧生成状态:on(eval)/ dup(复制真实帧:复位帧/零光流/面板关)/
 // off(本会话未激活)/ unavailable(初始化失败,回退 1:1)
 inline constexpr const char *SK_FG = "fg";
-// 当前插帧倍数(2-4;FG 未激活 = 0。面板显示 "3x")
+// 当前插帧倍数(2-6;FG 未激活 = 0。面板显示 "3x")
 inline constexpr const char *SK_FG_MULT = "fg_mult";
 // FG 路由实际生效档(面板核心诉求:auto 档下"这次到底走了谁"不再翻
 // timing log):
@@ -226,7 +226,7 @@ inline constexpr const char *SK_FG_MULT = "fg_mult";
 //   copy          — FG 已请求但初始化失败 → 输出回落 1:1/复制帧(与 SK_FG
 //                   的 unavailable/dup 互补:那个说"帧是什么",这个说"谁产的")
 inline constexpr const char *SK_FG_ROUTE_EFFECTIVE = "fg_route_eff";
-// FG 会话创建倍数(2-4;FG 未激活 = 0)。live 倍数超过它时多出的档位本
+// FG 会话创建倍数(2-6;FG 未激活 = 0)。live 倍数超过它时多出的档位本
 // 会话无槽可填(面板红色提示"需 seek 重建")。
 inline constexpr const char *SK_FG_MULT_CREATE = "fg_mult_create";
 // FG 最近一次初始化失败原因(消毒串;成功后清空)。"为什么没插帧"的

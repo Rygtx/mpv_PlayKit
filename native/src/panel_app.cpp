@@ -205,18 +205,19 @@ int ReadFgOptimizedIni() noexcept {
     return 1;
 }
 
-void WriteFgOptimizedIni(int v) noexcept {
+bool WriteFgProxyIniKey(const char *key, int v) noexcept {
     wchar_t path[MAX_PATH];
-    if (!FgProxyIniPath(path, MAX_PATH)) return;
+    if (!FgProxyIniPath(path, MAX_PATH)) return false;
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        PanelLog("panel: fg proxy ini missing, Optimized not written");
-        return;
+        PanelLog("panel: fg proxy ini missing, %s not written", key);
+        return false;
     }
     std::ostringstream ss;
     ss << in.rdbuf();
     std::string content = ss.str();
     in.close();
+    const size_t klen = strlen(key);
     size_t pos = 0;
     while (pos < content.size()) {
         const size_t eol = content.find('\n', pos);
@@ -225,22 +226,30 @@ void WriteFgOptimizedIni(int v) noexcept {
         if (len && content[pos + len - 1] == '\r') --len;
         const size_t s = content.find_first_not_of(" \t", pos);
         if (s != std::string::npos && s < pos + len &&
-            content.compare(s, 9, "Optimized") == 0) {
-            const bool boundary = (s + 9 == pos + len) || content[s + 9] == '=' ||
-                                  content[s + 9] == ' ' || content[s + 9] == '\t';
-            const size_t eq = boundary ? content.find('=', s + 9) : std::string::npos;
+            content.compare(s, klen, key) == 0) {
+            const bool boundary = (s + klen == pos + len) || content[s + klen] == '=' ||
+                                  content[s + klen] == ' ' || content[s + klen] == '\t';
+            const size_t eq = boundary ? content.find('=', s + klen) : std::string::npos;
             if (eq != std::string::npos && eq < pos + len) {
                 content.replace(eq + 1, pos + len - (eq + 1), std::to_string(v));
                 std::ofstream out(path, std::ios::binary | std::ios::trunc);
                 out << content;
-                if (!out) PanelLog("panel: fg proxy ini write FAILED (locked?)");
-                return;
+                if (!out) {
+                    PanelLog("panel: fg proxy ini write FAILED (locked?)");
+                    return false;
+                }
+                return true;
             }
         }
         if (eol == std::string::npos) break;
         pos = eol + 1;
     }
-    PanelLog("panel: fg proxy ini has no Optimized key; not written");
+    PanelLog("panel: fg proxy ini has no %s key; not written", key);
+    return false;
+}
+
+void WriteFgOptimizedIni(int v) noexcept {
+    WriteFgProxyIniKey("Optimized", v);
 }
 
 // Shared-memory parameter channel: the panel creates the mapping and pushes
@@ -1035,18 +1044,21 @@ void DrawUi() noexcept {
             if (g_app.page != 1) savePagePref(1);
             y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
 
-    // DLSS 帧生成(整行:倍数选择 关/2x/3x/4x)
+    // DLSS 帧生成(整行:倍数选择 关/2x/3x/4x/5x/6x)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
     ImGui::TextUnformatted("帧生成");
     if (ImGui::IsItemHovered())
-        ShowTip("DLSS 补帧,输出帧率 ×2–×4,插值帧落在相邻真实帧之间。\n"
+        ShowTip("DLSS 补帧,输出帧率 ×2–×6,插值帧落在相邻真实帧之间。\n"
                 "需光流质量 > 0(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
-                "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。");
+                "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。\n"
+                "5x/6x 首次选择会写入代理运行库上限并需重启 mpv 后完整生效;\n"
+                "输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
-        // 单一控件:关(=0)/2x/3x/4x,同步 fgEnabled + fgMultiplier 两键。
-        const int items = 4;
-        const char *labels[items] = { "关", "2x", "3x", "4x" };
+        // 单一控件:关(=0)/2x..6x,同步 fgEnabled + fgMultiplier 两键;
+        // 同步代理运行库上限 MaxGeneratedFrames = 倍数-1(进程级,重启生效)。
+        const int items = kFgMultMax; // 关 + 2x..6x
+        const char *labels[items] = { "关", "2x", "3x", "4x", "5x", "6x" };
         int sel = g_app.params.fgEnabled ? std::clamp(g_app.params.fgMultiplier, kFgMultMin, kFgMultMax) - 1 : 0;
         ImGui::SetNextItemWidth(110 * s);
         if (ImGui::Combo("##fg_mode", &sel, labels, items)) {
@@ -1054,7 +1066,10 @@ void DrawUi() noexcept {
                 g_app.params.fgEnabled = 0;
             } else {
                 g_app.params.fgEnabled = 1;
-                g_app.params.fgMultiplier = sel + 1; // 2..4
+                g_app.params.fgMultiplier = sel + 1; // 2..6
+                // 运行库上限 = 插值帧数(6x → 5)。代理只在进程加载时读一次;
+                // 未重启时运行库仍按旧上限,超限插槽自动退化为复制真实帧。
+                WriteFgProxyIniKey("MaxGeneratedFrames", sel - 1);
             }
             g_app.liveDirty = true;
             // 输出契约(帧数/节奏)随创建档位定格,任何档位/开关的真变化都

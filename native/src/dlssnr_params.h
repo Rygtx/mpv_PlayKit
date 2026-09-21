@@ -23,10 +23,14 @@ inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
 // 全分辨率。上游 motionVectorQuality 的 1-2/3-5 在 FFX 内各只对应一种
 // 行为,收敛为独立三档 —— 不留冗余档位)
 inline constexpr int kFfxQualityMin = 0, kFfxQualityMax = 2;
-// DLSS 帧生成倍数(2-4;proxy MaxGeneratedFrames 上限 3 → 4X 封顶)。
+// DLSS 帧生成倍数(2-6;dlssg_for_sm86 0.3.x 310.9 运行库支持 6X)。
 // live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
 // 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
-inline constexpr int kFgMultMin = 2, kFgMultMax = 4;
+// 5x/6x 依赖代理 ini [FrameGeneration] MaxGeneratedFrames = M-1(面板改
+// 倍数时自动写入;代理只在进程加载时读一次 → 首次切 5x/6x 需重启 mpv;
+// 未重启时会话按运行库上限降级,超出插槽退化为复制真实帧)。输出帧率 =
+// 源 ×M,显示端刷新率建议 ≥ 输出帧率。
+inline constexpr int kFgMultMin = 2, kFgMultMax = 6;
 // 调试视图(live,不持久化):0 = 关,1 = 差异 ×20(|NR改动|×20 灰度),
 // 2 = 光流场(方向→色相、幅值→亮度;排查"光流有没有流/方向对不对")。
 inline constexpr int kDebugViewMax = 2;
@@ -117,7 +121,7 @@ struct DlssnrParams {
     //   下次播放(seek 重建滤镜)才生效。
     // FG 路径要求挂 DLSSNR 之后:FG 的 backbuffer = NR 输出。
     int fgEnabled = 0;
-    // DLSS 帧生成倍数(2-4,live 参数):每源帧产出 M 帧(1 真实 + M-1
+    // DLSS 帧生成倍数(2-6,live 参数):每源帧产出 M 帧(1 真实 + M-1
     // 插值),输出帧时长 = 源时长/M。源帧边界生效(当前源帧按触及时的 M
     // 走完),无重建/重启。fgEnabled=0 时忽略。
     int fgMultiplier = 2;

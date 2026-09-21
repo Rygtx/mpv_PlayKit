@@ -71,8 +71,12 @@ public:
 
     bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
 
+    // 运行库插值帧上限(能力键 MultiFrameCountMax,= 倍数上界-1;代理 ini
+    // MaxGeneratedFrames 钳定,默认 kFgMultMax-1)。Initialize 时定格。
+    int MaxGen() const noexcept { return _maxGen; }
+
     // 每处理帧每插值槽一次(fmParallel 并发由内部互斥串行;GPU dispatch 仍
-    // 随各槽命令列表重叠)。multiplier = 本源帧倍数 M(2-4),slotIndex =
+    // 随各槽命令列表重叠)。multiplier = 本源帧倍数 M(2-6),slotIndex =
     // 插值槽 1..M-1(同源帧内必须按序调用 —— 官方 MFG 契约)。cl = 槽命令
     // 列表;资源状态契约:backbuffer/mvec/depth = NSR,interpOut = UAV
     // (调用方负责屏障)。reset=true 的 eval 属于重置帧,输出不消费。返回
@@ -116,6 +120,7 @@ private:
     unsigned long long _frameId = 0; // DLSSG.BackbufferFrameID 单调计数
     int _width = 0;
     int _height = 0;
+    int _maxGen = kFgMultMax - 1; // 运行库插值帧上限(能力键覆写)
 };
 
 } // namespace vsdlssnr
