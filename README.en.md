@@ -48,7 +48,7 @@ For general mpv tweaks from upstream (configuration guides, mpv-lazy usage, etc.
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR model (must reside in the `ngx\` subdirectory; the plugin resolves it by this relative path; taken from the RenoDX project) |
 | `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, official-chain carrier; selectable via "FG route") |
 | `vs-plugins\ngx\version.dll` | DLSS frame-generation hook proxy 0.3.x ([dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0, RTX 30/20; self-signed; intercepts the `nvngx_dlssg.dll` load and swaps in its embedded runtime) |
-| `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy config (shipped as-is; the panel "kernel tier" writes the `Optimized` key only, everything else stays untouched) |
+| `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy config (shipped as-is + `MaxGeneratedFrames=5` for the 6x cap; the panel "kernel tier" writes the `Optimized` key only, everything else stays untouched) |
 | `portable_config\vs\DLSSNR_NV.vpy` | Filter script (parameters in the table below) |
 
 ## Installation (existing mpv-lazy)
@@ -93,7 +93,7 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 | `Motion_Vector_Quality` | 0–5 | 0 | NVIDIA optical-flow guidance level (0 = zero guidance; 1–5 use hardware optical flow to reduce motion-scene temporal artifacts; higher is more accurate but slower) |
 | `Nvof_Follow_Scaling` | True/False | False | Optical-flow input follows internal downsampling (requires Scaling_Enabled; greatly reduces optical-flow engine load at a slight motion-accuracy cost) |
 | `Fg_Enabled` | True/False | False | DLSS frame generation (chained after denoise, output fps ×2–×6; auto mode requires `ngx\version.dll` (dlssg_for_sm86 ≥0.3.0), falls back to 1:1 on init failure) |
-| `Fg_Multiplier` | 2–6 | 2 | Interpolation multiplier (output frame count/pacing is fixed per session; panel changes auto-trigger an in-place mpv reload via `input-ipc-server`; without IPC, off/down-grade falls back to in-session real-frame duplication and up-grade needs a manual seek; 24fps ×3 = 72fps). **5x/6x**: the panel auto-writes the proxy ini `MaxGeneratedFrames = M-1`; the first selection needs an mpv restart to take full effect, and until then slots beyond the runtime cap degrade to duplicated real frames; output fps = source ×M, display refresh rate should be ≥ output fps) |
+| `Fg_Multiplier` | 2–6 | 2 | Interpolation multiplier (output frame count/pacing is fixed per session; panel changes auto-trigger an in-place mpv reload via `input-ipc-server`; without IPC, off/down-grade falls back to in-session real-frame duplication and up-grade needs a manual seek; 24fps ×3 = 72fps). The runtime cap defaults to 6x (deployed ini `MaxGeneratedFrames=5` — a clamp only), so gear changes take effect via the in-place reload; output fps = source ×M, display refresh rate should be ≥ output fps) |
 | `Fg_Route` | 0–1 | 0 | FG route (0 = auto, preloads the dlssg_for_sm86 0.3.x hook proxy — RTX 30/20 get DLSS-G delivered through it while still driving the official signed chain; 1 = pure official, no preload, straight to the official runtime/RTX 40/50, no fallback when rejected on 30/20. Process-level, mpv restart required after switching; from v20 legacy values are incompatible — any of 1–3 clamps to 1, re-select auto in the panel after upgrading) |
 | `H_Max` | integer | 0 | Output height cap (sources above it skip processing; 0 = unlimited) |
 

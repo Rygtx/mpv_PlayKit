@@ -79,6 +79,18 @@ if (-not (Test-Path $fgProxyDll) -or (Get-Item $fgProxyDll).Length -ne $sm86DllB
     Write-Host "dlssg_for_sm86 ${sm86Tag}: $fgProxyDll ($sm86DllBytes bytes) + factory ini"
 }
 
+# 出厂 ini 的 MaxGeneratedFrames 默认 3(4X);部署默认开到 5(6X)——
+# 上限只是钳位,倍数由插件按面板请求,常开无副作用,免去"首次切 5x/6x
+# 需重启"的过渡态。仅裁剪部署副本,vendor 是可重建暂存区。
+if (Test-Path $fgProxyIni) {
+    $iniText = Get-Content $fgProxyIni -Raw
+    if ($iniText -notmatch '(?m)^MaxGeneratedFrames=5\s*$') {
+        $iniText = $iniText -replace '(?m)^MaxGeneratedFrames=\d+\s*$', "MaxGeneratedFrames=5"
+        Set-Content -Path $fgProxyIni -Value $iniText -NoNewline -Encoding utf8NoBOM
+        Write-Host "fg proxy ini: MaxGeneratedFrames -> 5 (6X cap)"
+    }
+}
+
 # --- VapourSynth R73 headers (runtime is R73 / API4, see mpv-lazy Lib\site-packages\vapoursynth-73.dist-info) ---
 foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
     Fetch "https://raw.githubusercontent.com/VapourSynth/VapourSynth/R73/include/$h" (Join-Path $vsInc $h)

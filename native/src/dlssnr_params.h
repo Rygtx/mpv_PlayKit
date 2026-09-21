@@ -26,10 +26,9 @@ inline constexpr int kFfxQualityMin = 0, kFfxQualityMax = 2;
 // DLSS 帧生成倍数(2-6;dlssg_for_sm86 0.3.x 310.9 运行库支持 6X)。
 // live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
 // 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
-// 5x/6x 依赖代理 ini [FrameGeneration] MaxGeneratedFrames = M-1(面板改
-// 倍数时自动写入;代理只在进程加载时读一次 → 首次切 5x/6x 需重启 mpv;
-// 未重启时会话按运行库上限降级,超出插槽退化为复制真实帧)。输出帧率 =
-// 源 ×M,显示端刷新率建议 ≥ 输出帧率。
+// 5x/6x 无过渡态:部署 ini 默认 MaxGeneratedFrames=5(6x 上限常开,
+// fetch-deps 归一;上限只是钳位,倍数由插件按面板请求),面板改倍数原地
+// 重载即时生效。输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率。
 inline constexpr int kFgMultMin = 2, kFgMultMax = 6;
 // 调试视图(live,不持久化):0 = 关,1 = 差异 ×20(|NR改动|×20 灰度),
 // 2 = 光流场(方向→色相、幅值→亮度;排查"光流有没有流/方向对不对")。

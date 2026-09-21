@@ -1051,12 +1051,13 @@ void DrawUi() noexcept {
         ShowTip("DLSS 补帧,输出帧率 ×2–×6,插值帧落在相邻真实帧之间。\n"
                 "需光流质量 > 0(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
                 "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。\n"
-                "5x/6x 首次选择会写入代理运行库上限并需重启 mpv 后完整生效;\n"
+                "运行库上限默认开到 6x(部署 ini MaxGeneratedFrames=5);\n"
                 "输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
-        // 单一控件:关(=0)/2x..6x,同步 fgEnabled + fgMultiplier 两键;
-        // 同步代理运行库上限 MaxGeneratedFrames = 倍数-1(进程级,重启生效)。
+        // 单一控件:关(=0)/2x..6x,同步 fgEnabled + fgMultiplier 两键。
+        // 运行库上限 MaxGeneratedFrames 由部署 ini 常开到 5(fetch-deps 归一),
+        // 倍数选择无需触碰代理 ini —— 改档原地重载即时生效。
         const int items = kFgMultMax; // 关 + 2x..6x
         const char *labels[items] = { "关", "2x", "3x", "4x", "5x", "6x" };
         int sel = g_app.params.fgEnabled ? std::clamp(g_app.params.fgMultiplier, kFgMultMin, kFgMultMax) - 1 : 0;
@@ -1067,9 +1068,6 @@ void DrawUi() noexcept {
             } else {
                 g_app.params.fgEnabled = 1;
                 g_app.params.fgMultiplier = sel + 1; // 2..6
-                // 运行库上限 = 插值帧数(6x → 5)。代理只在进程加载时读一次;
-                // 未重启时运行库仍按旧上限,超限插槽自动退化为复制真实帧。
-                WriteFgProxyIniKey("MaxGeneratedFrames", sel - 1);
             }
             g_app.liveDirty = true;
             // 输出契约(帧数/节奏)随创建档位定格,任何档位/开关的真变化都
