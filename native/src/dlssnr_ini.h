@@ -50,7 +50,6 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeInt(L"fg_multiplier", std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax));
     writeInt(L"fg_route", std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax));
     writeInt(L"of_backend", std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax));
-    writeInt(L"anti_flicker", std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax));
     writeInt(L"saved", 1);
     return ok;
 }
@@ -97,7 +96,6 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath) noexcept {
     p.fgMultiplier = std::clamp(readInt(L"fg_multiplier", p.fgMultiplier), kFgMultMin, kFgMultMax);
     p.fgRoute = std::clamp(readInt(L"fg_route", p.fgRoute), kFgRouteMin, kFgRouteMax);
     p.ofBackend = std::clamp(readInt(L"of_backend", p.ofBackend), kOfBackendMin, kOfBackendMax);
-    p.antiFlicker = std::clamp(readInt(L"anti_flicker", p.antiFlicker), kAntiFlickerMin, kAntiFlickerMax);
     return true;
 }
 

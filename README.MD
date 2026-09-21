@@ -92,7 +92,6 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Motion_Vector_Quality` | 0–5 | 0 | NVOF 光流引导档位(0 = 零 guidance;1–5 用硬件光流减轻运动场景时域伪影,档位越高越精确也越耗时)。仅后端 = NVOF 时消费 |
 | `Ffx_Quality` | 0–2 | 0 | FFX 光流引导档位(0 = 零 guidance;1 = 性能/OF 半分辨率;2 = 质量/全分辨率)。仅后端 = FFX(默认)时消费。两字段独立;面板"光流质量"单下拉按当前后端读写对应档位 |
 | `Nvof_Follow_Scaling` | True/False | False | 光流输入跟随内部降采样(需 Scaling_Enabled;大幅降低光流引擎占用,运动精度略降) |
-| `Anti_Flicker` | 0–4 | 0 | 抗闪烁时域稳定器(上游 Magpie v0.6.8):对降噪改动做运动补偿时域累积,减轻画面明暗/结构的逐帧抖动。0 = 无;1 = 静态累积;2 = 光流累积;3 = 光流累积+;4 = 低频时域重建。单 pass 即生效;2–4 建议光流质量 ≥ 1(无光流自动退化静态验证);切换档位短暂重建(毫秒级) |
 | `Of_Backend` | 0–1 | 0 | 光流后端(0 = FFX/AMD FidelityFX,跨厂商通用,默认;1 = NVOF/NVIDIA 专属引擎)。切换只影响下一次光流会话建立(下一帧/seek 生效) |
 | `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×4;依赖 `ngx\version.dll`,初始化失败自动回退 1:1) |
 | `Fg_Multiplier` | 2–4 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps) |
@@ -107,7 +106,6 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 |---|---|---|
 | 光流引导 1–5 档 | FFX:D3D12 SM6.2 + WaveOps + R16G16_SINT UAV(跨厂商);NVOF:RTX Turing+ | 会话建立失败自动回退零 guidance,不挡其他功能 |
 | 光流跟随降采样 | `Scaling_Enabled = True`;**帧生成激活时被强制忽略**(帧生成要求源尺寸运动场) | 开关无效,光流按源尺寸计算 |
-| 抗闪烁模式 2–4(光流累积/累积+/低频时域重建) | 光流质量 ≥ 1(运动补偿需要真运动场) | 自动退化为静态验证(等效模式 1 的无光流路径),不挡其他功能 |
 | `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | 无意义(关闭缩放按源尺寸直接处理) |
 | 帧生成 `Fg_Enabled` | ① **光流质量 ≥ 1**(零 guidance 无真运动场)② `ngx\` 内对应运行时(官方 `nvngx_dlssg.dll` 或代理 `version.dll`) | 零 guidance 下插值帧全部退化为复制真实帧(等于白开);运行时缺失/拒载自动回退 1:1,降噪不受影响 |
 | 帧生成改档/开关自动重载 | mpv.conf `input-ipc-server`(本包发行配置已默认开启) | 关/降档退化为会话内复制真实帧;升档需手动 seek |

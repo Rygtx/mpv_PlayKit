@@ -71,10 +71,6 @@ constexpr const char *kOfQualityNames[] = {
 // FFX 质量档位(独立三档,与上游 6 档解耦:1 = Performance 半分辨率,
 // 2 = Quality 全分辨率 —— 上游 1-2/3-5 在 FFX 内各只对应一种行为)
 constexpr const char *kFfxQualityNames[] = { "无", "性能 (1/2 分辨率)", "质量 (全分辨率)" };
-// 抗闪烁时域稳定器(上游 antiFlicker 0-4,文案对齐上游界面命名)
-constexpr const char *kAntiFlickerNames[] = {
-    "无", "静态累积", "光流累积", "光流累积+", "低频时域重建"
-};
 // 预设/风格/光流质量/各滑块/开关原以 kEnums/kSliders/kFlags 成员指针表
 // 驱动通用循环;两列归并后每行控件异构(组合/滑块/复选框/整行),改为
 // DrawUi 内联 + pairLabel/pairCombo/pairSlider lambda,tip 随行内联。
@@ -780,26 +776,6 @@ void DrawUi() noexcept {
         }
     }
     y += rowH;
-
-    // 抗闪烁(整行)—— 暂时下架(2026-09-17 裁定:当前素材上 NR 输出收敛
-    // 稳定,EMA 位移低于 8bit 量化半 LSB,感知无差异;机制已全链验证
-    // [test_temporal ALL PASS],vpy/ini/IPC 参数链保留可编程调用)。
-    // 恢复暴露:取消本块注释即可,无其它接线改动。
-    // ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    // ImGui::TextUnformatted("抗闪烁");
-    // if (ImGui::IsItemHovered())
-    //     ShowTip("对降噪改动做时域累积,减轻画面明暗/结构的逐帧抖动。\n"
-    //             "\"光流累积\"两档需光流质量 > 1(否则退化为静态验证);\n切换短暂重建(毫秒级)。");
-    // ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
-    // ImGui::SetNextItemWidth((std::min)(wsize.x - colCtrl - marginX, 260 * s));
-    // {
-    //     int v = g_app.params.antiFlicker;
-    //     if (ImGui::Combo("##anti_flicker", &v, kAntiFlickerNames, kAntiFlickerMax + 1)) {
-    //         g_app.params.antiFlicker = v;
-    //         g_app.liveDirty = true;
-    //     }
-    // }
-    // y += rowH;
 
     // (强度 | 局部色调)
     pairLabel(0, "强度", "整体处理强度(0-2,默认 1)。数值越高降噪/增强越明显。");

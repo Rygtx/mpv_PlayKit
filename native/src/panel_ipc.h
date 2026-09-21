@@ -35,17 +35,13 @@ constexpr uint32_t PAYLOAD_SIZE = 512;
 // v13 adds debugView(差异调试 ×20 视图 0/1,live,不持久化 —— 输出被替换为
 // |NR改动|×20 灰度图)并退役 uiCorrection(视频管线无 UI 图层,模型端结构性
 // no-op —— 字段保留占位防布局漂移,写入恒 1,面板不再暴露);
-// v14 adds antiFlicker(抗闪烁时域稳定器 0-4,live —— 结构体增长,新旧混跑
-// 按 magic 拒读); v15 adds ofBackend(光流后端,切档下一帧生效,无需
-// mpv 重启 —— 结构体增长,新旧混跑按 magic 拒读); v16 reinterprets
-// ofBackend 为 0=ffx(默认)/1=nvof(原 auto 厂商排序档移除 —— FFX 跨厂商
-// 通用,用户裁定 2026-09-21;字段宽度不变,值域收缩,无偏移漂移,但
-// 新旧面板/插件混跑时 0/1/2 语义错位,仍按 magic 拒读保护); v17 adds
-// ffxQuality(FFX 光流档位 0-2,live —— 两后端档位分字段,面板单下拉按
-// 当前后端读写;结构体增长,新旧混跑按 magic 拒读)。
+// v14/v15/v17 曾引入 antiFlicker/ofBackend/ffxQuality;v18 撤销抗闪烁时域
+// 稳定器全链移植(上游 antiFlicker 2026-09-21 裁定移除 —— NR 输出收敛稳定,
+// 机制维护成本 > 感知收益),ofBackend/ffxQuality 保留(FFX 后端);结构体
+// 缩减,新旧混跑按 magic 拒读。
 // The bump keeps mixed-version panel/plugin pairs from decoding shifted
 // offsets as valid payloads — panel and plugin must be deployed as a pair.
-constexpr uint32_t PAYLOAD_MAGIC = 0x484C5344u; // "DSLH" (v17, 版本位走 hex:9 之后是 A/B/C/D/E/F)
+constexpr uint32_t PAYLOAD_MAGIC = 0x494C5344u; // "DSLI" (v18, 版本位走 hex:9 之后是 A/B/C/D/E/F)
 constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
 
 #pragma pack(push, 8)
@@ -78,7 +74,6 @@ struct PanelPayload {
     int32_t fgRoute;             // 0-3 FG 路由(v12;0=自动,1=SM86,2=SM75,3=官方 NGX,重启生效)
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
     int32_t debugView;           // 0/1 差异调试 ×20 视图(v13;live,不持久化)
-    int32_t antiFlicker;         // 0-4 抗闪烁时域稳定器(v14;live)
     int32_t ofBackend;           // 0-1 光流后端(v16;0=ffx 默认 1=nvof;切档下一帧生效)
 };
 #pragma pack(pop)
@@ -112,7 +107,6 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.fgEnabled = pl.fgEnabled != 0;
     p.fgMultiplier = std::clamp(pl.fgMultiplier, kFgMultMin, kFgMultMax);
     p.debugView = pl.debugView != 0;
-    p.antiFlicker = std::clamp(pl.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
     p.ofBackend = std::clamp(pl.ofBackend, kOfBackendMin, kOfBackendMax);
 }
 
@@ -155,7 +149,6 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.fgMultiplier = std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax);
     pl.fgRoute = std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
     pl.debugView = p.debugView ? 1 : 0;
-    pl.antiFlicker = std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
     pl.ofBackend = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
     return pl;
 }

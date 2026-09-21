@@ -23,15 +23,6 @@ inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
 // 全分辨率。上游 motionVectorQuality 的 1-2/3-5 在 FFX 内各只对应一种
 // 行为,收敛为独立三档 —— 不留冗余档位)
 inline constexpr int kFfxQualityMin = 0, kFfxQualityMax = 2;
-// 抗闪烁时域稳定器(上游 antiFlicker,v0.6.8 093efe21/55d4cc38;live 参数):
-//   0 = 无  1 = 静态累积(稳定区域检测 + 自适应 EMA,无光流)
-//   2 = 光流累积(重投影 + 输入验证 + 自适应 EMA,需光流质量 ≥ 1)
-//   3 = 光流累积+(条件幅度 + 持续性迟滞,需光流质量 ≥ 1)
-//   4 = 低频时域重建(半分辨率残差历史 + 原色引导重建,需光流质量 ≥ 1)
-// 对 NR 链残差做运动补偿累积,**单 pass 即生效**(上游 _temporal 只看
-// antiFlicker != 0)。模式 2-4 无光流时自动降级为静态验证(UseMotion=0)。
-// 切换重建时域资源(PoolHold 排空,毫秒级纹理分配),不动 NGX feature。
-inline constexpr int kAntiFlickerMin = 0, kAntiFlickerMax = 4;
 // DLSS 帧生成倍数(2-4;proxy MaxGeneratedFrames 上限 3 → 4X 封顶)。
 // live 参数:输出节奏由逐帧 _DurationDen ×M 驱动(mpv vapoursynth 契约),
 // 逐源帧求和恒等于源时长 —— M 在源帧边界生效,无需重建/重启。
@@ -117,12 +108,6 @@ struct DlssnrParams {
     // 注意 FG(DLSS FG)激活时本开关被忽略:FG 的 MVecs 契约要求与
     // backbuffer 同尺寸的稠密运动场,必须按源尺寸建 NVOF 会话。
     int nvofFollowScaling = 0;
-    // 抗闪烁时域稳定器(0-4,live 参数):对 NR 链残差做运动补偿历史累积,
-    // 治 NR 输出的逐帧明暗/结构修正抖动(上游 v0.6.8 antiFlicker,单 pass
-    // 即生效)。语义见 kAntiFlickerMin 注释。切换只重建时域资源(PoolHold
-    // 排空),不动 NGX feature;NR 关(skipEval/诊断/直通)时本帧跳过并
-    // 作废历史。模式 2-4 建议光流质量 ≥ 1,无光流自动降级静态验证。
-    int antiFlicker = 0;
     // DLSS 帧生成(0/1)。语义分两层:
     //   create-time —— 非零且 FG 上下文初始化成功时,滤镜输出帧率 ×2
     //   (vi.fps 翻倍,奇数索引输出插值帧);初始化失败优雅回退 1:1。

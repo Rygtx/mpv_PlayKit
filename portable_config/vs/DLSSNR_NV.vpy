@@ -34,7 +34,6 @@ Motion_Vector_Quality = 0
 Ffx_Quality = 0
 Nvof_Follow_Scaling = False
 Of_Backend = 0
-Anti_Flicker = 0
 Fg_Enabled = False
 Fg_Multiplier = 2
 Fg_Route = 0
@@ -69,11 +68,6 @@ H_Max = 0
 ##          1 = NVOF (NVIDIA 专属引擎); 面板"光流后端"同步此值
 ## <0-2> 整数, FFX 光流档位 (默认 0): 0 = 无; 1 = 性能 (半分辨率),
 ##          2 = 质量 (全分辨率); 面板"光流质量"按当前后端读写对应档位
-## <0-4> 整数, 抗闪烁时域稳定器 (默认 0): 对降噪改动做时域累积,
-##          减轻画面明暗/结构的逐帧抖动 (上游 Magpie v0.6.8 antiFlicker)
-##          0 = 无; 1 = 静态累积; 2 = 光流累积; 3 = 光流累积+; 4 = 低频时域重建
-##          单 pass 即生效; 2-4 建议光流质量 >= 1 (无光流自动退化为静态验证);
-##          切换档位短暂重建 (毫秒级), 面板保存的设置优先
 ## <True|False> DLSS 帧生成 (默认 False)
 ##          挂降噪之后: 每源帧产出 M 帧, 插值帧由 DLSS FG 模型合成,
 ##          落在相邻两真实帧之间; 依赖 ngx\version.dll (dlssg_for_sm86),
@@ -133,7 +127,6 @@ else :
 		ffx_quality = Ffx_Quality,
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
 		of_backend = Of_Backend,
-		anti_flicker = Anti_Flicker,
 		fg_enabled = int(Fg_Enabled),
 		fg_multiplier = Fg_Multiplier,
 		fg_route = int(Fg_Route),
