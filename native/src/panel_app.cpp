@@ -326,10 +326,12 @@ void WritePayload(bool saveRequest = false) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// mpv IPC 自动重载:需要重建滤镜会话的变动(FG 倍数/开关、创建即全关后重开
-// NR)由面板经 mpv JSON IPC 直接触发一次原地 seek —— mpv 的 vf_vapoursynth
-// 在每次 seek 时整脚本重建,新实例采纳面板刚写入的 payload,变动即时生效,
-// 免手动拖进度条。输出契约(帧数/节奏)随创建倍数定格,会话内无法改 ——
+// mpv IPC 自动重载:需要重建滤镜会话的变动(vsrMode/scale/HDR 开关、FG
+// 开关等 create-time 参数)由面板经 mpv JSON IPC 回读 vf 链并原样 set
+// —— mpv 对 vf 属性的任何 set 都重走链初始化(实测 seek 不重建 vf 链,
+// 旧版原地微 seek 前提不成立,gen 恒定实证 2026-09-22),新实例在 create
+// 时采纳面板刚写入的 payload,变动即时生效,免手动拖进度条。输出契约
+// (帧数/节奏、输出尺寸/格式)随创建定格,会话内无法改 ——
 // 真档位变化只能重建,这正是自动 seek 的存在理由。
 // 管道名发现:解析 ..\portable_config\mpv.conf 的 input-ipc-server,缺失时
 // 回落常见默认名。全程 best-effort:连接失败(未启用 IPC / mpv 未运行 /
@@ -400,18 +402,20 @@ bool TriggerMpvReseek() noexcept {
         HANDLE pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
                                   0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (pipe == INVALID_HANDLE_VALUE) continue;
-        // 原地微 seek(1ms 向前,exact):目标必异于当前帧 → 走完整 seek 路径
-        // → vf_vapoursynth 整脚本重建;显示位置几乎不动。暂停态同样生效。
-        const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
-        DWORD written = 0;
+        // 强制滤镜链重建(seek 不重建 vf 链,set_property 同值被去重跳过,
+        // vf remove+add 会把上一实例的放大输出当新输入级联污染 —— 三者皆
+        // 实测否决,2026-09-22)。vf set 从源重解码整链重初始化,新实例在
+        // create 时采纳刚发布的 payload create-time 三元组(vsrMode/scale/
+        // hdr)。链串与 mpv-lazy uosc 菜单同款约定(vapoursynth 槽独占)。
+        const char *cmd = "{\"command\":[\"vf\",\"set\",\"vapoursynth=~~/vs/DLSSNR_NV.vpy\"]}\n";
+        DWORD written = 0, got = 0;
         ok = WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)), &written, nullptr) &&
              written == strlen(cmd);
-        char reply[128]{}; // 读掉一行响应(mpv 回显 success/error),内容不关心
-        DWORD got = 0;
-        ReadFile(pipe, reply, sizeof(reply) - 1, &got, nullptr);
+        char ack[128]{};
+        ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr);
         CloseHandle(pipe);
         if (ok) {
-            PanelLog("panel: mpv reseek via IPC pipe %ls", candidates[i]);
+            PanelLog("panel: mpv vf reinit via IPC pipe %ls", candidates[i]);
         }
     }
     if (!ok) {
@@ -2089,7 +2093,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
         // Throttled shared-memory pushes while dragging sliders
         if (g_app.liveDirty && nowSec - g_app.lastLiveWrite > 0.1) {
-            WritePayload();
+            // create-time 变动(vsrMode/FG 档位等)= reseek 语义:vf 重初始化
+            // 会杀掉本面板(watchdog LOST → 插件重拉新面板),新面板读 ini
+            // —— 不落盘则刚点的档位在重启后的面板上"弹回旧值"。saveRequest
+            // 由插件侧写 ini(与"保存设置"按钮同路径)。
+            WritePayload(g_app.reseekDirty);
             g_app.liveDirty = false;
             g_app.lastLiveWrite = nowSec;
             // 需要重建会话的变动:payload 落地后立即触发 mpv 原地 seek,
