@@ -2,6 +2,7 @@
 #include "iat_hook.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 
 namespace vsdlssnr {
@@ -89,15 +90,22 @@ void **FindImportedFunctionSlot(HMODULE module, const char *functionName) noexce
 
 } // namespace
 
-bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook) noexcept {
+bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook,
+                              char *err, size_t errLen) noexcept {
+    // 失败原因经 err 上报:调用方曾把五种失败统一报成静态文案(缺槽位),
+    // 真因是 VirtualProtect/owner 被占时日志误导排查方向。
+    auto fail = [&](const char *why) {
+        if (err && errLen) std::snprintf(err, errLen, "%s", why);
+        return false;
+    };
     hook = {};
     hook.iatSlot = FindImportedFunctionSlot(snippetModule, "GetModuleFileNameW");
-    if (!hook.iatSlot) return false;
+    if (!hook.iatSlot) return fail("no GetModuleFileNameW import slot");
 
     void *expectedOwner = nullptr;
     if (!g_hookOwner.compare_exchange_strong(
             expectedOwner, &hook, std::memory_order_acq_rel)) {
-        return false; // another live context already owns the hook
+        return fail("another live context owns the hook");
     }
 
     void *hookAddress = FunctionAddress(&HookedGetModuleFileNameW);
@@ -106,13 +114,16 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook) no
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             reinterpret_cast<LPCWSTR>(hookAddress), &callerModule)) {
         g_hookOwner.store(nullptr, std::memory_order_release);
-        return false;
+        return fail("GetModuleHandleExW failed");
     }
 
     DWORD oldProtection = 0;
     if (!VirtualProtect(hook.iatSlot, sizeof(void *), PAGE_READWRITE, &oldProtection)) {
+        char why[64];
+        std::snprintf(why, sizeof(why), "VirtualProtect failed (err %lu)",
+                      static_cast<unsigned long>(GetLastError()));
         g_hookOwner.store(nullptr, std::memory_order_release);
-        return false;
+        return fail(why);
     }
 
     g_snippetCallerModule.store(callerModule, std::memory_order_release);
@@ -134,6 +145,9 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook) no
         // ERROR_INVALID_FUNCTION from this IAT slot for the whole session
         // and block every future context from installing.
         OutputDebugStringA("vs_dlssnr: IAT hook null import (GetModuleFileNameW slot is null); hook disarmed\n");
+        if (err && errLen) {
+            std::snprintf(err, errLen, "null import (GetModuleFileNameW slot is null)");
+        }
         InterlockedExchangePointer(
             reinterpret_cast<void *volatile *>(hook.iatSlot), original);
         g_originalGetModuleFileNameW.store(nullptr, std::memory_order_release);

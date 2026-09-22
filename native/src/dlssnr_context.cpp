@@ -235,6 +235,16 @@ void TimingLog(const char *line) noexcept {
 // STATUS 行(失败必须进 timing log —— 跨进程观测只认它)。
 void TimingStatusLine(const char *line) noexcept { TimingLog(line); }
 
+// stats 通道自身建立失败的留痕钩子(panel_ipc.h):映射创建失败曾经只有
+// OutputDebugString 一个出口 —— GUI mpv 没人看,面板从此空白而 timing log
+// 零痕迹,与"插件没加载"无法区分。注册后失败行进同一日志文件。
+namespace {
+const bool s_registerStatsFailLog = [] {
+    vsdlssnr::g_statsChannelFailLog = TimingLog;
+    return true;
+}();
+} // namespace
+
 // 逐帧级探针开关(VSDLSSNR_PROBE=1 启用;逐帧行会淹没 perf 行,平时关)。
 // 导出到头文件供 d3d12_context 的 init 期细分探针共用。
 bool ProbeEnabled() noexcept {
@@ -507,10 +517,23 @@ bool DlssnrContext::Initialize(
     if (_shared->Snapshot().fgEnabled &&
         std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
         fgDllPath && fgDllPath[0] &&
-        dlssfg_gate::GpuFamilyPrefersProxy() &&
-        DlssfgContext::PreloadProxyModule(fgDllPath)) {
-        TimingStatusLine(
-            "DLSSNR STATUS: dlssfg proxy preloaded before NGX core (load-monitor hook attach path)");
+        dlssfg_gate::GpuFamilyPrefersProxy()) {
+        // 预载失败曾经裸 return false 零痕迹:下游只会报 "official NGX
+        // reports DLSSG unavailable",把用户引向驱动/官方 DLL,真因
+        // (version.dll 缺失/被杀软隔离)无一行日志。原因串进 _fgProxyNote,
+        // 官方链失败时并入 fg_detail(面板直读)。
+        char proxyErr[96]{};
+        if (DlssfgContext::PreloadProxyModule(fgDllPath, proxyErr, sizeof(proxyErr))) {
+            TimingStatusLine(
+                "DLSSNR STATUS: dlssfg proxy preloaded before NGX core (load-monitor hook attach path)");
+        } else {
+            std::snprintf(_fgProxyNote, sizeof(_fgProxyNote), "%s", proxyErr);
+            char msg[224];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: dlssfg proxy preload FAILED (%s); falling through to official chain",
+                          proxyErr);
+            TimingStatusLine(msg);
+        }
     }
 
     // 1) NGX static core (NgxD3D12Core.cpp:118-151)
@@ -593,8 +616,16 @@ bool DlssnrContext::Initialize(
         return fail("DLSSNR signed snippet exports are incomplete");
     }
 
-    if (!InstallSnippetCallerHook(_snippetModule, _hook)) {
-        return fail("IAT hook install failed (no GetModuleFileNameW import slot)");
+    {
+        // 真因透传:五种失败(缺槽位/owner 被占/句柄失败/VirtualProtect/null
+        // 导入)曾统一报成静态文案,日志误导排查方向。
+        char hookErr[96]{};
+        if (!InstallSnippetCallerHook(_snippetModule, _hook, hookErr, sizeof(hookErr))) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "IAT hook install failed (%s)",
+                          hookErr[0] ? hookErr : "unknown");
+            return fail(msg);
+        }
     }
 
     {
@@ -624,6 +655,14 @@ bool DlssnrContext::Initialize(
                         : 0;
     std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s", _fgRequested ? "copy" : "off");
     _fgDetail[0] = '\0';
+    // 预载失败归因并入:官方链失败时 _fgDetail 只描述官方链自身,真因
+    // (proxy 没进托)在 _fgProxyNote —— 拼接后面板一行直读完整因果,
+    // 不必再翻 timing log 反推。
+    auto appendProxyNote = [&]() noexcept {
+        if (!_fgProxyNote[0] || !_fgDetail[0]) return;
+        const size_t len = std::strlen(_fgDetail);
+        std::snprintf(_fgDetail + len, sizeof(_fgDetail) - len, "; %s", _fgProxyNote);
+    };
     if (!_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested, err, errLen)) return failWithExistingErr();
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
@@ -671,6 +710,7 @@ bool DlssnrContext::Initialize(
                                      ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
                                      : "DLSSNR STATUS: dlssfg official capability block FAILED; FG off");
                 std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
+                appendProxyNote();
             } else {
                 _fg = std::make_unique<DlssfgContext>();
                 char fgErr[256]{};
@@ -694,6 +734,7 @@ bool DlssnrContext::Initialize(
                     DbgLine(msg);
                     TimingStatusLine(msg);
                     SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
+                    appendProxyNote();
                     _fg.reset();
                     // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
                     // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
@@ -708,6 +749,7 @@ bool DlssnrContext::Initialize(
                 TimingStatusLine(
                     "DLSSNR STATUS: dlssfg nvngx_dlssg.dll missing; 1:1 output");
                 std::snprintf(_fgDetail, sizeof(_fgDetail), "nvngx_dlssg.dll missing");
+                appendProxyNote();
             }
             _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
             _fgCreateMult = 0;    // 未激活:面板倍数 mismatch 判定归零
@@ -736,6 +778,7 @@ bool DlssnrContext::Initialize(
             _ofBackend = CreateOfBackend(ofq, _width, _height, ofErr, sizeof(ofErr));
             if (_ofBackend) {
                 _curOfBackend = backendReq;
+                _ofDetail[0] = '\0';
                 char msg[160];
                 std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: of session created backend=%d quality=%d %dx%d",
                               _curOfBackend, ofq, _width, _height);
@@ -743,6 +786,10 @@ bool DlssnrContext::Initialize(
                 TimingLog(msg);
             } else {
                 _nvofFailed = true;
+                // 原因串入 _ofDetail(of_detail 键):诊断页"请求 X | 实际
+                // zero"只说降级事实,"为什么"(SM6.2 不支持/驱动拒双向/
+                // dll 缺失)从这里直达面板 —— fg_detail 同款三件套。
+                SanitizeJsonDetail(ofErr, _ofDetail, sizeof(_ofDetail));
                 char msg[288];
                 std::snprintf(msg, sizeof(msg),
                               "DLSSNR STATUS: of init failed (%s); zero guidance", ofErr);
@@ -764,17 +811,23 @@ bool DlssnrContext::Initialize(
             WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
                                 _gpuNameUtf8, sizeof(_gpuNameUtf8), nullptr, nullptr);
         }
-        char body[512];
+        // 960:gpu_name(≤128)+ fg_detail(≤128)+ of_detail(≤96)全满时
+        // 512 会截断(PublishStatsJson 超长静默截断 = 尾键丢失,面板读不到
+        // 还不报错 —— v19 扩容 tick body 的同一教训)。
+        char body[960];
         std::snprintf(body, sizeof(body),
                       "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d,"
                       "\"%s\":\"%s\",\"%s\":\"%s\","
-                      "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\"}",
+                      "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
+                      "\"%s\":%d,\"%s\":\"%s\"}",
                       _gpuNameUtf8, _width, _height,
                       SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
                       SK_OF_MODE, OfModeString(),
                       SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
                       SK_FG_MULT_CREATE, _fgCreateMult,
-                      SK_FG_DETAIL, _fgDetail);
+                      SK_FG_DETAIL, _fgDetail,
+                      SK_FG_MULT_MAX, _fg ? _fg->MaxGen() : 0,
+                      SK_OF_DETAIL, _ofDetail);
         PublishStatsJson(body);
     }
 
@@ -1792,6 +1845,8 @@ bool DlssnrContext::ProcessFrame(
                 }
                 if (fgGenOk) fgGenOk[g] = true;
                 ++fgEvaluatedCount;
+                // eval 恢复:解除降级日志闩锁,下次新故障重新记一条。
+                _fgDupLogged.store(false, std::memory_order_release);
             } else {
                 // eval 失败(会话已被闩停):fgInterp 回 COMMON,本帧全部
                 // 插值槽降级复制。
@@ -1802,11 +1857,16 @@ bool DlssnrContext::ProcessFrame(
                 };
                 fgCl->ResourceBarrier(1, undo);
                 // 失败必须进 timing log(dlssfg 内部已留痕;此处补帧号锚点)。
-                char msg[224];
-                std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: dlssfg frame %d slot %d degraded to dup: %.140s",
-                              n, g + 1, fgErr);
-                TimingStatusLine(msg);
+                // 闩锁一次:gate 回落 2x 等场景下每源帧都有槽失败,不闩 =
+                // 24fps 源每秒 24 行,根因行被淹没(eval 恢复即解除)。
+                if (!_fgDupLogged.exchange(true, std::memory_order_acq_rel)) {
+                    char msg[256];
+                    std::snprintf(msg, sizeof(msg),
+                                  "DLSSNR STATUS: dlssfg frame %d slot %d degraded to dup: %.140s"
+                                  " (further dup logs suppressed until recovery)",
+                                  n, g + 1, fgErr);
+                    TimingStatusLine(msg);
+                }
                 break;
             }
         }
@@ -2148,6 +2208,10 @@ bool DlssnrContext::ProcessFrame(
             const char *fgState = !_fg ? "off"
                 : (!_fg->Enabled() ? "unavailable"
                                    : (fgEvaluatedCount > 0 ? "on" : "dup"));
+            // fg_mult_max = 运行库插值帧上限(gate 解锁结果定格值):40 系
+            // 解锁失败回落 2x 时创建/面板仍报 6,没有它面板无从知道实际
+            // 密度只有 (max+1)x。
+            const int fgMultMax = _fg ? _fg->MaxGen() : 0;
             snprintf(body, sizeof(body),
                      "{\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
@@ -2155,6 +2219,7 @@ bool DlssnrContext::ProcessFrame(
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
                      "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d,"
                      "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
+                     "\"%s\":%d,\"%s\":\"%s\","
                      "\"%s\":%.2f,\"%s\":%.2f,"
                      "\"%s\":%u,\"%s\":%u,\"%s\":%u}",
                      SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
@@ -2171,6 +2236,8 @@ bool DlssnrContext::ProcessFrame(
                      SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
                      SK_FG_MULT_CREATE, _fgCreateMult,
                      SK_FG_DETAIL, _fgDetail,
+                     SK_FG_MULT_MAX, fgMultMax,
+                     SK_OF_DETAIL, _ofDetail,
                      SK_SLOT_WAIT, slotWaitLast,
                      SK_LOCK_WAIT, lockWaitLast,
                      SK_GATE_SKIPS, nvStats ? nvStats->GateSkips() : 0u,

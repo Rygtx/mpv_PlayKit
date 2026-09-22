@@ -48,11 +48,15 @@ constexpr uint32_t PAYLOAD_SIZE = 1024;
 // v20:fgRoute 值域 0-3 → 0-1(0=自动 预载 0.3.x hook 代理,1=纯官方;
 // dlssg_for_sm86 0.3.x 起 SM86/SM75 内核档语义作废)。布局不变,但旧面板
 // 发 2/3 会被新插件 clamp 成 1(纯官方)= 语义漂移 —— 按 magic 拒读,
-// 面板与插件必须成对部署。
-// The bump keeps mixed-version panel/plugin pairs from decoding shifted
-// offsets as valid payloads — panel and plugin must be deployed as a pair.
+// 面板与插件必须成对部署;
+// v21(stats DSSL3):stats JSON 新增 fg_mult_max(运行库插值帧上限 ——
+// 40 系 gate 解锁失败回落 2x 时,创建/面板倍数仍报 6,没有它面板无从
+// 知道实际密度)与 of_detail(光流降级原因,与 fg_detail 同语义)。
+// 键为纯增量,但按仓库惯例契约变化即 bump:旧面板读到新 magic 冻结
+// 显示(其 501 行 valid 判定拒绝),新版面板读旧 magic 走"版本不匹配"
+// 红显 —— 两端都有明确信号,成对部署约束不变。
 constexpr uint32_t PAYLOAD_MAGIC = 0x4B4C5344u; // "DSLK" (v20, 版本位走 hex:9 之后是 A/B/C/D/E/F)
-constexpr uint32_t STATS_MAGIC = 0x324C5344u;   // "DSSL2"
+constexpr uint32_t STATS_MAGIC = 0x334C5344u;   // "DSSL3" (v21)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -229,9 +233,19 @@ inline constexpr const char *SK_FG_ROUTE_EFFECTIVE = "fg_route_eff";
 // FG 会话创建倍数(2-6;FG 未激活 = 0)。live 倍数超过它时多出的档位本
 // 会话无槽可填(面板红色提示"需 seek 重建")。
 inline constexpr const char *SK_FG_MULT_CREATE = "fg_mult_create";
+// FG 会话运行库插值帧上限(0-5;FG 未激活 = 0,含义与 fg_mult_create 的
+// 0 同语义)。MaxGeneratedFrames 查询值(含 mfg gate 解锁结果)。没有它,
+// 40 系 gate 解锁失败回落 2x 时创建/面板仍全绿显示 6x —— 输出按 6x 节拍
+// 但只有 2x 密度(超限槽复制真实帧),用户毫无感知。面板红显条件:
+// fg_mult_create > fg_mult_max > 0。
+inline constexpr const char *SK_FG_MULT_MAX = "fg_mult_max";
 // FG 最近一次初始化失败原因(消毒串;成功后清空)。"为什么没插帧"的
 // 面板侧直接答案,不再翻 timing log。
 inline constexpr const char *SK_FG_DETAIL = "fg_detail";
+// 光流最近一次会话创建失败原因(消毒串;成功后清空;fg_detail 的光流
+// 同款)。诊断页"光流: 请求 X | 实际 zero"只说降级事实,原因(SM6.2
+// 不支持/驱动拒双向/dll 缺失)在这里直达面板。
+inline constexpr const char *SK_OF_DETAIL = "of_detail";
 // ---- 排队细分(诊断页专供;主面板只留六段用时,这里放"要翻 perf 行
 // 才有"的次级数据)----
 // 槽池等待 last(3 槽全在飞时的排队;gpu 段正常而此值大 = GPU 超容量)
@@ -274,6 +288,14 @@ inline void PublishWithSeq(volatile uint32_t *seq, uint32_t newSeq, WriteBody &&
 // kept for the process lifetime (the kernel object dies with the plugin
 // process; readers map read-only per refresh). Replacing the mapping handle
 // per write would leak one handle per publish.
+
+// stats 通道自身建立失败的留痕钩子:PublishStatsJson 属于头文件层,够不
+// 着 dlssnr_context 的 timing log;本头文件只声明函数指针,插件侧启动时
+// 注册(见 dlssnr_context.cpp)。没有它,映射创建失败只有 OutputDebugString
+// 一个出口 —— GUI mpv 场景没人看,面板从此空白而用户常看的日志零痕迹,
+// 与"插件没加载"无法区分。
+inline void (*g_statsChannelFailLog)(const char *) = nullptr;
+
 inline bool PublishStatsJson(const char *json) noexcept {
     // Every publisher (the per-frame stats publish in ProcessFrame, the
     // GPU-hang path in WaitFenceValue, Initialize) serializes
@@ -290,11 +312,16 @@ inline bool PublishStatsJson(const char *json) noexcept {
                                          0, PAYLOAD_SIZE, STATS_MAPPING);
             if (!mapping) {
                 // 探针:stats 通道建立失败一次(此后每次发布都失败,面板
-                // 永远空 stats —— 只报一次,不刷 DebugView)。
+                // 永远空 stats —— 只报一次,不刷 DebugView)。钩子注册时
+                // 进 timing log(GUI mpv 不透传 OutputDebugString)。
                 static bool warnedCreate = false;
                 if (!warnedCreate) {
                     warnedCreate = true;
                     OutputDebugStringA("vs_dlssnr: stats mapping create FAILED; panel stats unavailable\n");
+                    if (g_statsChannelFailLog) {
+                        g_statsChannelFailLog(
+                            "DLSSNR STATUS: stats mapping create FAILED; panel stats unavailable");
+                    }
                 }
                 return false;
             }
@@ -305,6 +332,10 @@ inline bool PublishStatsJson(const char *json) noexcept {
             if (!warnedMap) {
                 warnedMap = true;
                 OutputDebugStringA("vs_dlssnr: stats mapping MapViewOfFile FAILED\n");
+                if (g_statsChannelFailLog) {
+                    g_statsChannelFailLog(
+                        "DLSSNR STATUS: stats mapping MapViewOfFile FAILED; panel stats unavailable");
+                }
             }
             return false;
         }

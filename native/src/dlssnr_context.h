@@ -152,6 +152,17 @@ private:
     // 创建倍数 M0(plugin.cpp 侧 vi.fps/帧数契约的同一值;FG 未激活 = 0)。
     // live 倍数 > M0 的面板档位本会话无槽可填 —— 面板据此红显"需重建"。
     int _fgCreateMult = 0;
+    // 自动档 hook 代理预载失败原因(非空 = 预载没进托)。官方链失败时并
+    // 入 _fgDetail(面板直读真因,而非误导性的 "DLSSG unavailable");
+    // 官方链成功则保持无消费( FG 能跑,预载失败无实际影响)。
+    char _fgProxyNote[96] = "";
+    // 光流会话创建失败原因(消毒串;of_detail 键的数据源,与 _fgDetail
+    // 同语义 —— "降级为零 guidance"的面板侧"为什么")。
+    char _ofDetail[96] = "";
+    // 超限槽降级复制的日志闩锁:gate 回落 2x 时每源帧都有槽 eval 失败,
+    // 无闩锁 = 24fps 源每秒 24 行 timing log,根因行被淹没(plugin.cpp 的
+    // failureLogged 同款惯例)。eval 恢复成功即解除,新故障重新记一条。
+    std::atomic<bool> _fgDupLogged{false};
 
     D3D12Context *_d3d12 = nullptr;
     NVSDK_NGX_Parameter *_parameters = nullptr;

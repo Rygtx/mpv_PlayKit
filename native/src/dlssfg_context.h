@@ -49,7 +49,8 @@ public:
     // —— 时序铁律,见 dlssnr_context FG 段)。经 FgModule 进程级缓存,重复
     // 调用路径相同即命中;永不 FreeLibrary —— 与 nvofapi64.dll 同哲学。
     // 返回预载后模块是否可用。
-    static bool PreloadProxyModule(const wchar_t *dllPath) noexcept;
+    static bool PreloadProxyModule(const wchar_t *dllPath,
+                                   char *err = nullptr, size_t errLen = 0) noexcept;
 
     // 缓存中的 proxy 模块是否 0.3.x hook 型(有 DlssgProxy_Role 查询导出;
     // 仅查已缓存模块,未加载过 = false)。用于 fg_route_eff 定名

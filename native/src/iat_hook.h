@@ -33,7 +33,8 @@ inline void *FunctionAddress(T function) noexcept {
     return result;
 }
 
-bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook) noexcept;
+bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook,
+                              char *err = nullptr, size_t errLen = 0) noexcept;
 bool RestoreSnippetCallerHook(SnippetCallerHook &hook) noexcept;
 
 } // namespace vsdlssnr

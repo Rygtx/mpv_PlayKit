@@ -118,6 +118,11 @@ struct AppState {
     char fgRouteEff[16]{};   // SK_FG_ROUTE_EFFECTIVE: off/official-hook/official/copy
     int fgMultCreate = 0;    // SK_FG_MULT_CREATE: 会话创建倍数(FG 未激活 = 0)
     char fgDetail[128]{};    // SK_FG_DETAIL: FG 最近一次初始化失败原因(成功 = 空)
+    int fgMultMax = 0;       // SK_FG_MULT_MAX: 运行库插值帧上限(FG 未激活 = 0)。
+                             // gate 解锁失败回落 2x 的唯一面板侧信号源
+    char ofDetail[96]{};     // SK_OF_DETAIL: 光流会话创建失败原因(成功 = 空)
+    int connState = 0;       // stats 通道连接态:0=未检测到插件 1=已连接
+                             // 2=magic 不匹配(面板/插件版本未成对更新)
     int fgOptimized = 1;     // dlssg_for_sm86 [FrameGeneration] Optimized 0-3
                              // (存储单点 = 代理 ini;面板启动回读,重启 mpv 生效)
     float slotWait = 0.0f;   // SK_SLOT_WAIT: 槽池等待 last(诊断页)
@@ -262,8 +267,8 @@ bool WriteFgProxyIniKey(const char *key, int v) noexcept {
     return false;
 }
 
-void WriteFgOptimizedIni(int v) noexcept {
-    WriteFgProxyIniKey("Optimized", v);
+bool WriteFgOptimizedIni(int v) noexcept {
+    return WriteFgProxyIniKey("Optimized", v);
 }
 
 // Shared-memory parameter channel: the panel creates the mapping and pushes
@@ -332,9 +337,12 @@ bool TriggerMpvReseek() noexcept {
     wchar_t base[MAX_PATH];
     if (!BasePath(base, MAX_PATH)) return false;
 
-    // 管道名候选:mpv.conf 解析值优先(用户自定义名也能跟上),其后默认名。
+    // 管道名候选:mpv.conf 解析值优先(用户自定义名也能跟上),其后默认名
+    // 与 umpv 默认值(umpv 拉起的 mpv 以 --input-ipc-server=<umpv.conf 值>
+    // 覆盖 mpv.conf,面板解析 mpv.conf 会扑空 —— 候选兜底,两个默认值
+    // 错开的场景仍能连上)。
     wchar_t *parsedName = nullptr; // _wcsdup;末尾 free(nullptr) 恒安全
-    const wchar_t *candidates[3] = { nullptr, L"mpvpipe", L"mpvsocket" };
+    const wchar_t *candidates[4] = { nullptr, L"mpvpipe", L"mpvsocket", L"umpv" };
     {
         wchar_t confPath[MAX_PATH];
         swprintf_s(confPath, L"%s\\..\\portable_config\\mpv.conf", base);
@@ -356,6 +364,11 @@ bool TriggerMpvReseek() noexcept {
                         ++eq;
                         while (eq < eol && (buf[eq] == ' ' || buf[eq] == '\t')) ++eq;
                         size_t e = eol;
+                        // 行内注释剥离:`input-ipc-server = mpvpipe # ...`
+                        // 曾经把 "# ..." 并进管道名,首选候选必然失连。
+                        for (size_t h = eq; h < e; ++h) {
+                            if (buf[h] == '#') { e = h; break; }
+                        }
                         while (e > eq && (buf[e - 1] == ' ' || buf[e - 1] == '\t' ||
                                           buf[e - 1] == '"' || buf[e - 1] == '\'')) --e;
                         if (e > eq && e - eq < 64) {
@@ -378,7 +391,7 @@ bool TriggerMpvReseek() noexcept {
     }
 
     bool ok = false;
-    for (int i = 0; i < 3 && !ok; ++i) {
+    for (int i = 0; i < 4 && !ok; ++i) {
         if (!candidates[i] || !candidates[i][0]) continue;
         wchar_t pipePath[MAX_PATH];
         swprintf_s(pipePath, L"\\\\.\\pipe\\%s", candidates[i]);
@@ -406,14 +419,19 @@ bool TriggerMpvReseek() noexcept {
     return ok;
 }
 
-void WriteIniNow() noexcept {
+bool WriteIniNow() noexcept {
     wchar_t base[MAX_PATH];
-    if (!BasePath(base, MAX_PATH)) return;
+    if (!BasePath(base, MAX_PATH)) return false;
     wchar_t path[MAX_PATH];
     swprintf_s(path, L"%s\\%s", base, INI_FILE);
     if (!WriteDlssnrIni(g_app.params, path)) { // shared key list (dlssnr_ini.h)
+        // 失败必须可被调用方感知:曾经失败只进本日志,按钮回调无条件报
+        // "已保存" —— ini 被占用时用户看到已保存,重启全部回旧值(面板
+        // 有 status 状态栏机制,这里接上)。
         PanelLog("panel: save ini FAILED (file locked?)");
+        return false;
     }
+    return true;
 }
 
 void LoadIni() noexcept {
@@ -427,7 +445,18 @@ void LoadIni() noexcept {
     g_app.advancedOpen = GetPrivateProfileIntW(L"panel", L"advanced", 0, path) != 0;
     // 页签:0=降噪增强 1=帧生成 2=诊断
     g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 2u));
-    LoadDlssnrIni(g_app.params, path);
+    // 旧版 fg_route 越界值(v20 语义作废的 2/3 钉档)被 clamp 重解释:
+    // 状态行提示,不再无声 —— 老用户"补帧怎么没了"的直接答案。
+    {
+        int legacyRoute = 0;
+        LoadDlssnrIni(g_app.params, path, &legacyRoute);
+        if (legacyRoute > kFgRouteMax) {
+            snprintf(g_app.status, sizeof(g_app.status),
+                     "检测到旧版 fg_route=%d(档位语义已作废),已按新版解释为纯官方;"
+                     "如需自动档请在面板选回 \"自动\"",
+                     legacyRoute);
+        }
+    }
     // Optimized 档位的存储单点 = 代理 ini(代理只在进程加载时读一次),
     // 面板启动回读为准 —— 不落 ui.ini,避免双存储漂移。
     g_app.fgOptimized = ReadFgOptimizedIni();
@@ -466,10 +495,13 @@ bool JsonGetString(const char *body, const char *key, char *out, size_t outLen) 
 void LoadStats() noexcept {
     const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
     if (!m) {
-        g_app.statsDirty = g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0 ||
+        const int prevConn = g_app.connState;
+        g_app.statsDirty = prevConn != 0 ||
+                           g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0 ||
                            g_app.filterState[0] != 0 || g_app.stateDetail[0] != 0 ||
                            g_app.ofMode[0] != 0 || g_app.fgState[0] != 0 ||
-                           g_app.fgRouteEff[0] != 0 || g_app.fgDetail[0] != 0;
+                           g_app.fgRouteEff[0] != 0 || g_app.fgDetail[0] != 0 ||
+                           g_app.ofDetail[0] != 0;
         g_app.statsBig[0] = 0;
         g_app.statsRes[0] = 0;
         g_app.filterState[0] = 0;
@@ -478,10 +510,13 @@ void LoadStats() noexcept {
         g_app.fgState[0] = 0;
         g_app.fgRouteEff[0] = 0;
         g_app.fgDetail[0] = 0;
+        g_app.ofDetail[0] = 0;
         g_app.fgMult = 0;
         g_app.fgMultCreate = 0;
+        g_app.fgMultMax = 0;
         g_app.slotWait = g_app.lockWait = 0.0f;
         g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
+        g_app.connState = 0; // 连接指示随之变化(statsDirty 已置)
         return;
     }
     // Seq-gated snapshot (protocol mirrors PublishStatsJson): a copy whose
@@ -491,15 +526,34 @@ void LoadStats() noexcept {
         static_cast<const StatsPayload *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
     StatsPayload st{};
     bool valid = false;
+    bool badMagic = false;
     if (view) {
-        memcpy(&st, view, sizeof(st));
+        // 混部署(新面板 + 旧插件的小映射)时按映射实际区域钳制拷贝量:
+        // 直接 sizeof(st) 是标准意义上的越界读,分页粒度通常掩盖但不该赌。
+        MEMORY_BASIC_INFORMATION mbi{};
+        size_t copy = sizeof(st);
+        if (VirtualQuery(view, &mbi, sizeof(mbi)) && mbi.RegionSize > 0 &&
+            mbi.RegionSize < sizeof(st)) {
+            copy = mbi.RegionSize;
+        }
+        memcpy(&st, view, copy);
+        badMagic = st.magic != 0 && st.magic != STATS_MAGIC;
         valid = st.magic == STATS_MAGIC && st.seq != 0 &&
                 st.seq == static_cast<const volatile StatsPayload *>(view)->seq;
         UnmapViewOfFile(view);
     }
     CloseHandle(m);
-    if (!valid) return;
+    if (!valid) {
+        // magic 不符 = 面板与插件版本未成对更新:不再静默冻结旧显示,
+        // 连接指示红显("看起来活着但调参无效"的最短诊断路径)。
+        if (badMagic) {
+            if (g_app.connState != 2) g_app.statsDirty = true;
+            g_app.connState = 2;
+        }
+        return;
+    }
     const AppState before = g_app; // display snapshot for the redraw gate below
+    g_app.connState = 1;           // after the snapshot: 0→1 跳变要进下方 diff
     const char *body = st.json;
     // 缺键即清零(JsonGetString 命中失败不写 out;旧版本插件的 body 没有
     // 新键,残留旧值会让状态行说谎)。
@@ -519,6 +573,11 @@ void LoadStats() noexcept {
     g_app.fgMultCreate = JsonGetInt(body, SK_FG_MULT_CREATE, 0);
     if (!JsonGetString(body, SK_FG_DETAIL, g_app.fgDetail, sizeof(g_app.fgDetail)))
         g_app.fgDetail[0] = 0;
+    // v21 键:运行库上限 + 光流失败原因(旧插件 body 无键,缺键即清,
+    // 与 fgDetail 同款规则 —— 残留旧值会让状态行说谎)。
+    g_app.fgMultMax = JsonGetInt(body, SK_FG_MULT_MAX, 0);
+    if (!JsonGetString(body, SK_OF_DETAIL, g_app.ofDetail, sizeof(g_app.ofDetail)))
+        g_app.ofDetail[0] = 0;
     g_app.slotWait = static_cast<float>(JsonGetFloat(body, SK_SLOT_WAIT, 0));
     g_app.lockWait = static_cast<float>(JsonGetFloat(body, SK_LOCK_WAIT, 0));
     g_app.gateSkips = JsonGetInt(body, SK_GATE_SKIPS, 0);
@@ -540,8 +599,10 @@ void LoadStats() noexcept {
         g_app.fgState[0] = 0;
         g_app.fgRouteEff[0] = 0;
         g_app.fgDetail[0] = 0;
+        g_app.ofDetail[0] = 0;
         g_app.fgMult = 0;
         g_app.fgMultCreate = 0;
+        g_app.fgMultMax = 0;
         g_app.slotWait = g_app.lockWait = 0.0f;
         g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
     } else {
@@ -594,8 +655,10 @@ void LoadStats() noexcept {
             g_app.fps = 0.0;
             g_app.fgRouteEff[0] = 0;
             g_app.fgDetail[0] = 0;
+            g_app.ofDetail[0] = 0;
             g_app.fgMult = 0;
             g_app.fgMultCreate = 0;
+            g_app.fgMultMax = 0;
             g_app.slotWait = g_app.lockWait = 0.0f;
             g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
         }
@@ -609,7 +672,9 @@ void LoadStats() noexcept {
                        memcmp(before.fgState, g_app.fgState, sizeof(g_app.fgState)) != 0 ||
                        memcmp(before.fgRouteEff, g_app.fgRouteEff, sizeof(g_app.fgRouteEff)) != 0 ||
                        memcmp(before.fgDetail, g_app.fgDetail, sizeof(g_app.fgDetail)) != 0 ||
+                       memcmp(before.ofDetail, g_app.ofDetail, sizeof(g_app.ofDetail)) != 0 ||
                        before.fgMult != g_app.fgMult || before.fgMultCreate != g_app.fgMultCreate ||
+                       before.fgMultMax != g_app.fgMultMax || before.connState != g_app.connState ||
                        before.slotWait != g_app.slotWait || before.lockWait != g_app.lockWait ||
                        before.gateSkips != g_app.gateSkips ||
                        before.gateExpired != g_app.gateExpired ||
@@ -712,6 +777,22 @@ void DrawUi() noexcept {
     // 上这里写死 16*s,而 WindowPadding 不缩放,高 DPI 下首行比后续行更靠右。
     ImGui::Text("GPU: %s", g_app.gpuName[0] ? g_app.gpuName : "(等待滤镜加载)");
     ImGui::Text("帧率: %.1f FPS", g_app.fps);
+    // 连接指示:此前"滤镜未加载 / 插件没在跑 / stats magic 不配对"三种
+    // 故障的用户可见表象完全相同(滑块能调、能保存、画面永远不变),
+    // 区别只在日志文件。这里一行给出最短诊断路径。
+    {
+        const char *connTxt;
+        ImVec4 col = kDimTxt;
+        if (g_app.connState == 1) {
+            connTxt = "插件: 已连接";
+        } else if (g_app.connState == 2) {
+            connTxt = "插件: 版本不匹配 —— 面板与 vs_dlssnr.dll 必须成对更新";
+            col = kErrRed;
+        } else {
+            connTxt = "插件: 未检测到(等待滤镜加载;不走滤镜路线则调参仅作默认值保存)";
+        }
+        ImGui::TextColored(col, "%s", connTxt);
+    }
 
     // 大号:NGX 纯延迟(窗口级字体缩放, imgui 1.91 的 PushFont 是单参;
     // 1.4→1.25 高度收紧,辨识度足够)
@@ -735,7 +816,8 @@ void DrawUi() noexcept {
             if (g_app.stateDetail[0]) ImGui::TextDisabled("%s", g_app.stateDetail);
         } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
             ImGui::TextColored(warnCol, "光流已降级为零 guidance(增强继续)");
-            if (g_app.stateDetail[0]) ImGui::TextDisabled("%s", g_app.stateDetail);
+            // 原因直达(of_detail):此前"为什么降级"只活在 timing log。
+            if (g_app.ofDetail[0]) ImGui::TextDisabled("%s", g_app.ofDetail);
         }
         // 实际光流模式:请求档位 ≠ 实际能力(Turing 无 cost / 驱动拒双向)
         // 时在这里暴露;档位关闭(off)不显示。
@@ -751,7 +833,15 @@ void DrawUi() noexcept {
                              : g_app.fgState;
             if (g_app.fgMult >= 2 && (std::strcmp(g_app.fgState, "on") == 0 ||
                                       std::strcmp(g_app.fgState, "dup") == 0)) {
-                ImGui::TextDisabled("帧生成: %s (%dx)", desc, g_app.fgMult);
+                // 库上限 < 面板倍数(40 系 gate 解锁失败回落 2x):输出按
+                // 面板倍数节拍走但实际密度只有 (上限+1)x —— 必须在此可见,
+                // 否则"选了 6x 全绿"而实际每 6 帧里 4 帧是复制帧。
+                if (g_app.fgMultMax >= 1 && g_app.fgMultMax + 1 < g_app.fgMult) {
+                    ImGui::TextDisabled("帧生成: %s (%dx, 实效 %dx —— 运行库上限)",
+                                        desc, g_app.fgMult, g_app.fgMultMax + 1);
+                } else {
+                    ImGui::TextDisabled("帧生成: %s (%dx)", desc, g_app.fgMult);
+                }
             } else {
                 ImGui::TextDisabled("帧生成: %s", desc);
             }
@@ -1075,8 +1165,14 @@ void DrawUi() noexcept {
                                       "3 全部有损" };
         int sel = std::clamp(g_app.fgOptimized, 0, 3);
         if (ImGui::Combo("##fg_optimized", &sel, labels, items)) {
-            g_app.fgOptimized = sel;
-            WriteFgOptimizedIni(sel);
+            if (WriteFgOptimizedIni(sel)) {
+                g_app.fgOptimized = sel;
+            } else {
+                // 写失败(UI 与磁盘静默分叉曾经只进日志):不采纳选择,
+                // 下拉弹回现值 + 状态栏说明,重启后"档位自己变回去"不再发生。
+                snprintf(g_app.status, sizeof(g_app.status),
+                         "内核档位写入失败(代理配置缺失或被占用)");
+            }
         }
     }
     y += rowH;
@@ -1183,8 +1279,9 @@ void DrawUi() noexcept {
                                                   : g_app.params.motionVectorQuality,
                                               0, kOfQualityMax);
                 const bool ofBroken = std::strcmp(g_app.ofMode, "zero") == 0 && ofqReq > 0;
-                ImGui::TextColored(ofBroken ? kErrRed : kDimTxt, "光流: 请求 %s | 实际 %s",
-                                   ofReq, g_app.ofMode[0] ? g_app.ofMode : "(未加载)");
+                ImGui::TextColored(ofBroken ? kErrRed : kDimTxt, "光流: 请求 %s | 实际 %s%s%s",
+                                   ofReq, g_app.ofMode[0] ? g_app.ofMode : "(未加载)",
+                                   g_app.ofDetail[0] ? " —— " : "", g_app.ofDetail);
 
                 // FG 请求 vs 实际路由
                 char fgReq[96];
@@ -1212,13 +1309,26 @@ void DrawUi() noexcept {
                 ImGui::TextColored(fgBroken ? kErrRed : kDimTxt, "帧生成: 请求 %s | 实际 %s",
                                    fgReq, fgEff);
 
-                // 创建倍数 vs live 倍数
+                // 创建倍数 vs live 倍数 vs 运行库上限:上限 < 创建值 = gate
+                // 解锁失败回落(输出按高倍率节拍,超出槽位全是复制真实帧)
+                // —— 此前这一事实无任何 stats 键,面板全绿,用户毫无感知。
                 if (g_app.params.fgEnabled && g_app.fgMultCreate > 0) {
                     const bool multClipped = g_app.params.fgMultiplier > g_app.fgMultCreate;
-                    ImGui::TextColored(multClipped ? kErrRed : kDimTxt,
-                                       "FG 倍数: 会话创建 %dx | 面板 %dx%s",
-                                       g_app.fgMultCreate, g_app.params.fgMultiplier,
-                                       multClipped ? "(超出部分需重载生效)" : "");
+                    const bool capped = g_app.fgMultMax >= 1 &&
+                                        g_app.fgMultMax < g_app.fgMultCreate;
+                    if (capped) {
+                        ImGui::TextColored(
+                            kErrRed,
+                            "FG 倍数: 会话创建 %dx | 面板 %dx | 运行库上限 %dx"
+                            "(实效 %dx,超出槽位为复制帧 —— gate 解锁失败?驱动更新后重试)",
+                            g_app.fgMultCreate, g_app.params.fgMultiplier,
+                            g_app.fgMultMax, g_app.fgMultMax + 1);
+                    } else {
+                        ImGui::TextColored(multClipped ? kErrRed : kDimTxt,
+                                           "FG 倍数: 会话创建 %dx | 面板 %dx%s",
+                                           g_app.fgMultCreate, g_app.params.fgMultiplier,
+                                           multClipped ? "(超出部分需重载生效)" : "");
+                    }
                 }
             }
             // 处理分辨率(读 stats 缓存的六段之外字段:LoadStats 已存在
@@ -1267,9 +1377,14 @@ void DrawUi() noexcept {
     y += 8 * s;
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     if (ImGui::Button("保存设置", ImVec2(120 * s, 30 * s))) {
-        WriteIniNow();
-        WritePayload(true); // persist-through-bridge flag included
-        snprintf(g_app.status, sizeof(g_app.status), "已保存: %ls", INI_FILE);
+        // 失败不再假报成功:ini 被占用/只读时状态栏红字说明,否则用户
+        // 看到"已保存",重启全部回旧值(dlssnr_ini.h 注释预言的场景)。
+        if (WriteIniNow()) {
+            WritePayload(true); // persist-through-bridge flag included
+            snprintf(g_app.status, sizeof(g_app.status), "已保存");
+        } else {
+            snprintf(g_app.status, sizeof(g_app.status), "保存失败(文件被占用或不可写)");
+        }
     }
     if (ImGui::IsItemHovered()) {
         ShowTip("当前设置即时生效(下一帧画面);保存为默认值(dlssnr_ui.ini)后,下次加载滤镜自动生效。");
@@ -1282,10 +1397,15 @@ void DrawUi() noexcept {
         g_app.params = DlssnrParams{};
         WritePayload();
         // Optimized 档位不在 payload 里(插件不消费):随重置归 1 并写回
-        // 代理 ini,与面板显示保持一致。
-        g_app.fgOptimized = 1;
-        WriteFgOptimizedIni(1);
-        snprintf(g_app.status, sizeof(g_app.status), "已重置");
+        // 代理 ini,与面板显示保持一致。写失败保持现值 + 状态栏说明
+        // (与档位下拉同款语义:UI 不说谎)。
+        if (WriteFgOptimizedIni(1)) {
+            g_app.fgOptimized = 1;
+            snprintf(g_app.status, sizeof(g_app.status), "已重置");
+        } else {
+            snprintf(g_app.status, sizeof(g_app.status),
+                     "参数已重置;内核档位写入失败(代理配置缺失或被占用)");
+        }
     }
     ImGui::SameLine(0, 16 * s);
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6 * s);
@@ -1702,7 +1822,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                                                     IMAGE_ICON, traySize, traySize, LR_SHARED));
     }
     wcscpy_s(g_nid.szTip, TRAY_TIP);
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
+    // 托盘图标是隐藏窗口的唯一入口:创建失败 = 进程活着但面板永不可达,
+    // 双击 exe 表现为"没反应"。必须给出可见失败,不能静默继续。
+    if (!Shell_NotifyIconW(NIM_ADD, &g_nid)) {
+        PanelLog("panel: Shell_NotifyIconW(NIM_ADD) FAILED (err %lu)",
+                 static_cast<unsigned long>(GetLastError()));
+        MessageBoxW(g_hwnd,
+                    L"托盘图标创建失败,面板无法显示(Explorer 未运行或 shell 服务异常)。",
+                    L"DLSSNR 控制面板", MB_OK | MB_ICONWARNING);
+        return 1;
+    }
 
     LoadIni();
     const bool mappingOk = CreateParamsMapping(); // adopts previous session's live params if present
@@ -1753,7 +1882,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             // 重建的滤镜实例即采纳新值(免手动拖进度条)。
             if (g_app.reseekDirty) {
                 g_app.reseekDirty = false;
-                TriggerMpvReseek();
+                // 失败不再无声:此前 IPC 不可达(mpv 未开 / input-ipc-server
+                // 未启用)时变动退化为"等下次手动 seek",面板零提示。
+                if (TriggerMpvReseek()) {
+                    snprintf(g_app.status, sizeof(g_app.status),
+                             "已通知 mpv 原地重载滤镜会话");
+                } else {
+                    snprintf(g_app.status, sizeof(g_app.status),
+                             "mpv IPC 不可达 —— 该变动需手动 seek 后生效");
+                }
             }
         }
 

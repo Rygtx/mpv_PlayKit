@@ -63,11 +63,13 @@ H_Max = 0
 ##          NVOF (NVIDIA Turing+, 面板"光流后端"切换)
 ##          播放中可在面板实时切换 (只重建光流会话, 毫秒级)
 ##          帧生成开启时建议 >= 2 (Balanced): 光流是插值帧的运动来源
+## <0-2> 整数, FFX 光流档位 (默认 0): 0 = 无; 1 = 性能 (半分辨率),
+##          2 = 质量 (全分辨率); 面板"光流质量"按当前后端读写对应档位
 ## <True|False> 光流输入跟随内部降采样 (默认 False); 帧生成激活时被忽略
 ## <0-1> 整数, 光流后端 (默认 0): 0 = FFX (AMD FidelityFX, 跨厂商通用);
 ##          1 = NVOF (NVIDIA 专属引擎); 面板"光流后端"同步此值
-## <0-2> 整数, FFX 光流档位 (默认 0): 0 = 无; 1 = 性能 (半分辨率),
-##          2 = 质量 (全分辨率); 面板"光流质量"按当前后端读写对应档位
+##          注意: 以上四参的注释顺序与变量顺序一致
+##          (Motion_Vector_Quality → Ffx_Quality → Nvof_Follow_Scaling → Of_Backend)
 ## <True|False> DLSS 帧生成 (默认 False)
 ##          挂降噪之后: 每源帧产出 M 帧, 插值帧由 DLSS FG 模型合成,
 ##          落在相邻两真实帧之间; 依赖 ngx\version.dll (dlssg_for_sm86

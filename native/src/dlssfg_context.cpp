@@ -59,18 +59,30 @@ bool DlssfgSehCall(Fn &&fn, DWORD *sehCode) noexcept {
 
 } // namespace
 
-bool DlssfgContext::PreloadProxyModule(const wchar_t *dllPath) noexcept {
+bool DlssfgContext::PreloadProxyModule(const wchar_t *dllPath,
+                                       char *err, size_t errLen) noexcept {
     // official 能力查询前的预载(0.3.x hook 型代理:LoadLibrary 即装钩,
     // 先于查询才有"接答 Available=1"的时序;调用点见 dlssnr_context
     // Initialize FG 段)。同缓存复用:重复调用路径相同即命中,不重复
-    // LoadLibrary。
-    if (!dllPath || !dllPath[0]) return false;
+    // LoadLibrary。失败原因经 err 上报(曾经裸 return false,调用方连
+    // "预载过"都无从知晓 —— 下游只能报 "official NGX reports DLSSG
+    // unavailable",把用户引向驱动/官方 DLL 而非 version.dll 本身)。
+    auto fail = [&](const char *why) {
+        if (err && errLen) std::snprintf(err, errLen, "%s", why);
+        return false;
+    };
+    if (!dllPath || !dllPath[0]) return fail("proxy dll path empty");
     FgModuleCache &cache = FgModule();
     if (cache.module && wcscmp(cache.path, dllPath) == 0) return true;
     HMODULE mod = LoadLibraryExW(dllPath, nullptr,
                                  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
                                      LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (!mod) return false;
+    if (!mod) {
+        char why[96];
+        std::snprintf(why, sizeof(why), "LoadLibrary failed (err %lu)",
+                      static_cast<unsigned long>(GetLastError()));
+        return fail(why);
+    }
     cache.module = mod;
     wcsncpy_s(cache.path, dllPath, _TRUNCATE);
     return true;

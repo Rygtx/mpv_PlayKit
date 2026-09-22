@@ -153,8 +153,14 @@ bool GetGpuArchs(uint32_t *archs, size_t cap, size_t *archCount) noexcept {
 bool GpuFamilyPrefersProxy() noexcept {
     uint32_t archs[64]{};
     size_t count = 0;
-    if (!GetGpuArchs(archs, 64, &count))
-        return true; // fail-open:维持无条件预载的现状
+    if (!GetGpuArchs(archs, 64, &count)) {
+        // fail-open:维持无条件预载的现状(30 系无损)。留痕:40/50 系 +
+        // NVAPI 异常时会给 Ada 预载 SM86 代理(未定义行为场景),排查
+        // "为什么 40 系也走了预载"必须有迹可循。
+        TimingStatusLine(
+            "DLSSNR STATUS: dlssfg GPU family probe failed; proxy preload fail-open");
+        return true;
+    }
     for (size_t i = 0; i < count; ++i)
         if (archs[i] == kArchTuring || archs[i] == kArchAmpere) return true;
     return false;

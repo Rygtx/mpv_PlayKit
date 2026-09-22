@@ -31,32 +31,39 @@ def pull(clip, n):
 
 
 print("=== case 1: 默认(ofq=0,零 guidance 是用户选择,应为 ok/off) ===")
-ret = core.dlssnr.Enhance(base)
+# 显式传参脱离 ini:本机部署的 dlssnr_ui.ini 若开着 FG/FFX,route_eff 会是
+# official-hook 而非 off —— 键位断言要的是确定性,不是用户现役配置。
+ret = core.dlssnr.Enhance(base, ffx_quality=0, motion_vector_quality=0, fg_enabled=0)
 pull(ret, 0)
 pull(ret, 1)
 st = panel_ipc.read_stats()
 print("stats:", st[2] if st else "MAPPING MISSING")
 
-# v19+ 新键:实际路由 / 创建倍数 / 排队细分(FG 未请求 → route=off,
-# mult_create=0;存活 tick 必带 slot_wait/lock_wait/gate_*)。
+# v19+ 新键:实际路由 / 创建倍数 / 排队细分;v21(DSSL3)新增:
+# fg_mult_max(运行库插值帧上限)、of_detail(光流失败原因)。
 # 断言挂在 case 1 的存活 body 上 —— case 2/3 会因同进程第二个滤镜实例
 # 的 IAT hook 单例走 passthrough,边缘 body 不带 tick 键(环境特性,非回归)。
+# 真实部署机上 dlssnr_ui.ini(面板保存的设置优先于 VS 参数)可能开着
+# FG/FFX,故断言键存在 + 值域自洽,不锁具体数值。
 new_keys_present = False
 if st:
     import json
     try:
         body = json.loads(st[2])
+        mc, mm = body.get("fg_mult_create", -1), body.get("fg_mult_max", -1)
         new_keys_present = (
             body.get("filter_state") == "ok"
-            and body.get("fg_route_eff") == "off"
-            and body.get("fg_mult_create") == 0
-            and "fg_detail" in body
+            and body.get("fg_route_eff") in ("off", "official-hook", "official", "copy")
+            and 0 <= mc <= 6 and 0 <= mm <= 5
+            and (mc == 0 or mm >= 1)  # FG 会话存在时运行库上限必 >= 1
+            and (mc <= mm + 1)        # 创建倍数不超上限+1(gate 正常钳制)
+            and "fg_detail" in body and "of_detail" in body
             and "slot_wait" in body and "lock_wait" in body
             and "gate_skips" in body and "gate_expired" in body and "gate_resets" in body
         )
     except json.JSONDecodeError:
         new_keys_present = False
-print("v19 keys (fg_route_eff/fg_mult_create/slot_wait/lock_wait/gate_*):",
+print("v19/v21 keys (fg_route_eff/fg_mult_create/fg_mult_max/of_detail/slot_wait/lock_wait/gate_*):",
       "PASS" if new_keys_present else "FAIL")
 
 print("=== case 2: ofq=5(NVOF 会话建立,验证实际模式上报) ===")
