@@ -2,6 +2,7 @@
 ### 依赖_ vs-plugins\vs_dlssnr.dll (VapourSynth 插件, 自动加载)
 ###       vs-plugins\ngx\nvngx_dlssnr.dll (模型文件, 310.9.0, 取自 RenoDX)
 ###       vs-plugins\ngx\version.dll (DLSS FG hook 代理 0.3.x, dlssg_for_sm86; 帧生成可选, 用户自备)
+###       vs-plugins\ngx\nvngx_vsr.dll / nvngx_truehdr.dll (RTX Video SDK 1.1, VSR/HDR 可选, fetch-deps 自动)
 ###       vs-plugins\dlssnr_panel.exe (控制面板, 可选; 滤镜加载时自动启动)
 ### 说明_ 移植自 Magpie experimental 的 DLSSNR (NGX Feature 18)
 ###       处理为同分辨率 (非超分); 默认零 guidance, 可选硬件光流引导 (0-5 档)
@@ -37,6 +38,14 @@ Of_Backend = 0
 Fg_Enabled = False
 Fg_Multiplier = 2
 Fg_Route = 0
+VSR_Mode = 1
+VSR_Height = 2160
+VSR_Strength = 2
+HDR_Enabled = False
+HDR_Contrast = 100
+HDR_Saturation = 100
+HDR_MiddleGray = 50
+HDR_PeakNits = 1000
 H_Max = 0
 ## <True|False> 降噪总开关 (默认 True): False = 跳过降噪推理输出源帧,
 ##          补帧/光流照常工作不受影响; 降噪与帧生成都关时整个滤镜
@@ -89,6 +98,26 @@ H_Max = 0
 ##          1 = 纯官方 (不预载代理, 直连官方运行时, 同样解锁;
 ##          30/20 系被拒载不回落)
 ##          进程级, 切换后重启 mpv 生效; 面板保存的设置优先
+## <0-2> 整数, RTX Video 超分 (NVIDIA RTX Video SDK 1.1 的 NGX VSR, 默认 1):
+##          0 = 关; 1 = 自动 (按 mpv 窗口所在显示器原生高度适配, 源更高时
+##          自动旁路 —— VSR 只做放大); 2 = 手动目标高度 (VSR_Height)
+##          挂降噪之后: 源尺寸降噪 → VSR 放大 → (可选 HDR) → 帧生成,
+##          temporal 模型全部只吃真实源帧; 输出帧尺寸 = 目标尺寸
+##          依赖 vs-plugins\ngx\nvngx_vsr.dll (fetch-deps.ps1 自动拉取);
+##          需要 RTX 20 系+ 与 r550.58+ 驱动, capability 不过自动降级直通
+##          窗口换屏/改尺寸后的生效点 = 下一次链重建 (seek/换片)
+## <144-8192> 整数, VSR 手动目标高度 (VSR_Mode=2 时消费; 默认 2160)
+## <0-4> 整数, VSR 质量档 (默认 2): 0 = bicubic (纯插值), 1-4 = AI
+##          (4 = Ultra 最优最慢); >4x 放大先 VSR 到 4x 中间尺寸再线性收尾
+## <True|False> RTX Video HDR (NGX TrueHDR, SDR→HDR, 默认 False):
+##          挂 VSR 之后 (官方契约: TrueHDR 不能吃 HDR 输入, 必须在 VSR 后);
+##          输出切换 YUV420P10 BT.2020 PQ, HDR10 元数据随帧 props,
+##          mpv 侧建议 target-colorspace-hint=yes 上屏 HDR (SDR 屏自动色调映射)
+##          依赖 vs-plugins\ngx\nvngx_truehdr.dll; HDR 源内容仍走 vpy 直通守卫
+## <0-200> 整数, HDR 对比度 (默认 100)
+## <0-200> 整数, HDR 饱和度 (默认 100)
+## <10-100> 整数, HDR 中间灰 (默认 50)
+## <400-2000> 整数, HDR 峰值亮度 nits (默认 1000)
 ## 整数, 输出高度限制 (源高度超过该值时跳过处理; 0 = 不限制)
 ## 注意_ 4K 源建议配合 Input_Resolution 50 使用, 否则帧率过低
 
@@ -137,6 +166,14 @@ else :
 		fg_enabled = int(Fg_Enabled),
 		fg_multiplier = Fg_Multiplier,
 		fg_route = int(Fg_Route),
+		vsr_mode = int(VSR_Mode),
+		vsr_height = int(VSR_Height),
+		vsr_strength = int(VSR_Strength),
+		hdr_enabled = int(HDR_Enabled),
+		hdr_contrast = int(HDR_Contrast),
+		hdr_saturation = int(HDR_Saturation),
+		hdr_middle_gray = int(HDR_MiddleGray),
+		hdr_peak_nits = int(HDR_PeakNits),
 	)
 
 ret.set_output()

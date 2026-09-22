@@ -91,6 +91,66 @@ if (Test-Path $fgProxyIni) {
     }
 }
 
+# --- RTX Video SDK 1.1(VSR / TrueHDR 官方 NGX feature;公开 NGC 工件,
+#     SHA-256 钉死。URL 与校验和取自 Magpie scripts/Fetch-RtxVideoSdk.ps1
+#     同一来源:nvidia/multimedia/dlpp:1.5)---
+# 产物:
+#   vendor\rtxvideo\include\  — vsr/truehdr 的 defs+helpers 头(4 个;依赖
+#     既有 dependencies\ngx 的核心头,Feature ID = Reserved14/16 已在位)
+#   vendor\ngx\               — nvngx_vsr.dll / nvngx_truehdr.dll(rel,与
+#     nvngx_dlssg.dll 同目录;经 NGX core 的 PathList 解析,插件不做 LoadLibrary)
+# 不入库,可重建暂存区;NVIDIA 专有许可文本随包留档。
+$rtxDir = Join-Path $root "vendor\rtxvideo"
+$rtxZipMarker = Join-Path $rtxDir ".sdk-1.1.0-ok"
+if (-not (Test-Path $rtxZipMarker)) {
+    $rtxArchive = Join-Path $env:TEMP "RTX_Video_SDK_v1.1.0.zip"
+    $rtxSha256 = 'ABF4F34E2B5A618E355B0D5A0365D8ECC3DB4396E756E4C850A867E1AE2ED69E'
+    $needDownload = -not (Test-Path $rtxArchive)
+    if (-not $needDownload) {
+        $needDownload = (Get-FileHash -LiteralPath $rtxArchive -Algorithm SHA256).Hash -ne $rtxSha256
+    }
+    if ($needDownload) {
+        # NGC 下载 API 返回 302 → xfiles.ngc.nvidia.com 签名 CDN 地址,curl -L 跟随。
+        & curl.exe -sSL --fail --retry 8 --retry-all-errors --retry-delay 2 `
+            -o $rtxArchive "https://api.ngc.nvidia.com/v2/models/nvidia/multimedia/dlpp/versions/1.5/files/RTX_Video_SDK_v1.1.0.zip"
+        if ($LASTEXITCODE -ne 0) { throw "RTX Video SDK download failed (curl exit $LASTEXITCODE)" }
+    }
+    $gotSha = (Get-FileHash -LiteralPath $rtxArchive -Algorithm SHA256).Hash
+    if ($gotSha -ne $rtxSha256) { throw "RTX Video SDK checksum mismatch ($gotSha); retry the official NGC download" }
+    $rtxExtract = Join-Path $env:TEMP "rtx-video-sdk-extract"
+    if (Test-Path $rtxExtract) { Remove-Item $rtxExtract -Recurse -Force }
+    New-Item -ItemType Directory -Force $rtxExtract | Out-Null
+    Expand-Archive -LiteralPath $rtxArchive -DestinationPath $rtxExtract -Force
+    # zip 无包装目录(bin/include 直接在根;内嵌同名 zip 是原样冗余):
+    # 根含目标头即用根,否则退单包装目录。
+    $rtxSdkRoot = $rtxExtract
+    if (-not (Test-Path (Join-Path $rtxSdkRoot "include\nvsdk_ngx_defs_vsr.h"))) {
+        $wrapper = Get-ChildItem $rtxExtract -Directory | Select-Object -First 1
+        if (-not $wrapper) { throw "RTX Video SDK zip layout unexpected" }
+        $rtxSdkRoot = $wrapper.FullName
+    }
+    $rtxInc = Join-Path $rtxDir "include"
+    New-Item -ItemType Directory -Force $rtxInc | Out-Null
+    foreach ($h in @("nvsdk_ngx_defs_vsr.h", "nvsdk_ngx_defs_truehdr.h",
+                     "nvsdk_ngx_helpers_vsr.h", "nvsdk_ngx_helpers_truehdr.h")) {
+        $from = Join-Path $rtxSdkRoot "include\$h"
+        if (-not (Test-Path $from)) { throw "RTX Video SDK trim: missing include\$h" }
+        Copy-Item $from $rtxInc -Force
+    }
+    foreach ($d in @("nvngx_vsr.dll", "nvngx_truehdr.dll")) {
+        $from = Join-Path $rtxSdkRoot "bin\Windows\x64\rel\$d"
+        if (-not (Test-Path $from)) { throw "RTX Video SDK trim: missing bin\Windows\x64\rel\$d" }
+        # 尺寸断言:HTML/LFS 指针伪 DLL 拦下(与 nvngx_dlssg.dll 同款防线)。
+        if ((Get-Item $from).Length -lt 1MB) { throw "RTX Video SDK: $d size sanity failed" }
+        Copy-Item $from (Join-Path $root "vendor\ngx") -Force
+    }
+    $lic = Join-Path $rtxSdkRoot "NVIDIA_RTX_Video_SDK_License.pdf"
+    if (Test-Path $lic) { Copy-Item $lic $rtxDir -Force }
+    Remove-Item $rtxExtract -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType File -Path $rtxZipMarker -Force | Out-Null
+    Write-Host "RTX Video SDK 1.1: headers -> $rtxInc, snippets -> vendor\ngx (SHA256 verified)"
+}
+
 # --- VapourSynth R73 headers (runtime is R73 / API4, see mpv-lazy Lib\site-packages\vapoursynth-73.dist-info) ---
 foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
     Fetch "https://raw.githubusercontent.com/VapourSynth/VapourSynth/R73/include/$h" (Join-Path $vsInc $h)

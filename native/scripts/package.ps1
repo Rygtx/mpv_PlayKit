@@ -22,8 +22,11 @@ $model      = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"
 $fgDll      = Join-Path $native "vendor\ngx\version.dll"
 $fgIni      = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
 $fgOfficial = Join-Path $native "vendor\ngx\nvngx_dlssg.dll"
+$rtxVsr     = Join-Path $native "vendor\ngx\nvngx_vsr.dll"
+$rtxHdr     = Join-Path $native "vendor\ngx\nvngx_truehdr.dll"
+$rtxLicense = Join-Path $native "vendor\rtxvideo\NVIDIA_RTX_Video_SDK_License.pdf"
 # 全部文件必须齐备(fetch-deps.ps1 自动落地官方 runtime / dlssg_for_sm86
-# 代理 / NVOF·NGX 依赖;仅模型 nvngx_dlssnr.dll 为手工 vendor 部署)。
+# 代理 / NVOF·NGX·RTX Video 依赖;仅模型 nvngx_dlssnr.dll 为手工 vendor 部署)。
 # 缺任一件 = 打包失败,杜绝残缺发行包。
 if (-not (Test-Path $binDll))     { throw "缺少编译产物: $binDll (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $binPanel))   { throw "缺少编译产物: $binPanel (先运行 scripts\build.ps1)" }
@@ -31,6 +34,8 @@ if (-not (Test-Path $model))      { throw "缺少模型文件: $model (把 nvngx
 if (-not (Test-Path $fgDll))      { throw "缺少帧生成代理: $fgDll (先运行 scripts\fetch-deps.ps1 自动拉取)" }
 if (-not (Test-Path $fgIni))      { throw "缺少帧生成代理配置: $fgIni (先运行 scripts\fetch-deps.ps1 自动拉取)" }
 if (-not (Test-Path $fgOfficial)) { throw "缺少官方帧生成运行时: $fgOfficial (先运行 scripts\fetch-deps.ps1 自动下载)" }
+if (-not (Test-Path $rtxVsr))     { throw "缺少 RTX Video VSR 运行时: $rtxVsr (先运行 scripts\fetch-deps.ps1 自动下载)" }
+if (-not (Test-Path $rtxHdr))     { throw "缺少 RTX Video TrueHDR 运行时: $rtxHdr (先运行 scripts\fetch-deps.ps1 自动下载)" }
 
 $dist  = Join-Path $native "dist"
 $stage = Join-Path $dist "stage"
@@ -50,11 +55,17 @@ Copy-Item $model      (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $fgDll      (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $fgIni      (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $fgOfficial (Join-Path $stage "vs-plugins\ngx")
+Copy-Item $rtxVsr     (Join-Path $stage "vs-plugins\ngx")
+Copy-Item $rtxHdr     (Join-Path $stage "vs-plugins\ngx")
 
-# --- 第三方许可:AMD FidelityFX SDK(MIT,静态编入 vs_dlssnr.dll 的 OF 后端)---
+# --- 第三方许可:AMD FidelityFX SDK(MIT,静态编入 vs_dlssnr.dll 的 OF 后端)
+#     + NVIDIA RTX Video SDK(专有条款,VSR/TrueHDR 运行库随包分发)---
 $ffxNotice = Join-Path $native "vendor\fidelityfx\3rdpartynotice.md"
 if (Test-Path $ffxNotice) {
     Copy-Item $ffxNotice (Join-Path $stage "AMD-FidelityFX-SDK-THIRD-PARTY.md")
+}
+if (Test-Path $rtxLicense) {
+    Copy-Item $rtxLicense (Join-Path $stage "NVIDIA-RTX-VIDEO-SDK-LICENSE.pdf")
 }
 
 # --- 安装说明 ---

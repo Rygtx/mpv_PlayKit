@@ -122,6 +122,9 @@ private:
     int _width = 0;
     int _height = 0;
     int _maxGen = kFgMultMax - 1; // 运行库插值帧上限(能力键覆写)
+    // HDR backbuffer(TrueHDR 管线:FP16 scRGB)—— DLSSG.ColorBuffersHDR
+    // 键随 create 格式定格;eval 每帧携带(官方键面)。
+    bool _colorHdr = false;
 };
 
 } // namespace vsdlssnr

@@ -111,9 +111,18 @@ struct FrameSlot {
     ComPtr<ID3D12Resource> confidence;    // W×H R8_UNORM,UAV
     ComPtr<ID3D12Resource> reducedMotion;     // internalW×internalH R16G16_FLOAT
     ComPtr<ID3D12Resource> reducedConfidence; // internalW×internalH R8_UNORM
-    // DLSS FG(仅 _fgSlots 建立时分配):FG 插值输出(BGRA8,UAV —— DLSSG
-    // 契约:输出为 UAV;NSR 化后走 RGB→YUV 第二遍转换)。
-    ComPtr<ID3D12Resource> fgInterp;      // W×H BGRA8,UAV
+    // DLSS FG(仅 _fgSlots 建立时分配):FG 插值输出(UAV —— DLSSG
+    // 契约:输出为 UAV;NSR 化后走 RGB→YUV 第二遍转换)。格式随管线:
+    // SDR = BGRA8,HDR = R16G16B16A16_FLOAT(FP16 scRGB,插帧在线性光域)。
+    ComPtr<ID3D12Resource> fgInterp;
+    // RTX Video 管线纹理(PIPE 尺寸;VSR/HDR 请求时创建,无则占位视图):
+    //   vsrColor — VSR 输出(BGRA8,UAV)
+    //   hdrColor — TrueHDR 输出(FP16 scRGB,UAV;FG backbuffer)
+    //   motionDense — 源尺寸运动场的 PIPE 尺寸双线性放大(FG MVecs 契约 =
+    //                 backbuffer 同尺寸;PIPE==src 时无纹理直接用 motion)
+    ComPtr<ID3D12Resource> vsrColor;      // PIPEW×PIPEH BGRA8,UAV
+    ComPtr<ID3D12Resource> hdrColor;      // PIPEW×PIPEH FP16,UAV
+    ComPtr<ID3D12Resource> motionDense;   // PIPEW×PIPEH R16G16_FLOAT,UAV
     // FG 插值帧的独立回读缓冲(与真实帧的 readbackYuv 并存:同一条 CL 上
     // 先后多次转换+回读,真实帧回读不能被插值帧覆写)。按插值槽分组
     // [gen 0..kFgGenSlots-1][plane] —— 倍数 M 时 M-1 个插值帧各自落一组,
@@ -159,6 +168,9 @@ public:
     ID3D12Device *Device() const noexcept { return _device.Get(); }
     IDXGIAdapter1 *Adapter() const noexcept { return _adapter.Get(); }
     ID3D12CommandQueue *Queue() const noexcept { return _queue.Get(); }
+    // 全局提交栅栏(SubmitBaseFrame 的 signal 源;RTX 专用队列以它为
+    // 生产者等待锚)。
+    ID3D12Fence *Fence() const noexcept { return _fence.Get(); }
 
     // Control-path recording (NGX CreateFeature / diagnostics dump): guarded
     // by CtlMutex, never overlaps a slot's frame work on this list.
@@ -175,9 +187,24 @@ public:
     // fg = 建 DLSS FG 槽资源(插值输出纹理 + 第二组回读缓冲)。create-time
     // 语义:FG 激活与否决定帧资源形态,变化走 PoolHold 全量重建(同 Rebind
     // 尺寸变化路径),不做逐槽懒补。
+    // RTX Video 双尺寸(创建时,无 RTX 时 pipe/out = 源尺寸):
+    //   pipeW/H — VSR 输出 / TrueHDR / FG backbuffer 所在的管线尺寸
+    //             (vsr 开 = min(目标, 源×4);关 = 源)
+    //   outW/H  — YUV 输出平面尺寸(vsr 开 = 目标;关 = 源)
+    //   vsr     — 建 vsrColor 槽纹理(PIPE≠src 时必有;=src 且 vsr 旁路时无)
+    //   hdr     — TrueHDR:fgInterp 切 FP16、输出平面切 P10(PQ)
     bool CreateFrameResources(int width, int height, int depth, bool fg,
+                              int pipeW, int pipeH, int outW, int outH,
+                              bool vsr, bool hdr,
                               char *err, size_t errLen) noexcept;
     bool FgSlots() const noexcept { return _fgSlots; }
+    // RTX Video 管线几何(create-time 定格;ProcessFrame/插件侧共用)。
+    int PipeWidth() const noexcept { return _pipeW; }
+    int PipeHeight() const noexcept { return _pipeH; }
+    int OutWidth() const noexcept { return _outW; }
+    int OutHeight() const noexcept { return _outH; }
+    bool HdrPipe() const noexcept { return _hdrPipe; }
+    bool VsrPipe() const noexcept { return _vsrSlots; }
 
     // 诊断探针:把 InfoQueue 已存消息格式化进 buf(debug layer 开启时)。
     // 非 SetErr 失败点(如命令列表 Close 失败)定位用。
@@ -247,6 +274,25 @@ public:
                          ColorRange range, D3D12_RESOURCE_STATES outputStateBefore,
                          ID3D12Resource *srcColor = nullptr,
                          UINT srcSrvIndex = kSrvOutputColor) noexcept;
+    // RTX Video 管线的颜色输出(PIPE 尺寸源 → OUT 尺寸 YUV 平面):
+    //   isFp16 = false → BGRA8 源,归一化 uv 双线性缩放采样(SDR;矩阵/范围
+    //                    同 RecordYuvOutput);1:1 时与旧路径逐位同价。
+    //   isFp16 = true  → FP16 scRGB 线性源(HDR):709→2020 线性域转换 →
+    //                    PQ(ST 2084)编码 → BT.2020 limited → P10 平面。
+    //                    scRGB 语义:1.0 = 80 nits(SDR 参考白)。
+    // 源状态契约与 RecordYuvOutput 相同:stateBefore(UAV/NSR)→ NSR 转换 →
+    // 收尾归 COMMON;yuvOut 留 UAV 交 RecordReadbackCopy。dstW/H = OUT 尺寸。
+    void RecordColorOutput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                           ID3D12Resource *srcColor, UINT srcSrvIndex,
+                           bool isFp16, int srcW, int srcH,
+                           ColorMatrix matrix, ColorRange range,
+                           D3D12_RESOURCE_STATES stateBefore) noexcept;
+    // 源尺寸稠密运动场 → PIPE 尺寸双线性放大(FG MVecs 契约 = backbuffer
+    // 同尺寸,像素单位向量;双线性对 R16G16F 向量场 = 线性插值,语义保真)。
+    // 状态契约:motion(NSR)→ 本 pass SRV 读;motionDense COMMON→UAV→NSR。
+    // 仅 PIPE≠src 且 FG 激活时被记录。
+    void RecordMotionScale(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                           int srcW, int srcH) noexcept;
     // 光流输入降采样(#46/#48):YUV→RGB 转换已在同一 CL 上产出 inputColor
     // (NSR),本 pass 直接采样槽 0 srvInput 双线性写 NVOF 注册输入纹理
     // inputIndex(0/1,UAV 23/24)。调用方(NvofContext)负责注册纹理的
@@ -315,7 +361,11 @@ public:
     // CPU 等待 NVOF execute 完成)。
     bool SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
                          char *err, size_t errLen) noexcept;
-    bool SubmitFgFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
+    // post/fg 段提交:waitFence/waitValue = RTX 专用队列的完成栅栏(可选;
+    // 排在本次 Execute 之前 —— post CL 消费 VSR/TrueHDR 的输出,跨队列
+    // 生产者-消费者顺序由此保证)。
+    bool SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+                       char *err, size_t errLen) noexcept;
     bool WaitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
     // GPU 完成后调用:回读缓冲 → VS 三平面(纯 CPU 行拷贝,色度半尺寸)。
@@ -366,6 +416,9 @@ public:
     static constexpr UINT kSrvOutputColor = 22; // outputColor 的 SRV
     static constexpr UINT kSrvFgInterp = 32;    // fgInterp 的 SRV(FG 槽)
     static constexpr UINT kUavDebugDiff = 34;   // 共享差异调试纹理的 UAV
+    static constexpr UINT kSrvVsrColor = 36;    // vsrColor 的 SRV(RTX 输出转换读)
+    static constexpr UINT kSrvHdrColor = 37;    // hdrColor 的 SRV(FP16 scRGB → PQ)
+    static constexpr UINT kUavMotionDense = 38; // motionDense 的 UAV(mvec 放大写)
     // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
@@ -390,6 +443,9 @@ public:
     // motion R16G16_FLOAT、depth R32_FLOAT,内容全 0,常驻 NSR 只读
     ID3D12Resource *Motion() const noexcept { return _motion.Get(); }
     ID3D12Resource *Depth() const noexcept { return _depth.Get(); }
+    // PIPE 尺寸零深度(FG + VSR 放大;仅在需要时创建,否则空 —— 调用方
+    // 以 motionDense 的有无判别同一条件,勿单独判空)。
+    ID3D12Resource *DepthPipe() const noexcept { return _depthPipe.Get(); }
 
 private:
     bool CreateSlotResources(FrameSlot &slot, int depth, char *err, size_t errLen) noexcept;
@@ -449,12 +505,28 @@ private:
     int _width = 0;
     int _height = 0;
     int _bitDepth = 0;  // YUV 位深(8/10;不叫 _depth —— 那是零 guidance 深度纹理)
-    int _chromaW = 0;   // 色度平面尺寸 = (w+1)>>1 / (h+1)>>1
+    int _chromaW = 0;   // 色度平面尺寸 = (w+1)>>1 / (h+1)>>1(输入/源)
     int _chromaH = 0;
+    // RTX Video 双尺寸(create-time 定格;无 RTX = 与源一致)。
+    //   pipe  — VSR 输出 / TrueHDR / FG backbuffer
+    //   out   — YUV 输出平面(hdr 开 = 恒 P10:格式 R16_UNORM、2 字节平面)
+    int _pipeW = 0;
+    int _pipeH = 0;
+    int _outW = 0;
+    int _outH = 0;
+    int _outChromaW = 0;
+    int _outChromaH = 0;
+    bool _vsrSlots = false;         // 槽池含 vsrColor / motionDense
+    bool _hdrPipe = false;          // TrueHDR 激活(fgInterp FP16 / P10 输出)
+    DXGI_FORMAT _outFmt = DXGI_FORMAT_R8_UNORM;      // yuvOut/readback 平面格式
+    UINT _outPlaneBytes = 1;
 
     // shared read-only resources
     ComPtr<ID3D12Resource> _motion; // resident NON_PIXEL_SHADER_RESOURCE
     ComPtr<ID3D12Resource> _depth;  // resident NON_PIXEL_SHADER_RESOURCE
+    // RTX Video + FG 且 PIPE≠src 时的 PIPE 尺寸零深度(FG Depth 子矩形 =
+    // backbuffer 尺寸;与 _depth 同为常驻 NSR 零纹理,仅在需要时创建)。
+    ComPtr<ID3D12Resource> _depthPipe; // resident NON_PIXEL_SHADER_RESOURCE
     ComPtr<ID3D12DescriptorHeap> _rtvHeap;
 
     // residual compute objects (shared: PSOs are stateless)
@@ -495,6 +567,17 @@ private:
     ComPtr<ID3D12RootSignature> _rsConvertOut;
     ComPtr<ID3D12PipelineState> _psoConvertOutLuma;
     ComPtr<ID3D12PipelineState> _psoConvertOutChroma;
+    // RTX Video 输出转换(PIPE→OUT;与 _rsConvertOut 同根签名布局 ——
+    // 12 常量 + t0 + u0/u1,仅换 PSO):
+    //   Scaled — BGRA8 源归一化 uv 双线性缩放(VSR-only 路径)
+    //   PQ     — FP16 scRGB → 2020/PQ → P10(TrueHDR 路径)
+    ComPtr<ID3D12PipelineState> _psoConvertScaledLuma;
+    ComPtr<ID3D12PipelineState> _psoConvertScaledChroma;
+    ComPtr<ID3D12PipelineState> _psoPqLuma;
+    ComPtr<ID3D12PipelineState> _psoPqChroma;
+    // mvec 放大(源→PIPE;CreateOfPso 通用形态:1 SRV + 1 UAV + 4 常量)。
+    ComPtr<ID3D12RootSignature> _rsMotionScale;
+    ComPtr<ID3D12PipelineState> _psoMotionScale;
 
     // AMD 光流后端 PSO(FFX Prepare/Densify;录制在各自会话 CL 上,
     // d3d12_context.cpp 内嵌 HLSL 同款编译)。

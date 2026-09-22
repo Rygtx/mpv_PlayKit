@@ -227,6 +227,7 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
 
     _width = width;
     _height = height;
+    _colorHdr = backbufferFormat == DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (!CreateFeatureOnCtl(width, height, backbufferFormat, err, errLen)) {
         _d3d12 = nullptr;
         _params = nullptr;
@@ -322,6 +323,7 @@ bool DlssfgContext::Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,
     }
     _width = width;
     _height = height;
+    _colorHdr = backbufferFormat == DXGI_FORMAT_R16G16B16A16_FLOAT;
     if (!CreateFeatureOnCtl(width, height, backbufferFormat, err, errLen)) {
         _ready.store(false, std::memory_order_release);
         return false;
@@ -423,7 +425,7 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
     _params->Set(NVSDK_NGX_DLSSG_Parameter_CameraFOV, 1.04719755f);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio,
                  height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f);
-    _params->Set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, 0u);
+    _params->Set(NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, _colorHdr ? 1u : 0u);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset, 0u);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0u);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_OrthoProjection, 0u);

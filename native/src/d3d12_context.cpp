@@ -469,6 +469,8 @@ bool D3D12Context::CreateColorTexture(
 }
 
 bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool fg,
+                                        int pipeW, int pipeH, int outW, int outH,
+                                        bool vsr, bool hdr,
                                         char *err, size_t errLen) noexcept {
     _width = width;
     _height = height;
@@ -476,6 +478,27 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     _chromaW = (width + 1) >> 1;
     _chromaH = (height + 1) >> 1;
     _fgSlots = fg;
+    // RTX Video 双尺寸定格。守卫:pipe/out 必须落在 [源, 合理上界] 内,
+    // 越界 = 调用方换算 bug,按无 RTX 兜底(与占位视图语义一致)。
+    _vsrSlots = vsr && pipeW >= width && pipeH >= height &&
+                pipeW <= width * 8 && pipeH <= height * 8;
+    _hdrPipe = hdr;
+    if (_vsrSlots) {
+        _pipeW = pipeW;
+        _pipeH = pipeH;
+        _outW = outW;
+        _outH = outH;
+    } else {
+        _pipeW = width;
+        _pipeH = height;
+        _outW = width;
+        _outH = height;
+    }
+    _outChromaW = (_outW + 1) >> 1;
+    _outChromaH = (_outH + 1) >> 1;
+    // HDR 输出 = 恒 P10(PQ BT.2020 limited);SDR 输出 = 源位深同格式。
+    _outPlaneBytes = (_hdrPipe || _bitDepth > 8) ? 2u : 1u;
+    _outFmt = _outPlaneBytes > 1 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
 
     // 零 guidance 纹理:R16G16_FLOAT motion + R32_FLOAT depth,内容清 0。
     // RTV clear 要求 ALLOW_RENDER_TARGET 标志。clear 后常驻
@@ -487,6 +510,15 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
         return false;
     }
     if (!CreateColorTexture(_depth.GetAddressOf(), width, height,
+                            DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, err, errLen)) {
+        return false;
+    }
+    // PIPE 尺寸零深度(FG + VSR 放大时:DLSSG Depth 子矩形 = backbuffer
+    // 尺寸;内容与 _depth 同为全零)。
+    const bool needDepthPipe = fg && _vsrSlots && (_pipeW != width || _pipeH != height);
+    if (needDepthPipe &&
+        !CreateColorTexture(_depthPipe.GetAddressOf(), _pipeW, _pipeH,
                             DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, err, errLen)) {
         return false;
@@ -503,7 +535,7 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     if (ProbeEnabled()) TimingStatusLine("PROBE: d3d12 frame-res before clear"); // init 细分(DEVICE_HUNG 时序定位)
     {
         D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
-        rtvDesc.NumDescriptors = 2;
+        rtvDesc.NumDescriptors = 3;
         rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         HRESULT hr = _device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(_rtvHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -513,31 +545,38 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
         const D3D12_CPU_DESCRIPTOR_HANDLE base = _rtvHeap->GetCPUDescriptorHandleForHeapStart();
         const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
         const D3D12_CPU_DESCRIPTOR_HANDLE depthRtv{ base.ptr + static_cast<SIZE_T>(inc) };
+        const D3D12_CPU_DESCRIPTOR_HANDLE depthPipeRtv{ base.ptr + static_cast<SIZE_T>(inc * 2) };
         D3D12_RENDER_TARGET_VIEW_DESC rtv{};
         rtv.Format = DXGI_FORMAT_R16G16_FLOAT;
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
         _device->CreateRenderTargetView(_motion.Get(), &rtv, base);
         rtv.Format = DXGI_FORMAT_R32_FLOAT;
         _device->CreateRenderTargetView(_depth.Get(), &rtv, depthRtv);
+        if (_depthPipe) {
+            _device->CreateRenderTargetView(_depthPipe.Get(), &rtv, depthPipeRtv);
+        }
 
         std::lock_guard<std::mutex> ctlLock(_ctlMutex);
         if (!BeginCtlRecording()) {
             SetErr(err, errLen, E_FAIL, "BeginCtlRecording(guidance clear) failed");
             return false;
         }
-        D3D12_RESOURCE_BARRIER toRt[2]{
+        D3D12_RESOURCE_BARRIER toRt[3]{
             Transition(_motion.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
             Transition(_depth.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
+            Transition(_depthPipe.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET),
         };
-        _ctlCommandList->ResourceBarrier(2, toRt);
+        _ctlCommandList->ResourceBarrier(_depthPipe ? 3u : 2u, toRt);
         const float zero[4]{ 0.0f, 0.0f, 0.0f, 0.0f };
         _ctlCommandList->ClearRenderTargetView(base, zero, 0, nullptr);
         _ctlCommandList->ClearRenderTargetView(depthRtv, zero, 0, nullptr);
-        D3D12_RESOURCE_BARRIER toResident[2]{
+        if (_depthPipe) _ctlCommandList->ClearRenderTargetView(depthPipeRtv, zero, 0, nullptr);
+        D3D12_RESOURCE_BARRIER toResident[3]{
             Transition(_motion.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             Transition(_depth.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            Transition(_depthPipe.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         };
-        _ctlCommandList->ResourceBarrier(2, toResident);
+        _ctlCommandList->ResourceBarrier(_depthPipe ? 3u : 2u, toResident);
         if (!ExecuteCtlAndWait()) {
             SetErr(err, errLen, E_FAIL, "Execute(guidance clear) failed");
             return false;
@@ -637,6 +676,9 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     }
     slot.inputColor.Reset();
     slot.outputColor.Reset();
+    slot.vsrColor.Reset();
+    slot.hdrColor.Reset();
+    slot.motionDense.Reset();
     slot.reducedColor.Reset();
     slot.reducedDenoised.Reset();
     slot.controlledRes.Reset();
@@ -715,11 +757,36 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }
+    // RTX Video 管线纹理(PIPE 尺寸;请求了才建,描述符侧占位视图)。
+    // vsrColor: VSR 输出(BGRA8 —— 官方 VSR 支持的输入/输出格式族
+    // R8G8B8A8/B8G8R8A8/R10G10B10A2,输出需 UAV 标志,SDK D3D12 样例同款)。
+    // hdrColor: TrueHDR 输出 FP16 scRGB(FG backbuffer / PQ 转换源)。
+    // motionDense: FG MVecs 的 PIPE 尺寸版本(PIPE==src 时无纹理,eval
+    // 直用 motion)。创建顺序在描述符块之前 —— NULL 描述符 TDR 铁律。
+    if (_vsrSlots &&
+        !CreateColorTexture(slot.vsrColor.GetAddressOf(), _pipeW, _pipeH,
+                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
+    if (_hdrPipe &&
+        !CreateColorTexture(slot.hdrColor.GetAddressOf(), _pipeW, _pipeH,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
+    if (_fgSlots && _vsrSlots && (_pipeW != width || _pipeH != height) &&
+        !CreateColorTexture(slot.motionDense.GetAddressOf(), _pipeW, _pipeH,
+                            DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+        return false;
+    }
 
-    // YUV 平面纹理:In = upload 拷入供转换采样;Out = RGB→YUV dispatch 写出
-    // 供回读。R8_UNORM(8bit)/R16_UNORM(10bit,存储字 = VS P10 采样值,
-    // 右对齐 0-1023 —— 2026-09-08 BlankClip 实测;UNORM 读出 word/65535,
-    // round(×65535) 精确还原整数采样值)。
+    // YUV 平面纹理:In = upload 拷入供转换采样(源尺寸);Out = 颜色→YUV
+    // dispatch 写出供回读(OUT 尺寸 —— RTX VSR 放大后输出平面在目标尺寸;
+    // 无 RTX 时 OUT=src 同旧管线)。R8_UNORM(8bit)/R16_UNORM(10bit,存储字
+    // = VS P10 采样值,右对齐 0-1023 —— 2026-09-08 BlankClip 实测;UNORM
+    // 读出 word/65535,round(×65535) 精确还原整数采样值)。
     const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
     for (int i = 0; i < 3; ++i) {
         const int pw = i == 0 ? width : _chromaW;
@@ -729,8 +796,10 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
                                 D3D12_RESOURCE_FLAG_NONE, err, errLen)) {
             return false;
         }
-        if (!CreateColorTexture(slot.yuvOut[i].GetAddressOf(), pw, ph,
-                                yuvFmt, D3D12_RESOURCE_STATE_COMMON,
+        const int ow = i == 0 ? _outW : _outChromaW;
+        const int oh = i == 0 ? _outH : _outChromaH;
+        if (!CreateColorTexture(slot.yuvOut[i].GetAddressOf(), ow, oh,
+                                _outFmt, D3D12_RESOURCE_STATE_COMMON,
                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
             return false;
         }
@@ -750,7 +819,8 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     }
 
     // YUV upload/readback staging:每平面一条 buffer,行距 256 对齐,
-    // persist-mapped(纯行拷贝,无像素算术)。
+    // persist-mapped(纯行拷贝,无像素算术)。upload = 源尺寸(输入平面);
+    // readback = OUT 尺寸(RTX 放大后的输出平面)。
     const UINT planeBytes = _bitDepth > 8 ? 2 : 1;
     for (int i = 0; i < 3; ++i) {
         const int pw = i == 0 ? width : _chromaW;
@@ -770,10 +840,13 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         // READBACK heap only accepts buffers on this runtime (texture staging
         // on READBACK heap returns E_INVALIDARG), so copy via placed footprint
         // into a readback buffer. Persist-mapped like the upload side.
-        if (!CreateRawBuffer(static_cast<UINT64>(ph) * bytesPerRow, D3D12_HEAP_TYPE_READBACK,
+        const int orw = i == 0 ? _outW : _outChromaW;
+        const int orh = i == 0 ? _outH : _outChromaH;
+        const UINT outBytesPerRow = static_cast<UINT>(orw) * _outPlaneBytes;
+        if (!CreateRawBuffer(static_cast<UINT64>(orh) * outBytesPerRow, D3D12_HEAP_TYPE_READBACK,
                              D3D12_RESOURCE_STATE_COPY_DEST,
                              slot.readbackYuv[i].GetAddressOf(), slot.readbackPitchYuv[i],
-                             bytesPerRow, err, errLen)) {
+                             outBytesPerRow, err, errLen)) {
             return false;
         }
         hr = slot.readbackYuv[i]->Map(0, nullptr, &slot.readbackYuvMapped[i]);
@@ -791,10 +864,12 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         // slot-local shader-visible descriptor heap; input/output descriptors
         // here, the residual pipeline descriptors on every scaling rebuild.
         // 35 = 0..31 原有 + 32/33(FG 插值输出的 SRV/UAV;堆空间常备,
-        // 非 FG 槽写占位视图)+ 34(共享差异调试纹理 UAV)。
+        // 非 FG 槽写占位视图)+ 34(共享差异调试纹理 UAV)+ 36/37/38
+        // (RTX:vsrColor/hdrColor 的 SRV、motionDense 的 UAV;无 RTX 槽 =
+        // outputColor/motion 占位视图)。
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 51; // 0-34 原有 + 49/50(FFX OF 后端)
+        heapDesc.NumDescriptors = 51; // 0-34 原有 + 36/37/38(RTX)+ 49/50(FFX OF 后端)
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -857,23 +932,38 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         // 它:slot.motion 的内容在首 densify 前未定义,直接绑会显示假流;
         // 零纹理保证"黑 = 无光流数据"的语义成立。
         _device->CreateShaderResourceView(_motion.Get(), nullptr, slotHandle(35));
+        // 36/37/38:RTX Video(占位 = outputColor/motion,资源带 UAV flag,
+        // 满足"绝不写 NULL 描述符"惯例;RTX 未激活时这些槽永不被有效读取
+        // —— 对应的 Record 调用只在 RTX 管线被记录)。
+        _device->CreateShaderResourceView(slot.vsrColor ? slot.vsrColor.Get()
+                                                        : slot.outputColor.Get(),
+                                          nullptr, slotHandle(36));
+        _device->CreateShaderResourceView(slot.hdrColor ? slot.hdrColor.Get()
+                                                        : slot.outputColor.Get(),
+                                          nullptr, slotHandle(37));
+        _device->CreateUnorderedAccessView(slot.motionDense ? slot.motionDense.Get()
+                                                            : slot.motion.Get(),
+                                           nullptr, nullptr, slotHandle(38));
     }
     return true;
 }
 
 // DLSS FG 槽资源(仅 _fgSlots):插值输出纹理 + 第二组回读缓冲。
+// RTX 双尺寸:fgInterp 在 PIPE 尺寸(backbuffer 同侧),格式随 _hdrPipe
+// (SDR BGRA8 / HDR FP16 scRGB);回读缓冲 = OUT 尺寸(与真实帧一致)。
 bool D3D12Context::CreateFgSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
-    if (!CreateColorTexture(slot.fgInterp.GetAddressOf(), _width, _height,
-                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+    if (!CreateColorTexture(slot.fgInterp.GetAddressOf(), _pipeW, _pipeH,
+                            _hdrPipe ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                     : DXGI_FORMAT_B8G8R8A8_UNORM,
+                            D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }
-    const UINT planeBytes = _bitDepth > 8 ? 2 : 1;
     for (int g = 0; g < kFgGenSlots; ++g) {
         for (int i = 0; i < 3; ++i) {
-            const int pw = i == 0 ? _width : _chromaW;
-            const int ph = i == 0 ? _height : _chromaH;
-            const UINT bytesPerRow = static_cast<UINT>(pw) * planeBytes;
+            const int pw = i == 0 ? _outW : _outChromaW;
+            const int ph = i == 0 ? _outH : _outChromaH;
+            const UINT bytesPerRow = static_cast<UINT>(pw) * _outPlaneBytes;
             if (!CreateRawBuffer(static_cast<UINT64>(ph) * bytesPerRow, D3D12_HEAP_TYPE_READBACK,
                                  D3D12_RESOURCE_STATE_COPY_DEST,
                                  slot.readbackFg[g][i].GetAddressOf(), slot.readbackPitchFg[g][i],
@@ -1019,9 +1109,9 @@ bool D3D12Context::RecordReadbackCopy(ID3D12GraphicsCommandList &clRef, FrameSlo
     // 转换+回读,共用 yuvOut,目标缓冲两两不同)。cl 由调用方显式给定
     // (真实帧 = base CL,插值 = fg CL)。
     ID3D12GraphicsCommandList *cl = &clRef;
-    const DXGI_FORMAT yuvFmt = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
-    const int planeW[3]{ _width, _chromaW, _chromaW };
-    const int planeH[3]{ _height, _chromaH, _chromaH };
+    const DXGI_FORMAT yuvFmt = _outFmt;
+    const int planeW[3]{ _outW, _outChromaW, _outChromaW };
+    const int planeH[3]{ _outH, _outChromaH, _outChromaH };
     for (int i = 0; i < 3; ++i) {
         ID3D12Resource *dstBuf = fgGen >= 0 ? slot.readbackFg[fgGen][i].Get()
                                             : slot.readbackYuv[i].Get();
@@ -1107,13 +1197,18 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence,
     return true;
 }
 
-bool D3D12Context::SubmitFgFrame(FrameSlot &slot, char *err, size_t errLen) noexcept {
+bool D3D12Context::SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+                                 char *err, size_t errLen) noexcept {
     HRESULT hr = slot.fgCommandList->Close();
     if (FAILED(hr)) {
         SetErr(err, errLen, hr, "Close(slot fg) failed");
         return false;
     }
     std::lock_guard<std::mutex> lock(_submitMutex);
+    // RTX 专用队列的产出(管线色)是本段输入 —— 跨队列 Wait 排在执行前。
+    if (waitFence && waitValue) {
+        _queue->Wait(waitFence, waitValue);
+    }
     ID3D12CommandList *lists[]{ slot.fgCommandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
     slot.fenceValue = _fenceValue.fetch_add(1) + 1;
@@ -1134,7 +1229,9 @@ bool D3D12Context::UnpackOutput(
     uint8_t **dstPlanes, int64_t *dstStrides,
     int width, int height, char *err, size_t errLen,
     int fgGen) noexcept {
-    if (width != _width || height != _height) {
+    // RTX 双尺寸:输出平面在 OUT 尺寸(调用方按 OUT 建帧)。width/height
+    // 即调用方帧尺寸,与 _outW/_outH 对账。
+    if (width != _outW || height != _outH) {
         SetErr(err, errLen, E_INVALIDARG, "UnpackOutput: size mismatch");
         return false;
     }
@@ -1145,9 +1242,9 @@ bool D3D12Context::UnpackOutput(
     // P10 word 逐位一致 —— 所以是纯拷贝。
     // fgGen >= 0 = 读 FG 插值帧第 fgGen 组回读缓冲。
     for (int p = 0; p < 3; ++p) {
-        const int pw = p == 0 ? width : _chromaW;
-        const int ph = p == 0 ? height : _chromaH;
-        const size_t rowBytes = static_cast<size_t>(pw) * (_bitDepth > 8 ? 2u : 1u);
+        const int pw = p == 0 ? width : _outChromaW;
+        const int ph = p == 0 ? height : _outChromaH;
+        const size_t rowBytes = static_cast<size_t>(pw) * _outPlaneBytes;
         const uint8_t *srcRow = static_cast<const uint8_t *>(
             fgGen >= 0 ? slot.readbackFgMapped[fgGen][p] : slot.readbackYuvMapped[p]);
         const size_t srcPitch = fgGen >= 0 ? slot.readbackPitchFg[fgGen][p]
@@ -1911,6 +2008,198 @@ void BgraToYuvChroma(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// ---- RTX Video:PIPE → OUT 缩放转换(SDR;BGRA8 源)----
+// VSR 输出(PIPE 尺寸)→ OUT 尺寸 YUV 平面。双 bilinear 采样(归一化坐标
+// 映射,手工 4 tap——全仓惯例无 sampler,SRV [] 索引)。PIPE==OUT 时坐标
+// 恒等映射 = 逐位等价旧路径。cbuffer 布局与 BGRA_TO_YUV_HLSL 完全一致
+// (dstExtent / srcExtent / Kr Kb LoOverCM SpanOverCM + pad),共用
+// _rsConvertOut 根签名,仅换 PSO。4 tap 权重全正,色度平均后一次转换
+// (与 2×2 box 同款仿射论证)。
+constexpr char COLOR_TO_YUV_SCALED_HLSL[] = R"(
+Texture2D<float4> CompositeColor : register(t0);
+RWTexture2D<float> OutputA : register(u0);
+RWTexture2D<float> OutputB : register(u1);
+
+cbuffer ConvertOutParams : register(b0) {
+    uint2 DstExtent;      // luma: OUT W,H;chroma: OUT cw,ch(dispatch 边界)
+    uint2 SourceExtent;   // PIPE 全分辨率尺寸
+    float Kr;
+    float Kb;
+    float LoOverCM;
+    float SpanOverCM;
+    float Pad0;
+    float Pad1;
+    float Pad2;
+};
+
+float LumaOf(float3 rgb) {
+    return dot(rgb, float3(Kr, 1.0 - Kr - Kb, Kb));
+}
+float ChromaToCode(float c) {
+    return saturate(c * SpanOverCM + LoOverCM);
+}
+// 手工双线性(4 tap,clamp 边界;idx 域 = 源纹理尺寸)。
+float3 SampleBilinear(float2 srcPos) {
+    const float2 f = floor(srcPos);
+    const int2 i0 = int2(f);
+    const float2 t = srcPos - f;
+    const int2 e = SourceExtent - 1;
+    const int2 a = clamp(i0, int2(0, 0), e);
+    const int2 b = clamp(i0 + int2(1, 0), int2(0, 0), e);
+    const int2 c = clamp(i0 + int2(0, 1), int2(0, 0), e);
+    const int2 d = clamp(i0 + int2(1, 1), int2(0, 0), e);
+    return CompositeColor[a].xyz * ((1 - t.x) * (1 - t.y))
+         + CompositeColor[b].xyz * (t.x * (1 - t.y))
+         + CompositeColor[c].xyz * ((1 - t.x) * t.y)
+         + CompositeColor[d].xyz * (t.x * t.y);
+}
+float2 ToSrcPos(float2 dstPos) {
+    return (dstPos + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
+}
+
+[numthreads(8, 8, 1)]
+void ScaledToYuvLuma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float3 rgb = saturate(SampleBilinear(ToSrcPos(float2(tid.xy))));
+    const float nY = LumaOf(rgb);
+    OutputA[tid.xy] = saturate(nY * SpanOverCM + LoOverCM);
+}
+
+[numthreads(8, 8, 1)]
+void ScaledToYuvChroma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    // luma 域 2×2 覆盖区四点采样(各点双线性)平均 → 转换。
+    const float2 base = tid.xy * 2;
+    const float3 rgb = saturate(0.25 * (SampleBilinear(ToSrcPos(base + float2(0.5, 0.5)))
+                                      + SampleBilinear(ToSrcPos(base + float2(1.5, 0.5)))
+                                      + SampleBilinear(ToSrcPos(base + float2(0.5, 1.5)))
+                                      + SampleBilinear(ToSrcPos(base + float2(1.5, 1.5)))));
+    const float nY = LumaOf(rgb);
+    const float cb = (rgb.z - nY) * (0.5 / (1.0 - Kb));
+    const float cr = (rgb.x - nY) * (0.5 / (1.0 - Kr));
+    OutputA[tid.xy] = ChromaToCode(cb);
+    OutputB[tid.xy] = ChromaToCode(cr);
+}
+)";
+
+// ---- RTX Video HDR:FP16 scRGB → BT.2020 PQ P10(TrueHDR 输出转换)----
+// TrueHDR 输出语义 = linear scRGB(1.0 = 80 nits SDR 参考白,Magpie
+// RTXVideoHdr 同解读)。链路:线性 709 →(线性域)2020 色域 → 各分量 PQ
+// (ST 2084,归一 10000 nits)→ 2020 YCbCr limited 10bit → P10 字(右对齐
+// 惯例:w = code/65535)。双线性在 LINEAR 光域 = 物理正确插值。cbuffer 同
+// 上(Kr/Kb 位置复用为 2020 的 0.2627/0.0593,Lo/Span 传 limited 常量)。
+constexpr char FP16_TO_YUV_PQ_HLSL[] = R"(
+Texture2D<float4> HdrColor : register(t0);
+RWTexture2D<float> OutputA : register(u0);
+RWTexture2D<float> OutputB : register(u1);
+
+cbuffer ConvertOutParams : register(b0) {
+    uint2 DstExtent;
+    uint2 SourceExtent;
+    float Kr;             // BT.2020: 0.2627
+    float Kb;             // BT.2020: 0.0593
+    float LoOverCM;       // luma: 64/876;chroma: 512/896
+    float SpanOverCM;     // 1/876 或 1/896
+    float Pad0;
+    float Pad1;
+    float Pad2;
+};
+
+static const float3x3 M709To2020 = {
+    0.6274, 0.3293, 0.0433,
+    0.0690, 0.9195, 0.0112,
+    0.0164, 0.0880, 0.8955,
+};
+
+// ST 2084 PQ EOTF 逆(输入 nits → [0,1] PQ 码值;归一 10000 nits)。
+float PqEncode(float nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    float p = pow(saturate(nits / 10000.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+float4 SampleHdrBilinear(float2 srcPos) {
+    const float2 f = floor(srcPos);
+    const int2 i0 = int2(f);
+    const float2 t = srcPos - f;
+    const int2 e = SourceExtent - 1;
+    const int2 a = clamp(i0, int2(0, 0), e);
+    const int2 b = clamp(i0 + int2(1, 0), int2(0, 0), e);
+    const int2 c = clamp(i0 + int2(0, 1), int2(0, 0), e);
+    const int2 d = clamp(i0 + int2(1, 1), int2(0, 0), e);
+    return HdrColor[a] * ((1 - t.x) * (1 - t.y))
+         + HdrColor[b] * (t.x * (1 - t.y))
+         + HdrColor[c] * ((1 - t.x) * t.y)
+         + HdrColor[d] * (t.x * t.y);
+}
+float2 ToSrcPos(float2 dstPos) {
+    return (dstPos + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
+}
+// 线性 scRGB(709)→ PQ 编码的 2020 RGB 三元组。
+float3 ToPq2020(float3 lin709) {
+    const float3 lin2020 = mul(max(lin709, 0.0), M709To2020) * 80.0; // nits
+    return float3(PqEncode(lin2020.r), PqEncode(lin2020.g), PqEncode(lin2020.b));
+}
+
+[numthreads(8, 8, 1)]
+void PqToYuvLuma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float3 pq = ToPq2020(SampleHdrBilinear(ToSrcPos(float2(tid.xy))).rgb);
+    const float y = dot(pq, float3(Kr, 1.0 - Kr - Kb, Kb));
+    OutputA[tid.xy] = saturate(y * SpanOverCM + LoOverCM);
+}
+
+[numthreads(8, 8, 1)]
+void PqToYuvChroma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float2 base = tid.xy * 2;
+    const float3 pq = 0.25 * (ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(0.5, 0.5))).rgb)
+                            + ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(1.5, 0.5))).rgb)
+                            + ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(0.5, 1.5))).rgb)
+                            + ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(1.5, 1.5))).rgb));
+    const float y = dot(pq, float3(Kr, 1.0 - Kr - Kb, Kb));
+    const float cb = (pq.b - y) * (0.5 / (1.0 - Kb));
+    const float cr = (pq.r - y) * (0.5 / (1.0 - Kr));
+    OutputA[tid.xy] = saturate(cb * SpanOverCM + LoOverCM);
+    OutputB[tid.xy] = saturate(cr * SpanOverCM + LoOverCM);
+}
+)";
+
+// ---- RTX Video + FG:源尺寸运动场 → PIPE 尺寸(mvec 放大)----
+// DLSSG MVecs 契约 = backbuffer 同尺寸、像素单位 current-to-previous。
+// R16G16F 向量场双线性 = 线性插值,语义保真。4 常量:dstExtent(2)+srcExtent(2)
+// (CreateOfPso 通用形态)。
+constexpr char MVEC_SCALE_HLSL[] = R"(
+Texture2D<float2> SrcMotion : register(t0);
+RWTexture2D<float2> DstMotion : register(u0);
+
+cbuffer MotionScaleParams : register(b0) {
+    uint2 DstExtent;
+    uint2 SourceExtent;
+};
+
+[numthreads(8, 8, 1)]
+void ScaleMotion(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float2 srcPos = (tid.xy + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
+    const float2 f = floor(srcPos);
+    const int2 i0 = int2(f);
+    const float2 t = srcPos - f;
+    const int2 e = SourceExtent - 1;
+    const int2 a = clamp(i0, int2(0, 0), e);
+    const int2 b = clamp(i0 + int2(1, 0), int2(0, 0), e);
+    const int2 c = clamp(i0 + int2(0, 1), int2(0, 0), e);
+    const int2 d = clamp(i0 + int2(1, 1), int2(0, 0), e);
+    DstMotion[tid.xy] = SrcMotion[a] * ((1 - t.x) * (1 - t.y))
+                      + SrcMotion[b] * (t.x * (1 - t.y))
+                      + SrcMotion[c] * ((1 - t.x) * t.y)
+                      + SrcMotion[d] * (t.x * t.y);
+}
+)";
+
 // AMD 光流后端通用 cs_5_0 PSO 构造:1 个 32 位常量根参数(b0,numConsts)
 // + nSrv 个独立 t 表 + nUav 个独立 u 表(与 densify/nvof downsample 同构;
 // 独立表参数,同表重叠 range 禁忌)。FFX 的两个 PSO 全走这里 ——
@@ -2567,10 +2856,22 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
         const OutCso outCsos[]{
             { "BgraToYuvLuma", _psoConvertOutLuma.GetAddressOf() },
             { "BgraToYuvChroma", _psoConvertOutChroma.GetAddressOf() },
+            // RTX Video 输出转换:与上面共用 _rsConvertOut(同 12 常量 +
+            // t0/u0/u1 布局),仅换 HLSL 入口。
+            { "ScaledToYuvLuma", _psoConvertScaledLuma.GetAddressOf() },
+            { "ScaledToYuvChroma", _psoConvertScaledChroma.GetAddressOf() },
+            { "PqToYuvLuma", _psoPqLuma.GetAddressOf() },
+            { "PqToYuvChroma", _psoPqChroma.GetAddressOf() },
         };
-        for (const auto &cso : outCsos) {
+        constexpr const char *kOutHlslByEntry[] = {
+            BGRA_TO_YUV_HLSL, BGRA_TO_YUV_HLSL,
+            COLOR_TO_YUV_SCALED_HLSL, COLOR_TO_YUV_SCALED_HLSL,
+            FP16_TO_YUV_PQ_HLSL, FP16_TO_YUV_PQ_HLSL,
+        };
+        for (size_t ci = 0; ci < std::size(outCsos); ++ci) {
+            const auto &cso = outCsos[ci];
             ComPtr<ID3DBlob> code, csErr;
-            if (FAILED(D3DCompile(BGRA_TO_YUV_HLSL, strlen(BGRA_TO_YUV_HLSL),
+            if (FAILED(D3DCompile(kOutHlslByEntry[ci], strlen(kOutHlslByEntry[ci]),
                                   nullptr, nullptr, nullptr, cso.entry, "cs_5_0",
                                   0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
                 SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(convert out) failed");
@@ -2583,6 +2884,14 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
                 SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert out) failed");
                 return false;
             }
+        }
+    }
+    {
+        // mvec 放大(源→PIPE):CreateOfPso 通用形态(1 SRV + 1 UAV + 4 常量)。
+        if (!CreateOfPso(_device.Get(), MVEC_SCALE_HLSL, "ScaleMotion", 4, 1, 1,
+                         _rsMotionScale.GetAddressOf(), _psoMotionScale.GetAddressOf(),
+                         "motion scale", err, errLen)) {
+            return false;
         }
     }
     return true;
@@ -3187,6 +3496,134 @@ void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
     cl->ResourceBarrier(1, back);
+}
+
+void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                     ID3D12Resource *srcColor, UINT srcSrvIndex,
+                                     bool isFp16, int srcW, int srcH,
+                                     ColorMatrix matrix, ColorRange range,
+                                     D3D12_RESOURCE_STATES stateBefore) noexcept {
+    // RTX Video 管线的颜色输出(PIPE 尺寸源 → OUT 尺寸平面;契约同
+    // RecordYuvOutput,见头文件注释)。PIPE==OUT 且 SDR 时坐标恒等映射,
+    // 与旧路径逐位同价。
+    ID3D12GraphicsCommandList *cl = &clRef;
+    if (stateBefore != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER toNsr[1]{
+            Transition(srcColor, stateBefore,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        cl->ResourceBarrier(1, toNsr);
+    }
+    D3D12_RESOURCE_BARRIER toUav[3];
+    for (int i = 0; i < 3; ++i) {
+        toUav[i] = Transition(slot.yuvOut[i].Get(),
+                              D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    cl->ResourceBarrier(3, toUav);
+
+    cl->SetComputeRootSignature(_rsConvertOut.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+
+    const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _outPlaneBytes > 1 ? 10 : 8);
+    ID3D12PipelineState *lumaPso = isFp16 ? _psoPqLuma.Get() : _psoConvertScaledLuma.Get();
+    ID3D12PipelineState *chromaPso = isFp16 ? _psoPqChroma.Get() : _psoConvertScaledChroma.Get();
+    if (!isFp16) {
+        cl->SetPipelineState(lumaPso);
+        {
+            const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
+            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+            const float consts[8]{ cf.kr, cf.kb,
+                                   cf.yLo / cf.containerMax, cf.ySpan / cf.containerMax,
+                                   0.0f, 0.0f, 0.0f, 0.0f };
+            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
+            cl->SetComputeRootDescriptorTable(2, gpu(28));
+            cl->SetComputeRootDescriptorTable(3, gpu(29));
+            cl->Dispatch((static_cast<UINT>(_outW) + 7) / 8, (static_cast<UINT>(_outH) + 7) / 8, 1);
+        }
+        cl->SetPipelineState(chromaPso);
+        {
+            const UINT extent[2]{ static_cast<UINT>(_outChromaW), static_cast<UINT>(_outChromaH) };
+            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+            const float consts[8]{ cf.kr, cf.kb,
+                                   cf.cMid / cf.containerMax, cf.cSpan / cf.containerMax,
+                                   0.0f, 0.0f, 0.0f, 0.0f };
+            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
+            cl->SetComputeRootDescriptorTable(2, gpu(29));
+            cl->SetComputeRootDescriptorTable(3, gpu(30));
+            cl->Dispatch((static_cast<UINT>(_outChromaW) + 7) / 8, (static_cast<UINT>(_outChromaH) + 7) / 8, 1);
+        }
+    } else {
+        // PQ:Kr/Kb = BT.2020(0.2627/0.0593);limited 10bit luma 64+876y、
+        // chroma 512+896c(÷CM 折进常量,与 SDR 路径同布局)。
+        constexpr float kKr2020 = 0.2627f;
+        constexpr float kKb2020 = 0.0593f;
+        cl->SetPipelineState(lumaPso);
+        {
+            const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
+            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+            const float consts[8]{ kKr2020, kKb2020,
+                                   64.0f / 876.0f, 1.0f / 876.0f,
+                                   0.0f, 0.0f, 0.0f, 0.0f };
+            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
+            cl->SetComputeRootDescriptorTable(2, gpu(28));
+            cl->SetComputeRootDescriptorTable(3, gpu(29));
+            cl->Dispatch((static_cast<UINT>(_outW) + 7) / 8, (static_cast<UINT>(_outH) + 7) / 8, 1);
+        }
+        cl->SetPipelineState(chromaPso);
+        {
+            const UINT extent[2]{ static_cast<UINT>(_outChromaW), static_cast<UINT>(_outChromaH) };
+            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+            const float consts[8]{ kKr2020, kKb2020,
+                                   512.0f / 896.0f, 1.0f / 896.0f,
+                                   0.0f, 0.0f, 0.0f, 0.0f };
+            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
+            cl->SetComputeRootDescriptorTable(2, gpu(29));
+            cl->SetComputeRootDescriptorTable(3, gpu(30));
+            cl->Dispatch((static_cast<UINT>(_outChromaW) + 7) / 8, (static_cast<UINT>(_outChromaH) + 7) / 8, 1);
+        }
+    }
+
+    D3D12_RESOURCE_BARRIER back[1]{
+        Transition(srcColor,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+    };
+    cl->ResourceBarrier(1, back);
+}
+
+void D3D12Context::RecordMotionScale(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                                     int srcW, int srcH) noexcept {
+    // 源尺寸运动场(NSR)→ motionDense(PIPE 尺寸,UAV)。motionDense 由
+    // 调用方(帧路径)按 COMMON→UAV 屏障后调用,UAV→NSR 收尾归调用方。
+    const UINT extent[2]{ static_cast<UINT>(_pipeW), static_cast<UINT>(_pipeH) };
+    const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl.SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    cl.SetComputeRootSignature(_rsMotionScale.Get());
+    cl.SetPipelineState(_psoMotionScale.Get());
+    cl.SetComputeRoot32BitConstants(0, 2, extent, 0);
+    cl.SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+    cl.SetComputeRootDescriptorTable(1, gpu(10));             // t0 slot.motion SRV
+    cl.SetComputeRootDescriptorTable(2, gpu(kUavMotionDense)); // u0 motionDense
+    cl.Dispatch((extent[0] + 7) / 8, (extent[1] + 7) / 8, 1);
 }
 
 } // namespace vsdlssnr

@@ -75,6 +75,7 @@ add_library(vs_dlssnr SHARED
     src/dlssfg_gate.cpp          # 官方链运行库适配(40 系 mfg gate 解锁 + 代理族判定)
     src/nvof_context.cpp
     src/ffxof_context.cpp        # AMD FidelityFX OF 会话(of_backend=0,默认)
+    src/rtx_video_context.cpp    # RTX Video(NGX VSR + TrueHDR;RTX Video SDK 1.1)
     src/iat_hook.cpp
     src/d3d12_context.cpp
     src/bridge.cpp
@@ -93,6 +94,7 @@ add_library(vs_dlssnr SHARED
 target_include_directories(vs_dlssnr PRIVATE
     src
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvof"
+    "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rtxvideo/include"
     "${DEP_DIR}/ngx/include"
     "${DEP_DIR}/vapoursynth/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/api/include"

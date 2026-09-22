@@ -6,6 +6,7 @@
 #include "bridge.h"
 #include "d3d12_context.h"
 #include "dlssnr_context.h"
+#include "dlssnr_ini.h" // LoadRtxVideoIni([rtxvideo] 节)
 #include "dlssnr_params.h"
 #include "panel_ipc.h"
 #include "shared_params.h"
@@ -64,6 +65,9 @@ struct FilterData {
     // Runtime-mutable parameters shared with the tray panel (initial values
     // come from the .vpy call).
     std::unique_ptr<vsdlssnr::SharedParams> params;
+    // RTX Video(VSR/TrueHDR)创建时参数(vpy args ← [rtxvideo] ini;面板
+    // payload 不携带)。vsrAutoHeight 由显示器探测填入。
+    RtxVideoParams rtx;
 
     // Eagerly initialized in DlssnrCreate (before playback starts); VS may
     // call getFrame on several threads under fmParallel, but each frame runs
@@ -79,6 +83,12 @@ struct FilterData {
     int width = 0;
     int height = 0;
     int depth = 0; // YUV 位深(8/10);同尺寸换深度必须走冷重建(hotMatch 拦截)
+    // RTX Video 输出几何(init 后从 context 读回;输出帧按此建)。
+    int outW = 0;
+    int outH = 0;
+    bool hdrOut = false;       // 输出 = P10 BT.2020 PQ(HDR props 随帧写)
+    bool rtxActive = false;    // RTX 在管线(输出格式/尺寸可能 ≠ 源)
+    VSVideoFormat outFi{};     // 输出帧格式(hdr → YUV420P10,否则沿用源)
     // Failure-log latch: a wedged context fails every frame at frame rate —
     // log the first failure only, re-arm on the next success.
     std::atomic<bool> failureLogged{ false };
@@ -137,6 +147,9 @@ struct HotContext {
     // 有无),必须冷重建。路由(route)进程级,重启生效,不参与。
     bool fgEnabled = false;
     std::wstring fgDllPath;
+    // RTX Video 参与 hotMatch:模式/目标/强度/HDR 参数变化 = 管线几何或
+    // 输出格式变化,冷重建。
+    RtxVideoParams rtx{};
     bool valid = false;
 };
 HotContext &Hot() {
@@ -184,6 +197,124 @@ static void CopyPlanes(const VSFrame *src, VSFrame *dst, const VSAPI *vsapi,
                     vsapi->getReadPtr(src, p), vsapi->getStride(src, p),
                     static_cast<size_t>(pw) * bpp, static_cast<size_t>(ph));
     }
+}
+
+// ---- RTX Video:目标尺寸的"跟随播放器"落点 ----
+// 探测本进程可见顶层窗口(即 mpv 的 vo 窗)所在显示器,取其原生高度。
+// 链创建粒度:mpv 在 seek/换片时重建整条 VS 链 → 重新探测;窗口换屏/
+// 改尺寸后的生效点是下一次链重建(与 VS constant-format 契约一致,无法
+// 做到每帧跟随 —— Magpie 式逐帧跟随在 mpv 架构下不存在落点)。
+// 探测失败(无窗口/枚举失败)回落主显示器。
+struct DisplayPick {
+    int width = 0;
+    int height = 0;
+};
+
+static DisplayPick DetectDisplaySize() noexcept {
+    struct Ctx {
+        DWORD pid;
+        HWND hwnd;
+        LONG area;
+    } ctx{ GetCurrentProcessId(), nullptr, 0 };
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto *c = reinterpret_cast<Ctx *>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != c->pid || !IsWindowVisible(hwnd)) return TRUE;
+        // mpv vo 窗口 = 本进程可见、带标题栏/边框的主窗口;排除工具窗/
+        // 无边框隐藏辅助窗(面板另有进程)。
+        const LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+        RECT rc{};
+        if (!GetWindowRect(hwnd, &rc)) return TRUE;
+        const LONG area = (rc.right - rc.left) * (rc.bottom - rc.top);
+        if (area > c->area) {
+            c->area = area;
+            c->hwnd = hwnd;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    HMONITOR mon = ctx.hwnd
+                       ? MonitorFromWindow(ctx.hwnd, MONITOR_DEFAULTTONEAREST)
+                       : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (mon && GetMonitorInfoW(mon, &mi)) {
+        return { mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top };
+    }
+    return { 0, 0 };
+}
+
+// RTX 参数裁决:vpy args(已应用在 rtx 上)← [rtxvideo] ini 覆盖 ←
+// mode=1 的显示器探测。返回最终参数(plugin.cpp 是 vsrAutoHeight 的唯一
+// 写入点)。
+static void ResolveRtxParams(RtxVideoParams &rtx) noexcept {
+    wchar_t iniPath[MAX_PATH]{};
+    HMODULE self = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&ResolveRtxParams), &self)) {
+        wchar_t dllPath[MAX_PATH]{};
+        if (GetModuleFileNameW(self, dllPath, MAX_PATH)) {
+            const std::filesystem::path dir =
+                std::filesystem::path(dllPath).parent_path() / "dlssnr_ui.ini";
+            const std::wstring ws = dir.wstring();
+            if (ws.size() < MAX_PATH) {
+                wcscpy_s(iniPath, ws.c_str());
+            }
+        }
+    }
+    if (iniPath[0]) vsdlssnr::LoadRtxVideoIni(rtx, iniPath);
+    if (rtx.vsrMode == 1) {
+        const DisplayPick disp = DetectDisplaySize();
+        if (disp.height > 0) {
+            rtx.vsrAutoHeight = disp.height;
+        }
+    } else {
+        rtx.vsrAutoHeight = rtx.vsrHeight;
+    }
+}
+
+// 降级路径的缩放拷贝(OUT ≠ 源 或 位深不同:处理失败帧的兜底,画质次要,
+// 可用性第一)。近邻采样;8/10bit 同构(按样本粒度)。VS 平面 stride 对齐。
+static void CopyPlanesScaled(const VSFrame *src, VSFrame *dst, const VSAPI *vsapi,
+                             int srcW, int srcH, int dstW, int dstH) noexcept {
+    const VSVideoFormat *fi = vsapi->getVideoFrameFormat(dst);
+    const int bpp = fi->bytesPerSample;
+    const int srcCw = (srcW + 1) >> 1, srcCh = (srcH + 1) >> 1;
+    const int dstCw = (dstW + 1) >> 1, dstCh = (dstH + 1) >> 1;
+    for (int p = 0; p < 3; ++p) {
+        const int sw = p == 0 ? srcW : srcCw;
+        const int sh = p == 0 ? srcH : srcCh;
+        const int dw = p == 0 ? dstW : dstCw;
+        const int dh = p == 0 ? dstH : dstCh;
+        const uint8_t *sp = vsapi->getReadPtr(src, p);
+        const int64_t sstride = vsapi->getStride(src, p);
+        uint8_t *dp = vsapi->getWritePtr(dst, p);
+        const int64_t dstride = vsapi->getStride(dst, p);
+        const size_t sampleBytes = static_cast<size_t>(bpp);
+        for (int y = 0; y < dh; ++y) {
+            const int sy = (std::min)(sh - 1, static_cast<int>(static_cast<int64_t>(y) * sh / dh));
+            const uint8_t *srow = sp + sstride * sy;
+            uint8_t *drow = dp + dstride * y;
+            for (int x = 0; x < dw; ++x) {
+                const int sx = (std::min)(sw - 1, static_cast<int>(static_cast<int64_t>(x) * sw / dw));
+                memcpy(drow + static_cast<size_t>(x) * sampleBytes,
+                       srow + static_cast<size_t>(sx) * sampleBytes, sampleBytes);
+            }
+        }
+    }
+}
+
+// HDR 输出帧色彩签名(BT.2020 PQ limited;mpv 按 props 上屏/色调映射)。
+static void SetHdrFrameProps(VSFrame *frame, const VSAPI *vsapi) noexcept {
+    VSMap *props = vsapi->getFramePropertiesRW(frame);
+    if (!props) return;
+    vsapi->mapSetInt(props, "_Matrix", 9, maReplace);      // BT.2020 NCL
+    vsapi->mapSetInt(props, "_Transfer", 16, maReplace);   // ST 2084 (PQ)
+    vsapi->mapSetInt(props, "_Primaries", 9, maReplace);   // BT.2020
+    vsapi->mapSetInt(props, "_ColorRange", 1, maReplace);  // limited
 }
 
 // 从源帧 props 解析色彩矩阵/范围(缺失/未知回落 709 limited);值变化时
@@ -318,7 +449,14 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             // NR 关不在此列 —— ProcessFrame 内部门控跳过降噪评估,补帧以
             // 直通帧为 backbuffer 照常插值)。FG 输出计数仍是 M0(帧率已
             // ×M0):源帧单次复制入缓存,各槽回落该帧,时长按 1/M0 摊分。
-            VSFrame *dup = vsapi->copyFrame(src, core);
+            // RTX 几何 ≠ 源时走缩放拷贝(输出帧尺寸契约不破)。
+            VSFrame *dup = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
+            if (d->rtxActive) {
+                CopyPlanesScaled(src, dup, vsapi, d->width, d->height, d->outW, d->outH);
+            } else {
+                CopyPlanes(src, dup, vsapi, d->width, d->height);
+            }
+            if (d->hdrOut) SetHdrFrameProps(dup, vsapi);
             ScaleOutputDuration(dup, vsapi, m0);
             d->fgCacheK = k;
             d->fgCacheM = 1;
@@ -332,13 +470,12 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             return ret;
         }
 
-        const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-        VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
+        VSFrame *out = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
         // effGens 个插值输出帧(仅 eval 成功槽进缓存;失败/降级槽直接释放,
         // 槽位在出帧时回落真实帧引用 —— 零复制优于再拷一份重复帧)。
         VSFrame *genFrame[kFgGenSlots] = {};
         for (int g = 0; g < effGens; ++g) {
-            genFrame[g] = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
+            genFrame[g] = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
         }
 
         const uint8_t *srcPlanes[3]{};
@@ -384,10 +521,16 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 vsdlssnr::TimingStatusLine(msg);
             }
             // Failed frames fall back to a plain copy of the source content so
-            // the output planes are never left uninitialized. YUV420:色度半尺寸。
-            CopyPlanes(src, out, vsapi, d->width, d->height);
+            // the output planes are never left uninitialized. YUV420:色度半尺寸;
+            // RTX 几何 ≠ 源时缩放拷贝兜底。
+            if (d->rtxActive) {
+                CopyPlanesScaled(src, out, vsapi, d->width, d->height, d->outW, d->outH);
+            } else {
+                CopyPlanes(src, out, vsapi, d->width, d->height);
+            }
         } else {
             d->failureLogged.store(false);
+            if (d->hdrOut) SetHdrFrameProps(out, vsapi);
         }
         // 失败/未评插值槽:释放帧(出帧时槽位回落真实帧引用)。
         for (int g = 0; g < effGens; ++g) {
@@ -413,7 +556,10 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         // 时长。缓存帧各设一次(出帧交引用,props 随帧)。
         ScaleOutputDuration(out, vsapi, m0);
         for (int g = 0; g < effGens; ++g) {
-            if (genFrame[g]) ScaleOutputDuration(genFrame[g], vsapi, m0);
+            if (genFrame[g]) {
+                if (d->hdrOut) SetHdrFrameProps(genFrame[g], vsapi);
+                ScaleOutputDuration(genFrame[g], vsapi, m0);
+            }
         }
         // 缓存替换:[0]=真实帧,[1..effGens]=成功插值帧(slot g+1)。
         for (int i = 0; i < kFgMultMax; ++i) {
@@ -437,12 +583,13 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         return ret;
     }
 
-    // ---- 非 FG 路径(1:1,与旧管线一致) ----
+    // ---- 非 FG 路径(1:1,与旧管线一致;RTX 开 = OUT 几何)----
     const VSFrame *src = vsapi->getFrameFilter(n, d->node, frameCtx);
-    if (!d->initOk || !nrLive) return src; // passthrough(NR 关 = 原帧零拷贝);引用移交调用方
+    // passthrough(NR 关 = 原帧零拷贝;RTX 开时仍要处理 —— VSR/HDR 独立
+    // 于 NR 开关)。引用移交调用方。
+    if (!d->initOk || (!nrLive && !d->rtxActive)) return src;
 
-    const VSVideoFormat *fi = vsapi->getVideoFrameFormat(src);
-    VSFrame *out = vsapi->newVideoFrame(fi, d->width, d->height, src, core);
+    VSFrame *out = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
     const uint8_t *srcPlanes[3]{};
     int64_t srcStrides[3]{};
     uint8_t *dstPlanes[3]{};
@@ -468,9 +615,14 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             vsapi->logMessage(mtWarning, msg, core);
             vsdlssnr::TimingStatusLine(msg);
         }
-        CopyPlanes(src, out, vsapi, d->width, d->height);
+        if (d->rtxActive) {
+            CopyPlanesScaled(src, out, vsapi, d->width, d->height, d->outW, d->outH);
+        } else {
+            CopyPlanes(src, out, vsapi, d->width, d->height);
+        }
     } else {
         d->failureLogged.store(false);
+        if (d->hdrOut) SetHdrFrameProps(out, vsapi);
     }
     if (timingEnabled && timing[0]) {
         static std::atomic<int> timingFrameCount{ 0 };
@@ -507,6 +659,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().depth = d->depth;
         Hot().fgEnabled = d->fgActive;
         Hot().fgDllPath = std::move(d->fgDllPath);
+        Hot().rtx = d->rtx;
         Hot().valid = true;
         // 探针:停放行 —— 与下一次 create 的 "hot rebind kept"/"re-init"
         // 行配对,seek 生命周期序列(bridge stopped → freed → started →
@@ -592,6 +745,18 @@ static void VS_CC DlssnrCreate(
     // parameters only came back after touching the panel again.
     const bool iniLoaded = vsdlssnr::BridgeLoadIni(initial);
     const bool payloadAdopted = vsdlssnr::BridgeAdoptPanelPayload(initial);
+    // RTX Video(vpy args 已在上面 Apply 到 d->rtx):[rtxvideo] ini 覆盖
+    // + mode=1 显示器探测。三层里没有面板 payload —— RTX 参数暂不走面板
+    // (PanelPayload ABI 未动),以 ini/vpy 为准。
+    ApplyIntArg(in, vsapi, "vsr_mode", d->rtx.vsrMode, kVsrModeMin, kVsrModeMax);
+    ApplyIntArg(in, vsapi, "vsr_height", d->rtx.vsrHeight, kVsrHeightMin, kVsrHeightMax);
+    ApplyIntArg(in, vsapi, "vsr_strength", d->rtx.vsrStrength, kVsrStrengthMin, kVsrStrengthMax);
+    ApplyIntArg(in, vsapi, "hdr_enabled", d->rtx.hdrEnabled, 0, 1);
+    ApplyIntArg(in, vsapi, "hdr_contrast", d->rtx.hdrContrast, kHdrContrastMin, kHdrContrastMax);
+    ApplyIntArg(in, vsapi, "hdr_saturation", d->rtx.hdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
+    ApplyIntArg(in, vsapi, "hdr_middle_gray", d->rtx.hdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
+    ApplyIntArg(in, vsapi, "hdr_peak_nits", d->rtx.hdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
+    ResolveRtxParams(d->rtx);
     // 探针:三层参数源(vpy 默认 → ini → 面板 payload)的最终裁决值。
     // "参数没生效/拖进度条回去了"类问题(#37)一行定位:ini/payload 哪层
     // 参与了、create-time 三元组最终是什么,一眼可查。
@@ -684,18 +849,23 @@ static void VS_CC DlssnrCreate(
     // 变化,必须冷重建。路由(route)进程级,重启生效,不参与。
     // NR+FG 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开秒回);
     // 仅 NR 关而 FG 开仍需热复用(设备与上下文都在用)。
-    const bool hotMatch = (initial.nrEnabled || initial.fgEnabled) && Hot().valid &&
+    // RTX 请求开 = vsr_mode>0 或 hdr 开(初始化守卫参与;皆关 + NR/FG 皆关
+    // = 纯直通零 GPU)。
+    const bool rtxRequested = d->rtx.vsrMode > 0 || d->rtx.hdrEnabled != 0;
+    const bool hotMatch = (initial.nrEnabled || initial.fgEnabled || rtxRequested) &&
+                          Hot().valid &&
                           Hot().ngxDllPath == d->ngxDllPath &&
                           Hot().width == d->width && Hot().height == d->height &&
                           Hot().depth == d->depth &&
                           Hot().fgEnabled == (initial.fgEnabled != 0) &&
-                          Hot().fgDllPath == d->fgDllPath;
+                          Hot().fgDllPath == d->fgDllPath &&
+                          Hot().rtx == d->rtx;
     if (hotMatch) {
         d->d3d12 = std::move(Hot().d3d12);
         d->ngx = std::move(Hot().ngx);
         Hot().valid = false;
         Hot().ngxDllPath.clear();
-        if (d->ngx->Rebind(d->params.get(), d->width, d->height, d->depth, err, sizeof(err))) {
+        if (d->ngx->Rebind(d->params.get(), d->width, d->height, d->depth, d->rtx, err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
             if (!vsdlssnr::BridgeStart(d->params.get())) {
@@ -718,7 +888,7 @@ static void VS_CC DlssnrCreate(
             d->d3d12.reset();
         }
     }
-    if ((initial.nrEnabled || initial.fgEnabled) && !d->initOk && !d->d3d12) {
+    if ((initial.nrEnabled || initial.fgEnabled || rtxRequested) && !d->initOk && !d->d3d12) {
         // Any parked context left over (different snippet DLL) must be torn
         // down BEFORE a cold init: the IAT hook and the NGX core are
         // process-global singletons. A second full Initialize could never
@@ -736,7 +906,8 @@ static void VS_CC DlssnrCreate(
         d->ngx = std::make_unique<vsdlssnr::DlssnrContext>();
         if (d->d3d12->Initialize(err, sizeof(err)) &&
             d->ngx->Initialize(*d->d3d12, d->ngxDllPath.c_str(), d->fgDllPath.c_str(),
-                               d->width, d->height, d->depth, d->params.get(), err, sizeof(err))) {
+                               d->width, d->height, d->depth, d->params.get(), d->rtx,
+                               err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
             if (!vsdlssnr::BridgeStart(d->params.get())) {
@@ -767,15 +938,15 @@ static void VS_CC DlssnrCreate(
             vsdlssnr::PublishStatsJson(body);
         }
     }
-    if (!initial.nrEnabled && !initial.fgEnabled) {
-        // NR + FG 皆关:热/冷初始化全部跳过 —— 零设备、零显存、零 GPU,
-        // 滤镜纯直通(getFrame 原帧交还)。仅 NR 关而 FG 开时不走此分支:
-        // 初始化照常(补帧/光流需要设备与 NVOF),降噪评估由 ProcessFrame
-        // 内部门控跳过。桥接照常启动:面板仍被拉起并可实时控制 —— 已激活
-        // 会话 live 重开立即恢复;创建即全关的实例重开需下个 seek(停泊热
-        // 上下文原样保留,同参数重开走秒回的热复用)。
+    if (!initial.nrEnabled && !initial.fgEnabled && !rtxRequested) {
+        // NR + FG + RTX 皆关:热/冷初始化全部跳过 —— 零设备、零显存、零 GPU,
+        // 滤镜纯直通(getFrame 原帧交还)。仅 NR 关而 FG/RTX 开时不走此分支:
+        // 初始化照常,降噪评估由 ProcessFrame 内部门控跳过。桥接照常启动:
+        // 面板仍被拉起并可实时控制 —— 已激活会话 live 重开立即恢复;创建即
+        // 全关的实例重开需下个 seek(停泊热上下文原样保留,同参数重开走
+        // 秒回的热复用)。
         char body[192];
-        std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR+FG disabled (panel/vpy)\"}",
+        std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR+FG+RTX disabled (panel/vpy)\"}",
                       vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
         vsdlssnr::PublishStatsJson(body);
         if (!vsdlssnr::BridgeStart(d->params.get())) {
@@ -784,7 +955,7 @@ static void VS_CC DlssnrCreate(
                               core);
             vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
         }
-        vsdlssnr::TimingStatusLine("DLSSNR STATUS: NR+FG disabled; passthrough (zero GPU)");
+        vsdlssnr::TimingStatusLine("DLSSNR STATUS: NR+FG+RTX disabled; passthrough (zero GPU)");
     }
 
     // FG 多帧输出判定(两条初始化路径汇合):会话激活 = 每源帧产出 M 帧
@@ -792,7 +963,39 @@ static void VS_CC DlssnrCreate(
     // 否则 1:1(FG 失败的降级语义)。vi 副本按创建值倍增 fps —— 纯元数据
     // (mpv 不据此节拍,但下游工具/时长估算消费它)。
     d->fgActive = d->initOk && d->ngx && d->ngx->FgActive();
+    // RTX 输出几何(init 后从 context 读回 —— pipe/out 的最终裁决在
+    // Initialize 内含 capability/倍率旁路)。未初始化实例 = 源几何直通。
+    d->outW = d->width;
+    d->outH = d->height;
+    d->hdrOut = false;
+    d->rtxActive = false;
+    d->outFi = vi->format; // VS4:VSVideoInfo.format 为内嵌值(VS4 API 形态)
+    if (d->initOk && d->ngx) {
+        d->outW = d->ngx->OutWidth();
+        d->outH = d->ngx->OutHeight();
+        d->hdrOut = d->ngx->HdrActive();
+        d->rtxActive = d->ngx->RtxActive();
+        if (d->hdrOut) {
+            // HDR 输出契约 = YUV420P10(BT.2020 PQ limited;props 逐帧写)。
+            VSVideoFormat p10{};
+            if (!vsapi->getVideoFormatByID(&p10, pfYUV420P10, core)) {
+                vsapi->mapSetError(out, "dlssnr.Enhance: getVideoFormatByID(YUV420P10) failed");
+                delete d;
+                return;
+            }
+            d->outFi = p10;
+        }
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: output geometry %dx%d fmt=%dbpp hdr=%d rtx=%d (src %dx%dd%d)",
+                      d->outW, d->outH, d->outFi.bitsPerSample, d->hdrOut ? 1 : 0,
+                      d->rtxActive ? 1 : 0, d->width, d->height, d->depth);
+        vsdlssnr::TimingStatusLine(msg);
+    }
     VSVideoInfo viOut = *vi;
+    viOut.width = d->outW;
+    viOut.height = d->outH;
+    viOut.format = d->outFi; // VS4:VSVideoInfo.format 为内嵌值
     if (d->fgActive) {
         d->fgCreateMult = std::clamp(d->params->Snapshot().fgMultiplier, kFgMultMin, kFgMultMax);
         viOut.fpsNum *= d->fgCreateMult;
@@ -855,6 +1058,14 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "fg_multiplier:int:opt;"
         "fg_route:int:opt;"
         "of_backend:int:opt;"
+        "vsr_mode:int:opt;"
+        "vsr_height:int:opt;"
+        "vsr_strength:int:opt;"
+        "hdr_enabled:int:opt;"
+        "hdr_contrast:int:opt;"
+        "hdr_saturation:int:opt;"
+        "hdr_middle_gray:int:opt;"
+        "hdr_peak_nits:int:opt;"
         "fg_dll:data:opt;",
         "clip:vnode;",
         DlssnrCreate, nullptr, plugin);

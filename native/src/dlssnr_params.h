@@ -55,6 +55,57 @@ inline constexpr int kFgRouteAuto = 0, kFgRouteOfficial = 1;
 //  clamp 落 1 = nvof。)
 inline constexpr int kOfBackendMin = 0, kOfBackendMax = 1;
 inline constexpr int kOfBackendFfx = 0, kOfBackendNvof = 1;
+// ---- RTX Video(VSR / TrueHDR;创建时参数,seek/重启生效)----
+// NVIDIA RTX Video SDK 1.1 的两个 NGX feature(Feature 16 / 14,与 NR/FG
+// 同一 NGX core;snippet nvngx_vsr.dll / nvngx_truehdr.dll 部署在 ngx\):
+//   VSR     — SDR RGB 放大(输入/输出 BGRA8,quality 0=bicubic 1-4=AI)
+//   TrueHDR — SDR RGB → FP16 scRGB 线性(不能吃 HDR 输入,官方明文 VSR→HDR 序)
+// 管线顺序(NR→VSR→HDR→FG)与 per-eval 成本论证见 fetch-deps 注释与
+// docs/experimental。参数走独立 [rtxvideo] ini 节 + vpy args,不进面板
+// payload(PanelPayload ABI 不动,面板后续再接)。
+inline constexpr int kVsrModeMin = 0, kVsrModeMax = 2;   // 0=关 1=显示器适配 2=手动高度
+inline constexpr int kVsrStrengthMin = 0, kVsrStrengthMax = 4; // 0=bicubic,1-4=AI(4 最优)
+inline constexpr int kVsrHeightMin = 144, kVsrHeightMax = 8192;
+// VSR 单 pass 官方上限倍率:超过时先 VSR 到 4x 中间尺寸,OUT 收尾由
+// convert-out 双线性补完(VSR 只做放大,bilinear 从 4x 高清中间位拉到目标)。
+inline constexpr float kVsrMaxScale = 4.0f;
+inline constexpr int kHdrContrastMin = 0, kHdrContrastMax = 200;       // TrueHDR Contrast
+inline constexpr int kHdrSaturationMin = 0, kHdrSaturationMax = 200;   // TrueHDR Saturation
+inline constexpr int kHdrMiddleGrayMin = 10, kHdrMiddleGrayMax = 100;  // TrueHDR MiddleGray
+inline constexpr int kHdrMaxLumMin = 400, kHdrMaxLumMax = 2000;        // MaxLuminance(nits)
+
+struct RtxVideoParams {
+    // VSR 目标尺寸来源(创建时):0=关 1=自动(按 mpv 窗口所在显示器的
+    // 可视矩形适配,1:1/缩小时自动旁路 —— VSR 只支持放大,对齐浏览器端
+    // 官方语义)2=手动目标高度(vsr_height,宽度按源宽高比推)。
+    int vsrMode = 0;
+    int vsrHeight = 2160;    // 手动目标高度(mode=2)
+    // mode=1 时由 plugin.cpp 按窗口所在显示器探测填入(链创建粒度;非
+    // 持久化字段,ini 不读写)。"跟随播放器"的语义落点:seek/换片重建链
+    // 时重探,窗口换屏/改尺寸后的生效点是下一次链重建。
+    int vsrAutoHeight = 2160;
+    int vsrStrength = 2;     // VSR QualityLevel(0=bicubic 1-4=AI)
+    // TrueHDR(0/1):输出域切换为 HDR10 —— 滤镜输出 YUV420P10(BT.2020
+    // PQ limited),mpv 侧 target-colorspace-hint 上屏。创建时。
+    int hdrEnabled = 0;
+    int hdrContrast = 100;       // 0-200(官方默认 100)
+    int hdrSaturation = 100;     // 0-200
+    int hdrMiddleGray = 50;      // 10-100
+    int hdrMaxLuminance = 1000;  // 400-2000 nits
+
+    // vsrAutoHeight 由 plugin.cpp 探测填入,相等性必须参与(显示器变化 =
+    // 槽资源几何变化,热复用必须拦截)。
+    friend bool operator==(const RtxVideoParams &a, const RtxVideoParams &b) noexcept {
+        return a.vsrMode == b.vsrMode && a.vsrHeight == b.vsrHeight &&
+               a.vsrAutoHeight == b.vsrAutoHeight && a.vsrStrength == b.vsrStrength &&
+               a.hdrEnabled == b.hdrEnabled && a.hdrContrast == b.hdrContrast &&
+               a.hdrSaturation == b.hdrSaturation && a.hdrMiddleGray == b.hdrMiddleGray &&
+               a.hdrMaxLuminance == b.hdrMaxLuminance;
+    }
+    friend bool operator!=(const RtxVideoParams &a, const RtxVideoParams &b) noexcept {
+        return !(a == b);
+    }
+};
 
 struct DlssnrParams {
     // NR 总开关(0/1,默认 1)—— 只关降噪,不影响补帧/光流:

@@ -10,6 +10,7 @@
 #include "dlssnr_params.h"
 #include "iat_hook.h"
 #include "of_backend.h" // 光流后端接口(NvofContext/FxofContext 在 cpp 内具化)
+#include "rtx_video_context.h"
 #include "shared_params.h"
 #include <atomic>
 #include <cstdio>
@@ -39,6 +40,7 @@ public:
     bool Initialize(D3D12Context &d3d12, const wchar_t *ngxDllPath,
                     const wchar_t *fgDllPath,
                     int width, int height, int depth, SharedParams *shared,
+                    const RtxVideoParams &rtx,
                     char *err, size_t errLen) noexcept;
     void Shutdown() noexcept;
 
@@ -51,7 +53,8 @@ public:
     // size/depth actually differs; otherwise it is free. Returns false (and
     // leaves _ready false) when the rebuild fails; the caller then falls back
     // to a full Initialize.
-    bool Rebind(SharedParams *shared, int width, int height, int depth, char *err, size_t errLen) noexcept;
+    bool Rebind(SharedParams *shared, int width, int height, int depth,
+                const RtxVideoParams &rtx, char *err, size_t errLen) noexcept;
 
     // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
     // on panel change the frame thread rebuilds the feature (and scaling
@@ -71,7 +74,9 @@ public:
     // 光流历史失效(seek = 新时间线)。热 Rebind 上调用;下一帧重新播种。
     void ResetNvofHistory() noexcept;
 
-    // YUV420P8/P10 三平面进 → 处理 → 同格式三平面出(同分辨率)。
+    // YUV420P8/P10 三平面进 → 处理 → 三平面出。输出平面在 OUT 尺寸
+    // (RTX VSR 开 = 目标尺寸,调用方按 OUT 建帧/传平面;关 = 源尺寸),
+    // 位深 = HDR ? 10 : 源位深(HDR 输出 = BT.2020 PQ limited P10)。
     // matrix/range 来自源帧属性(props _Matrix/_ColorRange,plugin.cpp 读;
     // 缺省 709 limited)—— YUV↔RGB GPU 转换按此展开/压缩。
     // n is the frame index; discontinuity detection (NGX history reset) is
@@ -90,6 +95,15 @@ public:
                       ColorMatrix matrix, ColorRange range,
                       char *err, size_t errLen,
                       char *timingOut = nullptr, size_t timingLen = 0) noexcept;
+
+    // ---- RTX Video(VSR / TrueHDR)会话事实(create-time 定格)----
+    // 输出几何的单一权威(plugin.cpp 建 vi/输出帧、D3D12Context 建平面、
+    // ProcessFrame 校验全部经这里)。
+    int OutWidth() const noexcept { return _outW; }
+    int OutHeight() const noexcept { return _outH; }
+    bool HdrActive() const noexcept { return _hdrActive; }
+    // RTX 段是否在管线中(vsr 或 hdr 任一存活;FG backbuffer 形态随之)。
+    bool RtxActive() const noexcept { return _rtxActive; }
 
     // FG 会话是否激活(创建时 fgEnabled 且官方链初始化成功且槽资源在)。
     // 决定滤镜输出帧率是否 ×2(插件 create 侧)。
@@ -226,6 +240,23 @@ private:
     std::unique_ptr<DlssfgContext> _fg;
     NVSDK_NGX_Parameter *_fgParams = nullptr; // FG 专用核心参数块(core 拥有)
     bool _fgRequested = false;
+    // RTX Video(VSR→TrueHDR,均挂 NR 之后、FG 之前):创建时参数快照
+    // (_rtx;vpy/[rtxvideo] ini,面板 payload 不携带)。VSR/HDR feature
+    // 与尺寸无关,跨 seek/分辨率热复用;SEH 本地闩锁(NR 不连坐)。
+    // 失败降级:capability 不过 = 资源就不建(直通尺寸);CreateFeature
+    // 在 capability 过后仍失败 = 初始化整体失败(插件回落纯直通)。
+    RtxVideoParams _rtx{};
+    std::unique_ptr<RtxVsrContext> _vsr;
+    std::unique_ptr<RtxHdrContext> _hdr;
+    NVSDK_NGX_Parameter *_vsrParams = nullptr; // 各自的 capability 块(core 拥有)
+    NVSDK_NGX_Parameter *_hdrParams = nullptr;
+    bool _vsrRequested = false; // VSR 在管线(模式开 + 倍率 > 1 + capability 过)
+    bool _hdrActive = false;    // TrueHDR 在管线(创建时定格;输出 P10)
+    bool _rtxActive = false;    // _vsrRequested || _hdrActive(输出几何判据)
+    int _pipeW = 0;             // VSR 输出 / TrueHDR / FG backbuffer 尺寸
+    int _pipeH = 0;
+    int _outW = 0;              // YUV 输出平面尺寸(vsr 关 = 源)
+    int _outH = 0;
     // fmParallel: several frame threads call EvaluateFeature concurrently.
     // The feature and the parameter block are singletons, so evaluate
     // (parameter setup + snippet call) is serialized; GPU-side dispatches
