@@ -327,11 +327,11 @@ void WritePayload(bool saveRequest = false) noexcept {
 
 // ---------------------------------------------------------------------------
 // mpv IPC 自动重载:需要重建滤镜会话的变动(vsrMode/scale/HDR 开关、FG
-// 开关等 create-time 参数)由面板经 mpv JSON IPC 回读 vf 链并原样 set
-// —— mpv 对 vf 属性的任何 set 都重走链初始化(实测 seek 不重建 vf 链,
-// 旧版原地微 seek 前提不成立,gen 恒定实证 2026-09-22),新实例在 create
-// 时采纳面板刚写入的 payload,变动即时生效,免手动拖进度条。输出契约
-// (帧数/节奏、输出尺寸/格式)随创建定格,会话内无法改 ——
+// 开关等 create-time 参数)由面板经 mpv JSON IPC 直接触发一次原地 seek
+// —— vf_vapoursynth 在 seek 时整脚本重建(播放/暂停两态实测均重建,
+// 2026-09-23),新实例在 create 时采纳面板刚写入的 payload,变动即时
+// 生效,免手动拖进度条。输出契约(帧数/节奏、输出尺寸/格式)随创建
+// 定格,会话内无法改 ——
 // 真档位变化只能重建,这正是自动 seek 的存在理由。
 // 管道名发现:解析 ..\portable_config\mpv.conf 的 input-ipc-server,缺失时
 // 回落常见默认名。全程 best-effort:连接失败(未启用 IPC / mpv 未运行 /
@@ -402,12 +402,12 @@ bool TriggerMpvReseek() noexcept {
         HANDLE pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
                                   0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (pipe == INVALID_HANDLE_VALUE) continue;
-        // 强制滤镜链重建(seek 不重建 vf 链,set_property 同值被去重跳过,
-        // vf remove+add 会把上一实例的放大输出当新输入级联污染 —— 三者皆
-        // 实测否决,2026-09-22)。vf set 从源重解码整链重初始化,新实例在
-        // create 时采纳刚发布的 payload create-time 三元组(vsrMode/scale/
-        // hdr)。链串与 mpv-lazy uosc 菜单同款约定(vapoursynth 槽独占)。
-        const char *cmd = "{\"command\":[\"vf\",\"set\",\"vapoursynth=~~/vs/DLSSNR_NV.vpy\"]}\n";
+        // 原地微 seek(1ms 向前,exact)触发 vf_vapoursynth 整脚本重建,
+        // 新实例在 create 时采纳刚发布的 payload create-time 三元组
+        // (vsrMode/scale/hdr)。实测播放/暂停两态均稳定重建(2026-09-23
+        // 4/4);曾误判"seek 不重建"(23:02 风暴零新实例)—— 对照测试
+        // 推翻,该次异常归因于管道归属的环境性歧义,机制本身有效。
+        const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
         DWORD written = 0, got = 0;
         ok = WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)), &written, nullptr) &&
              written == strlen(cmd);
@@ -415,7 +415,7 @@ bool TriggerMpvReseek() noexcept {
         ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr);
         CloseHandle(pipe);
         if (ok) {
-            PanelLog("panel: mpv vf reinit via IPC pipe %ls", candidates[i]);
+            PanelLog("panel: mpv reseek via IPC pipe %ls", candidates[i]);
         }
     }
     if (!ok) {
