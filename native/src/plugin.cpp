@@ -211,7 +211,7 @@ struct DisplayPick {
     int height = 0;
 };
 
-static DisplayPick DetectTargetSize() noexcept {
+static DisplayPick DetectTargetSize(int srcW, int srcH) noexcept {
     struct Ctx {
         DWORD pid;
         HWND hwnd;
@@ -241,20 +241,43 @@ static DisplayPick DetectTargetSize() noexcept {
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
     if (mon && !GetMonitorInfoW(mon, &mi)) mon = nullptr;
-    // 目标 = 窗口客户区(设备像素,mpv 进程 DPI aware 同源),clamp 到
-    // 显示器;无窗口时 = 显示器原生。
+    // 目标 = 窗口客户区(设备像素,mpv 进程 per-monitor DPI aware 同源 ——
+    // 多屏异 DPI 各取所在屏物理像素,MonitorFromWindow 已按窗口所在屏
+    // clamp;跨屏窗口取交集最大者)。
     int w = 0, h = 0;
     if (ctx.hwnd) {
-        RECT rc{};
-        if (GetClientRect(ctx.hwnd, &rc)) {
-            w = rc.right - rc.left;
-            h = rc.bottom - rc.top;
+        if (IsIconic(ctx.hwnd)) {
+            // 最小化时 GetClientRect 给的是任务栏代表尺寸(极小)—— 直接
+            // 用会让"最小化中的任何重建"把 VSR 目标掉到极小。取还原矩形
+            // 近似客户区(含边框 ~±16px,对超分目标无碍)。
+            WINDOWPLACEMENT wp{};
+            wp.length = sizeof(wp);
+            if (GetWindowPlacement(ctx.hwnd, &wp)) {
+                w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+                h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+            }
+        }
+        if (w <= 0 || h <= 0) {
+            RECT rc{};
+            if (GetClientRect(ctx.hwnd, &rc)) {
+                w = rc.right - rc.left;
+                h = rc.bottom - rc.top;
+            }
         }
     }
     if (w <= 0 || h <= 0) {
         w = mi.rcMonitor.right - mi.rcMonitor.left;
         h = mi.rcMonitor.bottom - mi.rcMonitor.top;
         return { w, h };
+    }
+    // 视频实际显示矩形 = 源宽高比在客户区内 min-fit(mpv letterbox 语义;
+    // panscan/zoom 覆盖不追,近似足够)—— 黑边不计入目标,避免"宽窗放
+    // 窄视频"时目标虚大。随后 clamp 到所在显示器。
+    if (srcW > 0 && srcH > 0) {
+        const double s = (std::min)(static_cast<double>(w) / srcW,
+                                    static_cast<double>(h) / srcH);
+        w = (std::max)(1, static_cast<int>(std::lround(srcW * s)));
+        h = (std::max)(1, static_cast<int>(std::lround(srcH * s)));
     }
     if (mon) {
         const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
@@ -271,10 +294,11 @@ static DisplayPick DetectTargetSize() noexcept {
 
 // RTX 参数裁决:vpy args + ini + 面板 payload 已在 DlssnrParams 上合并
 // (BridgeLoadIni/AdoptPanelPayload 走共享映射),本函数只剩 mode=1 的
-// mpv 窗口客户区探测(plugin.cpp 是 vsrAutoHeight 的唯一写入点)。
-static void ResolveRtxParams(DlssnrParams &p) noexcept {
+// mpv 窗口显示矩形探测(plugin.cpp 是 vsrAutoHeight 的唯一写入点)。
+// srcW/srcH = 源分辨率,用于把客户区换算成视频实际显示矩形。
+static void ResolveRtxParams(DlssnrParams &p, int srcW, int srcH) noexcept {
     if (p.rtxVsrMode == 1) {
-        const DisplayPick disp = DetectTargetSize();
+        const DisplayPick disp = DetectTargetSize(srcW, srcH);
         if (disp.height > 0) {
             p.rtxVsrAutoHeight = disp.height;
         }
@@ -777,7 +801,7 @@ static void VS_CC DlssnrCreate(
     const bool iniLoaded = vsdlssnr::BridgeLoadIni(initial);
     const bool payloadAdopted = vsdlssnr::BridgeAdoptPanelPayload(initial);
     // mode=1 的 mpv 窗口客户区探测(三层裁决的唯一 probe 写入点)。
-    ResolveRtxParams(initial);
+    ResolveRtxParams(initial, d->width, d->height);
     // 探针:三层参数源(vpy 默认 → ini → 面板 payload)的最终裁决值。
     // "参数没生效/拖进度条回去了"类问题(#37)一行定位:ini/payload 哪层
     // 参与了、create-time 三元组最终是什么,一眼可查。
