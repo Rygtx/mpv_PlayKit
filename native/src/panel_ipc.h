@@ -55,7 +55,11 @@ constexpr uint32_t PAYLOAD_SIZE = 1024;
 // 键为纯增量,但按仓库惯例契约变化即 bump:旧面板读到新 magic 冻结
 // 显示(其 501 行 valid 判定拒绝),新版面板读旧 magic 走"版本不匹配"
 // 红显 —— 两端都有明确信号,成对部署约束不变。
-constexpr uint32_t PAYLOAD_MAGIC = 0x4B4C5344u; // "DSLK" (v20, 版本位走 hex:9 之后是 A/B/C/D/E/F)
+// v22:RTX Video(VSR/TrueHDR)参数全量进 payload —— vsrMode(0=关
+// 1=自动窗口适配 2=手动倍率)/ vsrScale(1.0-4.0)/ vsrStrength(1-4)/
+// hdrEnabled + HDR 四参。旧面板的 payload 无这些字段(结构体尾部缺段,
+// 读取按 magic 拒)—— 面板与插件必须成对部署。
+constexpr uint32_t PAYLOAD_MAGIC = 0x4D4C5344u; // "DSLM" (v22, 版本位走 hex:9 之后是 A/B/C/D/E/F)
 constexpr uint32_t STATS_MAGIC = 0x334C5344u;   // "DSSL3" (v21)
 
 #pragma pack(push, 8)
@@ -89,6 +93,15 @@ struct PanelPayload {
     int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
     int32_t debugView;           // 0-2 调试视图(v13;v19 起含光流场;live,不持久化)
     int32_t ofBackend;           // 0-1 光流后端(v16;0=ffx 默认 1=nvof;切档下一帧生效)
+    // ---- RTX Video(v22)----
+    int32_t vsrMode;             // 0=关 1=自动(mpv 窗口适配)2=手动倍率(创建时,reseek)
+    float vsrScale;              // 1.0-4.0 手动放大倍率(创建时,reseek)
+    int32_t vsrStrength;         // 1-4 VSR QualityLevel(live,per-eval)
+    int32_t hdrEnabled;          // 0/1 TrueHDR(创建时,reseek;输出切 P10 PQ)
+    int32_t hdrContrast;         // 0-200(live)
+    int32_t hdrSaturation;       // 0-200(live)
+    int32_t hdrMiddleGray;       // 10-100(live)
+    int32_t hdrMaxLuminance;     // 400-2000 nits(live)
 };
 #pragma pack(pop)
 
@@ -122,6 +135,12 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.fgMultiplier = std::clamp(pl.fgMultiplier, kFgMultMin, kFgMultMax);
     p.debugView = std::clamp(pl.debugView, 0, kDebugViewMax);
     p.ofBackend = std::clamp(pl.ofBackend, kOfBackendMin, kOfBackendMax);
+    // RTX Video live 项(v22):VSR 质量 + HDR 四参,per-eval,下一帧生效。
+    p.rtxVsrStrength = std::clamp(pl.vsrStrength, kVsrStrengthMin, kVsrStrengthMax);
+    p.rtxHdrContrast = std::clamp(pl.hdrContrast, kHdrContrastMin, kHdrContrastMax);
+    p.rtxHdrSaturation = std::clamp(pl.hdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
+    p.rtxHdrMiddleGray = std::clamp(pl.hdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
+    p.rtxHdrMaxLuminance = std::clamp(pl.hdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
 }
 
 inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
@@ -133,6 +152,11 @@ inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     // Route 进程级(hook 代理预载与否随重启对齐,钩子装上不可拆):不进
     // LoadLiveParams,不参与 hotMatch;只在滤镜创建时消费,重启后全面生效。
     p.fgRoute = std::clamp(pl.fgRoute, kFgRouteMin, kFgRouteMax);
+    // RTX Video 创建时项(v22):mode/scale/hdrEnabled 变化 = 槽资源几何
+    // 形态变化 —— 面板经 reseek 触发链重建,新实例在 create 时采纳本节。
+    p.rtxVsrMode = std::clamp(pl.vsrMode, kVsrModeMin, kVsrModeMax);
+    p.rtxVsrScale = std::clamp(pl.vsrScale, kVsrScaleMin, kVsrScaleMax);
+    p.rtxHdrEnabled = pl.hdrEnabled != 0;
 }
 
 // Parameter fields only; the caller fills seq/generation/save/reset/log.
@@ -163,6 +187,15 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.fgRoute = std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
     pl.debugView = std::clamp(p.debugView, 0, kDebugViewMax);
     pl.ofBackend = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
+    // RTX Video(v22):live 与创建时项全量随载荷(payload 单通道)。
+    pl.vsrMode = std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax);
+    pl.vsrScale = std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax);
+    pl.vsrStrength = std::clamp(p.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax);
+    pl.hdrEnabled = p.rtxHdrEnabled ? 1 : 0;
+    pl.hdrContrast = std::clamp(p.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax);
+    pl.hdrSaturation = std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
+    pl.hdrMiddleGray = std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
+    pl.hdrMaxLuminance = std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
     return pl;
 }
 
@@ -246,6 +279,11 @@ inline constexpr const char *SK_FG_DETAIL = "fg_detail";
 // 同款)。诊断页"光流: 请求 X | 实际 zero"只说降级事实,原因(SM6.2
 // 不支持/驱动拒双向/dll 缺失)在这里直达面板。
 inline constexpr const char *SK_OF_DETAIL = "of_detail";
+// RTX Video 实际管线态(off / vsr / hdr / vsr+hdr,带 out 几何)与最近
+// 一次 VSR/TrueHDR 初始化失败原因(消毒串;成功后清空)。请求开但实态
+// off = 降级(能力/部署问题),面板诊断页红显,原因在 rtx_detail。
+inline constexpr const char *SK_RTX = "rtx";
+inline constexpr const char *SK_RTX_DETAIL = "rtx_detail";
 // ---- 排队细分(诊断页专供;主面板只留六段用时,这里放"要翻 perf 行
 // 才有"的次级数据)----
 // 槽池等待 last(3 槽全在飞时的排队;gpu 段正常而此值大 = GPU 超容量)

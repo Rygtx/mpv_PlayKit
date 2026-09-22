@@ -39,7 +39,7 @@ Fg_Enabled = False
 Fg_Multiplier = 2
 Fg_Route = 0
 VSR_Mode = 1
-VSR_Height = 2160
+VSR_Scale = 2.0
 VSR_Strength = 2
 HDR_Enabled = False
 HDR_Contrast = 100
@@ -101,15 +101,17 @@ H_Max = 0
 ## <0-2> 整数, RTX Video 超分 (NVIDIA RTX Video SDK 1.1 的 NGX VSR, 默认 1):
 ##          0 = 关; 1 = 自动 (插件直读 mpv 窗口客户区 = osd-dimensions,
 ##          按实际显示矩形适配并 clamp 到所在显示器; 源更高时自动旁路
-##          —— VSR 只做放大); 2 = 手动目标高度 (VSR_Height)
+##          —— VSR 只做放大); 2 = 手动倍率 (VSR_Scale)
 ##          挂降噪之后: 源尺寸降噪 → VSR 放大 → (可选 HDR) → 帧生成,
 ##          temporal 模型全部只吃真实源帧; 输出帧尺寸 = 目标尺寸
 ##          依赖 vs-plugins\ngx\nvngx_vsr.dll (fetch-deps.ps1 自动拉取);
 ##          需要 RTX 20 系+ 与 r550.58+ 驱动, capability 不过自动降级直通
 ##          窗口换屏/改尺寸后的生效点 = 下一次链重建 (seek/换片)
-## <144-8192> 整数, VSR 手动目标高度 (VSR_Mode=2 时消费; 默认 2160)
-## <0-4> 整数, VSR 质量档 (默认 2): 0 = bicubic (纯插值), 1-4 = AI
-##          (4 = Ultra 最优最慢); >4x 放大先 VSR 到 4x 中间尺寸再线性收尾
+## <1.0-4.0> 浮点, VSR 手动放大倍率 (VSR_Mode=2 时消费; 默认 2.0;
+##          官方单 pass 上限 4x)
+## <1-4> 整数, VSR 质量档 (默认 2): 1-4 = AI 档 (4 = Ultra 最优最慢);
+##          关闭走 VSR_Mode=0, 官方 bicubic 0 档不暴露;
+##          >4x 放大先 VSR 到 4x 中间尺寸再线性收尾
 ## <True|False> RTX Video HDR (NGX TrueHDR, SDR→HDR, 默认 False):
 ##          挂 VSR 之后 (官方契约: TrueHDR 不能吃 HDR 输入, 必须在 VSR 后);
 ##          输出切换 YUV420P10 BT.2020 PQ, HDR10 元数据随帧 props,
@@ -168,7 +170,7 @@ else :
 		fg_multiplier = Fg_Multiplier,
 		fg_route = int(Fg_Route),
 		vsr_mode = int(VSR_Mode),
-		vsr_height = int(VSR_Height),
+		vsr_scale = float(VSR_Scale),
 		vsr_strength = int(VSR_Strength),
 		hdr_enabled = int(HDR_Enabled),
 		hdr_contrast = int(HDR_Contrast),

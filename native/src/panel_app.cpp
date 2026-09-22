@@ -121,6 +121,8 @@ struct AppState {
     int fgMultMax = 0;       // SK_FG_MULT_MAX: 运行库插值帧上限(FG 未激活 = 0)。
                              // gate 解锁失败回落 2x 的唯一面板侧信号源
     char ofDetail[96]{};     // SK_OF_DETAIL: 光流会话创建失败原因(成功 = 空)
+    char rtxState[16]{};     // SK_RTX: off / vsr / hdr / vsr+hdr(RTX 管线实态)
+    char rtxDetail[96]{};    // SK_RTX_DETAIL: VSR/TrueHDR 最近失败原因(成功 = 空)
     int connState = 0;       // stats 通道连接态:0=未检测到插件 1=已连接
                              // 2=magic 不匹配(面板/插件版本未成对更新)
     int fgOptimized = 1;     // dlssg_for_sm86 [FrameGeneration] Optimized 0-3
@@ -443,8 +445,8 @@ void LoadIni() noexcept {
     // (independent of the saved profile)
     g_app.timingLog = GetPrivateProfileIntW(L"panel", L"log", 1, path) != 0;
     g_app.advancedOpen = GetPrivateProfileIntW(L"panel", L"advanced", 0, path) != 0;
-    // 页签:0=降噪增强 1=帧生成 2=诊断
-    g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 2u));
+    // 页签:0=降噪增强 1=帧生成 2=RTX 超分/HDR 3=诊断
+    g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 3u));
     // 旧版 fg_route 越界值(v20 语义作废的 2/3 钉档)被 clamp 重解释:
     // 状态行提示,不再无声 —— 老用户"补帧怎么没了"的直接答案。
     {
@@ -501,7 +503,8 @@ void LoadStats() noexcept {
                            g_app.filterState[0] != 0 || g_app.stateDetail[0] != 0 ||
                            g_app.ofMode[0] != 0 || g_app.fgState[0] != 0 ||
                            g_app.fgRouteEff[0] != 0 || g_app.fgDetail[0] != 0 ||
-                           g_app.ofDetail[0] != 0;
+                           g_app.ofDetail[0] != 0 ||
+                           g_app.rtxState[0] != 0 || g_app.rtxDetail[0] != 0;
         g_app.statsBig[0] = 0;
         g_app.statsRes[0] = 0;
         g_app.filterState[0] = 0;
@@ -511,6 +514,8 @@ void LoadStats() noexcept {
         g_app.fgRouteEff[0] = 0;
         g_app.fgDetail[0] = 0;
         g_app.ofDetail[0] = 0;
+        g_app.rtxState[0] = 0;
+        g_app.rtxDetail[0] = 0;
         g_app.fgMult = 0;
         g_app.fgMultCreate = 0;
         g_app.fgMultMax = 0;
@@ -578,6 +583,11 @@ void LoadStats() noexcept {
     g_app.fgMultMax = JsonGetInt(body, SK_FG_MULT_MAX, 0);
     if (!JsonGetString(body, SK_OF_DETAIL, g_app.ofDetail, sizeof(g_app.ofDetail)))
         g_app.ofDetail[0] = 0;
+    // v22 键:RTX Video 实态 + 失败原因(缺键即清,同款规则)。
+    if (!JsonGetString(body, SK_RTX, g_app.rtxState, sizeof(g_app.rtxState)))
+        g_app.rtxState[0] = 0;
+    if (!JsonGetString(body, SK_RTX_DETAIL, g_app.rtxDetail, sizeof(g_app.rtxDetail)))
+        g_app.rtxDetail[0] = 0;
     g_app.slotWait = static_cast<float>(JsonGetFloat(body, SK_SLOT_WAIT, 0));
     g_app.lockWait = static_cast<float>(JsonGetFloat(body, SK_LOCK_WAIT, 0));
     g_app.gateSkips = JsonGetInt(body, SK_GATE_SKIPS, 0);
@@ -600,6 +610,8 @@ void LoadStats() noexcept {
         g_app.fgRouteEff[0] = 0;
         g_app.fgDetail[0] = 0;
         g_app.ofDetail[0] = 0;
+        g_app.rtxState[0] = 0;
+        g_app.rtxDetail[0] = 0;
         g_app.fgMult = 0;
         g_app.fgMultCreate = 0;
         g_app.fgMultMax = 0;
@@ -656,6 +668,8 @@ void LoadStats() noexcept {
             g_app.fgRouteEff[0] = 0;
             g_app.fgDetail[0] = 0;
             g_app.ofDetail[0] = 0;
+            g_app.rtxState[0] = 0;
+            g_app.rtxDetail[0] = 0;
             g_app.fgMult = 0;
             g_app.fgMultCreate = 0;
             g_app.fgMultMax = 0;
@@ -673,6 +687,8 @@ void LoadStats() noexcept {
                        memcmp(before.fgRouteEff, g_app.fgRouteEff, sizeof(g_app.fgRouteEff)) != 0 ||
                        memcmp(before.fgDetail, g_app.fgDetail, sizeof(g_app.fgDetail)) != 0 ||
                        memcmp(before.ofDetail, g_app.ofDetail, sizeof(g_app.ofDetail)) != 0 ||
+                       memcmp(before.rtxState, g_app.rtxState, sizeof(g_app.rtxState)) != 0 ||
+                       memcmp(before.rtxDetail, g_app.rtxDetail, sizeof(g_app.rtxDetail)) != 0 ||
                        before.fgMult != g_app.fgMult || before.fgMultCreate != g_app.fgMultCreate ||
                        before.fgMultMax != g_app.fgMultMax || before.connState != g_app.connState ||
                        before.slotWait != g_app.slotWait || before.lockWait != g_app.lockWait ||
@@ -923,7 +939,7 @@ void DrawUi() noexcept {
 
     // --- 功能页签:降噪增强 / 帧生成分页,不再全挤在一页 ---
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-    bool pgNrVis = false, pgFgVis = false, pgDiagVis = false; // 本帧各页可见性
+    bool pgNrVis = false, pgFgVis = false, pgRtxVis = false, pgDiagVis = false; // 本帧各页可见性
     if (ImGui::BeginTabBar("##feature_tabs")) {
         // --- 页:降噪增强(NR + 光流 + 分辨率缩放) ---
         if (ImGui::BeginTabItem("降噪增强", nullptr,
@@ -1185,15 +1201,185 @@ void DrawUi() noexcept {
             ImGui::EndTabItem();
         }
 
+        // --- 页:RTX 超分 / HDR(NVIDIA RTX Video SDK 1.1 的 NGX VSR +
+        // TrueHDR;管线顺序 NR→VSR→HDR→FG,官方明文 HDR 必须在 VSR 后)---
+        if (ImGui::BeginTabItem("RTX 超分/HDR", nullptr,
+                                (g_app.pageRestore && g_app.page == 2)
+                                    ? ImGuiTabItemFlags_SetSelected
+                                    : ImGuiTabItemFlags_None)) {
+            pgRtxVis = true;
+            if (!g_app.pageRestore && g_app.page != 2) savePagePref(2);
+            y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
+
+    // (VSR 超分 | VSR 质量):开关为创建时参数(变化触发 mpv 原地重载);
+    // 质量 1-4 为 per-eval live,拖动即时生效(官方 bicubic 0 档不暴露 ——
+    // 关闭走开关,不再付一份 GPU 价买双线性)。
+    pairLabel(0, "VSR 超分", "NVIDIA RTX Video 超分(SDR RGB,RTX 显卡)。模式:自动 = 插件直读\n"
+              "mpv 窗口客户区(= osd-dimensions)按实际显示矩形适配并 clamp 显示器,\n"
+              "1:1/缩小时自动旁路(VSR 只做放大);手动 = 按倍率放大。\n"
+              "开关/模式/倍率为创建时参数:变化自动触发 mpv 原地重载(需 IPC)。\n"
+              "需插件 ngx\\ 下有 nvngx_vsr.dll(RTX Video SDK 1.1)。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
+    {
+        bool vsrOn = g_app.params.rtxVsrMode != 0;
+        if (ImGui::Checkbox("##rtx_vsr_enabled", &vsrOn)) {
+            g_app.params.rtxVsrMode = vsrOn ? (g_app.params.rtxVsrMode == 0 ? 1 : g_app.params.rtxVsrMode) : 0;
+            g_app.liveDirty = true;
+            // 槽资源几何(vsrColor/yuvOut 尺寸/输出格式)随创建定格,开关
+            // 真变化只能链重建 —— 与帧生成开关同款 reseek 语义。
+            g_app.reseekDirty = true;
+        }
+    }
+    pairLabel(1, "VSR 质量", "AI 档位 1-4(4 = 最优,耗时最长;1 = 最快)。per-eval,拖动下一帧生效。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
+    ImGui::SetNextItemWidth(trackW);
+    {
+        const bool vsrOn = g_app.params.rtxVsrMode != 0;
+        if (!vsrOn) ImGui::BeginDisabled(true);
+        int q = std::clamp(g_app.params.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax);
+        if (ImGui::SliderInt("##vsr_strength", &q, kVsrStrengthMin, kVsrStrengthMax, "%d")) {
+            g_app.params.rtxVsrStrength = q;
+            g_app.liveDirty = true;
+        }
+        if (!vsrOn) ImGui::EndDisabled();
+    }
+    y += rowH;
+
+    // (模式 | RTX Video HDR):模式与 HDR 开关都是创建时参数并排。
+    pairLabel(0, "模式", "自动 = mpv 窗口客户区适配(窗口/全屏的显示矩形即目标,免配置);\n"
+              "手动 = 按下方倍率放大(不跟随窗口)。切档触发 mpv 原地重载。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
+    ImGui::SetNextItemWidth(trackW);
+    {
+        const bool vsrOn = g_app.params.rtxVsrMode != 0;
+        if (!vsrOn) ImGui::BeginDisabled(true);
+        static const char *kVsrModeNames[] = { "自动 (窗口适配)", "手动 (倍率)" };
+        int sel = std::clamp(g_app.params.rtxVsrMode, kVsrModeMin, kVsrModeMax);
+        if (ImGui::Combo("##vsr_mode", &sel, kVsrModeNames, 2)) {
+            g_app.params.rtxVsrMode = std::clamp(sel, 1, kVsrModeMax); // combo 只在开态可达,无 0 档
+            g_app.liveDirty = true;
+            g_app.reseekDirty = true;
+        }
+        if (!vsrOn) ImGui::EndDisabled();
+    }
+    pairLabel(1, "RTX Video HDR", "TrueHDR(SDR → HDR10):输出切 YUV420P10(BT.2020 PQ),\n"
+              "mpv 侧 target-colorspace-hint 上屏。官方明文必须排在 VSR 之后\n"
+              "(VSR 不吃 HDR 输入),管线顺序 NR→VSR→HDR→FG。\n"
+              "开关为创建时参数:变化自动触发 mpv 原地重载。\n"
+              "需插件 ngx\\ 下有 nvngx_truehdr.dll(RTX Video SDK 1.1)。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
+    {
+        bool hdr = g_app.params.rtxHdrEnabled != 0;
+        if (ImGui::Checkbox("##rtx_hdr_enabled", &hdr)) {
+            g_app.params.rtxHdrEnabled = hdr ? 1 : 0;
+            g_app.liveDirty = true;
+            g_app.reseekDirty = true; // 输出格式(P8/P10)随创建定格
+        }
+    }
+    y += rowH;
+
+    // (放大倍率 | HDR 对比度):倍率为创建时参数(松手才推送,免拖动连环
+    // 重载),模式=手动时启用;对比度为 per-eval live。
+    pairLabel(0, "放大倍率", "手动模式的目标倍率(1.0-4.0,官方单 pass 上限 4x)。\n"
+              "改动松手后自动触发 mpv 原地重载(免拖动过程连环重建)。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
+    {
+        const bool manual = g_app.params.rtxVsrMode == 2;
+        if (!manual) ImGui::BeginDisabled(true);
+        float sc = std::clamp(g_app.params.rtxVsrScale, kVsrScaleMin, kVsrScaleMax);
+        ImGui::SetNextItemWidth(trackW);
+        if (ImGui::SliderFloat("##vsr_scale", &sc, kVsrScaleMin, kVsrScaleMax, "%.2fx")) {
+            g_app.params.rtxVsrScale = sc;
+            // 松手才推送:拖动过程连续重载会连环重建链(与分辨率缩放 %滑杆
+            // 同款 debounce)。
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                g_app.liveDirty = true;
+                g_app.reseekDirty = true;
+            }
+        }
+        if (!manual) ImGui::EndDisabled();
+    }
+    pairLabel(1, "HDR 对比度", "TrueHDR Contrast(0-200,默认 100):明暗差强度。per-eval,拖动下一帧生效。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
+    {
+        const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
+        if (!hdrOn) ImGui::BeginDisabled(true);
+        float v = static_cast<float>(std::clamp(g_app.params.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax));
+        ImGui::SetNextItemWidth(trackW);
+        if (ImGui::SliderFloat("##hdr_contrast", &v,
+                               static_cast<float>(kHdrContrastMin), static_cast<float>(kHdrContrastMax), "%.0f")) {
+            g_app.params.rtxHdrContrast = static_cast<int>(v + 0.5f);
+            g_app.liveDirty = true;
+        }
+        if (!hdrOn) ImGui::EndDisabled();
+    }
+    y += rowH;
+
+    // (HDR 饱和度 | HDR 中间灰)
+    pairLabel(0, "HDR 饱和度", "TrueHDR Saturation(0-200,默认 100):色彩强度。per-eval。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
+    {
+        const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
+        if (!hdrOn) ImGui::BeginDisabled(true);
+        float v = static_cast<float>(std::clamp(g_app.params.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax));
+        ImGui::SetNextItemWidth(trackW);
+        if (ImGui::SliderFloat("##hdr_saturation", &v,
+                               static_cast<float>(kHdrSaturationMin), static_cast<float>(kHdrSaturationMax), "%.0f")) {
+            g_app.params.rtxHdrSaturation = static_cast<int>(v + 0.5f);
+            g_app.liveDirty = true;
+        }
+        if (!hdrOn) ImGui::EndDisabled();
+    }
+    pairLabel(1, "HDR 中间灰", "TrueHDR MiddleGray(10-100,默认 50):平均亮度。per-eval。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
+    {
+        const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
+        if (!hdrOn) ImGui::BeginDisabled(true);
+        float v = static_cast<float>(std::clamp(g_app.params.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax));
+        ImGui::SetNextItemWidth(trackW);
+        if (ImGui::SliderFloat("##hdr_middle_gray", &v,
+                               static_cast<float>(kHdrMiddleGrayMin), static_cast<float>(kHdrMiddleGrayMax), "%.0f")) {
+            g_app.params.rtxHdrMiddleGray = static_cast<int>(v + 0.5f);
+            g_app.liveDirty = true;
+        }
+        if (!hdrOn) ImGui::EndDisabled();
+    }
+    y += rowH;
+
+    // HDR 峰值亮度(整行;HDR 关时置灰)+ 跨页提示
+    pairLabel(0, "HDR 峰值亮度", "TrueHDR MaxLuminance(400-2000 nits,默认 1000):显示器峰值亮度,\n"
+              "与显示器的实际峰值一致时色调映射最准。per-eval。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
+    {
+        const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
+        if (!hdrOn) ImGui::BeginDisabled(true);
+        int v = std::clamp(g_app.params.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
+        ImGui::SetNextItemWidth(trackW);
+        if (ImGui::SliderInt("##hdr_peak_nits", &v, kHdrMaxLumMin, kHdrMaxLumMax, "%d nits")) {
+            g_app.params.rtxHdrMaxLuminance = v;
+            g_app.liveDirty = true;
+        }
+        if (!hdrOn) ImGui::EndDisabled();
+    }
+    y += rowH;
+
+            // 跨页依赖提示
+            ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
+            ImGui::TextDisabled("提示: 实际生效状态见\"诊断\"页;HDR 上屏需 mpv.conf target-colorspace-hint=true。");
+            y += rowH;
+
+            ImGui::EndTabItem();
+        }
+
         // --- 页:诊断(运行时事实 + 排队细分)。timing log 里才有的次级
         // 数据搬到这里;"请求 vs 实际"不一致的行一律红 —— 全页无红 = 插件
         // 正常工作。数据与 dlssnr_timing.log 的 perf/STATUS 行同源。---
         if (ImGui::BeginTabItem("诊断", nullptr,
-                                (g_app.pageRestore && g_app.page == 2)
+                                (g_app.pageRestore && g_app.page == 3)
                                     ? ImGuiTabItemFlags_SetSelected
                                     : ImGuiTabItemFlags_None)) {
             pgDiagVis = true;
-            if (!g_app.pageRestore && g_app.page != 2) savePagePref(2);
+            if (!g_app.pageRestore && g_app.page != 3) savePagePref(3);
             y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
 
@@ -1330,6 +1516,28 @@ void DrawUi() noexcept {
                                            multClipped ? "(超出部分需重载生效)" : "");
                     }
                 }
+
+                // RTX 请求 vs 实际:请求开(vsrMode>0 / hdrEnabled)而实态
+                // off = 降级(capability/部署问题),原因串 rtx_detail 红显。
+                {
+                    const bool vsrReq = g_app.params.rtxVsrMode != 0;
+                    const bool hdrReq = g_app.params.rtxHdrEnabled != 0;
+                    char rtxReq[64];
+                    if (!vsrReq && !hdrReq) {
+                        std::snprintf(rtxReq, sizeof(rtxReq), "关");
+                    } else if (vsrReq && hdrReq) {
+                        std::snprintf(rtxReq, sizeof(rtxReq), "VSR + HDR");
+                    } else {
+                        std::snprintf(rtxReq, sizeof(rtxReq), "%s", vsrReq ? "VSR" : "HDR");
+                    }
+                    const bool rtxDown = (vsrReq || hdrReq) &&
+                                         std::strcmp(g_app.rtxState, "off") == 0;
+                    ImGui::TextColored(rtxDown ? kErrRed : kDimTxt,
+                                       "RTX Video: 请求 %s | 实际 %s%s%s",
+                                       rtxReq,
+                                       g_app.rtxState[0] ? g_app.rtxState : "(未加载)",
+                                       g_app.rtxDetail[0] ? " —— " : "", g_app.rtxDetail);
+                }
             }
             // 处理分辨率(读 stats 缓存的六段之外字段:LoadStats 已存在
             // internal_w/h 到 statsRes 展示串;此处直接从共享内存的解析结果
@@ -1363,7 +1571,7 @@ void DrawUi() noexcept {
         if (g_app.pageRestore) {
             const bool targetVis =
                 (g_app.page == 0 && pgNrVis) || (g_app.page == 1 && pgFgVis) ||
-                (g_app.page == 2 && pgDiagVis);
+                (g_app.page == 2 && pgRtxVis) || (g_app.page == 3 && pgDiagVis);
             if (targetVis || --g_app.restoreFrames <= 0)
                 g_app.pageRestore = false;
         }
@@ -1394,8 +1602,14 @@ void DrawUi() noexcept {
         // Reset = push the factory-default payload itself; the plugin applies
         // it through the same Request*/Update path as any other edit (there
         // is no separate reset command in the protocol).
+        const DlssnrParams beforeReset = g_app.params;
         g_app.params = DlssnrParams{};
         WritePayload();
+        // RTX Video 开关(mode/HDR)是创建时参数:重置真关掉了它们才触发
+        // 链重建(与开关控件同款 reseek 语义;本来就没开时不付一次 seek)。
+        if (beforeReset.rtxVsrMode != 0 || beforeReset.rtxHdrEnabled != 0) {
+            g_app.reseekDirty = true;
+        }
         // Optimized 档位不在 payload 里(插件不消费):随重置归 1 并写回
         // 代理 ini,与面板显示保持一致。写失败保持现值 + 状态栏说明
         // (与档位下拉同款语义:UI 不说谎)。

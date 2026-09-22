@@ -253,6 +253,10 @@ private:
     bool _vsrRequested = false; // VSR 在管线(模式开 + 倍率 > 1 + capability 过)
     bool _hdrActive = false;    // TrueHDR 在管线(创建时定格;输出 P10)
     bool _rtxActive = false;    // _vsrRequested || _hdrActive(输出几何判据)
+    // RTX 最近一次初始化失败原因(消毒串;成功路径清空;_rtxDetail 键的
+    // 数据源,与 _fgDetail/_ofDetail 同语义)。请求开但实态 off = 降级,
+    // 面板诊断页红显的原因串。
+    char _rtxDetail[96] = "";
     int _pipeW = 0;             // VSR 输出 / TrueHDR / FG backbuffer 尺寸
     int _pipeH = 0;
     int _outW = 0;              // YUV 输出平面尺寸(vsr 关 = 源)

@@ -506,11 +506,17 @@ bool DlssnrContext::Initialize(
     {
         int dstW = width, dstH = height;
         if (_rtx.vsrMode == 1 || _rtx.vsrMode == 2) {
-            dstH = _rtx.vsrMode == 2
-                       ? std::clamp(_rtx.vsrHeight, kVsrHeightMin, kVsrHeightMax)
-                       : std::clamp(_rtx.vsrAutoHeight, kVsrHeightMin, kVsrHeightMax);
-            const double scale = static_cast<double>(dstH) / static_cast<double>(height);
-            dstW = static_cast<int>(std::lround(static_cast<double>(width) * scale));
+            if (_rtx.vsrMode == 2) {
+                // 手动倍率:输出 = 源 × scale(宽度按源宽高比推)。
+                const double sc = std::clamp(_rtx.vsrScale, kVsrScaleMin, kVsrScaleMax);
+                dstH = static_cast<int>(std::lround(static_cast<double>(height) * sc));
+                dstW = static_cast<int>(std::lround(static_cast<double>(width) * sc));
+            } else {
+                dstH = std::clamp(_rtx.vsrAutoHeight, 144, 8192);
+                const double scale = static_cast<double>(dstH) / static_cast<double>(height);
+                dstW = static_cast<int>(std::lround(static_cast<double>(width) * scale));
+            }
+            dstH = (std::max)(1, dstH);
             dstW = (std::max)(1, dstW);
         }
         const double ratio = static_cast<double>(dstH) / static_cast<double>(height);
@@ -647,6 +653,8 @@ bool DlssnrContext::Initialize(
         if (!vsrCapOk()) {
             if (_vsrRequested) {
                 TimingStatusLine("DLSSNR STATUS: rtx vsr unavailable (capability); passthrough size");
+                std::snprintf(_rtxDetail, sizeof(_rtxDetail),
+                              "VSR 不可用(capability;驱动/RTX 显卡/nvngx_vsr.dll)");
             }
             _vsrRequested = false;
             _pipeW = width;
@@ -657,6 +665,8 @@ bool DlssnrContext::Initialize(
         if (!hdrCapOk()) {
             if (_hdrActive) {
                 TimingStatusLine("DLSSNR STATUS: rtx hdr unavailable (capability); SDR output");
+                std::snprintf(_rtxDetail, sizeof(_rtxDetail),
+                              "TrueHDR 不可用(capability;驱动/RTX 显卡/nvngx_truehdr.dll)");
             }
             _hdrActive = false;
         }
@@ -860,6 +870,7 @@ bool DlssnrContext::Initialize(
         _vsr = std::make_unique<RtxVsrContext>();
         char rtxErr[192]{};
         if (!_vsr->Initialize(*_d3d12, _vsrParams, _width, _height, rtxErr, sizeof(rtxErr))) {
+            SanitizeJsonDetail(rtxErr, _rtxDetail, sizeof(_rtxDetail));
             char msg[256];
             std::snprintf(msg, sizeof(msg), "rtx vsr CreateFeature failed: %.180s", rtxErr);
             return fail(msg);
@@ -869,11 +880,13 @@ bool DlssnrContext::Initialize(
         _hdr = std::make_unique<RtxHdrContext>();
         char rtxErr[192]{};
         if (!_hdr->Initialize(*_d3d12, _hdrParams, _pipeW, _pipeH, rtxErr, sizeof(rtxErr))) {
+            SanitizeJsonDetail(rtxErr, _rtxDetail, sizeof(_rtxDetail));
             char msg[256];
             std::snprintf(msg, sizeof(msg), "rtx hdr CreateFeature failed: %.180s", rtxErr);
             return fail(msg);
         }
     }
+    _rtxDetail[0] = '\0'; // VSR/HDR 全部成功:清空失败原因(diagnostic 红显解除)
 
     // 4b) 光流会话(of_backend 单一后端,默认 FFX):quality > 0 时建立;
     // 失败优雅回退零 guidance(记 _nvofFailed,不拖垮整个滤镜)。冷初始化
@@ -946,12 +959,12 @@ bool DlssnrContext::Initialize(
         char body[1024];
         std::snprintf(body, sizeof(body),
                       "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d,"
-                      "\"rtx\":\"%s\","
+                      "\"rtx\":\"%s\",\"rtx_detail\":\"%s\","
                       "\"%s\":\"%s\",\"%s\":\"%s\","
                       "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
                       "\"%s\":%d,\"%s\":\"%s\"}",
                       _gpuNameUtf8, _width, _height,
-                      rtxState,
+                      rtxState, _rtxDetail,
                       SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
                       SK_OF_MODE, OfModeString(),
                       SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
@@ -2030,13 +2043,16 @@ bool DlssnrContext::ProcessFrame(
     //(NGX 非线程安全;两队列的 CL/allocator 均为单例,锁内顺序录制)。
     uint64_t rtxFenceVal = 0;
     ID3D12Fence *rtxFence = nullptr;
+    // per-eval 参数走本帧快照(面板质量/HDR 滑块逐帧生效;几何/形态仍按
+    // 创建时的 _rtx)。clamp 在 helper 内的常量引用,越界面板值安全。
+    const DlssnrParams rtxLive = _shared->Snapshot();
     if (vsrRun) {
         std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
         char rtxErr[160]{};
         uint64_t fv = 0;
         if (!_vsr->Evaluate(_d3d12->OutputColor(*slot), width, height,
                             slot->vsrColor.Get(), _pipeW, _pipeH,
-                            std::clamp(_rtx.vsrStrength, kVsrStrengthMin, kVsrStrengthMax),
+                            std::clamp(rtxLive.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax),
                             _d3d12->Fence(), slot->baseFenceValue, &fv,
                             rtxErr, sizeof(rtxErr))) {
             if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
@@ -2053,8 +2069,8 @@ bool DlssnrContext::ProcessFrame(
         if (!_hdr->Evaluate(vsrRun ? slot->vsrColor.Get()
                                    : _d3d12->OutputColor(*slot),
                             pipeW, pipeH, slot->hdrColor.Get(),
-                            _rtx.hdrContrast, _rtx.hdrSaturation,
-                            _rtx.hdrMiddleGray, _rtx.hdrMaxLuminance,
+                            rtxLive.rtxHdrContrast, rtxLive.rtxHdrSaturation,
+                            rtxLive.rtxHdrMiddleGray, rtxLive.rtxHdrMaxLuminance,
                             vsrRun ? _vsr->Queue().Fence() : _d3d12->Fence(),
                             vsrRun ? rtxFenceVal : slot->baseFenceValue, &fv,
                             rtxErr, sizeof(rtxErr))) {

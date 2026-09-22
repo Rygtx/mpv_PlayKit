@@ -63,11 +63,10 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
 struct FilterData {
     VSNode *node = nullptr;
     // Runtime-mutable parameters shared with the tray panel (initial values
-    // come from the .vpy call).
+    // come from the .vpy call). RTX Video 参数(v22 起)也住 DlssnrParams:
+    // vpy args ← ini ← 面板 payload 合并,创建时经 RtxFromParams 折成
+    // ctx 载荷。
     std::unique_ptr<vsdlssnr::SharedParams> params;
-    // RTX Video(VSR/TrueHDR)创建时参数(vpy args ← [rtxvideo] ini;面板
-    // payload 不携带)。vsrAutoHeight 由显示器探测填入。
-    RtxVideoParams rtx;
 
     // Eagerly initialized in DlssnrCreate (before playback starts); VS may
     // call getFrame on several threads under fmParallel, but each frame runs
@@ -147,8 +146,9 @@ struct HotContext {
     // 有无),必须冷重建。路由(route)进程级,重启生效,不参与。
     bool fgEnabled = false;
     std::wstring fgDllPath;
-    // RTX Video 参与 hotMatch:模式/目标/强度/HDR 参数变化 = 管线几何或
-    // 输出格式变化,冷重建。
+    // RTX Video 参与 hotMatch:mode/scale/autoHeight/hdrEnabled 变化 = 管
+    // 线几何或输出格式变化,冷重建。RtxVideoParams 的 == 只覆盖这些
+    // (strength/HDR 四参是 live per-eval,不参与,拖滑块不付冷重建)。
     RtxVideoParams rtx{};
     bool valid = false;
 };
@@ -269,34 +269,32 @@ static DisplayPick DetectTargetSize() noexcept {
     return { w, h };
 }
 
-// RTX 参数裁决:vpy args(已应用在 rtx 上)← [rtxvideo] ini 覆盖 ←
-// mode=1 的显示器探测。返回最终参数(plugin.cpp 是 vsrAutoHeight 的唯一
-// 写入点)。
-static void ResolveRtxParams(RtxVideoParams &rtx) noexcept {
-    wchar_t iniPath[MAX_PATH]{};
-    HMODULE self = nullptr;
-    if (GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(&ResolveRtxParams), &self)) {
-        wchar_t dllPath[MAX_PATH]{};
-        if (GetModuleFileNameW(self, dllPath, MAX_PATH)) {
-            const std::filesystem::path dir =
-                std::filesystem::path(dllPath).parent_path() / "dlssnr_ui.ini";
-            const std::wstring ws = dir.wstring();
-            if (ws.size() < MAX_PATH) {
-                wcscpy_s(iniPath, ws.c_str());
-            }
-        }
-    }
-    if (iniPath[0]) vsdlssnr::LoadRtxVideoIni(rtx, iniPath);
-    if (rtx.vsrMode == 1) {
+// RTX 参数裁决:vpy args + ini + 面板 payload 已在 DlssnrParams 上合并
+// (BridgeLoadIni/AdoptPanelPayload 走共享映射),本函数只剩 mode=1 的
+// mpv 窗口客户区探测(plugin.cpp 是 vsrAutoHeight 的唯一写入点)。
+static void ResolveRtxParams(DlssnrParams &p) noexcept {
+    if (p.rtxVsrMode == 1) {
         const DisplayPick disp = DetectTargetSize();
         if (disp.height > 0) {
-            rtx.vsrAutoHeight = disp.height;
+            p.rtxVsrAutoHeight = disp.height;
         }
-    } else {
-        rtx.vsrAutoHeight = rtx.vsrHeight;
     }
+}
+
+// ctx 载荷(创建时定格):DlssnrParams 合并值 → RtxVideoParams(几何/形态
+// + per-eval 初值;per-eval 项运行中改由 Snapshot 逐帧取)。
+static RtxVideoParams RtxFromParams(const DlssnrParams &p) noexcept {
+    RtxVideoParams rtx;
+    rtx.vsrMode = std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax);
+    rtx.vsrScale = std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax);
+    rtx.vsrStrength = std::clamp(p.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax);
+    rtx.hdrEnabled = p.rtxHdrEnabled != 0;
+    rtx.hdrContrast = std::clamp(p.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax);
+    rtx.hdrSaturation = std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
+    rtx.hdrMiddleGray = std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
+    rtx.hdrMaxLuminance = std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
+    rtx.vsrAutoHeight = std::clamp(p.rtxVsrAutoHeight, 144, 8192);
+    return rtx;
 }
 
 // 降级路径的缩放拷贝(OUT ≠ 源 或 位深不同:处理失败帧的兜底,画质次要,
@@ -682,7 +680,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().depth = d->depth;
         Hot().fgEnabled = d->fgActive;
         Hot().fgDllPath = std::move(d->fgDllPath);
-        Hot().rtx = d->rtx;
+        Hot().rtx = RtxFromParams(d->params->Snapshot());
         Hot().valid = true;
         // 探针:停放行 —— 与下一次 create 的 "hot rebind kept"/"re-init"
         // 行配对,seek 生命周期序列(bridge stopped → freed → started →
@@ -766,20 +764,20 @@ static void VS_CC DlssnrCreate(
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
     // the bridge poll skips the existing payload (history), so the panel's
     // parameters only came back after touching the panel again.
+    // RTX Video(v22 起参数住 DlssnrParams):vpy args 先于 ini 应用(与其
+    // 他参数同序:vpy 默认 → ini → 面板 payload)。
+    ApplyIntArg(in, vsapi, "vsr_mode", initial.rtxVsrMode, kVsrModeMin, kVsrModeMax);
+    ApplyFloatArg(in, vsapi, "vsr_scale", initial.rtxVsrScale, kVsrScaleMin, kVsrScaleMax);
+    ApplyIntArg(in, vsapi, "vsr_strength", initial.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax);
+    ApplyIntArg(in, vsapi, "hdr_enabled", initial.rtxHdrEnabled, 0, 1);
+    ApplyIntArg(in, vsapi, "hdr_contrast", initial.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax);
+    ApplyIntArg(in, vsapi, "hdr_saturation", initial.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
+    ApplyIntArg(in, vsapi, "hdr_middle_gray", initial.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
+    ApplyIntArg(in, vsapi, "hdr_peak_nits", initial.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
     const bool iniLoaded = vsdlssnr::BridgeLoadIni(initial);
     const bool payloadAdopted = vsdlssnr::BridgeAdoptPanelPayload(initial);
-    // RTX Video(vpy args 已在上面 Apply 到 d->rtx):[rtxvideo] ini 覆盖
-    // + mode=1 显示器探测。三层里没有面板 payload —— RTX 参数暂不走面板
-    // (PanelPayload ABI 未动),以 ini/vpy 为准。
-    ApplyIntArg(in, vsapi, "vsr_mode", d->rtx.vsrMode, kVsrModeMin, kVsrModeMax);
-    ApplyIntArg(in, vsapi, "vsr_height", d->rtx.vsrHeight, kVsrHeightMin, kVsrHeightMax);
-    ApplyIntArg(in, vsapi, "vsr_strength", d->rtx.vsrStrength, kVsrStrengthMin, kVsrStrengthMax);
-    ApplyIntArg(in, vsapi, "hdr_enabled", d->rtx.hdrEnabled, 0, 1);
-    ApplyIntArg(in, vsapi, "hdr_contrast", d->rtx.hdrContrast, kHdrContrastMin, kHdrContrastMax);
-    ApplyIntArg(in, vsapi, "hdr_saturation", d->rtx.hdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
-    ApplyIntArg(in, vsapi, "hdr_middle_gray", d->rtx.hdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
-    ApplyIntArg(in, vsapi, "hdr_peak_nits", d->rtx.hdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
-    ResolveRtxParams(d->rtx);
+    // mode=1 的 mpv 窗口客户区探测(三层裁决的唯一 probe 写入点)。
+    ResolveRtxParams(initial);
     // 探针:三层参数源(vpy 默认 → ini → 面板 payload)的最终裁决值。
     // "参数没生效/拖进度条回去了"类问题(#37)一行定位:ini/payload 哪层
     // 参与了、create-time 三元组最终是什么,一眼可查。
@@ -873,8 +871,10 @@ static void VS_CC DlssnrCreate(
     // NR+FG 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开秒回);
     // 仅 NR 关而 FG 开仍需热复用(设备与上下文都在用)。
     // RTX 请求开 = vsr_mode>0 或 hdr 开(初始化守卫参与;皆关 + NR/FG 皆关
-    // = 纯直通零 GPU)。
-    const bool rtxRequested = d->rtx.vsrMode > 0 || d->rtx.hdrEnabled != 0;
+    // = 纯直通零 GPU)。ctx 载荷从合并后的 DlssnrParams 折出(probe 已在
+    // ResolveRtxParams 填入)。
+    const RtxVideoParams rtx = RtxFromParams(initial);
+    const bool rtxRequested = rtx.vsrMode > 0 || rtx.hdrEnabled != 0;
     const bool hotMatch = (initial.nrEnabled || initial.fgEnabled || rtxRequested) &&
                           Hot().valid &&
                           Hot().ngxDllPath == d->ngxDllPath &&
@@ -882,13 +882,13 @@ static void VS_CC DlssnrCreate(
                           Hot().depth == d->depth &&
                           Hot().fgEnabled == (initial.fgEnabled != 0) &&
                           Hot().fgDllPath == d->fgDllPath &&
-                          Hot().rtx == d->rtx;
+                          Hot().rtx == rtx;
     if (hotMatch) {
         d->d3d12 = std::move(Hot().d3d12);
         d->ngx = std::move(Hot().ngx);
         Hot().valid = false;
         Hot().ngxDllPath.clear();
-        if (d->ngx->Rebind(d->params.get(), d->width, d->height, d->depth, d->rtx, err, sizeof(err))) {
+        if (d->ngx->Rebind(d->params.get(), d->width, d->height, d->depth, rtx, err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
             if (!vsdlssnr::BridgeStart(d->params.get())) {
@@ -929,7 +929,7 @@ static void VS_CC DlssnrCreate(
         d->ngx = std::make_unique<vsdlssnr::DlssnrContext>();
         if (d->d3d12->Initialize(err, sizeof(err)) &&
             d->ngx->Initialize(*d->d3d12, d->ngxDllPath.c_str(), d->fgDllPath.c_str(),
-                               d->width, d->height, d->depth, d->params.get(), d->rtx,
+                               d->width, d->height, d->depth, d->params.get(), rtx,
                                err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
@@ -1082,7 +1082,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "fg_route:int:opt;"
         "of_backend:int:opt;"
         "vsr_mode:int:opt;"
-        "vsr_height:int:opt;"
+        "vsr_scale:float:opt;"
         "vsr_strength:int:opt;"
         "hdr_enabled:int:opt;"
         "hdr_contrast:int:opt;"

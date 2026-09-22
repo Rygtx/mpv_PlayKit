@@ -55,17 +55,17 @@ inline constexpr int kFgRouteAuto = 0, kFgRouteOfficial = 1;
 //  clamp 落 1 = nvof。)
 inline constexpr int kOfBackendMin = 0, kOfBackendMax = 1;
 inline constexpr int kOfBackendFfx = 0, kOfBackendNvof = 1;
-// ---- RTX Video(VSR / TrueHDR;创建时参数,seek/重启生效)----
+// ---- RTX Video(VSR / TrueHDR)----
 // NVIDIA RTX Video SDK 1.1 的两个 NGX feature(Feature 16 / 14,与 NR/FG
 // 同一 NGX core;snippet nvngx_vsr.dll / nvngx_truehdr.dll 部署在 ngx\):
-//   VSR     — SDR RGB 放大(输入/输出 BGRA8,quality 0=bicubic 1-4=AI)
+//   VSR     — SDR RGB 放大(输入/输出 BGRA8,quality 1-4=AI;官方 0=bicubic
+//             不暴露 —— 关闭即旁路,不再付一份 GPU 价买双线性)
 //   TrueHDR — SDR RGB → FP16 scRGB 线性(不能吃 HDR 输入,官方明文 VSR→HDR 序)
-// 管线顺序(NR→VSR→HDR→FG)与 per-eval 成本论证见 fetch-deps 注释与
-// docs/experimental。参数走独立 [rtxvideo] ini 节 + vpy args,不进面板
-// payload(PanelPayload ABI 不动,面板后续再接)。
-inline constexpr int kVsrModeMin = 0, kVsrModeMax = 2;   // 0=关 1=显示器适配 2=手动高度
-inline constexpr int kVsrStrengthMin = 0, kVsrStrengthMax = 4; // 0=bicubic,1-4=AI(4 最优)
-inline constexpr int kVsrHeightMin = 144, kVsrHeightMax = 8192;
+// 管线顺序(NR→VSR→HDR→FG)。面板全量接入(payload v22);ini 走同一份
+// dlssnr_ui.ini 的 [rtxvideo] 节(面板保存时一并写入)。
+inline constexpr int kVsrModeMin = 0, kVsrModeMax = 2;   // 0=关 1=自动(mpv 窗口适配)2=手动倍率
+inline constexpr int kVsrStrengthMin = 1, kVsrStrengthMax = 4; // 1-4=AI 档(4 最优)
+inline constexpr float kVsrScaleMin = 1.0f, kVsrScaleMax = 4.0f; // 手动倍率(mode=2)
 // VSR 单 pass 官方上限倍率:超过时先 VSR 到 4x 中间尺寸,OUT 收尾由
 // convert-out 双线性补完(VSR 只做放大,bilinear 从 4x 高清中间位拉到目标)。
 inline constexpr float kVsrMaxScale = 4.0f;
@@ -75,32 +75,30 @@ inline constexpr int kHdrMiddleGrayMin = 10, kHdrMiddleGrayMax = 100;  // TrueHD
 inline constexpr int kHdrMaxLumMin = 400, kHdrMaxLumMax = 2000;        // MaxLuminance(nits)
 
 struct RtxVideoParams {
-    // VSR 目标尺寸来源(创建时):0=关 1=自动(按 mpv 窗口所在显示器的
-    // 可视矩形适配,1:1/缩小时自动旁路 —— VSR 只支持放大,对齐浏览器端
-    // 官方语义)2=手动目标高度(vsr_height,宽度按源宽高比推)。
+    // VSR 目标尺寸来源(创建时):0=关 1=自动(mpv 窗口客户区适配,1:1/
+    // 缩小时自动旁路 —— VSR 只支持放大,对齐浏览器端官方语义)2=手动倍率
+    // (vsrScale,宽度按源宽高比推)。
     int vsrMode = 0;
-    int vsrHeight = 2160;    // 手动目标高度(mode=2)
+    float vsrScale = 2.0f;   // 手动放大倍率(mode=2;1.0-4.0)
     // mode=1 时由 plugin.cpp 直读 mpv 窗口客户区(= osd-dimensions,进程
     // 内 GetClientRect 零桥接,clamp 到所在显示器)填入;链创建粒度,非
     // 持久化字段,ini 不读写。窗口换屏/改尺寸后的生效点 = 下一次链重建。
     int vsrAutoHeight = 2160;
-    int vsrStrength = 2;     // VSR QualityLevel(0=bicubic 1-4=AI)
+    int vsrStrength = 2;     // VSR QualityLevel(1-4=AI;per-eval,live)
     // TrueHDR(0/1):输出域切换为 HDR10 —— 滤镜输出 YUV420P10(BT.2020
     // PQ limited),mpv 侧 target-colorspace-hint 上屏。创建时。
     int hdrEnabled = 0;
-    int hdrContrast = 100;       // 0-200(官方默认 100)
+    int hdrContrast = 100;       // 0-200(官方默认 100;per-eval,live)
     int hdrSaturation = 100;     // 0-200
     int hdrMiddleGray = 50;      // 10-100
     int hdrMaxLuminance = 1000;  // 400-2000 nits
 
-    // vsrAutoHeight 由 plugin.cpp 探测填入,相等性必须参与(显示器变化 =
-    // 槽资源几何变化,热复用必须拦截)。
+    // 相等性只覆盖**创建时几何/形态**:mode/scale/autoHeight/hdrEnabled。
+    // strength 与 HDR 四参是 per-eval live 值 —— 变化不换槽资源几何,
+    // 参与 == 会让 hotMatch 拒掉本可秒回的热复用(每次拖质量滑块 = 冷重建)。
     friend bool operator==(const RtxVideoParams &a, const RtxVideoParams &b) noexcept {
-        return a.vsrMode == b.vsrMode && a.vsrHeight == b.vsrHeight &&
-               a.vsrAutoHeight == b.vsrAutoHeight && a.vsrStrength == b.vsrStrength &&
-               a.hdrEnabled == b.hdrEnabled && a.hdrContrast == b.hdrContrast &&
-               a.hdrSaturation == b.hdrSaturation && a.hdrMiddleGray == b.hdrMiddleGray &&
-               a.hdrMaxLuminance == b.hdrMaxLuminance;
+        return a.vsrMode == b.vsrMode && a.vsrScale == b.vsrScale &&
+               a.vsrAutoHeight == b.vsrAutoHeight && a.hdrEnabled == b.hdrEnabled;
     }
     friend bool operator!=(const RtxVideoParams &a, const RtxVideoParams &b) noexcept {
         return !(a == b);
@@ -187,6 +185,23 @@ struct DlssnrParams {
     // 幅值→亮度,黑 = 无运动/无光流(回应"看不出参数有没有效果"与
     // "光流到底有没有在流")。面板"调试视图"下拉,仅当前会话有效。
     int debugView = 0;
+
+    // ---- RTX Video(VSR / TrueHDR)----
+    //   创建时(seek/reload 生效;面板改动经 reseek 触发链重建):rtxVsrMode
+    //   (0=关 1=自动窗口适配 2=手动倍率)/ rtxVsrScale(1.0-4.0)/
+    //   rtxHdrEnabled(输出切 P10 BT.2020 PQ)。rtxVsrAutoHeight 仅 mode=1
+    //   时由 plugin.cpp 直读 mpv 窗口客户区填入,不持久化。
+    //   live(逐帧 per-eval,拖动即时生效):rtxVsrStrength(1-4)与 HDR
+    //   四参。
+    int rtxVsrMode = 0;
+    float rtxVsrScale = 2.0f;    // 1.0-4.0(官方单 pass 上限 4x)
+    int rtxVsrAutoHeight = 2160; // probe 字段(mode=1),非持久化
+    int rtxVsrStrength = 2;      // 1-4(0=bicubic 已移除,关闭走开关)
+    int rtxHdrEnabled = 0;       // 输出域 SDR → HDR10(P10 PQ)
+    int rtxHdrContrast = 100;      // 0-200
+    int rtxHdrSaturation = 100;    // 0-200
+    int rtxHdrMiddleGray = 50;     // 10-100
+    int rtxHdrMaxLuminance = 1000; // 400-2000 nits
 };
 
 // Create-time trio (preset / input_resolution / scaling_enabled) equivalence

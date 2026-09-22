@@ -50,6 +50,20 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeInt(L"fg_multiplier", std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax));
     writeInt(L"fg_route", std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax)); // v20 两档:保存即把存量 2/3 归一
     writeInt(L"of_backend", std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax));
+    // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管;
+    // 本函数是唯一写侧,面板"保存设置"与 bridge saveRequest 共用)。
+    auto writeRtxInt = [&](const wchar_t *key, int v) {
+        swprintf_s(buf, L"%d", v);
+        ok = WritePrivateProfileStringW(L"rtxvideo", key, buf, iniPath) && ok;
+    };
+    writeRtxInt(L"vsr_mode", std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax));
+    writeRtxInt(L"vsr_scale_x100", static_cast<int>(std::lround(std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax) * 100.0f)));
+    writeRtxInt(L"vsr_strength", std::clamp(p.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax));
+    writeRtxInt(L"hdr_enabled", p.rtxHdrEnabled ? 1 : 0);
+    writeRtxInt(L"hdr_contrast", std::clamp(p.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax));
+    writeRtxInt(L"hdr_saturation", std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax));
+    writeRtxInt(L"hdr_middle_gray", std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax));
+    writeRtxInt(L"hdr_peak_nits", std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax));
     writeInt(L"saved", 1);
     return ok;
 }
@@ -126,33 +140,31 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
     }
     p.fgRoute = std::clamp(readInt(L"fg_route", p.fgRoute), kFgRouteMin, kFgRouteMax);
     p.ofBackend = std::clamp(readInt(L"of_backend", p.ofBackend), kOfBackendMin, kOfBackendMax);
-    return true;
-}
-
-// RTX Video(VSR / TrueHDR)参数:[rtxvideo] 独立节。面板不读写本节
-// (PanelPayload ABI 不动),ini 手编或部署样例下发;字段缺失保持当前值
-// (同 LoadDlssnrIni 语义)。只读 —— 没有写侧,WriteDlssnrIni 不动。
-inline bool LoadRtxVideoIni(RtxVideoParams &p, const wchar_t *iniPath) noexcept {
-    const auto readInt = [&](const wchar_t *key, int def) -> int {
+    // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管,
+    // 与 WriteDlssnrIni 同键表)。旧部署样例的 vsr_height 键已作废(语义
+    // 换成倍率 vsr_scale_x100),不读取 —— 旧值静默失效,面板重存即归位。
+    const auto readRtxInt = [&](const wchar_t *key, int def) -> int {
         return static_cast<int>(GetPrivateProfileIntW(L"rtxvideo", key, def, iniPath));
     };
-    const auto readBool = [&](const wchar_t *key, bool def) -> bool {
+    const auto readRtxBool = [&](const wchar_t *key, bool def) -> bool {
         wchar_t raw[16]{};
         if (GetPrivateProfileStringW(L"rtxvideo", key, L"", raw, 16, iniPath) && raw[0]) {
             const auto eqi = [&](const wchar_t *lit) { return _wcsicmp(raw, lit) == 0; };
             if (eqi(L"true") || eqi(L"yes") || eqi(L"on")) return true;
             if (eqi(L"false") || eqi(L"no") || eqi(L"off")) return false;
         }
-        return readInt(key, def ? 1 : 0) != 0;
+        return readRtxInt(key, def ? 1 : 0) != 0;
     };
-    p.vsrMode = std::clamp(readInt(L"vsr_mode", p.vsrMode), kVsrModeMin, kVsrModeMax);
-    p.vsrHeight = std::clamp(readInt(L"vsr_height", p.vsrHeight), kVsrHeightMin, kVsrHeightMax);
-    p.vsrStrength = std::clamp(readInt(L"vsr_strength", p.vsrStrength), kVsrStrengthMin, kVsrStrengthMax);
-    p.hdrEnabled = readBool(L"hdr_enabled", p.hdrEnabled != 0);
-    p.hdrContrast = std::clamp(readInt(L"hdr_contrast", p.hdrContrast), kHdrContrastMin, kHdrContrastMax);
-    p.hdrSaturation = std::clamp(readInt(L"hdr_saturation", p.hdrSaturation), kHdrSaturationMin, kHdrSaturationMax);
-    p.hdrMiddleGray = std::clamp(readInt(L"hdr_middle_gray", p.hdrMiddleGray), kHdrMiddleGrayMin, kHdrMiddleGrayMax);
-    p.hdrMaxLuminance = std::clamp(readInt(L"hdr_peak_nits", p.hdrMaxLuminance), kHdrMaxLumMin, kHdrMaxLumMax);
+    p.rtxVsrMode = std::clamp(readRtxInt(L"vsr_mode", p.rtxVsrMode), kVsrModeMin, kVsrModeMax);
+    p.rtxVsrScale = std::clamp(
+        static_cast<float>(readRtxInt(L"vsr_scale_x100", static_cast<int>(p.rtxVsrScale * 100.0f))) / 100.0f,
+        kVsrScaleMin, kVsrScaleMax);
+    p.rtxVsrStrength = std::clamp(readRtxInt(L"vsr_strength", p.rtxVsrStrength), kVsrStrengthMin, kVsrStrengthMax);
+    p.rtxHdrEnabled = readRtxBool(L"hdr_enabled", p.rtxHdrEnabled != 0);
+    p.rtxHdrContrast = std::clamp(readRtxInt(L"hdr_contrast", p.rtxHdrContrast), kHdrContrastMin, kHdrContrastMax);
+    p.rtxHdrSaturation = std::clamp(readRtxInt(L"hdr_saturation", p.rtxHdrSaturation), kHdrSaturationMin, kHdrSaturationMax);
+    p.rtxHdrMiddleGray = std::clamp(readRtxInt(L"hdr_middle_gray", p.rtxHdrMiddleGray), kHdrMiddleGrayMin, kHdrMiddleGrayMax);
+    p.rtxHdrMaxLuminance = std::clamp(readRtxInt(L"hdr_peak_nits", p.rtxHdrMaxLuminance), kHdrMaxLumMin, kHdrMaxLumMax);
     return true;
 }
 
