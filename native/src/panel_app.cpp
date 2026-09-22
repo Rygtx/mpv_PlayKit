@@ -2096,11 +2096,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
         // Throttled shared-memory pushes while dragging sliders
         if (g_app.liveDirty && nowSec - g_app.lastLiveWrite > 0.1) {
-            // create-time 变动(vsrMode/FG 档位等)= reseek 语义:vf 重初始化
-            // 会杀掉本面板(watchdog LOST → 插件重拉新面板),新面板读 ini
-            // —— 不落盘则刚点的档位在重启后的面板上"弹回旧值"。saveRequest
-            // 由插件侧写 ini(与"保存设置"按钮同路径)。
-            WritePayload(g_app.reseekDirty);
+            // create-time 变动(vsrMode/FG 档位等)经 reseek 重建会话后面板
+            // 会重启,但重启面板在启动时采纳最后一份 payload(CreateParams
+            // Mapping 的 adopt 路径,含 rtx 三元组,后于 ini 生效)—— 切换
+            // 值不落盘也能跨面板重启保持;ini 仍只由"保存设置"显式写入
+            // (插件侧 saveRequest 落盘带 LoadCreateParams 叠加,见 bridge)。
+            WritePayload();
             g_app.liveDirty = false;
             g_app.lastLiveWrite = nowSec;
             // 需要重建会话的变动:payload 落地后立即触发 mpv 原地 seek,
