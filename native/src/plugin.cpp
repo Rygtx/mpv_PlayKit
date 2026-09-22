@@ -235,59 +235,39 @@ static DisplayPick DetectTargetSize(int srcW, int srcH) noexcept {
         }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&ctx));
-    HMONITOR mon = ctx.hwnd
-                       ? MonitorFromWindow(ctx.hwnd, MONITOR_DEFAULTTONEAREST)
-                       : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    if (mon && !GetMonitorInfoW(mon, &mi)) mon = nullptr;
-    // 目标 = 窗口客户区(设备像素,mpv 进程 per-monitor DPI aware 同源 ——
-    // 多屏异 DPI 各取所在屏物理像素,MonitorFromWindow 已按窗口所在屏
-    // clamp;跨屏窗口取交集最大者)。
+    // 找不到可见窗口(无窗音频/全屏独占被排除等)= 探测失败,返回 {0,0}
+    // 由调用方按 VSR 旁路处理;窗口出现后的链重建会重新探到并启用。
+    // 与显示器无关:有窗口时客户区即实际显示大小(宿主 per-monitor DPI
+    // aware,物理像素),无窗口时无目标 —— 不存在"拿显示器凑"的场景。
+    if (!ctx.hwnd) return { 0, 0 };
     int w = 0, h = 0;
-    if (ctx.hwnd) {
-        if (IsIconic(ctx.hwnd)) {
-            // 最小化时 GetClientRect 给的是任务栏代表尺寸(极小)—— 直接
-            // 用会让"最小化中的任何重建"把 VSR 目标掉到极小。取还原矩形
-            // 近似客户区(含边框 ~±16px,对超分目标无碍)。
-            WINDOWPLACEMENT wp{};
-            wp.length = sizeof(wp);
-            if (GetWindowPlacement(ctx.hwnd, &wp)) {
-                w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
-                h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
-            }
-        }
-        if (w <= 0 || h <= 0) {
-            RECT rc{};
-            if (GetClientRect(ctx.hwnd, &rc)) {
-                w = rc.right - rc.left;
-                h = rc.bottom - rc.top;
-            }
+    if (IsIconic(ctx.hwnd)) {
+        // 最小化时 GetClientRect 给的是任务栏代表尺寸(极小)—— 直接用
+        // 会让"最小化中的任何重建"把 VSR 目标掉到极小。取还原矩形近似
+        // 客户区(含边框 ~±16px,对超分目标无碍)。
+        WINDOWPLACEMENT wp{};
+        wp.length = sizeof(wp);
+        if (GetWindowPlacement(ctx.hwnd, &wp)) {
+            w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+            h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
         }
     }
     if (w <= 0 || h <= 0) {
-        w = mi.rcMonitor.right - mi.rcMonitor.left;
-        h = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        return { w, h };
+        RECT rc{};
+        if (GetClientRect(ctx.hwnd, &rc)) {
+            w = rc.right - rc.left;
+            h = rc.bottom - rc.top;
+        }
     }
+    if (w <= 0 || h <= 0) return { 0, 0 };
     // 视频实际显示矩形 = 源宽高比在客户区内 min-fit(mpv letterbox 语义;
     // panscan/zoom 覆盖不追,近似足够)—— 黑边不计入目标,避免"宽窗放
-    // 窄视频"时目标虚大。随后 clamp 到所在显示器。
+    // 窄视频"时目标虚大。
     if (srcW > 0 && srcH > 0) {
         const double s = (std::min)(static_cast<double>(w) / srcW,
                                     static_cast<double>(h) / srcH);
         w = (std::max)(1, static_cast<int>(std::lround(srcW * s)));
         h = (std::max)(1, static_cast<int>(std::lround(srcH * s)));
-    }
-    if (mon) {
-        const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-        const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        if (w > mw || h > mh) {
-            const double s = (std::min)(static_cast<double>(mw) / w,
-                                        static_cast<double>(mh) / h);
-            w = (std::max)(1, static_cast<int>(w * s));
-            h = (std::max)(1, static_cast<int>(h * s));
-        }
     }
     return { w, h };
 }
@@ -296,12 +276,12 @@ static DisplayPick DetectTargetSize(int srcW, int srcH) noexcept {
 // (BridgeLoadIni/AdoptPanelPayload 走共享映射),本函数只剩 mode=1 的
 // mpv 窗口显示矩形探测(plugin.cpp 是 vsrAutoHeight 的唯一写入点)。
 // srcW/srcH = 源分辨率,用于把客户区换算成视频实际显示矩形。
+// 探测失败(无可见窗口)写 0:mode=1 消费侧按"目标=源"处理 = VSR 旁路,
+// 窗口出现后的链重建重新探测并启用。
 static void ResolveRtxParams(DlssnrParams &p, int srcW, int srcH) noexcept {
     if (p.rtxVsrMode == 1) {
         const DisplayPick disp = DetectTargetSize(srcW, srcH);
-        if (disp.height > 0) {
-            p.rtxVsrAutoHeight = disp.height;
-        }
+        p.rtxVsrAutoHeight = disp.height > 0 ? disp.height : 0;
     }
 }
 

@@ -512,7 +512,11 @@ bool DlssnrContext::Initialize(
                 dstH = static_cast<int>(std::lround(static_cast<double>(height) * sc));
                 dstW = static_cast<int>(std::lround(static_cast<double>(width) * sc));
             } else {
-                dstH = std::clamp(_rtx.vsrAutoHeight, 144, 8192);
+                // vsrAutoHeight <= 0 = 探测失败(无可见窗口):目标=源,
+                // ratio=1 走旁路 —— 窗口出现后的链重建重新探测并启用。
+                dstH = _rtx.vsrAutoHeight > 0
+                           ? std::clamp(_rtx.vsrAutoHeight, 144, 8192)
+                           : height;
                 const double scale = static_cast<double>(dstH) / static_cast<double>(height);
                 dstW = static_cast<int>(std::lround(static_cast<double>(width) * scale));
             }
