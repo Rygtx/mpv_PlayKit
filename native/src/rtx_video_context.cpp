@@ -71,6 +71,15 @@ bool RtxQueue::Execute(ID3D12Fence *waitFence, uint64_t waitValue,
         return false;
     };
     if (waitFence && waitValue) _queue->Wait(waitFence, waitValue);
+    // 单 allocator 跨槽复用:CPU 端先等上一笔 eval 执行完再 Reset。
+    // 槽池流水下背靠背 eval(帧供 > 吞吐 / seek 后 burst)时上一 CL 可能
+    // 仍在 GPU 上跑 —— in-flight Reset 是 UB,实测表现 = VSR 队列静默
+    // wedge(Signal 永不来 → 主队列 Wait(rtx fence) 永挂 → mpv 卡死,
+    // 无 TDR 无报错,真机 0.6.8 2026-09-22 实锤)。keep-up 时 completed
+    // 值已满足,零开销;落后时即诚实背压。
+    if (const uint64_t pending = _fenceValue.load(std::memory_order_acquire)) {
+        Wait(pending, nullptr, 0);
+    }
     if (FAILED(_allocator->Reset())) return fail("allocator Reset failed");
     if (FAILED(_commandList->Reset(_allocator.Get(), nullptr))) return fail("CL Reset failed");
     if (!fn(_commandList.Get())) {
