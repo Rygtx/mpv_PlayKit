@@ -518,6 +518,12 @@ bool DlssnrContext::Initialize(
             }
             dstH = (std::max)(1, dstH);
             dstW = (std::max)(1, dstW);
+            // 420 输出契约:目标尺寸必须取偶。VS 按算术右移分配色度面
+            // (奇高 → floor 行数),拷贝侧按 ceil 行数写会越界一格 ——
+            // 静默堆腐蚀,落进未映射页时 c0000005(2026-09-22 真机实锤:
+            // 窗口客户区 2290x959 奇高,15 帧后崩)。偏差 ≤1px。
+            dstH &= ~1;
+            dstW &= ~1;
         }
         const double ratio = static_cast<double>(dstH) / static_cast<double>(height);
         _vsrRequested = _rtx.vsrMode > 0 && ratio > 1.001;
@@ -538,6 +544,12 @@ bool DlssnrContext::Initialize(
             _outW = width;
             _outH = height;
         }
+        // 同上:直通/HDR-only 路径的输出也强制偶尺寸(源本身奇尺寸时
+        // newVideoFrame 的色度面行数是 floor,拷贝侧必须与其一致)。
+        _outW &= ~1;
+        _outH &= ~1;
+        _pipeW &= ~1;
+        _pipeH &= ~1;
         _rtxActive = _vsrRequested || _hdrActive;
     }
 
@@ -956,6 +968,9 @@ bool DlssnrContext::Initialize(
         } else {
             std::snprintf(rtxState, sizeof(rtxState), "off");
         }
+        // 缓存进成员:每帧 stats 体(_rtx 键)复用 —— 每帧体覆盖 init 体后
+        // 若缺 rtx 键,面板诊断恒 "(未加载)"(2026-09-22 实锤)。
+        std::snprintf(_rtxStateStr, sizeof(_rtxStateStr), "%s", rtxState);
         char body[1024];
         std::snprintf(body, sizeof(body),
                       "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d,"
@@ -2560,7 +2575,7 @@ bool DlssnrContext::ProcessFrame(
             NvofContext *nvStats =
                 (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                     ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
-            char body[960];
+            char body[1016]; // 上限 = StatsPayload.json(1024-8);rtx 键入体后余量收紧
             // FG 状态:on = 本帧有真插值(附当前倍数);dup = 复制真实帧
             // (复位/零光流/面板关/降级);off = 本会话未激活;unavailable =
             // official 初始化或 eval 失败闩停(帧率仍 ×M,内容为复制帧)。
@@ -2583,6 +2598,7 @@ bool DlssnrContext::ProcessFrame(
                      "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d,"
                      "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
                      "\"%s\":%d,\"%s\":\"%s\","
+                     "\"%s\":\"%s\",\"%s\":\"%s\","
                      "\"%s\":%.2f,\"%s\":%.2f,"
                      "\"%s\":%u,\"%s\":%u,\"%s\":%u}",
                      SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
@@ -2601,6 +2617,8 @@ bool DlssnrContext::ProcessFrame(
                      SK_FG_DETAIL, _fgDetail,
                      SK_FG_MULT_MAX, fgMultMax,
                      SK_OF_DETAIL, _ofDetail,
+                     SK_RTX, _rtxStateStr,
+                     SK_RTX_DETAIL, _rtxDetail,
                      SK_SLOT_WAIT, slotWaitLast,
                      SK_LOCK_WAIT, lockWaitLast,
                      SK_GATE_SKIPS, nvStats ? nvStats->GateSkips() : 0u,

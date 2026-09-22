@@ -257,6 +257,10 @@ private:
     // 数据源,与 _fgDetail/_ofDetail 同语义)。请求开但实态 off = 降级,
     // 面板诊断页红显的原因串。
     char _rtxDetail[96] = "";
+    // RTX 会话实态串("vsr WxH" / "off" 等;init 时定格,_rtx 键的数据源)。
+    // 曾只在 init 体发布,每帧体覆盖后键丢失 → 面板诊断恒 "(未加载)"
+    // (2026-09-22 实锤)。每帧体必须带上,此串由 init 填好后逐帧复用。
+    char _rtxStateStr[96] = "";
     int _pipeW = 0;             // VSR 输出 / TrueHDR / FG backbuffer 尺寸
     int _pipeH = 0;
     int _outW = 0;              // YUV 输出平面尺寸(vsr 关 = 源)

@@ -494,8 +494,12 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
         _outW = width;
         _outH = height;
     }
-    _outChromaW = (_outW + 1) >> 1;
-    _outChromaH = (_outH + 1) >> 1;
+    // 色度面行数与 VS 帧分配规则一致(height >> subSampling = floor)。
+    // 曾用 ceil:奇高输出时 UnpackOutput 多拷一行越界 VS 帧分配尾部
+    // (静默堆腐蚀 → c0000005,2026-09-22 真机实锤)。几何入口已强制
+    // 偶尺寸,此处 floor 是最后一道防线(即使漏进奇尺寸也只欠拷不越界)。
+    _outChromaW = _outW >> 1;
+    _outChromaH = _outH >> 1;
     // HDR 输出 = 恒 P10(PQ BT.2020 limited);SDR 输出 = 源位深同格式。
     _outPlaneBytes = (_hdrPipe || _bitDepth > 8) ? 2u : 1u;
     _outFmt = _outPlaneBytes > 1 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
@@ -2056,6 +2060,14 @@ float3 SampleBilinear(float2 srcPos) {
 float2 ToSrcPos(float2 dstPos) {
     return (dstPos + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
 }
+// 色度域采样映射:入参为 out-luma 域坐标(chroma 侧 base = tid*2),映射
+// 分母必须是 out-luma 域 = 2*DstExtent(色度 dispatch 的 DstExtent=色度域;
+// 输出恒取偶故 2*DstExtent 精确)。误用 DstExtent = 2× 过采样 —— 色度
+// 右半平面 clamp 到源右缘,表现为大色块/失饱和(2026-09-22 真机实锤,
+// "只有一层分辨率放大了")。
+float2 ToSrcPosChroma(float2 lumaPos) {
+    return (lumaPos + 0.5) * float2(SourceExtent) / (2.0 * float2(DstExtent)) - 0.5;
+}
 
 [numthreads(8, 8, 1)]
 void ScaledToYuvLuma(uint3 tid : SV_DispatchThreadID) {
@@ -2070,10 +2082,10 @@ void ScaledToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
     // luma 域 2×2 覆盖区四点采样(各点双线性)平均 → 转换。
     const float2 base = tid.xy * 2;
-    const float3 rgb = saturate(0.25 * (SampleBilinear(ToSrcPos(base + float2(0.5, 0.5)))
-                                      + SampleBilinear(ToSrcPos(base + float2(1.5, 0.5)))
-                                      + SampleBilinear(ToSrcPos(base + float2(0.5, 1.5)))
-                                      + SampleBilinear(ToSrcPos(base + float2(1.5, 1.5)))));
+    const float3 rgb = saturate(0.25 * (SampleBilinear(ToSrcPosChroma(base + float2(0.5, 0.5)))
+                                      + SampleBilinear(ToSrcPosChroma(base + float2(1.5, 0.5)))
+                                      + SampleBilinear(ToSrcPosChroma(base + float2(0.5, 1.5)))
+                                      + SampleBilinear(ToSrcPosChroma(base + float2(1.5, 1.5)))));
     const float nY = LumaOf(rgb);
     const float cb = (rgb.z - nY) * (0.5 / (1.0 - Kb));
     const float cr = (rgb.x - nY) * (0.5 / (1.0 - Kr));
@@ -2138,6 +2150,11 @@ float4 SampleHdrBilinear(float2 srcPos) {
 float2 ToSrcPos(float2 dstPos) {
     return (dstPos + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
 }
+// 同 ScaledToYuvChroma 的 ToSrcPosChroma:色度侧入参为 out-luma 域坐标,
+// 分母 = 2*DstExtent(误用 DstExtent = 2× 过采样,色块/失饱和)。
+float2 ToSrcPosChroma(float2 lumaPos) {
+    return (lumaPos + 0.5) * float2(SourceExtent) / (2.0 * float2(DstExtent)) - 0.5;
+}
 // 线性 scRGB(709)→ PQ 编码的 2020 RGB 三元组。
 float3 ToPq2020(float3 lin709) {
     const float3 lin2020 = mul(max(lin709, 0.0), M709To2020) * 80.0; // nits
@@ -2156,10 +2173,10 @@ void PqToYuvLuma(uint3 tid : SV_DispatchThreadID) {
 void PqToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
     const float2 base = tid.xy * 2;
-    const float3 pq = 0.25 * (ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(0.5, 0.5))).rgb)
-                            + ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(1.5, 0.5))).rgb)
-                            + ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(0.5, 1.5))).rgb)
-                            + ToPq2020(SampleHdrBilinear(ToSrcPos(base + float2(1.5, 1.5))).rgb));
+    const float3 pq = 0.25 * (ToPq2020(SampleHdrBilinear(ToSrcPosChroma(base + float2(0.5, 0.5))).rgb)
+                            + ToPq2020(SampleHdrBilinear(ToSrcPosChroma(base + float2(1.5, 0.5))).rgb)
+                            + ToPq2020(SampleHdrBilinear(ToSrcPosChroma(base + float2(0.5, 1.5))).rgb)
+                            + ToPq2020(SampleHdrBilinear(ToSrcPosChroma(base + float2(1.5, 1.5))).rgb));
     const float y = dot(pq, float3(Kr, 1.0 - Kr - Kb, Kb));
     const float cb = (pq.b - y) * (0.5 / (1.0 - Kb));
     const float cr = (pq.r - y) * (0.5 / (1.0 - Kr));
