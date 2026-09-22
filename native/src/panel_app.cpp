@@ -1258,9 +1258,12 @@ void DrawUi() noexcept {
         const bool vsrOn = g_app.params.rtxVsrMode != 0;
         if (!vsrOn) ImGui::BeginDisabled(true);
         static const char *kVsrModeNames[] = { "自动 (窗口适配)", "手动 (倍率)" };
-        int sel = std::clamp(g_app.params.rtxVsrMode, kVsrModeMin, kVsrModeMax);
+        // 显示索引 = mode-1(mode 1=自动→item 0,2=手动→item 1;开态可达,
+        // 无 0 档)。曾用原始 mode 作索引:自动(1) 显示成 items[1]="手动",
+        // 点自动后下拉弹回"手动"(mode 实际已切对,纯显示错位,真机实锤)。
+        int sel = std::clamp(g_app.params.rtxVsrMode, 1, kVsrModeMax) - 1;
         if (ImGui::Combo("##vsr_mode", &sel, kVsrModeNames, 2)) {
-            g_app.params.rtxVsrMode = std::clamp(sel, 1, kVsrModeMax); // combo 只在开态可达,无 0 档
+            g_app.params.rtxVsrMode = std::clamp(sel + 1, 1, kVsrModeMax);
             g_app.liveDirty = true;
             g_app.reseekDirty = true;
         }
