@@ -181,6 +181,13 @@ void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
             DlssnrParams s = state->params->Snapshot();
             s.preset = state->params->SaveTimePreset();
             s.inputResolutionPercent = state->params->SaveTimeResolution();
+            // create-time 字段以 payload 为准:Snapshot 的 _cur 侧不含
+            // rtxVsrMode/Scale/HdrEnabled(LoadLiveParams 不带它们,只在
+            // create 时定格)—— 自动落盘把会话创建时的旧值写回 ini,面板
+            // 重启后读到的就是"点了自动还是手动"(2026-09-23 实锤)。payload
+            // 是面板当前态的单一事实,连同 NR 三元组的 pending 语义一起
+            // 叠加后才落盘。
+            LoadCreateParams(s, pl);
             // 探针:"保存设置"失败(文件被占/权限)此前完全静默,用户以为
             // 存上了,下次加载却又回到旧值。
             if (!WriteDlssnrIni(s, iniPath)) {
