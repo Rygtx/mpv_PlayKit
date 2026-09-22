@@ -80,9 +80,9 @@ struct RtxVideoParams {
     // 官方语义)2=手动目标高度(vsr_height,宽度按源宽高比推)。
     int vsrMode = 0;
     int vsrHeight = 2160;    // 手动目标高度(mode=2)
-    // mode=1 时由 plugin.cpp 按窗口所在显示器探测填入(链创建粒度;非
-    // 持久化字段,ini 不读写)。"跟随播放器"的语义落点:seek/换片重建链
-    // 时重探,窗口换屏/改尺寸后的生效点是下一次链重建。
+    // mode=1 时由 plugin.cpp 直读 mpv 窗口客户区(= osd-dimensions,进程
+    // 内 GetClientRect 零桥接,clamp 到所在显示器)填入;链创建粒度,非
+    // 持久化字段,ini 不读写。窗口换屏/改尺寸后的生效点 = 下一次链重建。
     int vsrAutoHeight = 2160;
     int vsrStrength = 2;     // VSR QualityLevel(0=bicubic 1-4=AI)
     // TrueHDR(0/1):输出域切换为 HDR10 —— 滤镜输出 YUV420P10(BT.2020

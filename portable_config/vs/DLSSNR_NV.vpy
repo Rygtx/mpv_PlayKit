@@ -99,8 +99,9 @@ H_Max = 0
 ##          30/20 系被拒载不回落)
 ##          进程级, 切换后重启 mpv 生效; 面板保存的设置优先
 ## <0-2> 整数, RTX Video 超分 (NVIDIA RTX Video SDK 1.1 的 NGX VSR, 默认 1):
-##          0 = 关; 1 = 自动 (按 mpv 窗口所在显示器原生高度适配, 源更高时
-##          自动旁路 —— VSR 只做放大); 2 = 手动目标高度 (VSR_Height)
+##          0 = 关; 1 = 自动 (插件直读 mpv 窗口客户区 = osd-dimensions,
+##          按实际显示矩形适配并 clamp 到所在显示器; 源更高时自动旁路
+##          —— VSR 只做放大); 2 = 手动目标高度 (VSR_Height)
 ##          挂降噪之后: 源尺寸降噪 → VSR 放大 → (可选 HDR) → 帧生成,
 ##          temporal 模型全部只吃真实源帧; 输出帧尺寸 = 目标尺寸
 ##          依赖 vs-plugins\ngx\nvngx_vsr.dll (fetch-deps.ps1 自动拉取);

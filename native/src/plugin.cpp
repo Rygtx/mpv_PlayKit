@@ -200,17 +200,18 @@ static void CopyPlanes(const VSFrame *src, VSFrame *dst, const VSAPI *vsapi,
 }
 
 // ---- RTX Video:目标尺寸的"跟随播放器"落点 ----
-// 探测本进程可见顶层窗口(即 mpv 的 vo 窗)所在显示器,取其原生高度。
-// 链创建粒度:mpv 在 seek/换片时重建整条 VS 链 → 重新探测;窗口换屏/
-// 改尺寸后的生效点是下一次链重建(与 VS constant-format 契约一致,无法
-// 做到每帧跟随 —— Magpie 式逐帧跟随在 mpv 架构下不存在落点)。
+// 探测本进程 mpv vo 窗口:**客户区尺寸 = mpv 的 osd-dimensions 等价**
+// (插件 DLL 活在 mpv 进程内,直读窗口零桥接),显示器原生分辨率仅作
+// 上限 clamp(窗口理论上不会大于所在屏)。链创建粒度:mpv 在 seek/换片
+// 时重建整条 VS 链 → 重新探测;窗口换屏/改尺寸后的生效点是下一次链重建
+// (VS constant-format 契约,每帧跟随在 mpv 架构下不存在落点)。
 // 探测失败(无窗口/枚举失败)回落主显示器。
 struct DisplayPick {
     int width = 0;
     int height = 0;
 };
 
-static DisplayPick DetectDisplaySize() noexcept {
+static DisplayPick DetectTargetSize() noexcept {
     struct Ctx {
         DWORD pid;
         HWND hwnd;
@@ -221,8 +222,8 @@ static DisplayPick DetectDisplaySize() noexcept {
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
         if (pid != c->pid || !IsWindowVisible(hwnd)) return TRUE;
-        // mpv vo 窗口 = 本进程可见、带标题栏/边框的主窗口;排除工具窗/
-        // 无边框隐藏辅助窗(面板另有进程)。
+        // mpv vo 窗口 = 本进程可见的主窗口;排除工具窗/无边框辅助窗
+        //(面板另有进程)。
         const LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
         if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
         RECT rc{};
@@ -239,11 +240,33 @@ static DisplayPick DetectDisplaySize() noexcept {
                        : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
-    if (mon && GetMonitorInfoW(mon, &mi)) {
-        return { mi.rcMonitor.right - mi.rcMonitor.left,
-                 mi.rcMonitor.bottom - mi.rcMonitor.top };
+    if (mon && !GetMonitorInfoW(mon, &mi)) mon = nullptr;
+    // 目标 = 窗口客户区(设备像素,mpv 进程 DPI aware 同源),clamp 到
+    // 显示器;无窗口时 = 显示器原生。
+    int w = 0, h = 0;
+    if (ctx.hwnd) {
+        RECT rc{};
+        if (GetClientRect(ctx.hwnd, &rc)) {
+            w = rc.right - rc.left;
+            h = rc.bottom - rc.top;
+        }
     }
-    return { 0, 0 };
+    if (w <= 0 || h <= 0) {
+        w = mi.rcMonitor.right - mi.rcMonitor.left;
+        h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        return { w, h };
+    }
+    if (mon) {
+        const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+        const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        if (w > mw || h > mh) {
+            const double s = (std::min)(static_cast<double>(mw) / w,
+                                        static_cast<double>(mh) / h);
+            w = (std::max)(1, static_cast<int>(w * s));
+            h = (std::max)(1, static_cast<int>(h * s));
+        }
+    }
+    return { w, h };
 }
 
 // RTX 参数裁决:vpy args(已应用在 rtx 上)← [rtxvideo] ini 覆盖 ←
@@ -267,7 +290,7 @@ static void ResolveRtxParams(RtxVideoParams &rtx) noexcept {
     }
     if (iniPath[0]) vsdlssnr::LoadRtxVideoIni(rtx, iniPath);
     if (rtx.vsrMode == 1) {
-        const DisplayPick disp = DetectDisplaySize();
+        const DisplayPick disp = DetectTargetSize();
         if (disp.height > 0) {
             rtx.vsrAutoHeight = disp.height;
         }
