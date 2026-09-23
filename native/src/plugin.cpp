@@ -285,6 +285,78 @@ static void ResolveRtxParams(DlssnrParams &p, int srcW, int srcH) noexcept {
     }
 }
 
+// ---- 窗口 resize 跟随(mode=1)----
+// 窗口尺寸变化不触发 mpv 的 video-reconfig(纯 VO 事件),链不重建、
+// 探测不重跑 —— VSR 目标停留在创建时尺寸,必须 seek 才跟随。轻量
+// watcher:每 400ms 复用 DetectTargetSize 探一次,高度连续两拍稳定偏离
+// 创建值(迟滞 max(8px, 2%))后经 mpv IPC 发一次 1ms seek 触发链重建;
+// 重建出的新实例带新探测值与新 watcher,本线程随即退出(存活事件关闭
+// = 滤镜释放,同样退出)。IPC 缺失则优雅降级为旧行为(需手动 seek)。
+namespace {
+
+struct ResizeWatchCtx {
+    int srcW, srcH, refH;
+};
+
+std::atomic<int> g_resizeWatchers{ 0 };
+
+bool ResizeWatchSendSeek() noexcept {
+    // mpv.conf 自定义管道名不追(自动跟随随 IPC 缺失优雅降级);三个
+    // 默认名覆盖 mpvpipe/mpvsocket/umpv 全部常规部署。
+    for (const wchar_t *name : { L"mpvpipe", L"mpvsocket", L"umpv" }) {
+        wchar_t path[MAX_PATH];
+        swprintf_s(path, L"\\\\.\\pipe\\%s", name);
+        HANDLE pipe = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                                  0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) continue;
+        const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
+        DWORD written = 0;
+        const bool ok = WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)),
+                                  &written, nullptr) && written == strlen(cmd);
+        char ack[128]{};
+        DWORD got = 0;
+        ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr);
+        CloseHandle(pipe);
+        if (ok) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: resize reload seek via IPC pipe %ls", name);
+            vsdlssnr::TimingStatusLine(msg);
+            return true;
+        }
+    }
+    return false;
+}
+
+DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
+    std::unique_ptr<ResizeWatchCtx> ctx(static_cast<ResizeWatchCtx *>(param));
+    HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, vsdlssnr::ALIVE_EVENT);
+    int drift = 0;
+    for (;;) {
+        const DWORD w = ev ? WaitForSingleObject(ev, 400) : WAIT_TIMEOUT;
+        if (w == WAIT_OBJECT_0) break; // 滤镜已释放(重建/热停泊/关停)
+        const DisplayPick d = DetectTargetSize(ctx->srcW, ctx->srcH);
+        if (d.height <= 0) { drift = 0; continue; } // 窗口暂不可见,不积累
+        const int thresh = (std::max)(8, ctx->refH / 50);
+        if (std::abs(d.height - ctx->refH) <= thresh) { drift = 0; continue; }
+        if (++drift < 2) continue; // 连续两拍稳定偏离才触发(拖动防抖)
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: window target %d -> %d, triggering reload",
+                      ctx->refH, d.height);
+        vsdlssnr::TimingStatusLine(msg);
+        if (!ResizeWatchSendSeek()) {
+            vsdlssnr::TimingStatusLine("DLSSNR STATUS: resize watch: mpv IPC unavailable, auto-follow off");
+        }
+        break; // 重建带来新探测值与新 watcher
+    }
+    if (ev) CloseHandle(ev);
+    g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
+    return 0;
+}
+
+} // namespace
+
 // ctx 载荷(创建时定格):DlssnrParams 合并值 → RtxVideoParams(几何/形态
 // + per-eval 初值;per-eval 项运行中改由 Snapshot 逐帧取)。
 static RtxVideoParams RtxFromParams(const DlssnrParams &p) noexcept {
@@ -1018,6 +1090,20 @@ static void VS_CC DlssnrCreate(
                       d->outW, d->outH, d->outFi.bitsPerSample, d->hdrOut ? 1 : 0,
                       d->rtxActive ? 1 : 0, d->width, d->height, d->depth);
         vsdlssnr::TimingStatusLine(msg);
+        // 窗口 resize 跟随(mode=1):见 ResizeWatchProc。refH = 本次创建
+        // 的探测值。
+        if (d->params->Snapshot().rtxVsrMode == 1 &&
+            g_resizeWatchers.load(std::memory_order_relaxed) < 2) {
+            g_resizeWatchers.fetch_add(1, std::memory_order_relaxed);
+            auto *wctx = new ResizeWatchCtx{ d->width, d->height, initial.rtxVsrAutoHeight };
+            HANDLE th = CreateThread(nullptr, 0, ResizeWatchProc, wctx, 0, nullptr);
+            if (th) {
+                CloseHandle(th);
+            } else {
+                delete wctx;
+                g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
     }
     VSVideoInfo viOut = *vi;
     viOut.width = d->outW;
