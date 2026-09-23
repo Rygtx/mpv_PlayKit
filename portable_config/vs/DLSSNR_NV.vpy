@@ -20,7 +20,7 @@ from vapoursynth import core
 # 用户选项 #
 ############
 
-NR_Enabled = True
+NR_Enabled = False
 Preset = 0
 Style = 0
 Intensity = 1.0
@@ -28,11 +28,11 @@ Local_Tone = 1.0
 Local_Structure = 1.0
 Skin_Structure = 0
 Use_Auto_Mask = True
-Scaling_Enabled = True
+Scaling_Enabled = False
 Input_Resolution = 100
 Residual_Multiplier = 1.0
 Motion_Vector_Quality = 0
-Ffx_Quality = 0
+Ffx_Quality = 2
 Nvof_Follow_Scaling = False
 Of_Backend = 0
 Fg_Enabled = False
@@ -47,7 +47,7 @@ HDR_Saturation = 100
 HDR_MiddleGray = 50
 HDR_PeakNits = 1000
 H_Max = 0
-## <True|False> 降噪总开关 (默认 True): False = 跳过降噪推理输出源帧,
+## <True|False> 降噪总开关 (默认 False): False = 跳过降噪推理输出源帧,
 ##          补帧/光流照常工作不受影响; 降噪与帧生成都关时整个滤镜
 ##          零初始化零开销 (重开需下个 seek); 已激活会话内面板切换
 ##          立即生效; 面板 "降噪增强" 开关同步此值, 面板保存的设置优先
@@ -58,7 +58,7 @@ H_Max = 0
 ## <0-2> 浮点, 局部结构强度 (默认 1.0)
 ## <0-2> 浮点, 皮肤结构强度 (默认 0; 上游 beta3 起 -1=auto 已移除)
 ## <True|False> 使用自动蒙版
-## <True|False> 内部分辨率缩放总开关 (默认 True)
+## <True|False> 内部分辨率缩放总开关 (默认 False)
 ##          False = 彻底关闭残差管线: 不建中间纹理/compute, 按源尺寸直接处理,
 ##          且 Input_Resolution 被忽略; 需要零缩放开销时用
 ## <25-100> 整数, NGX 内部推理分辨率占源尺寸的百分比 (默认 100);
@@ -72,7 +72,7 @@ H_Max = 0
 ##          NVOF (NVIDIA Turing+, 面板"光流后端"切换)
 ##          播放中可在面板实时切换 (只重建光流会话, 毫秒级)
 ##          帧生成开启时建议 >= 2 (Balanced): 光流是插值帧的运动来源
-## <0-2> 整数, FFX 光流档位 (默认 0): 0 = 无; 1 = 性能 (半分辨率),
+## <0-2> 整数, FFX 光流档位 (默认 2): 0 = 无; 1 = 性能 (半分辨率),
 ##          2 = 质量 (全分辨率); 面板"光流质量"按当前后端读写对应档位
 ## <True|False> 光流输入跟随内部降采样 (默认 False); 帧生成激活时被忽略
 ## <0-1> 整数, 光流后端 (默认 0): 0 = FFX (AMD FidelityFX, 跨厂商通用);

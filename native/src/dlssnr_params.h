@@ -106,14 +106,14 @@ struct RtxVideoParams {
 };
 
 struct DlssnrParams {
-    // NR 总开关(0/1,默认 1)—— 只关降噪,不影响补帧/光流:
+    // NR 总开关(0/1,默认 0)—— 只关降噪,不影响补帧/光流:
     //   create-time —— 与 fgEnabled 皆关时跳过 D3D12/NGX 全部初始化(零
     //     设备/零显存/零 GPU),滤镜纯直通;FG 开时初始化照常(补帧需要
     //     设备与 NVOF),仅降噪评估被跳过(模型驻留显存,即时重开)。
     //   live —— 会话已激活时面板切换立即生效:关 = 跳过 NGX 降噪评估,
     //     Input→Output 直拷,补帧以直通帧为 backbuffer 照常插值(输出
     //     计数与 _Duration 时长契约不变);开 = 立即恢复评估。
-    int nrEnabled = 1;
+    int nrEnabled = 0;
     // NGX "DLSSNR.Hint.Render.Preset" 0-3
     // 上游 v0.5.7 P8 引入、r2-fix1 取消暴露(fixed-0);移植端保留为扩展功能。
     int preset = 0;
@@ -134,7 +134,7 @@ struct DlssnrParams {
     // scalingEnabled == 0.
     int inputResolutionPercent = 100;
     // Master switch for internal-resolution scaling (0 = always process at 100%)
-    int scalingEnabled = 1;
+    int scalingEnabled = 0;
     // Magpie-side residual composite weight (1-2, per-frame via compute cbuffer)
     float residualMultiplier = 1.0f;
     // 残差精调(r1-r10):全部是相对语义 —— 对 "DLSSNR 相对原图造成的变化" 做倍率
@@ -150,7 +150,7 @@ struct DlssnrParams {
     // OF 会话(PoolHold 内,毫秒级),不动 NGX feature;会话建立失败优雅
     // 回退零 guidance。
     int motionVectorQuality = 0;  // NVOF 档位(0-5)
-    int ffxQuality = 0;           // FFX 档位(0=无,1=性能,2=质量)
+    int ffxQuality = 2;           // FFX 档位(0=无,1=性能,2=质量/全分辨率;默认质量档)
     // NVOF 输入跟随降采样(0/1,live 参数):开启且 scaling 启用时,NVOF
     // 会话按内部尺寸建立,输入由 GPU compute 从本帧 upload 双线性降采样
     // 直写注册纹理(nvof CL 第一次提交,替代整块拷贝)—— 引擎成本
