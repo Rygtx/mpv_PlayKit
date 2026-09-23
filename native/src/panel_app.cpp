@@ -1332,14 +1332,16 @@ void DrawUi() noexcept {
         if (!manual) ImGui::BeginDisabled(true);
         float sc = std::clamp(g_app.params.rtxVsrScale, kVsrScaleMin, kVsrScaleMax);
         ImGui::SetNextItemWidth(trackW);
-        if (ImGui::SliderFloat("##vsr_scale", &sc, kVsrScaleMin, kVsrScaleMax, "%.2fx")) {
+        if (ImGui::SliderFloat("##vsr_scale", &sc, kVsrScaleMin, kVsrScaleMax, "%.2fx"))
             g_app.params.rtxVsrScale = sc;
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
             // 松手才推送:拖动过程连续重载会连环重建链(与分辨率缩放 %滑杆
-            // 同款 debounce)。
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
-                g_app.liveDirty = true;
-                g_app.reseekDirty = true;
-            }
+            // 同款 debounce)。检查必须在 SliderFloat 的返回值分支外:松手帧
+            // SliderBehavior 先 ClearActiveID 再 return false,该帧返回值恒
+            // 为 false,而 IsItemDeactivatedAfterEdit 恰好只在松手帧为真 ——
+            // 嵌在里面是死代码,拖完松手 payload 从不落地、重载从不触发。
+            g_app.liveDirty = true;
+            g_app.reseekDirty = true;
         }
         if (!manual) ImGui::EndDisabled();
     }
@@ -1649,6 +1651,9 @@ void DrawUi() noexcept {
         const DlssnrParams beforeReset = g_app.params;
         g_app.params = DlssnrParams{};
         WritePayload();
+        g_app.liveDirty = true; // reseek 消费挂在 liveDirty 节流分支里,不置位
+                                // 上面 reseekDirty 永远无人消费(重置关 RTX
+                                // 也不重建链)。多写一次 payload 幂等无害。
         // RTX Video 开关(mode/HDR)是创建时参数:重置真关掉了它们才触发
         // 链重建(与开关控件同款 reseek 语义;本来就没开时不付一次 seek)。
         if (beforeReset.rtxVsrMode != 0 || beforeReset.rtxHdrEnabled != 0) {
