@@ -135,6 +135,7 @@ struct AppState {
     double fps = 0.0;
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
     float segFg = 0.0f;
+    float segRtxVsr = 0.0f, segRtxHdr = 0.0f; // SK_RTXVSR_LAST / SK_RTXHDR_LAST
     bool hasSegments = false;
     bool statsDirty = false; // LoadStats changed something on screen (redraw gate)
 };
@@ -675,7 +676,7 @@ void LoadStats() noexcept {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d(原生)", w, h);
             }
-            // 六段读每帧 last 值(与 NGX 延迟同语义):EMA 稳态冻结,
+            // 八段读每帧 last 值(与 NGX 延迟同语义):EMA 稳态冻结,
             // last 随帧呼吸(见 panel_ipc.h SK_*_LAST 注释)。
             g_app.segPack = static_cast<float>(JsonGetFloat(body, SK_PACK_LAST, 0));
             g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
@@ -683,6 +684,8 @@ void LoadStats() noexcept {
             g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_LAST, 0));
             g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_NVOF_LAST, 0));
             g_app.segFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
+            g_app.segRtxVsr = static_cast<float>(JsonGetFloat(body, SK_RTXVSR_LAST, 0));
+            g_app.segRtxHdr = static_cast<float>(JsonGetFloat(body, SK_RTXHDR_LAST, 0));
             g_app.hasSegments = g_app.segGpu > 0;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
             char gnPat[32];
@@ -703,7 +706,7 @@ void LoadStats() noexcept {
             g_app.statsBig[0] = 0;
             g_app.statsRes[0] = 0;
             g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = g_app.segNvof = 0.0f;
-            g_app.segFg = 0.0f;
+            g_app.segFg = g_app.segRtxVsr = g_app.segRtxHdr = 0.0f;
             g_app.hasSegments = false;
             g_app.fps = 0.0;
             g_app.fgRouteEff[0] = 0;
@@ -739,7 +742,8 @@ void LoadStats() noexcept {
                        before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
                        before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
                        before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack ||
-                       before.segNvof != g_app.segNvof || before.segFg != g_app.segFg;
+                       before.segNvof != g_app.segNvof || before.segFg != g_app.segFg ||
+                       before.segRtxVsr != g_app.segRtxVsr || before.segRtxHdr != g_app.segRtxHdr;
 }
 
 // ---------------------------------------------------------------------------
@@ -1585,7 +1589,7 @@ void DrawUi() noexcept {
                                        g_app.rtxDetail[0] ? " —— " : "", g_app.rtxDetail);
                 }
             }
-            // 处理分辨率(读 stats 缓存的六段之外字段:LoadStats 已存在
+            // 处理分辨率(读 stats 缓存的八段之外字段:LoadStats 已存在
             // internal_w/h 到 statsRes 展示串;此处直接从共享内存的解析结果
             // 复述 —— 分辨率信息主面板已有,诊断页仅回显会话事实)
             ImGui::TextDisabled("分辨率: %s", g_app.statsRes[0] ? g_app.statsRes : "(未加载)");
@@ -1682,21 +1686,26 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     const bool timingsOpen = ImGui::CollapsingHeader("处理用时", ImGuiTreeNodeFlags_DefaultOpen);
     if (timingsOpen && g_app.hasSegments) {
-        // 分段 = 帧内执行顺序:nvof(光流等待)在 pack 之后、NGX 录制之前。
-        // of=0 时 nvof 恒 0,零值段由下方 <1e-3f 跳过,时间线退回四段。
+        // 分段 = 帧内执行顺序:nvof(光流等待)在 pack 之后、NGX 录制之前;
+        // gpu(base CL)→ vsr/hdr(专用队列,fence 链顺序)→ fg(post CL)。
+        // 关闭段恒 0(of=0 的 nvof、NR 关的 eval_cpu、RTX 关的 vsr/hdr),
+        // 零值段由下方 <1e-3f 跳过,时间线自动收缩。
         const float total = g_app.segPack + g_app.segNvof + g_app.segEval +
-                            g_app.segFg + g_app.segGpu + g_app.segUnpack;
+                            g_app.segGpu + g_app.segRtxVsr + g_app.segRtxHdr +
+                            g_app.segFg + g_app.segUnpack;
         if (total > 0.5f) {
             struct Seg { float v; ImU32 c; const char *name; };
-            const Seg segs[6]{
+            const Seg segs[8]{
                 { g_app.segPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
                 { g_app.segNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
                 { g_app.segEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
-                { g_app.segFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" },
                 { g_app.segGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR+输出)" },
+                { g_app.segRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
+                { g_app.segRtxHdr, IM_COL32(255, 152, 0, 255),   "hdr(RTX HDR)" },
+                { g_app.segFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" },
                 { g_app.segUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
-            constexpr int kSegCount = 6;
+            constexpr int kSegCount = 8;
             // 实际要画的段数(零值段跳过)。BeginTable 的列数必须与之相等:
             // imgui 对本帧未 TableSetupColumn 的列按 SizingStretchSame 默认
             // 权重 1.0 补齐,而可见段权重和恒为 1.0 —— 空列恰好占掉一半

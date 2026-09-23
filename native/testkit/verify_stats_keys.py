@@ -40,7 +40,8 @@ st = panel_ipc.read_stats()
 print("stats:", st[2] if st else "MAPPING MISSING")
 
 # v19+ 新键:实际路由 / 创建倍数 / 排队细分;v21(DSSL3)新增:
-# fg_mult_max(运行库插值帧上限)、of_detail(光流失败原因)。
+# fg_mult_max(运行库插值帧上限)、of_detail(光流失败原因);RTX 分段键
+# rtxvsr_last/rtxhdr_last(VSR/TrueHDR 专用队列 eval 拆账,关闭时恒 0)。
 # 断言挂在 case 1 的存活 body 上 —— case 2/3 会因同进程第二个滤镜实例
 # 的 IAT hook 单例走 passthrough,边缘 body 不带 tick 键(环境特性,非回归)。
 # 真实部署机上 dlssnr_ui.ini(面板保存的设置优先于 VS 参数)可能开着
@@ -60,6 +61,7 @@ if st:
             and "fg_detail" in body and "of_detail" in body
             and "slot_wait" in body and "lock_wait" in body
             and "gate_skips" in body and "gate_expired" in body and "gate_resets" in body
+            and body.get("rtxvsr_last", -1) >= 0 and body.get("rtxhdr_last", -1) >= 0
         )
     except json.JSONDecodeError:
         new_keys_present = False

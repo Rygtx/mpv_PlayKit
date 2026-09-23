@@ -97,13 +97,18 @@ bool RtxQueue::Execute(ID3D12Fence *waitFence, uint64_t waitValue,
     return true;
 }
 
-bool RtxQueue::Wait(uint64_t value, char *err, size_t errLen) noexcept {
+bool RtxQueue::Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs) noexcept {
     if (_fence->GetCompletedValue() < value) {
         if (FAILED(_fence->SetEventOnCompletion(value, _event))) {
             if (err && errLen) std::snprintf(err, errLen, "rtx queue: SetEventOnCompletion failed");
             return false;
         }
-        WaitForSingleObject(_event, INFINITE);
+        if (WaitForSingleObject(_event, timeoutMs) != WAIT_OBJECT_0) {
+            // 超时 = 专用队列 wedge/设备丢失:不闩错(帧的最终判定归
+            // WaitFrame 的栅栏超时路径),仅向调用方报告未完成。
+            if (err && errLen) std::snprintf(err, errLen, "rtx queue: fence wait timed out (%lu ms)", timeoutMs);
+            return false;
+        }
     }
     return true;
 }

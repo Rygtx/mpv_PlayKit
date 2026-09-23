@@ -60,7 +60,12 @@ constexpr uint32_t PAYLOAD_SIZE = 1024;
 // hdrEnabled + HDR 四参。旧面板的 payload 无这些字段(结构体尾部缺段,
 // 读取按 magic 拒)—— 面板与插件必须成对部署。
 constexpr uint32_t PAYLOAD_MAGIC = 0x4D4C5344u; // "DSLM" (v22, 版本位走 hex:9 之后是 A/B/C/D/E/F)
-constexpr uint32_t STATS_MAGIC = 0x334C5344u;   // "DSSL3" (v21)
+// v23(stats DSSL4):stats JSON 新增 rtxvsr_last/rtxhdr_last(RTX Video
+// VSR/TrueHDR 专用队列 eval 分段拆账 —— 此前 RTX 时间无账目:CPU 录制混进
+// gpu 段窗口,GPU 执行经 post CL 的队列 Wait 全落 fg 段"补帧GPU"名下;
+// 同时 NR 关的直通帧 eval_cpu 归零)。键为纯增量,bump 理由同 v21:成对
+// 部署约束,两端都有明确信号。
+constexpr uint32_t STATS_MAGIC = 0x344C5344u;   // "DSSL4" (v23)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -217,16 +222,24 @@ static_assert(sizeof(StatsPayload) == PAYLOAD_SIZE, "stats payload must fit the 
 // format strings (dlssnr_context.cpp / d3d12_context.cpp) interpolate exactly
 // these; the panel reader is constant-driven.
 inline constexpr const char *SK_GPU_LAST = "gpu_last";
-// 六段用时走每帧 last(与 gpu_last 同语义):EMA 是 120 帧滚动平均,稳态
+// 八段用时走每帧 last(与 gpu_last 同语义):EMA 是 120 帧滚动平均,稳态
 // 播放时逐帧变化 <0.1ms,面板"处理用时"会冻结成"停几秒 + 突跳"的观感;
 // last 随帧呼吸。perf 日志行仍用 EMA(诊断要看趋势,不受影响)。
 inline constexpr const char *SK_PACK_LAST = "pack_last";
 inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
-// DLSS FG 段(插帧 GPU 耗时:FG 推理 + 插值 YUV/回读 —— 与 gpu 段按 base/fg
-// 两次提交的栅栏完成点差分,timestamp query 与 NGX 同 CL 会 SEH 无法直测;
-// fg 关/门关帧 ≈ 0,面板零值段自动隐藏)。gpu 段 = base CL(NR 推理/残差/
-// 直通 + 真实帧输出链)。
+// DLSS FG 段(post CL 耗时:FG 推理 + 插值 YUV/回读 + RTX 帧的管线色输出
+// 转换/回读 —— 与 gpu 段按 base/fg 两次提交的栅栏完成点差分,timestamp
+// query 与 NGX 同 CL 会 SEH 无法直测;起点 = 最后一个 RTX 完成栅栏,无 RTX
+// 帧 = base 完成点)。fg 关/门关帧 ≈ 0,面板零值段自动隐藏;RTX 开 + FG 关
+// 时剩输出转换/回读的零头(一次栅栏差分拆不出更细,量级 ~0.1ms)。
 inline constexpr const char *SK_FG_LAST = "fg_last";
+// RTX Video 分段(VSR/TrueHDR 专用队列 eval 的 GPU 墙钟):base 栅栏完成后
+// CPU 有界等待各自完成栅栏拆账(fence 链 base→vsr→hdr,hdr 起点 = vsr 完成
+// 点)。此前 RTX 时间无账目:CPU 录制混进 gpu 段窗口、GPU 执行经 post CL 的
+// 队列 Wait 全落 fg 段 —— "补帧关了 fg 段还在跳"的真身。vsr/hdr 关闭时恒
+// 0,面板零值段自动隐藏。
+inline constexpr const char *SK_RTXVSR_LAST = "rtxvsr_last";
+inline constexpr const char *SK_RTXHDR_LAST = "rtxhdr_last";
 // NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
 // 时恒 0,面板零值段自动隐藏)。与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
 inline constexpr const char *SK_NVOF_LAST = "nvof_last";
@@ -284,7 +297,7 @@ inline constexpr const char *SK_OF_DETAIL = "of_detail";
 // off = 降级(能力/部署问题),面板诊断页红显,原因在 rtx_detail。
 inline constexpr const char *SK_RTX = "rtx";
 inline constexpr const char *SK_RTX_DETAIL = "rtx_detail";
-// ---- 排队细分(诊断页专供;主面板只留六段用时,这里放"要翻 perf 行
+// ---- 排队细分(诊断页专供;主面板只留八段用时,这里放"要翻 perf 行
 // 才有"的次级数据)----
 // 槽池等待 last(3 槽全在飞时的排队;gpu 段正常而此值大 = GPU 超容量)
 inline constexpr const char *SK_SLOT_WAIT = "slot_wait";
