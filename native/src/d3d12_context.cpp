@@ -2099,7 +2099,9 @@ void ScaledToYuvChroma(uint3 tid : SV_DispatchThreadID) {
 // RTXVideoHdr 同解读)。链路:线性 709 →(线性域)2020 色域 → 各分量 PQ
 // (ST 2084,归一 10000 nits)→ 2020 YCbCr limited 10bit → P10 字(右对齐
 // 惯例:w = code/65535)。双线性在 LINEAR 光域 = 物理正确插值。cbuffer 同
-// 上(Kr/Kb 位置复用为 2020 的 0.2627/0.0593,Lo/Span 传 limited 常量)。
+// 上(Kr/Kb 位置复用为 2020 的 0.2627/0.0593,Lo/Span 传 limited 常量;
+// 2026-09-23 实锤:Lo/Span 曾按跨度 876/896 折 —— 整个 HDR 动态范围被
+// 压进 1.4 个 P10 码的"恒定纯色"。正确分母 = 容器 1023)。
 constexpr char FP16_TO_YUV_PQ_HLSL[] = R"(
 Texture2D<float4> HdrColor : register(t0);
 RWTexture2D<float> OutputA : register(u0);
@@ -2110,8 +2112,8 @@ cbuffer ConvertOutParams : register(b0) {
     uint2 SourceExtent;
     float Kr;             // BT.2020: 0.2627
     float Kb;             // BT.2020: 0.0593
-    float LoOverCM;       // luma: 64/876;chroma: 512/896
-    float SpanOverCM;     // 1/876 或 1/896
+    float LoOverCM;       // luma: 64/1023;chroma: 512/1023
+    float SpanOverCM;     // 876/1023 或 896/1023
     float Pad0;
     float Pad1;
     float Pad2;
@@ -2156,8 +2158,10 @@ float2 ToSrcPosChroma(float2 lumaPos) {
     return (lumaPos + 0.5) * float2(SourceExtent) / (2.0 * float2(DstExtent)) - 0.5;
 }
 // 线性 scRGB(709)→ PQ 编码的 2020 RGB 三元组。
+// mul(矩阵, 向量) = 行和语义(灰保持);曾写 mul(向量, 矩阵) = 列和
+// (0.713/1.337/0.950)→ 灰色扭曲成 R 压 G 涨 → 全画面青色罩。
 float3 ToPq2020(float3 lin709) {
-    const float3 lin2020 = mul(max(lin709, 0.0), M709To2020) * 80.0; // nits
+    const float3 lin2020 = mul(M709To2020, max(lin709, 0.0)) * 80.0; // nits
     return float3(PqEncode(lin2020.r), PqEncode(lin2020.g), PqEncode(lin2020.b));
 }
 
@@ -2166,7 +2170,9 @@ void PqToYuvLuma(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
     const float3 pq = ToPq2020(SampleHdrBilinear(ToSrcPos(float2(tid.xy))).rgb);
     const float y = dot(pq, float3(Kr, 1.0 - Kr - Kb, Kb));
-    OutputA[tid.xy] = saturate(y * SpanOverCM + LoOverCM);
+    // P10 存储约定(与 BGRA_TO_YUV 同款):R16_UNORM 字 = 10-bit 采样值,
+    // shader 侧 ×1023/65535 精确缩放 —— 缺它 = 字 = 码×64,mpv 读出越界垃圾。
+    OutputA[tid.xy] = saturate(y * SpanOverCM + LoOverCM) * (1023.0 / 65535.0);
 }
 
 [numthreads(8, 8, 1)]
@@ -2180,8 +2186,8 @@ void PqToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     const float y = dot(pq, float3(Kr, 1.0 - Kr - Kb, Kb));
     const float cb = (pq.b - y) * (0.5 / (1.0 - Kb));
     const float cr = (pq.r - y) * (0.5 / (1.0 - Kr));
-    OutputA[tid.xy] = saturate(cb * SpanOverCM + LoOverCM);
-    OutputB[tid.xy] = saturate(cr * SpanOverCM + LoOverCM);
+    OutputA[tid.xy] = saturate(cb * SpanOverCM + LoOverCM) * (1023.0 / 65535.0);
+    OutputB[tid.xy] = saturate(cr * SpanOverCM + LoOverCM) * (1023.0 / 65535.0);
 }
 )";
 
@@ -3589,7 +3595,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
             const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
             const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
             const float consts[8]{ kKr2020, kKb2020,
-                                   64.0f / 876.0f, 1.0f / 876.0f,
+                                   64.0f / 1023.0f, 876.0f / 1023.0f,
                                    0.0f, 0.0f, 0.0f, 0.0f };
             cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
             cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
@@ -3604,7 +3610,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
             const UINT extent[2]{ static_cast<UINT>(_outChromaW), static_cast<UINT>(_outChromaH) };
             const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
             const float consts[8]{ kKr2020, kKb2020,
-                                   512.0f / 896.0f, 1.0f / 896.0f,
+                                   512.0f / 1023.0f, 896.0f / 1023.0f,
                                    0.0f, 0.0f, 0.0f, 0.0f };
             cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
             cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);

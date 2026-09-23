@@ -2458,6 +2458,12 @@ bool DlssnrContext::ProcessFrame(
                                   DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
                     dumpOrLog(_d3d12->OutputColor(*slot), width, height, L"dump_output.bin", kColorDump);
+                    // TrueHDR 输出本体(FP16 scRGB,PIPE 尺寸):黑屏排查的
+                    // "没写 vs 写了零 vs 写了错值"判据(VSDLSSNR_DUMP=1)。
+                    if (slot->hdrColor) {
+                        dumpOrLog(slot->hdrColor.Get(), _pipeW, _pipeH,
+                                  L"dump_hdrcolor.bin", DXGI_FORMAT_R16G16B16A16_FLOAT);
+                    }
                     // FG 插值输出(仅 eval 过的帧有内容;首帧必为播种,等
                     // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。
                     if (fgRan) {

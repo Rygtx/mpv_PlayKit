@@ -337,14 +337,12 @@ void WritePayload(bool saveRequest = false) noexcept {
 // 回落常见默认名。全程 best-effort:连接失败(未启用 IPC / mpv 未运行 /
 // 已退出)静默放弃,变动退化为插件的会话内 live 机制(降档复制真实帧)。
 // ---------------------------------------------------------------------------
-bool TriggerMpvReseek() noexcept {
+// 面板→mpv IPC 单条命令:候选管道(mpv.conf 解析值优先,默认名/umpv 兜底)
+// 逐个尝试,写命令 + 读回执。cmd 须自带行尾 \n。命中管道名经 hitOut 带回。
+bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
     wchar_t base[MAX_PATH];
     if (!BasePath(base, MAX_PATH)) return false;
 
-    // 管道名候选:mpv.conf 解析值优先(用户自定义名也能跟上),其后默认名
-    // 与 umpv 默认值(umpv 拉起的 mpv 以 --input-ipc-server=<umpv.conf 值>
-    // 覆盖 mpv.conf,面板解析 mpv.conf 会扑空 —— 候选兜底,两个默认值
-    // 错开的场景仍能连上)。
     wchar_t *parsedName = nullptr; // _wcsdup;末尾 free(nullptr) 恒安全
     const wchar_t *candidates[4] = { nullptr, L"mpvpipe", L"mpvsocket", L"umpv" };
     {
@@ -368,8 +366,6 @@ bool TriggerMpvReseek() noexcept {
                         ++eq;
                         while (eq < eol && (buf[eq] == ' ' || buf[eq] == '\t')) ++eq;
                         size_t e = eol;
-                        // 行内注释剥离:`input-ipc-server = mpvpipe # ...`
-                        // 曾经把 "# ..." 并进管道名,首选候选必然失连。
                         for (size_t h = eq; h < e; ++h) {
                             if (buf[h] == '#') { e = h; break; }
                         }
@@ -382,11 +378,11 @@ bool TriggerMpvReseek() noexcept {
                                 parsed, 63);
                             if (cw > 0) {
                                 parsed[cw] = L'\0';
-                                parsedName = _wcsdup(parsed); // 首选 = 配置值
+                                parsedName = _wcsdup(parsed);
                                 candidates[0] = parsedName;
                             }
                         }
-                        break; // 注释行(前导 #)不进此分支:首字符已是 '#'
+                        break;
                     }
                 }
                 pos = eol + 1;
@@ -402,27 +398,67 @@ bool TriggerMpvReseek() noexcept {
         HANDLE pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
                                   0, nullptr, OPEN_EXISTING, 0, nullptr);
         if (pipe == INVALID_HANDLE_VALUE) continue;
-        // 原地微 seek(1ms 向前,exact)触发 vf_vapoursynth 整脚本重建,
-        // 新实例在 create 时采纳刚发布的 payload create-time 三元组
-        // (vsrMode/scale/hdr)。实测播放/暂停两态均稳定重建(2026-09-23
-        // 4/4);曾误判"seek 不重建"(23:02 风暴零新实例)—— 对照测试
-        // 推翻,该次异常归因于管道归属的环境性歧义,机制本身有效。
-        const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
         DWORD written = 0, got = 0;
         ok = WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)), &written, nullptr) &&
              written == strlen(cmd);
         char ack[128]{};
         ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr);
         CloseHandle(pipe);
-        if (ok) {
-            PanelLog("panel: mpv reseek via IPC pipe %ls", candidates[i]);
+        if (ok && hitOut && hitLen) {
+            swprintf_s(hitOut, hitLen, L"%ls", candidates[i]);
         }
-    }
-    if (!ok) {
-        PanelLog("panel: mpv IPC reseek unavailable (input-ipc-server off? mpv closed?); falling back to in-session live");
     }
     free(parsedName);
     return ok;
+}
+
+bool TriggerMpvReseek() noexcept {
+    // 原地微 seek(1ms 向前,exact)触发 vf_vapoursynth 整脚本重建,
+    // 新实例在 create 时采纳刚发布的 payload create-time 三元组
+    // (vsrMode/scale/hdr)。实测播放/暂停两态均稳定重建(2026-09-23
+    // 4/4);曾误判"seek 不重建"(23:02 风暴零新实例)—— 对照测试
+    // 推翻,该次异常归因于管道归属的环境性歧义,机制本身有效。
+    wchar_t hit[64];
+    if (MpvIpcSendCmd("{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n",
+                      hit, 64)) {
+        PanelLog("panel: mpv reseek via IPC pipe %ls", hit);
+        return true;
+    }
+    PanelLog("panel: mpv IPC reseek unavailable (input-ipc-server off? mpv closed?); falling back to in-session live");
+    return false;
+}
+
+// ---- HDR 输出打标同步 ----------------------------------------------------
+// vf_vapoursynth 不透传 VS 帧 props(mpv 源码实锤:vs_frame_done 只认
+// _DurationNum/_Den),插件 HDR 输出(YUV420P10 BT.2020 PQ)到 mpv 手里
+// 仍无标签 → 按 bt.709/bt.1886 解读 = 白/品红二色画面。面板按 SK_RTX 实态
+// 边缘触发 vf 标签滤镜增删(幂等;状态来自插件本体,不猜任何输出格式):
+//   hdr 实态(rtxState 含 hdr)→ 追加 @dlssnr-hdr-tag( lavfi setparams
+//   打 BT.2020 PQ 元数据);SDR 实态 → 移除该标签(8bit 输出不得标成 PQ)。
+// 失败不闩锁:下个 tick 静默重试(典型竞态 = mpv 刚起、IPC 未就绪)。
+void SyncHdrVfTag() noexcept {
+    static int lastTagState = -1; // -1 未同步 / 0 SDR / 1 HDR
+    const bool hdrActive = strstr(g_app.rtxState, "hdr") != nullptr;
+    const int want = hdrActive ? 1 : 0;
+    if (lastTagState == want) return;
+    char cmd[256];
+    if (want) {
+        snprintf(cmd, sizeof(cmd),
+                 "{\"command\":[\"vf\",\"add\","
+                 "\"@dlssnr-hdr-tag:lavfi=[setparams=colorspace=bt2020nc:"
+                 "color_primaries=bt2020:color_trc=smpte2084]\"]}\n");
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "{\"command\":[\"vf\",\"remove\",\"@dlssnr-hdr-tag\"]}\n");
+    }
+    wchar_t hit[64];
+    PanelLog("panel: hdr tag want=%d sending (rtxState=%s)", want, g_app.rtxState);
+    if (MpvIpcSendCmd(cmd, hit, 64)) {
+        lastTagState = want;
+        PanelLog("panel: hdr vf tag %ls via %ls", want ? L"added" : L"removed", hit);
+    } else {
+        PanelLog("panel: hdr tag send FAILED (mpv pipe unreachable?)");
+    }
 }
 
 bool WriteIniNow() noexcept {
@@ -592,6 +628,7 @@ void LoadStats() noexcept {
         g_app.rtxState[0] = 0;
     if (!JsonGetString(body, SK_RTX_DETAIL, g_app.rtxDetail, sizeof(g_app.rtxDetail)))
         g_app.rtxDetail[0] = 0;
+    SyncHdrVfTag(); // HDR 实态边缘 → mpv vf 链打/摘 PQ 元数据(见函数注释)
     g_app.slotWait = static_cast<float>(JsonGetFloat(body, SK_SLOT_WAIT, 0));
     g_app.lockWait = static_cast<float>(JsonGetFloat(body, SK_LOCK_WAIT, 0));
     g_app.gateSkips = JsonGetInt(body, SK_GATE_SKIPS, 0);

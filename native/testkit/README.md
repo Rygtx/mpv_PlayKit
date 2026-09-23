@@ -26,6 +26,12 @@
    python <仓库>\native\testkit\test_smoke.py
    ```
 
+3. **环境变量 `VSDLSSNR_TEST_MEDIA`** —— 真片源类脚本(时域稳定性、
+   mpv 端到端)的媒体路径;未设时相关脚本打印 SKIP。
+
+4. **环境变量 `VSDLSSNR_MPV_PIPE`** —— mpv IPC 管道名覆盖(默认
+   `mpvpipe`,须与 mpv.conf `input-ipc-server` 一致)。
+
 ### 环境前提检查
 
 脚本开头调用 `testenv.require_env()` / `require_nvidia()`:部署根解析
@@ -82,6 +88,17 @@
 dump 文件写在**宿主 exe 旁**(插件 `GetModuleFileNameW(nullptr)` 逻辑),
 `check_yuv_convert.py` 的 dump 目录参数缺省即该位置。
 
+### RTX Video / TrueHDR 链路
+
+| 脚本 | 验证点 |
+|---|---|
+| `test_rtx_hdr_diag.py` | TrueHDR 黑盒场景矩阵(hdr/vsrhdr/vsr + 第二参 min=nr/fg 全关):Enhance 读回帧 luma/chroma 统计 + timing 尾部 |
+| `verify_pq_roundtrip.py` | PQ 链路数值闭环:VSDLSSNR_DUMP hdrColor + numpy 前向复算(scRGB→2020→PQ→limited P10)vs 实测平面,max\|Δcode\|≤1 = PASS |
+| `verify_chroma_forward.py` | U/V 平面前向对照(shader 数学 vs 实测;PQ 常量/矩阵顺序回归;VSDLSSNR_DUMP_SKIP 对齐帧号) |
+| `verify_temporal_drift.py` | 真片源连续 600 帧采样,Y 码 rails(二值化)= 时域退化(需 `VSDLSSNR_TEST_MEDIA`) |
+| `test_hdrfix_vf.py` | 面板驱动 HDR 打标端到端:SK_RTX 含 hdr → 面板 IPC `vf add @dlssnr-hdr-tag` → mpv 按 PQ 解读 → 截图(需 `VSDLSSNR_TEST_MEDIA`;IPC 管道生命周期有竞态,失败先重跑) |
+| `hdr_tag_manual.py` | 手动打/摘 PQ 标签工具(面板自动同步的备用手段;独立 python 可跑,`VSDLSSNR_MPV_PIPE` 覆盖管道名) |
+
 ### 面板 UI 工具(PowerShell,交互排查非断言)
 
 `panel_ui_tools.ps1` —— 面板是 ImGui 自绘 UI 无控件树,只能 Win32 枚举:
@@ -99,6 +116,7 @@ powershell -File panel_ui_tools.ps1 -Action size|poll|dpi|hittest|windows
 |---|---|
 | `VSDLSSNR_TIMING=1` | 每帧 timing 行(mpv 侧须开;python 侧 add_log_handler 已见) |
 | `VSDLSSNR_DUMP=1` | 首帧管线中间纹理落盘(宿主 exe 旁,dump_*.bin) |
+| `VSDLSSNR_DUMP_SKIP=N` | dump 跳过 N 帧(与对比帧号对齐,时域管线逐位对照用) |
 | `VSDLSSNR_PROBE=1` | init 细分探针行(DEVICE_HUNG 时序定位) |
 | `VSDLSSNR_NO_PANEL=1` | 禁面板自动拉起(数值验收/无头场景) |
 | `VSDLSSNR_SKIP_EVAL=1` | 跳过 NGX eval(纯转换往返验收) |
@@ -115,3 +133,6 @@ powershell -File panel_ui_tools.ps1 -Action size|poll|dpi|hittest|windows
    否则孤儿进程锁 DLL。
 4. **timing log 跨进程可读是设计契约**:DENYNO 共享,测试应积极利用
    日志水位(`log_size`/`new_lines`)做断言,而不是 sleep 猜。
+5. **测试源别用 `std.Expr` 坐标语义**(TrueHDR 排查踩坑:表达式产出
+   全 40):确定性两值图案用 `std.BlankClip`(左右半不同 Y)+
+   `std.StackHorizontal` 拼,逐位可预期。
