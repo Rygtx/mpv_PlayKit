@@ -80,6 +80,15 @@ struct FrameSlot {
     ComPtr<ID3D12GraphicsCommandList> fgCommandList;
     HANDLE baseFenceEvent = nullptr;  // base 段栅栏等待专用事件(fg 等待用 fenceEvent)
     uint64_t baseFenceValue = 0;      // base 段提交的栅栏值(恒 ≤ fenceValue)
+    // postB 转换段(TrueHDR 后置重构,2026-09-24):HDR 会话的输出转换
+    // (PQ/SDR → YUV)依赖 TrueHDR 专用队列逐帧产出,与 postA(FG 推理)
+    // 之间隔着跨队列 TrueHDR 链 —— 独立第三 CL + 栅栏。非 HDR 会话不录制
+    // 不提交,资源闲置无害。
+    ComPtr<ID3D12CommandAllocator> postAllocator;
+    ComPtr<ID3D12GraphicsCommandList> postCommandList;
+    HANDLE postFenceEvent = nullptr;  // postB 段栅栏等待专用事件
+    uint64_t postFenceValue = 0;      // postB 段提交的栅栏值
+    uint64_t fgFenceValue = 0;        // postA(fg CL)提交的栅栏值(计时锚)
 
     // YUV 原生管道:VS 帧(YUV420P8/P10 三平面)与 GPU 之间纯行拷贝。
     // [0]=Y 全分辨率,[1]=U [2]=V 半分辨率;pitch 256 对齐,persist-mapped。
@@ -111,13 +120,18 @@ struct FrameSlot {
     ComPtr<ID3D12Resource> confidence;    // W×H R8_UNORM,UAV
     ComPtr<ID3D12Resource> reducedMotion;     // internalW×internalH R16G16_FLOAT
     ComPtr<ID3D12Resource> reducedConfidence; // internalW×internalH R8_UNORM
-    // DLSS FG(仅 _fgSlots 建立时分配):FG 插值输出(UAV —— DLSSG
-    // 契约:输出为 UAV;NSR 化后走 RGB→YUV 第二遍转换)。格式随管线:
-    // SDR = BGRA8,HDR = R16G16B16A16_FLOAT(FP16 scRGB,插帧在线性光域)。
-    ComPtr<ID3D12Resource> fgInterp;
+    // DLSS FG(仅 _fgSlots 建立时分配):FG 插值输出,**按插值槽一组**
+    // (TrueHDR 后置:postA 全部 gen 写完才有 TrueHDR 链消费 —— 单纹理会被
+    // 下一 gen 覆写)。恒 BGRA8(DLSSG 恒在 SDR 域插值;HDR 会话由逐帧
+    // TrueHDR 提升为 FP16 scRGB —— DLSSG 的 ColorBuffersHDR 路径实测压高光,
+    // 2026-09-23 实验定案)。UAV(DLSSG 契约);NSR 化后供转换/HDR 输入。
+    ComPtr<ID3D12Resource> fgInterp[kFgGenSlots];
+    // TrueHDR 逐插值帧输出(仅 _fgSlots && _hdrPipe):FP16 scRGB @PIPE,
+    // postB 经 SRV(44-48)做 PQ 转换。NGX 写后衰减 COMMON。
+    ComPtr<ID3D12Resource> hdrFg[kFgGenSlots];
     // RTX Video 管线纹理(PIPE 尺寸;VSR/HDR 请求时创建,无则占位视图):
     //   vsrColor — VSR 输出(BGRA8,UAV)
-    //   hdrColor — TrueHDR 输出(FP16 scRGB,UAV;FG backbuffer)
+    //   hdrColor — TrueHDR 真实帧输出(FP16 scRGB,UAV;PQ 转换源)
     //   motionDense — 源尺寸运动场的 PIPE 尺寸双线性放大(FG MVecs 契约 =
     //                 backbuffer 同尺寸;PIPE==src 时无纹理直接用 motion)
     ComPtr<ID3D12Resource> vsrColor;      // PIPEW×PIPEH BGRA8,UAV
@@ -144,12 +158,15 @@ struct FrameSlot {
     // 25=srvYuvIn0 26=srvYuvIn1 27=srvYuvIn2(YUV→RGB 转换采样)
     // 28=uavYuvOut0 29=uavYuvOut1 30=uavYuvOut2(RGB→YUV 写出)
     // 31=uavInput(inputColor 的 UAV,YUV→RGB 转换直写)
-    // 32=srvFgInterp 33=uavFgInterp(FG 插值输出;非 FG 槽 = outputColor
-    // 占位视图 —— 绝不写 NULL 描述符,见 14-17 注释)
+    // 32/33=fgInterp[0] 的 SRV/UAV 占位(历史槽位;逐 gen 视图在 39-43。
+    // 非 FG 槽 = outputColor 占位视图 —— 绝不写 NULL 描述符,见 14-17 注释)
+    // 39-43=srvFgInterp[0..4](FG 插值输出逐 gen SRV,转换读/HDR 输入读)
     // 34=uavDebugDiff(共享差异调试纹理的 UAV,"差异调试 ×20" 视图写入目标;
     // 资源为 context 级单例,每槽堆各持一份视图)
     // 35=srvZeroMotion(静态零运动纹理的 SRV,光流场视图无真运动帧绑定;
     // 资源为 context 级单例 _motion,常驻 NSR)
+    // 44-48=srvHdrFg[0..4](TrueHDR 逐插值帧输出 FP16 SRV,PQ 转换读;
+    // 非 HDR 槽 = hdrColor/outputColor 占位)
     // 49=uavFfxInput(FFX 会话输入,R8G8B8A8 OF extent;BindOfResources 填充)
     // 50=srvFfxSparse(FFX 稀疏流 R16G16_SINT,densify 读)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
@@ -363,11 +380,22 @@ public:
                          char *err, size_t errLen) noexcept;
     // post/fg 段提交:waitFence/waitValue = RTX 专用队列的完成栅栏(可选;
     // 排在本次 Execute 之前 —— post CL 消费 VSR/TrueHDR 的输出,跨队列
-    // 生产者-消费者顺序由此保证)。
+    // 生产者-消费者顺序由此保证)。提交后 slot->fgFenceValue = 本次栅栏值
+    // (计时锚;WaitFrame 目标由后续 postB 或本值决定)。
     bool SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
                        char *err, size_t errLen) noexcept;
+    // postB 转换段(TrueHDR 后置)录制起点与提交:与 fg CL 同型。仅 HDR
+    // 会话录制(输出转换依赖 TrueHDR 逐帧产出)。
+    bool BeginPostRecording(FrameSlot &slot) noexcept;
+    bool SubmitPostFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+                         char *err, size_t errLen) noexcept;
     bool WaitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
+    // 任意栅栏值的有界 CPU 等待(分段计时锚用;调用方保证 event 不与
+    // WaitBase/WaitFrame 的并发使用交错 —— 帧路径内全部串行)。
+    bool WaitFenceValuePublic(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept {
+        return WaitFenceValue(value, event, err, errLen);
+    }
     // GPU 完成后调用:回读缓冲 → VS 三平面(纯 CPU 行拷贝,色度半尺寸)。
     // fgGen >= 0 = 读 FG 插值帧第 fgGen 组缓冲。
     bool UnpackOutput(FrameSlot &slot, uint8_t **dstPlanes, int64_t *dstStrides,
@@ -411,14 +439,17 @@ public:
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
-    ID3D12Resource *FgInterp(FrameSlot &s) const noexcept { return s.fgInterp.Get(); }
+    ID3D12Resource *FgInterp(FrameSlot &s, int gen) const noexcept { return s.fgInterp[gen].Get(); }
+    // TrueHDR 逐插值帧输出(仅 _fgSlots && _hdrPipe 有纹理)。
+    ID3D12Resource *HdrFg(FrameSlot &s, int gen) const noexcept { return s.hdrFg[gen].Get(); }
     // 描述符堆槽位(RecordYuvOutput / FG 转换共用)。
-    static constexpr UINT kSrvOutputColor = 22; // outputColor 的 SRV
-    static constexpr UINT kSrvFgInterp = 32;    // fgInterp 的 SRV(FG 槽)
-    static constexpr UINT kUavDebugDiff = 34;   // 共享差异调试纹理的 UAV
-    static constexpr UINT kSrvVsrColor = 36;    // vsrColor 的 SRV(RTX 输出转换读)
-    static constexpr UINT kSrvHdrColor = 37;    // hdrColor 的 SRV(FP16 scRGB → PQ)
-    static constexpr UINT kUavMotionDense = 38; // motionDense 的 UAV(mvec 放大写)
+    static constexpr UINT kSrvOutputColor = 22;  // outputColor 的 SRV
+    static constexpr UINT kSrvFgInterpBase = 39; // fgInterp[0..4] 的 SRV(FG 槽)
+    static constexpr UINT kUavDebugDiff = 34;    // 共享差异调试纹理的 UAV
+    static constexpr UINT kSrvVsrColor = 36;     // vsrColor 的 SRV(RTX 输出转换读)
+    static constexpr UINT kSrvHdrColor = 37;     // hdrColor 的 SRV(FP16 scRGB → PQ)
+    static constexpr UINT kUavMotionDense = 38;  // motionDense 的 UAV(mvec 放大写)
+    static constexpr UINT kSrvHdrFgBase = 44;    // hdrFg[0..4] 的 SRV(PQ 转换读)
     // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
@@ -517,7 +548,7 @@ private:
     int _outChromaW = 0;
     int _outChromaH = 0;
     bool _vsrSlots = false;         // 槽池含 vsrColor / motionDense
-    bool _hdrPipe = false;          // TrueHDR 激活(fgInterp FP16 / P10 输出)
+    bool _hdrPipe = false;          // TrueHDR 激活(hdrColor/hdrFg FP16 / P10 输出)
     DXGI_FORMAT _outFmt = DXGI_FORMAT_R8_UNORM;      // yuvOut/readback 平面格式
     UINT _outPlaneBytes = 1;
 

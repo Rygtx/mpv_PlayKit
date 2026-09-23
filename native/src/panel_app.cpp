@@ -136,6 +136,11 @@ struct AppState {
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
     float segFg = 0.0f;
     float segRtxVsr = 0.0f, segRtxHdr = 0.0f; // SK_RTXVSR_LAST / SK_RTXHDR_LAST
+    // 分段显示值(EMA 平滑,用户裁定"显示平滑、真实数据不平滑"):上面
+    // 八段恒为插件上报的裸 last 值;时间线/列表/tooltip 用这里的平滑值,
+    // 避免 CPU 唤醒竞争造成的瞬时 0 让段忽隐忽现。
+    float segDispPack = 0.0f, segDispEval = 0.0f, segDispGpu = 0.0f, segDispUnpack = 0.0f,
+          segDispNvof = 0.0f, segDispFg = 0.0f, segDispRtxVsr = 0.0f, segDispRtxHdr = 0.0f;
     bool hasSegments = false;
     bool statsDirty = false; // LoadStats changed something on screen (redraw gate)
 };
@@ -678,6 +683,15 @@ void LoadStats() noexcept {
             }
             // 八段读每帧 last 值(与 NGX 延迟同语义):EMA 稳态冻结,
             // last 随帧呼吸(见 panel_ipc.h SK_*_LAST 注释)。
+            // **裸 last 恒存 segX(真实数据不平滑);EMA 只推进显示值
+            // segDispX(用户裁定)**:分段计时锚存在 CPU 唤醒竞争 —— 极快的
+            // 段(vsr ~0.5ms)会因 CPU 迟到测得瞬时 0,时间线忽隐忽现。
+            // α=0.35 ≈ 3-4 个更新周期收敛;持续为零的段(关开关)数秒内
+            // 衰减回隐藏阈值之下,过渡平滑。
+            constexpr float kSegAlpha = 0.35f;
+            auto segSmooth = [kSegAlpha](float prev, float v) {
+                return prev + (v - prev) * kSegAlpha;
+            };
             g_app.segPack = static_cast<float>(JsonGetFloat(body, SK_PACK_LAST, 0));
             g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
             g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_LAST, 0));
@@ -686,6 +700,14 @@ void LoadStats() noexcept {
             g_app.segFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
             g_app.segRtxVsr = static_cast<float>(JsonGetFloat(body, SK_RTXVSR_LAST, 0));
             g_app.segRtxHdr = static_cast<float>(JsonGetFloat(body, SK_RTXHDR_LAST, 0));
+            g_app.segDispPack = segSmooth(g_app.segDispPack, g_app.segPack);
+            g_app.segDispEval = segSmooth(g_app.segDispEval, g_app.segEval);
+            g_app.segDispGpu = segSmooth(g_app.segDispGpu, g_app.segGpu);
+            g_app.segDispUnpack = segSmooth(g_app.segDispUnpack, g_app.segUnpack);
+            g_app.segDispNvof = segSmooth(g_app.segDispNvof, g_app.segNvof);
+            g_app.segDispFg = segSmooth(g_app.segDispFg, g_app.segFg);
+            g_app.segDispRtxVsr = segSmooth(g_app.segDispRtxVsr, g_app.segRtxVsr);
+            g_app.segDispRtxHdr = segSmooth(g_app.segDispRtxHdr, g_app.segRtxHdr);
             g_app.hasSegments = g_app.segGpu > 0;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
             char gnPat[32];
@@ -707,6 +729,8 @@ void LoadStats() noexcept {
             g_app.statsRes[0] = 0;
             g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = g_app.segNvof = 0.0f;
             g_app.segFg = g_app.segRtxVsr = g_app.segRtxHdr = 0.0f;
+            g_app.segDispPack = g_app.segDispEval = g_app.segDispGpu = g_app.segDispUnpack =
+            g_app.segDispNvof = g_app.segDispFg = g_app.segDispRtxVsr = g_app.segDispRtxHdr = 0.0f;
             g_app.hasSegments = false;
             g_app.fps = 0.0;
             g_app.fgRouteEff[0] = 0;
@@ -1687,23 +1711,25 @@ void DrawUi() noexcept {
     const bool timingsOpen = ImGui::CollapsingHeader("处理用时", ImGuiTreeNodeFlags_DefaultOpen);
     if (timingsOpen && g_app.hasSegments) {
         // 分段 = 帧内执行顺序:nvof(光流等待)在 pack 之后、NGX 录制之前;
-        // gpu(base CL)→ vsr/hdr(专用队列,fence 链顺序)→ fg(post CL)。
+        // gpu(base CL)→ vsr(专用队列)→ fg(postA:DLSSG 推理)→
+        // hdr(TrueHDR 链 + postB 转换,TrueHDR 后置在插帧之后)。
+        // 显示值 = segDisp*(EMA 平滑);真实裸值在 seg*(诊断可用)。
         // 关闭段恒 0(of=0 的 nvof、NR 关的 eval_cpu、RTX 关的 vsr/hdr),
         // 零值段由下方 <1e-3f 跳过,时间线自动收缩。
-        const float total = g_app.segPack + g_app.segNvof + g_app.segEval +
-                            g_app.segGpu + g_app.segRtxVsr + g_app.segRtxHdr +
-                            g_app.segFg + g_app.segUnpack;
+        const float total = g_app.segDispPack + g_app.segDispNvof + g_app.segDispEval +
+                            g_app.segDispGpu + g_app.segDispRtxVsr + g_app.segDispFg +
+                            g_app.segDispRtxHdr + g_app.segDispUnpack;
         if (total > 0.5f) {
             struct Seg { float v; ImU32 c; const char *name; };
             const Seg segs[8]{
-                { g_app.segPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
-                { g_app.segNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
-                { g_app.segEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
-                { g_app.segGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR+输出)" },
-                { g_app.segRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
-                { g_app.segRtxHdr, IM_COL32(255, 152, 0, 255),   "hdr(RTX HDR)" },
-                { g_app.segFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" },
-                { g_app.segUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
+                { g_app.segDispPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
+                { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
+                { g_app.segDispEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
+                { g_app.segDispGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR+输出)" },
+                { g_app.segDispRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
+                { g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" },
+                { g_app.segDispRtxHdr, IM_COL32(255, 152, 0, 255),   "hdr(RTX HDR)" },
+                { g_app.segDispUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
             constexpr int kSegCount = 8;
             // 实际要画的段数(零值段跳过)。BeginTable 的列数必须与之相等:

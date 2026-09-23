@@ -227,17 +227,15 @@ inline constexpr const char *SK_GPU_LAST = "gpu_last";
 // last 随帧呼吸。perf 日志行仍用 EMA(诊断要看趋势,不受影响)。
 inline constexpr const char *SK_PACK_LAST = "pack_last";
 inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
-// DLSS FG 段(post CL 耗时:FG 推理 + 插值 YUV/回读 + RTX 帧的管线色输出
-// 转换/回读 —— 与 gpu 段按 base/fg 两次提交的栅栏完成点差分,timestamp
-// query 与 NGX 同 CL 会 SEH 无法直测;起点 = 最后一个 RTX 完成栅栏,无 RTX
-// 帧 = base 完成点)。fg 关/门关帧 ≈ 0,面板零值段自动隐藏;RTX 开 + FG 关
-// 时剩输出转换/回读的零头(一次栅栏差分拆不出更细,量级 ~0.1ms)。
+// DLSS FG 段(postA 栅栏差,纯 DLSSG 推理;非 HDR 会话 = 旧 post 全部:
+// 推理 + 转换/回读 —— TrueHDR 后置后 HDR 会话的转换移 postB)。fg 关/
+// 门关帧 ≈ 0,面板零值段自动隐藏。
 inline constexpr const char *SK_FG_LAST = "fg_last";
-// RTX Video 分段(VSR/TrueHDR 专用队列 eval 的 GPU 墙钟):base 栅栏完成后
-// CPU 有界等待各自完成栅栏拆账(fence 链 base→vsr→hdr,hdr 起点 = vsr 完成
-// 点)。此前 RTX 时间无账目:CPU 录制混进 gpu 段窗口、GPU 执行经 post CL 的
-// 队列 Wait 全落 fg 段 —— "补帧关了 fg 段还在跳"的真身。vsr/hdr 关闭时恒
-// 0,面板零值段自动隐藏。
+// RTX Video 分段(专用队列 eval 的 GPU 墙钟,t3a 后有界 CPU 等待完成栅栏
+// 拆账):vsr = VSR eval;hdr = TrueHDR 链(每输出帧一次:真实 + 逐插值
+// 帧)+ postB 转换/回读窗口。TrueHDR 后置(2026-09-24):DLSSG 恒 SDR 域
+// 插值(ColorBuffersHDR 路径实测压高光),逐帧 TrueHDR 提升为 FP16 scRGB。
+// vsr/hdr 关闭时恒 0,面板零值段自动隐藏(面板另有 EMA 平滑防忽隐忽现)。
 inline constexpr const char *SK_RTXVSR_LAST = "rtxvsr_last";
 inline constexpr const char *SK_RTXHDR_LAST = "rtxhdr_last";
 // NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0

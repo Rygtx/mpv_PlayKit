@@ -669,6 +669,8 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     slot.allocator.Reset();
     slot.fgCommandList.Reset();
     slot.fgAllocator.Reset();
+    slot.postCommandList.Reset();
+    slot.postAllocator.Reset();
     for (int i = 0; i < 3; ++i) {
         slot.uploadYuv[i].Reset();
         slot.readbackYuv[i].Reset();
@@ -691,7 +693,10 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     slot.confidence.Reset();
     slot.reducedMotion.Reset();
     slot.reducedConfidence.Reset();
-    slot.fgInterp.Reset();
+    for (int g = 0; g < kFgGenSlots; ++g) {
+        slot.fgInterp[g].Reset();
+        slot.hdrFg[g].Reset();
+    }
     slot.srvUavHeap.Reset();
 
     const int width = _width;
@@ -741,6 +746,30 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     hr = slot.fgCommandList->Close();
     if (FAILED(hr)) {
         SetErr(err, errLen, hr, "Close initial slot fg command list failed");
+        return false;
+    }
+    // postB 转换段 CL(与 fg 同型;仅 HDR 会话录制提交,闲置无害)。
+    hr = _device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(slot.postAllocator.GetAddressOf()));
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "CreateCommandAllocator(slot post) failed");
+        return false;
+    }
+    hr = _device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.postAllocator.Get(), nullptr,
+        IID_PPV_ARGS(slot.postCommandList.GetAddressOf()));
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "CreateCommandList(slot post) failed");
+        return false;
+    }
+    hr = slot.postCommandList->Close();
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "Close initial slot post command list failed");
+        return false;
+    }
+    slot.postFenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+    if (!slot.postFenceEvent) {
+        SetErr(err, errLen, E_FAIL, "Create slot post fence event failed");
         return false;
     }
 
@@ -867,13 +896,13 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     {
         // slot-local shader-visible descriptor heap; input/output descriptors
         // here, the residual pipeline descriptors on every scaling rebuild.
-        // 35 = 0..31 原有 + 32/33(FG 插值输出的 SRV/UAV;堆空间常备,
-        // 非 FG 槽写占位视图)+ 34(共享差异调试纹理 UAV)+ 36/37/38
-        // (RTX:vsrColor/hdrColor 的 SRV、motionDense 的 UAV;无 RTX 槽 =
-        // outputColor/motion 占位视图)。
+        // 35 = 0..31 原有 + 32/33(FG 插值输出占位;堆空间常备,非 FG 槽写
+        // 占位视图)+ 34(共享差异调试纹理 UAV)+ 36/37/38(RTX:vsrColor/
+        // hdrColor 的 SRV、motionDense 的 UAV;无 RTX 槽 = outputColor/motion
+        // 占位视图)+ 39-43(fgInterp 逐 gen SRV)+ 44-48(hdrFg 逐 gen SRV)。
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 51; // 0-34 原有 + 36/37/38(RTX)+ 49/50(FFX OF 后端)
+        heapDesc.NumDescriptors = 51; // 0-34 原有 + 36-38(RTX)+ 39-48(FG/HDR 逐 gen)+ 49/50(FFX OF 后端)
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -916,13 +945,13 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
             _device->CreateUnorderedAccessView(slot.yuvOut[i].Get(), nullptr, nullptr, slotHandle(28 + i));
         }
         _device->CreateUnorderedAccessView(slot.inputColor.Get(), nullptr, nullptr, slotHandle(31));
-        // 32/33:FG 插值输出的 SRV/UAV(fgInterp 已在上面创建 —— 顺序是
-        // 硬约束,见描述符块前的 NULL 描述符 TDR 注释)。非 FG 槽 =
-        // outputColor 占位视图(占位永不被有效读取:FG 第二遍转换仅在
-        // _fg && realMotion 帧被记录)。
+        // 32/33:fgInterp[0] 的 SRV/UAV 占位(历史槽位;逐 gen 转换视图在
+        // 39-43。fgInterp 已在上面创建 —— 顺序是硬约束,见描述符块前的
+        // NULL 描述符 TDR 注释)。非 FG 槽 = outputColor 占位视图(占位永
+        // 不被有效读取:FG 第二遍转换仅在 _fg && realMotion 帧被记录)。
         if (_fgSlots) {
-            _device->CreateShaderResourceView(slot.fgInterp.Get(), nullptr, slotHandle(32));
-            _device->CreateUnorderedAccessView(slot.fgInterp.Get(), nullptr, nullptr, slotHandle(33));
+            _device->CreateShaderResourceView(slot.fgInterp[0].Get(), nullptr, slotHandle(32));
+            _device->CreateUnorderedAccessView(slot.fgInterp[0].Get(), nullptr, nullptr, slotHandle(33));
         } else {
             _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(32));
             _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(33));
@@ -948,20 +977,49 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         _device->CreateUnorderedAccessView(slot.motionDense ? slot.motionDense.Get()
                                                             : slot.motion.Get(),
                                            nullptr, nullptr, slotHandle(38));
+        // 39-43:fgInterp[0..4] 逐 gen SRV(转换读 / TrueHDR 输入读 —— NGX
+        // 走资源参数不需要描述符,这里只服务我们自己的转换 pass)。非 FG 槽
+        // = outputColor 占位(永不有效读取)。
+        for (int g = 0; g < kFgGenSlots; ++g) {
+            _device->CreateShaderResourceView(_fgSlots ? slot.fgInterp[g].Get()
+                                                       : slot.outputColor.Get(),
+                                              nullptr, slotHandle(kSrvFgInterpBase + g));
+        }
+        // 44-48:hdrFg[0..4] 逐 gen SRV(TrueHDR 插值帧输出,PQ 转换读)。
+        // 非 HDR 槽 = hdrColor/outputColor 占位。
+        for (int g = 0; g < kFgGenSlots; ++g) {
+            _device->CreateShaderResourceView(slot.hdrFg[g] ? slot.hdrFg[g].Get()
+                                            : slot.hdrColor ? slot.hdrColor.Get()
+                                                            : slot.outputColor.Get(),
+                                              nullptr, slotHandle(kSrvHdrFgBase + g));
+        }
     }
     return true;
 }
 
-// DLSS FG 槽资源(仅 _fgSlots):插值输出纹理 + 第二组回读缓冲。
-// RTX 双尺寸:fgInterp 在 PIPE 尺寸(backbuffer 同侧),格式随 _hdrPipe
-// (SDR BGRA8 / HDR FP16 scRGB);回读缓冲 = OUT 尺寸(与真实帧一致)。
+// DLSS FG 槽资源(仅 _fgSlots):插值输出纹理(逐 gen)+ 第二组回读缓冲。
+// RTX 双尺寸:fgInterp[g] 在 PIPE 尺寸(backbuffer 同侧),**恒 BGRA8**
+// —— DLSSG 恒在 SDR 域插值(ColorBuffersHDR 路径实测压高光,2026-09-23
+// 定案),HDR 会话由逐帧 TrueHDR 提升为 FP16 scRGB(hdrFg[g])。
+// 回读缓冲 = OUT 尺寸(与真实帧一致)。
 bool D3D12Context::CreateFgSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
-    if (!CreateColorTexture(slot.fgInterp.GetAddressOf(), _pipeW, _pipeH,
-                            _hdrPipe ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                     : DXGI_FORMAT_B8G8R8A8_UNORM,
-                            D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
-        return false;
+    for (int g = 0; g < kFgGenSlots; ++g) {
+        if (!CreateColorTexture(slot.fgInterp[g].GetAddressOf(), _pipeW, _pipeH,
+                                DXGI_FORMAT_B8G8R8A8_UNORM,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+            return false;
+        }
+    }
+    if (_hdrPipe) {
+        for (int g = 0; g < kFgGenSlots; ++g) {
+            if (!CreateColorTexture(slot.hdrFg[g].GetAddressOf(), _pipeW, _pipeH,
+                                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+                return false;
+            }
+        }
     }
     for (int g = 0; g < kFgGenSlots; ++g) {
         for (int i = 0; i < 3; ++i) {
@@ -1215,7 +1273,42 @@ bool D3D12Context::SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64
     }
     ID3D12CommandList *lists[]{ slot.fgCommandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
-    slot.fenceValue = _fenceValue.fetch_add(1) + 1;
+    slot.fgFenceValue = _fenceValue.fetch_add(1) + 1;
+    slot.fenceValue = slot.fgFenceValue;
+    _queue->Signal(_fence.Get(), slot.fenceValue);
+    return true;
+}
+
+bool D3D12Context::BeginPostRecording(FrameSlot &slot) noexcept {
+    // 与 BeginFgRecording 同款防砖:上次录制中途失败遗留 open CL 会让
+    // allocator Reset 报 E_FAIL —— force-close 一次再试。
+    HRESULT hr = slot.postAllocator->Reset();
+    if (FAILED(hr)) {
+        slot.postCommandList->Close();
+        hr = slot.postAllocator->Reset();
+        if (FAILED(hr)) return false;
+    }
+    hr = slot.postCommandList->Reset(slot.postAllocator.Get(), nullptr);
+    return SUCCEEDED(hr);
+}
+
+bool D3D12Context::SubmitPostFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+                                   char *err, size_t errLen) noexcept {
+    HRESULT hr = slot.postCommandList->Close();
+    if (FAILED(hr)) {
+        SetErr(err, errLen, hr, "Close(slot post) failed");
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(_submitMutex);
+    // TrueHDR 专用队列的产出(hdrColor/hdrFg)是本段输入 —— 跨队列 Wait
+    // 排在执行前。
+    if (waitFence && waitValue) {
+        _queue->Wait(waitFence, waitValue);
+    }
+    ID3D12CommandList *lists[]{ slot.postCommandList.Get() };
+    _queue->ExecuteCommandLists(1, lists);
+    slot.postFenceValue = _fenceValue.fetch_add(1) + 1;
+    slot.fenceValue = slot.postFenceValue;
     _queue->Signal(_fence.Get(), slot.fenceValue);
     return true;
 }

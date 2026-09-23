@@ -832,12 +832,13 @@ bool DlssnrContext::Initialize(
             } else {
                 _fg = std::make_unique<DlssfgContext>();
                 char fgErr[256]{};
-                // FG backbuffer = 管线色(_hdrPipe → FP16 scRGB;
-                // SDR = BGRA8),尺寸 = PIPE(VSR 放大后= 中间位)。
+                // FG backbuffer = 管线色,**恒 BGRA8 SDR 域**(TrueHDR 后置:
+                // DLSSG 的 ColorBuffersHDR 路径实测压高光,2026-09-23 实验
+                // 定案;插值在 SDR 域,逐输出帧 TrueHDR 提升),尺寸 = PIPE
+                //(VSR 放大后 = 中间位)。
                 if (_fg->Initialize(*_d3d12, officialDll, _fgParams,
                                     _pipeW, _pipeH,
-                                    _hdrActive ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                               : DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    DXGI_FORMAT_B8G8R8A8_UNORM,
                                     fgErr, sizeof(fgErr))) {
                     fgUp = true;
                     // 钩子进程级、装上不可拆:只要缓存模块是 hook 型就标
@@ -1937,6 +1938,11 @@ bool DlssnrContext::ProcessFrame(
     const bool hdrRun = hdrLive && !rtxNoEval;
     const bool rtxIn = vsrRun || hdrRun; // 本帧有 RTX eval:base 尾转 NSR、
                                          // 真实帧输出移 post 段
+    // 管线色 = DLSSG 的 backbuffer(**恒 SDR 域**:vsrRun → vsrColor BGRA8
+    // @PIPE;否则 outputColor BGRA8 @src)。TrueHDR 后置(2026-09-24 用户
+    // 裁定):DLSSG 的 ColorBuffersHDR 路径实测压高光(插值帧 276→70 nits,
+    // 实验定案),插值一律在 SDR 域进行,每个输出帧(真实 + 各插值)再各自
+    // 过一次 TrueHDR 提升为 FP16 scRGB → PQ。
     ID3D12Resource *pipeColor = _d3d12->OutputColor(*slot);
     int pipeW = width, pipeH = height;
     if (vsrRun) {
@@ -1944,32 +1950,28 @@ bool DlssnrContext::ProcessFrame(
         pipeW = _pipeW;
         pipeH = _pipeH;
     }
-    if (hdrRun) {
-        pipeColor = slot->hdrColor.Get();
-        pipeW = _pipeW;
-        pipeH = _pipeH;
-    }
-    // FG backbuffer 形态门:backbuffer = pipeColor,仅当它在 PIPE 几何
-    // (vsr/hdr 实跑了,或本就无 RTX)。skipEval/NOEVAL 帧整体无 FG。
-    const bool fgPipeOk = vsrRun || hdrRun || !_rtxActive;
+    // FG backbuffer 形态门:backbuffer 在 PIPE 几何仅当 VSR 实跑;hdr-only
+    // 会话 PIPE==src,outputColor 直接可用。skipEval/NOEVAL 帧整体无 FG。
+    const bool fgPipeOk = vsrRun || !_vsrRequested;
 
-    // ---- base/fg 分段提交(处理用时拆账)----
-    // gpu 段与 fg 段的精确拆分靠两次提交 + 栅栏完成点差分(timestamp query
-    // 与 NGX 同 CL 会 SEH,2026-09-05 实锤,栅栏差分是无损精确拆分):
-    //   base CL = 基础管线(NR 推理/残差/直通 + 真实帧 YUV/回读)
-    //   fg CL   = 插帧链(FG 推理 + 插值 YUV/回读)
-    // Begin 在 base 提交前执行:失败即整体降级为门关帧(guidance 归位屏障
-    // 落 base 尾,motion 不滞留 NSR —— 帧末全资源 COMMON 不变量跨两段保持)。
+    // ---- base/postA(TrueHDR 链)/postB 分段提交(处理用时拆账)----
+    // 各段 GPU 耗时靠提交 + 栅栏完成点差分(timestamp query 与 NGX 同 CL
+    // 会 SEH,2026-09-05 实锤,栅栏差分是无损精确拆分):
+    //   base CL          = 基础管线(NR 推理/残差/直通)
+    //   postA(fg CL)    = DLSSG 推理链(HDR 会话;非 HDR = 推理+转换旧形态)
+    //   TrueHDR 专用队列 = 真实帧 + 逐插值帧(每输出帧一次 eval)
+    //   postB(post CL)  = HDR 会话的输出转换/回读(等 TrueHDR 链尾栅栏)
     const bool fgGateOpen = fgM > 0 && !skipEval && realMotion && !nvofHistoryReset &&
                             _fg && _fg->Enabled() && fgPipeOk;
-    // post 段(fg CL)= FG 门开帧 + RTX 帧(真实帧输出转换在 eval 之后)。
-    // Begin 失败:FG 帧降级门关;RTX 帧无处落管线色转换 —— 整帧失败。
-    const bool postBeginReq = fgGateOpen || rtxIn;
+    // postA(fg CL)= FG 门开帧 + 非 HDR 的 RTX 帧(HDR 会话的转换移 postB,
+    // postA 仅 FG 推理,可降级)。Begin 失败:非 HDR RTX 帧无处落转换 ——
+    // 整帧失败;否则 FG 降级门关。
+    const bool postBeginReq = fgGateOpen || (rtxIn && !hdrRun);
     bool fgBeginOk = false;
     if (postBeginReq) {
         fgBeginOk = _d3d12->BeginFgRecording(*slot);
         if (!fgBeginOk) {
-            if (rtxIn) {
+            if (rtxIn && !hdrRun) {
                 if (err && errLen) std::snprintf(err, errLen, "post CL begin failed (rtx frame)");
                 TimingStatusLine("DLSSNR STATUS: post CL begin FAILED on rtx frame");
                 return false;
@@ -2059,20 +2061,36 @@ bool DlssnrContext::ProcessFrame(
         return false;
     }
     if (ProbeEnabled()) TimingStatusLine("PROBE: base submitted"); // 临时探针(VSDLSSNR_PROBE=1)
+    // base 完成等待(= t3a 观测点)**必须在任何 RTX/post 提交之前**:它是
+    // 后续所有分段(vsr/fg/hdr)的计时起点 —— 若推到 post 提交之后,CPU
+    // 录制期足够 GPU 跑完 base+vsr+postA,醒来时各段早已完成,观测竞争把
+    // vsr/fg 段压成 0(2026-09-24 用户实测"VSR 段看不到"根因)。代价 =
+    // base 执行期 CPU 不再与 RTX/post 录制重叠(3 槽流水下由其他槽的
+    // GPU 工作填补空档)。栅栏超时 = GPU 挂起/设备移除,熔断停帧。
+    if (!_d3d12->WaitBaseFrame(*slot, err, errLen)) {
+        if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
+        if (err && errLen) {
+            TimingStatusLine(err); // 临时探针
+            std::snprintf(err, errLen, "Wait(base) failed");
+        }
+        return false;
+    }
+    if (ProbeEnabled()) TimingStatusLine("PROBE: base waited"); // 临时探针(VSDLSSNR_PROBE=1)
+    QueryPerformanceCounter(&t3a);
 
-    // ---- RTX eval(专用队列;fence 链 base → vsr → hdr)----
-    // CPU 端不等 eval 完成:post 段提交时主队列 Wait(rtx fence)保证消费
-    // 顺序,Unpack 由 post 栅栏覆盖。录制经 _evaluateMutex 与 NR/DLSSG 串行
-    //(NGX 非线程安全;两队列的 CL/allocator 均为单例,锁内顺序录制)。
-    uint64_t rtxFenceVal = 0;
-    ID3D12Fence *rtxFence = nullptr;
+    // ---- RTX eval(专用队列;fence 链 base → vsr → postA → hdr 链)----
+    // CPU 端不等 eval 完成:post 段提交时主队列 Wait(生产者 fence)保证
+    // 消费顺序,Unpack 由 post 栅栏覆盖。录制经 _evaluateMutex 与 NR/DLSSG
+    // 串行(NGX 非线程安全;两队列的 CL/allocator 均为单例,锁内顺序录制)。
     // 分段计时锚:每段 eval 的完成栅栏单独留存(t3a 后有界 CPU 等待,把
-    // RTX 墙钟拆回 vsr/hdr 名下;rtxFence/rtxFenceVal 始终指向链尾,供
-    // post CL 消费 Wait)。
+    // RTX 墙钟拆回 vsr/hdr 名下)。hdrChainFence/Val = TrueHDR 链尾(真实
+    // 帧或最后一个插值帧),postB 消费等待 + 计时锚。
     ID3D12Fence *vsrDoneFence = nullptr;
     uint64_t vsrDoneVal = 0;
     ID3D12Fence *hdrDoneFence = nullptr;
     uint64_t hdrDoneVal = 0;
+    ID3D12Fence *hdrChainFence = nullptr;
+    uint64_t hdrChainVal = 0;
     // per-eval 参数走本帧快照(面板质量/HDR 滑块逐帧生效;几何/形态仍按
     // 创建时的 _rtx)。clamp 在 helper 内的常量引用,越界面板值安全。
     const DlssnrParams rtxLive = _shared->Snapshot();
@@ -2088,48 +2106,49 @@ bool DlssnrContext::ProcessFrame(
             if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
             return false;
         }
-        rtxFence = _vsr->Queue().Fence();
-        rtxFenceVal = fv;
-        vsrDoneFence = rtxFence;
+        vsrDoneFence = _vsr->Queue().Fence();
         vsrDoneVal = fv;
     }
+    // 真实帧 TrueHDR(输入 = vsrColor(vsrRun)或 outputColor —— 恒 SDR 域;
+    // 插值帧的 TrueHDR 在 postA 提交后逐 gen 追加)。官方契约:TrueHDR 必须
+    // 在 VSR 之后(fence 链保证)。输出 hdrColor(FP16 scRGB @PIPE)。
     if (hdrRun) {
         std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
         char rtxErr[160]{};
         uint64_t fv = 0;
-        // TrueHDR 输入 = VSR 输出(vsrRun 链)或 NR 输出(仅 HDR 会话)。
         if (!_hdr->Evaluate(vsrRun ? slot->vsrColor.Get()
                                    : _d3d12->OutputColor(*slot),
                             pipeW, pipeH, slot->hdrColor.Get(),
                             rtxLive.rtxHdrContrast, rtxLive.rtxHdrSaturation,
                             rtxLive.rtxHdrMiddleGray, rtxLive.rtxHdrMaxLuminance,
                             vsrRun ? _vsr->Queue().Fence() : _d3d12->Fence(),
-                            vsrRun ? rtxFenceVal : slot->baseFenceValue, &fv,
+                            vsrRun ? vsrDoneVal : slot->baseFenceValue, &fv,
                             rtxErr, sizeof(rtxErr))) {
             if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
             return false;
         }
-        rtxFence = _hdr->Queue().Fence();
-        rtxFenceVal = fv;
-        hdrDoneFence = rtxFence;
+        hdrDoneFence = _hdr->Queue().Fence();
         hdrDoneVal = fv;
+        hdrChainFence = hdrDoneFence;
+        hdrChainVal = fv;
     }
 
-    // ---- post 段(fg CL;主队列以 RTX fence 排序,消费管线色)----
-    // 内容:RTX 帧的 outputColor 归位 + FG 插帧链(backbuffer = 管线色)
-    // + 真实帧输出转换/回读(RTX eval 之后才有管线色,落在本段)。
-    // 无 RTX 的帧 = 旧"fg CL"语义(仅 FG 门开帧录制)。插值输出就绪由本槽
-    // WaitFrame(fg 栅栏)覆盖(主队列 Wait(RTX fence) 已排在执行前)。
-    // backbuffer = 管线色 pipeColor(vsrRun → vsrColor BGRA8 / hdrRun →
-    // hdrColor FP16;NGX 写后已衰减 COMMON —— fgBar 显式 COMMON→NSR),
+    // ---- postA(fg CL:DLSSG 推理)→ TrueHDR 链(逐插值帧)→ postB(转换)----
+    // TrueHDR 后置管线(HDR 会话,2026-09-24 用户裁定):postA 只写
+    // fgInterp[g](恒 SDR 域),postA 提交后逐 gen 追加 TrueHDR eval 到专用
+    // 队列(等 postA 栅栏),postB 等链尾栅栏做全部输出转换/回读。非 HDR
+    // 会话:postA = 旧形态(FG 推理 + 逐 gen 转换/回读),无 postB。
+    // backbuffer = 管线色 pipeColor(vsrRun → vsrColor,NGX 写后衰减 COMMON,
+    // fgBar 显式 COMMON→NSR;hdr-only → outputColor,base 尾已 NSR 直读),
     // MVecs = PIPE 尺寸稠密运动(motionDense;FG 激活时 follow 被忽略),
     // Depth = 静态零纹理(PIPE≠src 用 PIPE 版)。倍数 M:按序 eval 插值槽
-    // 1..M-1(官方 MFG 契约),每槽紧随转换 + 独立回读。播种帧只提交首个
-    // eval(DLSSG.Reset=1,输出不消费);零光流帧整块跳过。
-    const bool postNeeded = rtxIn || fgOnFgCl;
+    // 1..M-1(官方 MFG 契约)。播种帧只提交首个 eval(DLSSG.Reset=1,输出
+    // 不消费);零光流帧整块跳过。
     ID3D12GraphicsCommandList *fgCl = slot->fgCommandList.Get();
-    if (rtxIn) {
-        // base 尾 outputColor 已 NSR 化作 RTX 输入;NSR 读不衰减,归位 COMMON。
+    if (rtxIn && !hdrRun) {
+        // VSR-only 帧:base 尾 outputColor 已 NSR 化作 VSR 输入;NSR 读不
+        // 衰减,归位 COMMON。(HDR 会话不在此归位 —— hdr-only 的 outputColor
+        // 还是 DLSSG backbuffer,vsrRun 的 vsrColor 才是,见 fgBar。)
         D3D12_RESOURCE_BARRIER inBack[1]{
             TransitionFromTo(_d3d12->OutputColor(*slot),
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -2139,12 +2158,18 @@ bool DlssnrContext::ProcessFrame(
     }
     if (fgOnFgCl) {
         const bool fgResetEval = _fg->NeedsReset();
-        D3D12_RESOURCE_BARRIER fgBar[1]{
-            TransitionFromTo(pipeColor,
-                             D3D12_RESOURCE_STATE_COMMON,
-                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-        };
-        fgCl->ResourceBarrier(1, fgBar);
+        // fgBar:管线色 → NSR 作 DLSSG 输入。vsrColor = NGX 写后衰减 COMMON;
+        // hdr-only 的 outputColor = base 尾已 NSR(免屏障直读);无 RTX 的
+        // outputColor = 常规 COMMON。
+        const bool pipeColorNeedsBar = vsrRun || !rtxIn;
+        if (pipeColorNeedsBar) {
+            D3D12_RESOURCE_BARRIER fgBar[1]{
+                TransitionFromTo(pipeColor,
+                                 D3D12_RESOURCE_STATE_COMMON,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            };
+            fgCl->ResourceBarrier(1, fgBar);
+        }
         // MVecs = PIPE 尺寸稠密运动场(FG 契约 = backbuffer 同尺寸、像素
         // 单位):PIPE≠src 时源尺寸 motion 双线性放大进 motionDense。
         // motion 已 NSR(densify 收尾),SRV 直读;放大后 UAV→NSR 供 eval。
@@ -2170,56 +2195,60 @@ bool DlssnrContext::ProcessFrame(
         for (int g = 0; g < fgM - 1; ++g) {
             if (fgResetEval && g > 0) break; // 播种帧只建历史,不产插值
             D3D12_RESOURCE_BARRIER toUav[1]{
-                Transition(slot->fgInterp.Get(),
+                Transition(slot->fgInterp[g].Get(),
                            D3D12_RESOURCE_STATE_COMMON,
                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
             fgCl->ResourceBarrier(1, toUav);
             if (_fg->Evaluate(fgCl, pipeColor, fgMvec,
-                              fgDepth, slot->fgInterp.Get(), pipeW, pipeH,
+                              fgDepth, slot->fgInterp[g].Get(), pipeW, pipeH,
                               fgM, g + 1, false, fgErr, sizeof(fgErr))) {
                 fgRan = true;
                 if (fgResetEval) {
-                    // 播种帧:插值输出不消费,fgInterp 归 COMMON。
+                    // 播种帧:插值输出不消费,fgInterp[g] 归 COMMON。
                     D3D12_RESOURCE_BARRIER fgSeed[1]{
-                        Transition(slot->fgInterp.Get(),
+                        Transition(slot->fgInterp[g].Get(),
                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                    D3D12_RESOURCE_STATE_COMMON),
                     };
                     fgCl->ResourceBarrier(1, fgSeed);
                     break;
                 }
-                // 有效插值:fgInterp UAV→NSR 进转换(HDR = FP16→PQ),转换
-                // 收尾归 COMMON;回读落第 g 组缓冲(各槽独立,真实帧回读
-                // 不被覆写)。
+                // 有效插值:fgInterp[g] UAV→NSR。HDR 会话 = TrueHDR 输入
+                // (转换在 postB);非 HDR = 直接进转换(HDR = FP16→PQ 的
+                // 旧形态已废,此处恒 SDR),转换收尾归 COMMON;回读落第 g
+                // 组缓冲(各槽独立,真实帧回读不被覆写)。
                 D3D12_RESOURCE_BARRIER toNsr[1]{
-                    Transition(slot->fgInterp.Get(),
+                    Transition(slot->fgInterp[g].Get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 };
                 fgCl->ResourceBarrier(1, toNsr);
-                if (_rtxActive) {
-                    _d3d12->RecordColorOutput(*fgCl, *slot, slot->fgInterp.Get(),
-                                              D3D12Context::kSrvFgInterp, _hdrActive,
-                                              pipeW, pipeH, matrix, range,
-                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                } else {
-                    _d3d12->RecordYuvOutput(*fgCl, *slot, matrix, range,
-                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                            slot->fgInterp.Get(), D3D12Context::kSrvFgInterp);
-                }
-                if (!_d3d12->RecordReadbackCopy(*fgCl, *slot, err, errLen, g)) {
-                    return false;
+                if (!hdrRun) {
+                    if (_rtxActive) {
+                        _d3d12->RecordColorOutput(*fgCl, *slot, slot->fgInterp[g].Get(),
+                                                  D3D12Context::kSrvFgInterpBase + g, false,
+                                                  pipeW, pipeH, matrix, range,
+                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    } else {
+                        _d3d12->RecordYuvOutput(*fgCl, *slot, matrix, range,
+                                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                                slot->fgInterp[g].Get(),
+                                                D3D12Context::kSrvFgInterpBase + g);
+                    }
+                    if (!_d3d12->RecordReadbackCopy(*fgCl, *slot, err, errLen, g)) {
+                        return false;
+                    }
                 }
                 if (fgGenOk) fgGenOk[g] = true;
                 ++fgEvaluatedCount;
                 // eval 恢复:解除降级日志闩锁,下次新故障重新记一条。
                 _fgDupLogged.store(false, std::memory_order_release);
             } else {
-                // eval 失败(会话已被闩停):fgInterp 回 COMMON,本帧全部
+                // eval 失败(会话已被闩停):fgInterp[g] 回 COMMON,本帧全部
                 // 插值槽降级复制。
                 D3D12_RESOURCE_BARRIER undo[1]{
-                    Transition(slot->fgInterp.Get(),
+                    Transition(slot->fgInterp[g].Get(),
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                D3D12_RESOURCE_STATE_COMMON),
                 };
@@ -2238,16 +2267,29 @@ bool DlssnrContext::ProcessFrame(
                 break;
             }
         }
-        // fg CL 尾归位:无 RTX 的 legacy 帧 = 管线色(outputColor)NSR→COMMON
-        // (eval 消费过;全败/播种帧同样 NSR 过 —— 统一归位);RTX 帧的
-        // 管线色归位由下方真实帧输出转换(RecordColorOutput 收尾)承担。
-        if (!rtxIn) {
+        // postA 尾归位:无 RTX 的 legacy 帧 = 管线色(outputColor)NSR→COMMON
+        // (eval 消费过;全败/播种帧同样 NSR 过 —— 统一归位);hdr-only 帧 =
+        // outputColor(DLSSG backbuffer)NSR→COMMON;vsrRun 帧 = outputColor
+        // 已在段首 inBack 归位,vsrColor(DLSSG backbuffer,fgBar 转 NSR)
+        // 在此归位 —— 真实帧转换源已改 hdrColor(postB),vsrColor 无消费者。
+        if (!rtxIn || !vsrRun) {
             D3D12_RESOURCE_BARRIER fgBack[1]{
                 TransitionFromTo(pipeColor,
                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  D3D12_RESOURCE_STATE_COMMON),
             };
             fgCl->ResourceBarrier(1, fgBack);
+        }
+        if (vsrRun && hdrRun) {
+            // 仅 HDR 会话:vsrColor(DLSSG backbuffer)无 postB 消费者,在此
+            // 归位。VSR-only 帧的 vsrColor 由下方真实帧转换收尾(stateBefore
+            // = NSR),不可重复归位。
+            D3D12_RESOURCE_BARRIER vsrBack[1]{
+                TransitionFromTo(slot->vsrColor.Get(),
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 D3D12_RESOURCE_STATE_COMMON),
+            };
+            fgCl->ResourceBarrier(1, vsrBack);
         }
         if (slot->motionDense) {
             D3D12_RESOURCE_BARRIER msBack[1]{
@@ -2257,34 +2299,107 @@ bool DlssnrContext::ProcessFrame(
             };
             fgCl->ResourceBarrier(1, msBack);
         }
-        recordGuidancePark(*fgCl);
+        // guidance 归位落帧尾最后一条主队列 CL:非 HDR = 本 CL;HDR 会话落
+        // postB(下方)。baseCl 兜底见上方 !fgOnFgCl && !rtxIn 分支。
+        if (!hdrRun) recordGuidancePark(*fgCl);
     }
-    if (rtxIn) {
-        // 真实帧输出转换(post 段):源 = 管线色(fgOnFgCl 时已被 fgBar 转
-        // NSR;否则 NGX 写后衰减 COMMON —— 两种 stateBefore 都由
-        // RecordColorOutput 统一 NSR 化),收尾归 COMMON。
-        const UINT rtxSrv = pipeColor == slot->hdrColor.Get() ? D3D12Context::kSrvHdrColor
-                                                              : D3D12Context::kSrvVsrColor;
-        _d3d12->RecordColorOutput(*fgCl, *slot, pipeColor, rtxSrv,
-                                  pipeColor == slot->hdrColor.Get(),
-                                  pipeW, pipeH, matrix, range,
+    // 门关但 postA 已开(VSR-only 帧)的 guidance 归位:帧尾最后一条主队列
+    // CL 规则 —— 非 HDR 会话无 postB,落本 CL(HDR 会话落 postB)。
+    if (!hdrRun && fgBeginOk && !fgOnFgCl) recordGuidancePark(*fgCl);
+    // 真实帧输出转换(VSR-only 帧,postA):源 = vsrColor(fgOnFgCl 时已被
+    // fgBar 转 NSR;否则 NGX 写后衰减 COMMON —— 两种 stateBefore 都由
+    // RecordColorOutput 统一 NSR 化),收尾归 COMMON。HDR 会话的转换在
+    // postB(读 hdrColor)。
+    if (rtxIn && !hdrRun) {
+        _d3d12->RecordColorOutput(*fgCl, *slot, pipeColor, D3D12Context::kSrvVsrColor,
+                                  false, pipeW, pipeH, matrix, range,
                                   fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                            : D3D12_RESOURCE_STATE_COMMON);
         if (!_d3d12->RecordReadbackCopy(*fgCl, *slot, err, errLen)) {
             return false;
         }
     }
-    if (postNeeded) {
-        // 主队列 Wait(RTX fence)排在 post CL 执行前 —— 跨队列生产者-消费
-        // 者顺序(管线色由专用队列写入后,本段才能读)。
-        if (!_d3d12->SubmitFgFrame(*slot, rtxFence, rtxFenceVal, err, errLen)) {
+    // postA 提交:等待 vsr 产出(vsrRun)或 base(hdr-only 的 DLSSG
+    // backbuffer = outputColor,等 base 尾 NSR 化完成)。
+    if (fgBeginOk) {
+        if (!_d3d12->SubmitFgFrame(*slot,
+                                   vsrRun ? vsrDoneFence : _d3d12->Fence(),
+                                   vsrRun ? vsrDoneVal : slot->baseFenceValue,
+                                   err, errLen)) {
             if (err && errLen) {
                 TimingStatusLine(err); // 临时探针
                 std::snprintf(err, errLen, "Submit(fg) failed");
             }
             return false;
         }
-    } else {
+    }
+    // 插值帧 TrueHDR 链(HDR 会话):逐 evaluated gen 追加到专用队列,全部
+    // 等 postA 栅栏(同队列 FIFO 保序);链尾栅栏 = postB 消费锚 + 计时锚。
+    if (hdrRun && fgOnFgCl && fgGenOk) {
+        for (int g = 0; g < fgM - 1; ++g) {
+            if (!fgGenOk[g]) continue;
+            std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
+            char rtxErr[160]{};
+            uint64_t fv = 0;
+            if (!_hdr->Evaluate(slot->fgInterp[g].Get(), pipeW, pipeH,
+                                slot->hdrFg[g].Get(),
+                                rtxLive.rtxHdrContrast, rtxLive.rtxHdrSaturation,
+                                rtxLive.rtxHdrMiddleGray, rtxLive.rtxHdrMaxLuminance,
+                                _d3d12->Fence(), slot->fgFenceValue, &fv,
+                                rtxErr, sizeof(rtxErr))) {
+                if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
+                return false;
+            }
+            hdrDoneFence = _hdr->Queue().Fence();
+            hdrDoneVal = fv;
+            hdrChainFence = hdrDoneFence;
+            hdrChainVal = fv;
+        }
+    }
+    if (hdrRun) {
+        // postB(HDR 会话独有):全部输出转换/回读,等 TrueHDR 链尾栅栏 ——
+        // 跨队列生产者-消费者顺序由此保证。真实帧 + 逐 evaluated gen。
+        if (!_d3d12->BeginPostRecording(*slot)) {
+            if (err && errLen) std::snprintf(err, errLen, "postB CL begin failed");
+            TimingStatusLine("DLSSNR STATUS: postB CL begin FAILED on hdr frame");
+            return false;
+        }
+        auto *postCl = slot->postCommandList.Get();
+        _d3d12->RecordColorOutput(*postCl, *slot, slot->hdrColor.Get(),
+                                  D3D12Context::kSrvHdrColor, true,
+                                  pipeW, pipeH, matrix, range,
+                                  D3D12_RESOURCE_STATE_COMMON);
+        if (!_d3d12->RecordReadbackCopy(*postCl, *slot, err, errLen)) {
+            return false;
+        }
+        if (fgOnFgCl && fgGenOk) {
+            for (int g = 0; g < fgM - 1; ++g) {
+                if (!fgGenOk[g]) continue;
+                _d3d12->RecordColorOutput(*postCl, *slot, slot->hdrFg[g].Get(),
+                                          D3D12Context::kSrvHdrFgBase + g, true,
+                                          pipeW, pipeH, matrix, range,
+                                          D3D12_RESOURCE_STATE_COMMON);
+                if (!_d3d12->RecordReadbackCopy(*postCl, *slot, err, errLen, g)) {
+                    return false;
+                }
+                // postA 只 NSR 化未归位的 fgInterp[g](TrueHDR 已消费)归位。
+                D3D12_RESOURCE_BARRIER fiBack[1]{
+                    TransitionFromTo(slot->fgInterp[g].Get(),
+                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     D3D12_RESOURCE_STATE_COMMON),
+                };
+                postCl->ResourceBarrier(1, fiBack);
+            }
+        }
+        recordGuidancePark(*postCl);
+        if (!_d3d12->SubmitPostFrame(*slot, hdrChainFence, hdrChainVal, err, errLen)) {
+            if (err && errLen) {
+                TimingStatusLine(err); // 临时探针
+                std::snprintf(err, errLen, "Submit(post) failed");
+            }
+            return false;
+        }
+    } else if (!fgBeginOk) {
         // 门关帧(面板关/诊断跳过/播种/零光流/fg CL 起点失败)不向 proxy
         // 提交 eval:其内部 backbuffer 历史滞留在跳过前 —— 置位重置让恢复
         // 帧重新播种(播种帧插值输出照常降级复制),否则"关→开"/播种后的
@@ -2294,27 +2409,21 @@ bool DlssnrContext::ProcessFrame(
         if (_fg && _fg->Enabled()) _fg->ResetHistory();
         slot->fenceValue = slot->baseFenceValue;
     }
-    if (!_d3d12->WaitBaseFrame(*slot, err, errLen)) {
-        // A timed-out fence means GPU hang / device removal: stop evaluating,
-        // otherwise every later frame stalls the full 10s fence wait again.
-        if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
-        if (err && errLen) {
-            TimingStatusLine(err); // 临时探针
-            std::snprintf(err, errLen, "Wait(base) failed");
-        }
-        return false;
-    }
-    if (ProbeEnabled()) TimingStatusLine("PROBE: base waited"); // 临时探针(VSDLSSNR_PROBE=1)
-    QueryPerformanceCounter(&t3a);
-    // RTX 分段拆账:CPU 有界等待专用队列完成栅栏(fence 链 base→vsr→hdr;
-    // post CL 本就 Wait 链尾 fence —— 提前 CPU 等待不改变提交时序,只把
-    // 原本混进 fg 段的 RTX 墙钟拆回 vsr/hdr 名下)。10s 上限与 WaitFrame
-    // 同级:专用队列 wedge 时等待会超时落空,帧的最终判定仍归 WaitFrame
-    // 既有失败路径,此处不闩错。
-    LARGE_INTEGER tVsrDone = t3a, tHdrDone = t3a;
+    // RTX 分段拆账:CPU 有界等待专用队列完成栅栏(fence 链 base→vsr→postA
+    // →hdr 链;起点 t3a 已在 base 提交后立即观测,见上)。post CL 本就
+    // Wait 链尾 fence —— 提前 CPU 等待不改变提交时序,只把墙钟拆回各段
+    // 名下。10s 上限与 WaitFrame 同级:专用队列 wedge 时等待会超时落空,
+    // 帧的最终判定仍归 WaitFrame 既有失败路径,此处不闩错。
+    LARGE_INTEGER tVsrDone = t3a, tHdrDone = t3a, tFgDone = t3a;
     if (vsrDoneFence) {
         _vsr->Queue().Wait(vsrDoneVal, nullptr, 0, 10000);
         QueryPerformanceCounter(&tVsrDone);
+    }
+    // postA(postA 栅栏 ≤ WaitFrame 目标栅栏,必不后完成 —— 等待近零开销;
+    // 复用 slot.fenceEvent 与 WaitFrame 串行,无并发)。
+    if (hdrRun && fgBeginOk) {
+        _d3d12->WaitFenceValuePublic(slot->fgFenceValue, slot->fenceEvent, nullptr, 0);
+        QueryPerformanceCounter(&tFgDone);
     }
     if (hdrDoneFence) {
         _hdr->Queue().Wait(hdrDoneVal, nullptr, 0, 10000);
@@ -2495,8 +2604,9 @@ bool DlssnrContext::ProcessFrame(
                     }
                     // FG 插值输出(仅 eval 过的帧有内容;首帧必为播种,等
                     // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。
+                    // 恒 SDR 域 BGRA8 @PIPE(VSR 时 = _pipeW/H,else 源尺寸)。
                     if (fgRan) {
-                        dumpOrLog(_d3d12->FgInterp(*slot), width, height,
+                        dumpOrLog(_d3d12->FgInterp(*slot, 0), pipeW, pipeH,
                                   L"dump_fg_interp.bin", kColorDump);
                     }
                     // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
@@ -2531,22 +2641,32 @@ bool DlssnrContext::ProcessFrame(
                                                        : 0.0;
         // 分段 GPU 时间 = 各提交的栅栏完成点差(timestamp query 与 NGX 同
         // CL 会 SEH,见 NOTE;栅栏差分是无损精确拆分):
-        // gpu 段 = base CL(NR 推理/残差/直通;RTX 帧的输出转换移 post 段),
-        // vsr/hdr 段 = 专用队列 eval(t3a 后有界 CPU 等待各自完成栅栏,
-        // hdr 起点 = vsr 完成点 —— fence 链顺序),
-        // fg 段 = post CL(FG 推理 + 插值 YUV/回读 + RTX 帧的管线色输出
-        // 转换/回读),起点 = 最后一个 RTX 栅栏完成点(无 RTX 帧 = t3a);
+        // gpu 段 = base CL(NR 推理/残差/直通),
+        // vsr 段 = VSR eval(t3a 后有界 CPU 等待完成栅栏),
+        // fg 段 = postA(HDR 会话 = 纯 DLSSG 推理;非 HDR = post 全部:
+        // 推理 + 转换/回读 旧形态),
+        // hdr 段 = TrueHDR 链 + postB 转换/回读窗口(每输出帧一次 eval;
+        // 仅 HDR 会话非零),
         // 门关帧 fg 段 ≈ 0(WaitFrame 等的就是 base 值,立即满足)。
         const double gpuWaitMs = ms(t2, t3a, qpcFreq);
         const double unpackMs = ms(t3b, t4, qpcFreq);
         const double rtxVsrMs = vsrDoneFence ? ms(t3a, tVsrDone, qpcFreq) : 0.0;
-        const double rtxHdrMs = hdrDoneFence ? ms(vsrDoneFence ? tVsrDone : t3a,
-                                                   tHdrDone, qpcFreq)
-                                             : 0.0;
-        const LARGE_INTEGER &fgStart = hdrDoneFence   ? tHdrDone
-                                       : vsrDoneFence ? tVsrDone
-                                                      : t3a;
-        const double fgMs = ms(fgStart, t3b, qpcFreq);
+        // HDR 会话:fg 段 = postA 栅栏差(纯 DLSSG 推理),hdr 段 = TrueHDR
+        // 链 + postB 转换窗口(fgStart → t3b)。非 HDR:fg 段 = 旧形态
+        // (post 全部,含转换/回读),hdr 段 = 0。各段不重叠、可加。
+        double fgMs = 0.0, rtxHdrMs = 0.0;
+        if (hdrRun) {
+            const LARGE_INTEGER &fgStart = vsrDoneFence ? tVsrDone : t3a;
+            if (fgBeginOk) {
+                fgMs = ms(fgStart, tFgDone, qpcFreq);
+                rtxHdrMs = ms(tFgDone, t3b, qpcFreq);
+            } else {
+                rtxHdrMs = ms(fgStart, t3b, qpcFreq);
+            }
+        } else {
+            const LARGE_INTEGER &fgStart = vsrDoneFence ? tVsrDone : t3a;
+            fgMs = ms(fgStart, t3b, qpcFreq);
+        }
         // Magpie-style perf log line into dlssnr_timing.log (time-gated ≥1s,
         // see perfDue below). TimingLog takes g_timingMutex itself — format
         // the line under the lock, log outside of it, or this thread
