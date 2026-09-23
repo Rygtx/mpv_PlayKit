@@ -1472,7 +1472,7 @@ bool DlssnrContext::ProcessFrame(
     // Telemetry is always on (QPC reads cost ~ns); timingOut additionally
     // receives a per-frame segment string for the VS-log channel.
     const bool vsTiming = timingOut && timingLen > 0;
-    LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3a{}, t3b{}, t4{};
+    LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3a{}, t3b{}, t3c{}, t4{};
     LARGE_INTEGER tSlot0{}, tSlot1{}; // AcquireSlot 等待(perf 行 slot=)
     LARGE_INTEGER tLock0{}, tLock1{}; // evaluate 互斥等待(perf 行 lock=)
     // t3a/t3b = base/fg 两段栅栏完成点(gpu 段 = t2→t3a 基础管线 GPU;
@@ -2094,6 +2094,10 @@ bool DlssnrContext::ProcessFrame(
     // per-eval 参数走本帧快照(面板质量/HDR 滑块逐帧生效;几何/形态仍按
     // 创建时的 _rtx)。clamp 在 helper 内的常量引用,越界面板值安全。
     const DlssnrParams rtxLive = _shared->Snapshot();
+    // 提交链探针:t3a(RTX eval 提交起点)→ 等待区起点 = 本帧全部 NGX
+    // eval 的 CPU 提交耗时(vsr/hdr/dlssg 的参数录制,专用队列逐笔串行)。
+    LARGE_INTEGER tSub0{}, tSub1{};
+    QueryPerformanceCounter(&tSub0);
     if (vsrRun) {
         std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
         char rtxErr[160]{};
@@ -2414,6 +2418,9 @@ bool DlssnrContext::ProcessFrame(
     // Wait 链尾 fence —— 提前 CPU 等待不改变提交时序,只把墙钟拆回各段
     // 名下。10s 上限与 WaitFrame 同级:专用队列 wedge 时等待会超时落空,
     // 帧的最终判定仍归 WaitFrame 既有失败路径,此处不闩错。
+    QueryPerformanceCounter(&tSub1);
+    const double subWaitMs = rtxIn ? (tSub1.QuadPart - tSub0.QuadPart) * 1000.0 / qpcFreq.QuadPart
+                                   : 0.0;
     LARGE_INTEGER tVsrDone = t3a, tHdrDone = t3a, tFgDone = t3a;
     if (vsrDoneFence) {
         _vsr->Queue().Wait(vsrDoneVal, nullptr, 0, 10000);
@@ -2440,6 +2447,11 @@ bool DlssnrContext::ProcessFrame(
     if (ProbeEnabled()) TimingStatusLine("PROBE: waited"); // 临时探针(VSDLSSNR_PROBE=1)
     QueryPerformanceCounter(&t3b);
     const bool rb = _d3d12->UnpackOutput(*slot, dstPlanes, dstStrides, _outW, _outH, err, errLen);
+    // unpack 段 = 真实帧回读(t3b→t3c);插值帧回读(t3c→t4)是 FG 的
+    // 输出搬运成本,归 fg 段 —— FG 4x 时 4 帧 P10 @OUT 几何可达 100MB+,
+    // 混在 unpack 里会让"解包"凭空翻倍而"补帧"恒 0(2026-09-24 用户
+    // 实测定案)。
+    QueryPerformanceCounter(&t3c);
     // FG 插值帧回读(各组独立缓冲;eval 成功的槽才有内容)。失败按整体
     // 失败处理:调用方会对全部输出做源帧复制降级。
     if (rb && fgDstPlanes) {
@@ -2633,12 +2645,17 @@ bool DlssnrContext::ProcessFrame(
             return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
         };
         const double packMs = ms(t0, t1, qpcFreq);
-        // eval_cpu 的原始窗口包含 NVOF 阶段(t1→t2);nvof 单独上报,这里
-        // 扣除保持各段可加。直通帧(evalZeroed)没有 NGX 调用,恒 0。
+        // eval_cpu = "NGX 调用" 的 CPU 成本:NR eval 窗口(t1→t2,扣 nvof)
+        // **+ RTX evals 的 CPU 提交链(t3a→tSub1,vsr/TrueHDR/DLSSG 逐笔
+        // 参数录制,~1.8ms/次,全家桶 8 笔 ≈ 14ms,2026-09-24 探针定案)**。
+        // 提交链与 GPU 执行并行,但它是真实的每帧 CPU 串行成本 —— 唯一
+        // 诚实呈现的位置就是本段(NR 关时不再恒 0,RTX 关时仍 0)。
+        // 直通帧(evalZeroed)没有 NGX 调用,恒 0。
         const double evalCpuMs = ms(t1, t2, qpcFreq);
-        const double evalOnlyMs = evalZeroed ? 0.0
-                                  : evalCpuMs > nvofMs ? evalCpuMs - nvofMs
-                                                       : 0.0;
+        const double evalBase = evalZeroed ? 0.0
+                                : evalCpuMs > nvofMs ? evalCpuMs - nvofMs
+                                                     : 0.0;
+        const double evalOnlyMs = evalBase + subWaitMs;
         // 分段 GPU 时间 = 各提交的栅栏完成点差(timestamp query 与 NGX 同
         // CL 会 SEH,见 NOTE;栅栏差分是无损精确拆分):
         // gpu 段 = base CL(NR 推理/残差/直通),
@@ -2649,14 +2666,21 @@ bool DlssnrContext::ProcessFrame(
         // 仅 HDR 会话非零),
         // 门关帧 fg 段 ≈ 0(WaitFrame 等的就是 base 值,立即满足)。
         const double gpuWaitMs = ms(t2, t3a, qpcFreq);
-        const double unpackMs = ms(t3b, t4, qpcFreq);
-        const double rtxVsrMs = vsrDoneFence ? ms(t3a, tVsrDone, qpcFreq) : 0.0;
+        // unpack 段 = 真实帧回读;插值帧回读(t3c→t4)= FG 输出搬运,
+        // 并入 fg 段(无 FG 帧两者差 ≈0)。
+        const double unpackMs = ms(t3b, t3c, qpcFreq);
+        const double fgReadbackMs = ms(t3c, t4, qpcFreq);
+        // RTX 各段起点 = tSub1(提交链结束,CPU 开始按 GPU 完成序等待):
+        // vsr 段 = 提交链后的真实 vsr 等待(GPU-bound 时 = vsr GPU 剩余;
+        // CPU-bound 时 ≈0 = "vsr 不构成瓶颈",其 GPU 执行与提交链并行被
+        // 覆盖);fg/hdr 段同理。GPU-bound 才逐段真实,总量恒真。
+        const double rtxVsrMs = vsrDoneFence ? ms(tSub1, tVsrDone, qpcFreq) : 0.0;
         // HDR 会话:fg 段 = postA 栅栏差(纯 DLSSG 推理),hdr 段 = TrueHDR
         // 链 + postB 转换窗口(fgStart → t3b)。非 HDR:fg 段 = 旧形态
         // (post 全部,含转换/回读),hdr 段 = 0。各段不重叠、可加。
         double fgMs = 0.0, rtxHdrMs = 0.0;
         if (hdrRun) {
-            const LARGE_INTEGER &fgStart = vsrDoneFence ? tVsrDone : t3a;
+            const LARGE_INTEGER &fgStart = vsrDoneFence ? tVsrDone : tSub1;
             if (fgBeginOk) {
                 fgMs = ms(fgStart, tFgDone, qpcFreq);
                 rtxHdrMs = ms(tFgDone, t3b, qpcFreq);
@@ -2664,9 +2688,13 @@ bool DlssnrContext::ProcessFrame(
                 rtxHdrMs = ms(fgStart, t3b, qpcFreq);
             }
         } else {
-            const LARGE_INTEGER &fgStart = vsrDoneFence ? tVsrDone : t3a;
+            const LARGE_INTEGER &fgStart = vsrDoneFence ? tVsrDone : tSub1;
             fgMs = ms(fgStart, t3b, qpcFreq);
         }
+        // 插值帧回读(FG 输出搬运,CPU 行拷贝)归入 fg 段:DLSSG 推理被
+        // 提交链遮盖时,这里就是补帧成本的主要可见账目(4x @OUT 几何可达
+        // 10ms+)。
+        fgMs += fgReadbackMs;
         // Magpie-style perf log line into dlssnr_timing.log (time-gated ≥1s,
         // see perfDue below). TimingLog takes g_timingMutex itself — format
         // the line under the lock, log outside of it, or this thread
@@ -2711,7 +2739,7 @@ bool DlssnrContext::ProcessFrame(
                     (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                         ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f unpack=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f | res=%d%% of=%d %dx%d f=%d fps=%.0f",
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f | res=%d%% of=%d %dx%d f=%d fps=%.0f",
                          gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
                          nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
                          nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
@@ -2719,7 +2747,7 @@ bool DlssnrContext::ProcessFrame(
                          nvProbe ? nvProbe->GateSkips() : 0u,
                          nvProbe ? nvProbe->GateExpired() : 0u,
                          nvProbe ? nvProbe->ResetCount() : 0u,
-                         evalCpuEma, fgLast, rtxVsrLast, rtxHdrLast, unpackEma,
+                         evalCpuEma, fgLast, rtxVsrLast, rtxHdrLast, unpackEma, subWaitMs,
                          slotEma, g_timing.slotW[lastIdx],
                          lockEma, g_timing.lockW[lastIdx],
                          std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),

@@ -226,10 +226,15 @@ inline constexpr const char *SK_GPU_LAST = "gpu_last";
 // 播放时逐帧变化 <0.1ms,面板"处理用时"会冻结成"停几秒 + 突跳"的观感;
 // last 随帧呼吸。perf 日志行仍用 EMA(诊断要看趋势,不受影响)。
 inline constexpr const char *SK_PACK_LAST = "pack_last";
+// eval_cpu = "NGX 调用" 的 CPU 成本:NR eval(NR 开时)+ RTX evals 的 CPU
+// 提交链(vsr/TrueHDR/DLSSG 逐笔参数录制,~1.8ms/笔;TrueHDR 后置 + FG 4x
+// = 每帧 8 笔 ≈ 14ms,2026-09-24 探针定案)。NR 关但 RTX 开时非零 —— 高的
+// 来源是 RTX evals 的提交,不是 NR。
 inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
-// DLSS FG 段(postA 栅栏差,纯 DLSSG 推理;非 HDR 会话 = 旧 post 全部:
-// 推理 + 转换/回读 —— TrueHDR 后置后 HDR 会话的转换移 postB)。fg 关/
-// 门关帧 ≈ 0,面板零值段自动隐藏。
+// DLSS FG 段 = 补帧的全部可见成本:postA 栅栏差(DLSSG 推理;HDR 会话
+// 被 CPU 提交链遮盖时常为 0,**插值帧回读的 CPU 行拷贝归本段** —— FG 4x
+// @OUT 几何可达 10ms+,是补帧成本的主要可见账目)。非 HDR 会话含旧 post
+// 全部(推理 + 转换/回读)。fg 关/门关帧 ≈ 0,面板零值段自动隐藏。
 inline constexpr const char *SK_FG_LAST = "fg_last";
 // RTX Video 分段(专用队列 eval 的 GPU 墙钟,t3a 后有界 CPU 等待完成栅栏
 // 拆账):vsr = VSR eval;hdr = TrueHDR 链(每输出帧一次:真实 + 逐插值

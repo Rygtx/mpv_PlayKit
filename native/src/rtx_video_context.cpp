@@ -44,16 +44,18 @@ bool RtxQueue::Initialize(ID3D12Device *device, const char *label, char *err, si
     if (FAILED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(_queue.GetAddressOf())))) {
         return fail("CreateCommandQueue failed");
     }
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                              IID_PPV_ARGS(_allocator.GetAddressOf())))) {
-        return fail("CreateCommandAllocator failed");
+    for (int i = 0; i < kAltCount; ++i) {
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(_allocator[i].GetAddressOf())))) {
+            return fail("CreateCommandAllocator failed");
+        }
+        if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                             _allocator[i].Get(), nullptr,
+                                             IID_PPV_ARGS(_commandList[i].GetAddressOf())))) {
+            return fail("CreateCommandList failed");
+        }
+        if (FAILED(_commandList[i]->Close())) return fail("initial Close failed");
     }
-    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                         _allocator.Get(), nullptr,
-                                         IID_PPV_ARGS(_commandList.GetAddressOf())))) {
-        return fail("CreateCommandList failed");
-    }
-    if (FAILED(_commandList->Close())) return fail("initial Close failed");
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(_fence.GetAddressOf())))) {
         return fail("CreateFence failed");
     }
@@ -71,28 +73,31 @@ bool RtxQueue::Execute(ID3D12Fence *waitFence, uint64_t waitValue,
         return false;
     };
     if (waitFence && waitValue) _queue->Wait(waitFence, waitValue);
-    // 单 allocator 跨槽复用:CPU 端先等上一笔 eval 执行完再 Reset。
-    // 槽池流水下背靠背 eval(帧供 > 吞吐 / seek 后 burst)时上一 CL 可能
-    // 仍在 GPU 上跑 —— in-flight Reset 是 UB,实测表现 = VSR 队列静默
-    // wedge(Signal 永不来 → 主队列 Wait(rtx fence) 永挂 → mpv 卡死,
-    // 无 TDR 无报错,真机 0.6.8 2026-09-22 实锤)。keep-up 时 completed
-    // 值已满足,零开销;落后时即诚实背压。
-    if (const uint64_t pending = _fenceValue.load(std::memory_order_acquire)) {
+    // 双 allocator 交替:本笔用的 idx 与上一笔相反,Reset 目标(同 idx 的
+    // allocator)最近一笔在两笔之前 —— 通常早已完成,等待即刻返回;GPU
+    // 落后超过两笔同 idx(>4 笔在飞)时有界等待 = 诚实背压(单 allocator
+    // 时代的 lookback 是"等上一笔"= 背靠背 eval 时 CPU 逐笔等 GPU,提交
+    // 链被 GPU 执行串行吸收 —— HDR 链 sub=17ms 根因,2026-09-24 探针定案;
+    // in-flight Reset 是 UB 且有 VSR 队列静默 wedge 前科,2026-09-22,背压
+    // 语义保留)。
+    const int idx = static_cast<int>(_fenceValue.load(std::memory_order_acquire) % kAltCount);
+    if (const uint64_t pending = _lastSignal[idx]) {
         Wait(pending, nullptr, 0);
     }
-    if (FAILED(_allocator->Reset())) return fail("allocator Reset failed");
-    if (FAILED(_commandList->Reset(_allocator.Get(), nullptr))) return fail("CL Reset failed");
-    if (!fn(_commandList.Get())) {
+    if (FAILED(_allocator[idx]->Reset())) return fail("allocator Reset failed");
+    if (FAILED(_commandList[idx]->Reset(_allocator[idx].Get(), nullptr))) return fail("CL Reset failed");
+    if (!fn(_commandList[idx].Get())) {
         // 录制失败:force-close 释放 CL 到封闭态(下帧 Reset 才能成功),
         // 队列不执行(已排的 Wait 无害,自然满足)。
-        _commandList->Close();
+        _commandList[idx]->Close();
         return fail("NGX eval recording failed");
     }
-    if (FAILED(_commandList->Close())) return fail("CL Close failed");
-    ID3D12CommandList *lists[]{ _commandList.Get() };
+    if (FAILED(_commandList[idx]->Close())) return fail("CL Close failed");
+    ID3D12CommandList *lists[]{ _commandList[idx].Get() };
     _queue->ExecuteCommandLists(1, lists);
     const uint64_t v = _fenceValue.fetch_add(1) + 1;
     _queue->Signal(_fence.Get(), v);
+    _lastSignal[idx] = v;
     if (signalValueOut) *signalValueOut = v;
     return true;
 }

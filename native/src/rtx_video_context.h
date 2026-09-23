@@ -66,14 +66,24 @@ public:
     // CPU 等待某次 Execute 的完成点(节点依赖链的 CPU 侧锚;GPU 侧顺序由
     // 消费者队列 Wait 保证,CPU 等待只为统一 Unpack 的完成时序)。
     // timeoutMs:分段计时用有界等待(超时 = 队列 wedge/设备丢失,交由
-    // WaitFrame 的既有失败路径收尾);Reset 回看的背压等待保持 INFINITE。
+    // WaitFrame 的既有失败路径收尾);同 allocator 复用的背压等待保持
+    // INFINITE。
     bool Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs = INFINITE) noexcept;
     ID3D12Fence *Fence() const noexcept { return _fence.Get(); }
 
 private:
     ComPtr<ID3D12CommandQueue> _queue;
-    ComPtr<ID3D12CommandAllocator> _allocator;
-    ComPtr<ID3D12GraphicsCommandList> _commandList;
+    // **双 allocator/CL 交替(0/1)**:单 allocator 下 back-to-back eval
+    //(HDR 链逐插值帧)的 allocator Reset 必须等上一笔 GPU 完成(lookback
+    // wait)→ CPU 提交链被 GPU 执行串行吸收(实测 sub=17ms,2026-09-24),
+    // vsr/fg 分段观测被填满塌 0。交替使用 = Reset 目标永不在飞(同 idx
+    // 间隔两笔,有界等待通常即刻满足),提交链回归纯录制。
+    static constexpr int kAltCount = 2;
+    ComPtr<ID3D12CommandAllocator> _allocator[kAltCount];
+    ComPtr<ID3D12GraphicsCommandList> _commandList[kAltCount];
+    // 每 idx 最近一次 Signal 的完成栅栏值(Reset 前有界等待它 —— 该 idx
+    // 上一笔在飞时的诚实背压)。
+    uint64_t _lastSignal[kAltCount] = {};
     ComPtr<ID3D12Fence> _fence;
     HANDLE _event = nullptr;
     std::atomic<uint64_t> _fenceValue{ 0 };
