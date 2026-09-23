@@ -241,23 +241,13 @@ static DisplayPick DetectTargetSize(int srcW, int srcH) noexcept {
     // aware,物理像素),无窗口时无目标 —— 不存在"拿显示器凑"的场景。
     if (!ctx.hwnd) return { 0, 0 };
     int w = 0, h = 0;
-    if (IsIconic(ctx.hwnd)) {
-        // 最小化时 GetClientRect 给的是任务栏代表尺寸(极小)—— 直接用
-        // 会让"最小化中的任何重建"把 VSR 目标掉到极小。取还原矩形近似
-        // 客户区(含边框 ~±16px,对超分目标无碍)。
-        WINDOWPLACEMENT wp{};
-        wp.length = sizeof(wp);
-        if (GetWindowPlacement(ctx.hwnd, &wp)) {
-            w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
-            h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
-        }
-    }
-    if (w <= 0 || h <= 0) {
-        RECT rc{};
-        if (GetClientRect(ctx.hwnd, &rc)) {
-            w = rc.right - rc.left;
-            h = rc.bottom - rc.top;
-        }
+    // 最小化窗口的 GetClientRect 是任务栏代表尺寸(~152x20,低于源)——
+    // 不做特例:探测目标低于源 = 旁路,正是"低于源分辨率直通"的设计语义;
+    // 还原时 resize watcher 探到高度变化,自动 seek 重建回全尺寸目标。
+    RECT rc{};
+    if (GetClientRect(ctx.hwnd, &rc)) {
+        w = rc.right - rc.left;
+        h = rc.bottom - rc.top;
     }
     if (w <= 0 || h <= 0) return { 0, 0 };
     // 视频实际显示矩形 = 源宽高比在客户区内 min-fit(mpv letterbox 语义;
