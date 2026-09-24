@@ -86,7 +86,8 @@ struct RtxVideoParams {
     int vsrAutoHeight = 2160;
     int vsrStrength = 2;     // VSR QualityLevel(1-4=AI;per-eval,live)
     // TrueHDR(0/1):输出域切换为 HDR10 —— 滤镜输出 YUV420P10(BT.2020
-    // PQ limited),mpv 侧 target-colorspace-hint 上屏。创建时。
+    // PQ limited),上屏由面板自动同步(vf 打标 + target-colorspace-hint)。
+    // 创建时。
     int hdrEnabled = 0;
     int hdrContrast = 100;       // 0-200(官方默认 100;per-eval,live)
     int hdrSaturation = 100;     // 0-200

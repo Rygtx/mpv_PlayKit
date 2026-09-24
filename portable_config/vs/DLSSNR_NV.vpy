@@ -115,7 +115,8 @@ H_Max = 0
 ## <True|False> RTX Video HDR (NGX TrueHDR, SDR→HDR, 默认 False):
 ##          挂 VSR 之后 (官方契约: TrueHDR 不能吃 HDR 输入, 必须在 VSR 后);
 ##          输出切换 YUV420P10 BT.2020 PQ, HDR10 元数据随帧 props,
-##          mpv 侧建议 target-colorspace-hint=yes 上屏 HDR (SDR 屏自动色调映射)
+##          HDR 上屏(打标 + 色彩空间 hint)由面板自动同步, 无需改 mpv.conf
+##          (SDR 屏自动色调映射)
 ##          依赖 vs-plugins\ngx\nvngx_truehdr.dll; HDR 源内容仍走 vpy 直通守卫
 ## <0-200> 整数, HDR 对比度 (默认 100)
 ## <0-200> 整数, HDR 饱和度 (默认 100)

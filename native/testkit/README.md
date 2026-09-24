@@ -97,6 +97,7 @@ dump 文件写在**宿主 exe 旁**(插件 `GetModuleFileNameW(nullptr)` 逻辑)
 | `verify_chroma_forward.py` | U/V 平面前向对照(shader 数学 vs 实测;PQ 常量/矩阵顺序回归;VSDLSSNR_DUMP_SKIP 对齐帧号) |
 | `verify_temporal_drift.py` | 真片源连续 600 帧采样,Y 码 rails(二值化)= 时域退化(需 `VSDLSSNR_TEST_MEDIA`) |
 | `test_hdrfix_vf.py` | 面板驱动 HDR 打标端到端:SK_RTX 含 hdr → 面板 IPC `vf add @dlssnr-hdr-tag` → mpv 按 PQ 解读 → 截图(需 `VSDLSSNR_TEST_MEDIA`;IPC 管道生命周期有竞态,失败先重跑) |
+| `test_hdr_hint_sync.py` | 打标 + target-colorspace-hint 同步:hdr=1 → 标签在链 + get hint==true;hdr=0 → 摘标 + hint 还原 mpv 连接时实值(媒体缺失自带合成 y4m,`VSDLSSNR_TEST_MEDIA` 可覆盖) |
 | `hdr_tag_manual.py` | 手动打/摘 PQ 标签工具(面板自动同步的备用手段;独立 python 可跑,`VSDLSSNR_MPV_PIPE` 覆盖管道名) |
 
 ### 面板 UI 工具(PowerShell,交互排查非断言)

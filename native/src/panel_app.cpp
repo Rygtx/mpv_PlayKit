@@ -564,6 +564,12 @@ static int ReadStatsSnapshot(StatsPayload *st, bool *badMagic) noexcept {
 // SDR 实态移除(8bit 输出不得标成 PQ)。标签参数 = 插件输出契约的镜像,
 // 固定不可配置。
 //
+// 同拍同步 target-colorspace-hint:打标只声明"数据是 PQ",显示端切 HDR
+// 由该属性决定(0.41 起 auto/no/yes 三档;no = 恒色调映射进 SDR,不上
+// HDR 亮度)。加标拍设 yes,摘标拍还原连接时读回的 mpv 实值(get 实测
+// 序列化:auto→"auto" 字符串,no/yes→JSON 布尔,三态都接;读不到按 auto
+// 兜底)。mpv.conf 零配置。
+//
 // 2026-09-24 从主循环 stats tick 独立成线程:面板隐藏进托盘后主循环
 // WaitMessage 全休眠,stats tick 不可达 —— 曾表现为"开 HDR 不点托盘
 // 图标就永远打不上标"。worker 每 250ms 自读 stats 快照(不经 g_app:
@@ -588,10 +594,37 @@ bool HdrTagSendOnPipe(HANDLE pipe, const char *cmd) noexcept {
            ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr) != FALSE;
 }
 
+// 读回 target-colorspace-hint 实值("auto"/"yes"/"no")到 out。入口先写
+// "auto" 兜底,故返回时 out 恒非空(调用方无需判空)。
+void HdrTagReadHint(HANDLE pipe, char *out, size_t cap) noexcept {
+    static const char kCmd[] =
+        "{\"command\":[\"get_property\",\"target-colorspace-hint\"]}\n";
+    strcpy_s(out, cap, "auto"); // mpv 0.41+ 默认档
+    char ack[256]{};
+    DWORD written = 0, got = 0;
+    if (!WriteFile(pipe, kCmd, static_cast<DWORD>(sizeof(kCmd) - 1), &written, nullptr) ||
+        written != sizeof(kCmd) - 1 ||
+        ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr) == FALSE)
+        return;
+    const char *d = strstr(ack, "\"data\":");
+    if (!d) return;
+    d += 7;
+    if (strncmp(d, "true", 4) == 0) strcpy_s(out, cap, "yes");
+    else if (strncmp(d, "false", 5) == 0) strcpy_s(out, cap, "no");
+    else if (*d == '"') {
+        const char *e = strchr(d + 1, '"');
+        if (e && static_cast<size_t>(e - d - 1) < cap) {
+            memcpy(out, d + 1, static_cast<size_t>(e - d - 1));
+            out[e - d - 1] = '\0';
+        }
+    }
+}
+
 struct HdrTagConn {
     HANDLE pipe = nullptr; // 持久连接:句柄存活 = 同一 mpv 会话
     wchar_t name[64]{};    // 当前管道名(conf 解析命中值,仅日志)
     int lastTagState = -1; // -1 未知(连接建立前/断开后)→ 重连必发
+    char initialHint[8]{}; // 连接时读回的 target-colorspace-hint 实值,摘标还原用
 };
 
 // 连接(若无)并把打标状态推到 want。返回 true = 连接存活且状态已对齐。
@@ -611,7 +644,9 @@ bool HdrTagTick(HdrTagConn &c, int want) noexcept {
         free(parsedName);
         if (!c.pipe) return false; // mpv 不在/IPC 未起:下拍重试,不闩锁
         c.lastTagState = -1;       // 新会话一律视为未知 → 必发
-        PanelLog("panel: hdr tag worker connected to pipe %ls", c.name);
+        HdrTagReadHint(c.pipe, c.initialHint, sizeof(c.initialHint));
+        PanelLog("panel: hdr tag worker connected to pipe %ls (colorspace-hint=%hs)",
+                 c.name, c.initialHint);
     }
     if (c.lastTagState == want) return true;
     char cmd[256];
@@ -626,7 +661,22 @@ bool HdrTagTick(HdrTagConn &c, int want) noexcept {
     }
     if (HdrTagSendOnPipe(c.pipe, cmd)) {
         c.lastTagState = want;
-        PanelLog("panel: hdr vf tag %ls via %ls", want ? L"added" : L"removed", c.name);
+        // 打标同拍把显示端拉到位:加标 = yes(上屏 HDR),摘标 = 还原连接
+        // 时读回的 mpv 实值(不写死 no —— conf 设了 auto 的用户不被降档)。
+        // 失败 = 管道断裂,走下方统一重连路径,下拍整组重发。
+        char hintCmd[160];
+        snprintf(hintCmd, sizeof(hintCmd),
+                 "{\"command\":[\"set_property\",\"target-colorspace-hint\",\"%s\"]}\n",
+                 want ? "yes" : (c.initialHint[0] ? c.initialHint : "auto"));
+        if (!HdrTagSendOnPipe(c.pipe, hintCmd)) {
+            PanelLog("panel: hdr tag pipe broken (hint sync) -> reconnect next tick");
+            CloseHandle(c.pipe);
+            c.pipe = nullptr;
+            c.lastTagState = -1;
+            return false;
+        }
+        PanelLog("panel: hdr vf tag %ls + colorspace-hint via %ls",
+                 want ? L"added" : L"removed", c.name);
         return true;
     }
     PanelLog("panel: hdr tag pipe broken -> reconnect next tick");
@@ -1460,7 +1510,7 @@ void DrawUi() noexcept {
         if (!vsrOn) ImGui::EndDisabled();
     }
     pairLabel(1, "RTX Video HDR", "TrueHDR(SDR → HDR10):输出切 YUV420P10(BT.2020 PQ),\n"
-              "mpv 侧 target-colorspace-hint 上屏。官方明文必须排在 VSR 之后\n"
+              "HDR 上屏(打标 + 色彩空间)由面板自动同步。官方明文必须排在 VSR 之后\n"
               "(VSR 不吃 HDR 输入),管线顺序 NR→VSR→HDR→FG。\n"
               "开关为创建时参数:变化自动触发 mpv 原地重载。\n"
               "需插件 ngx\\ 下有 nvngx_truehdr.dll(RTX Video SDK 1.1)。");
@@ -1588,7 +1638,7 @@ void DrawUi() noexcept {
 
             // 跨页依赖提示
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-            ImGui::TextDisabled("提示: 实际生效状态见\"诊断\"页;HDR 上屏需 mpv.conf target-colorspace-hint=true。");
+            ImGui::TextDisabled("提示: 实际生效状态见\"诊断\"页;HDR 上屏(打标 + 显示色彩空间)由面板自动同步,无需改 mpv.conf。");
             y += rowH;
 
             ImGui::EndTabItem();
