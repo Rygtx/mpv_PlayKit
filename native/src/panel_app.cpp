@@ -1381,7 +1381,7 @@ void DrawUi() noexcept {
               "需光流质量 > 0(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
               "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。\n"
               "运行库上限默认开到 6x(部署 ini MaxGeneratedFrames=5);\n"
-              "输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率。");
+              "输出帧率 = 源 ×M,显示端刷新率建议不低于输出帧率。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     ImGui::SetNextItemWidth(trackW);
     {
@@ -1624,10 +1624,10 @@ void DrawUi() noexcept {
 
     // 补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 代价提示。
     // 标签 ≤5 中文字宽(标签列宽限制,超宽侵入控件列与开关重叠,#53e 同款)。
-    pairLabel(0, "HDR域插帧", "实验性:DLSSG 在感知码域(PQ)插帧 —— TrueHDR 输出先编码成\n"
-              "PQ 码(≤1.0,DLSSG 对 >1.0 的 scRGB 线性值不保真,2026-09-24\n"
-              "值域定案)作 backbuffer,省 TrueHDR ×(M-1) 的 GPU/提交成本,\n"
-              "插值帧质量口径与默认模式(逐帧 TrueHDR)不同 —— 异常即关闭。\n"
+    pairLabel(0, "HDR域插帧", "实验性:HDR 转换只对真实帧做一次,插值帧直接在 HDR 域生成 ——\n"
+              "省去每个插值帧各自做一次 HDR 转换的开销,高倍数或高分辨率下\n"
+              "收益更明显。插值帧的画面口径与默认模式略有不同;若出现闪烁、\n"
+              "亮度跳变等画面异常,关闭本开关即恢复默认行为。\n"
               "创建时参数:变化自动触发 mpv 原地重载,需 HDR 与补帧同时开启。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     {
@@ -1642,7 +1642,7 @@ void DrawUi() noexcept {
         if (!usable) ImGui::EndDisabled();
         ImGui::SameLine(0, 12 * s);
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
-                           usable ? "实验性 —— 插值走感知域,异常即关闭"
+                           usable ? "实验性 —— 画面异常(闪烁/亮度跳变)请关闭"
                                   : "需 HDR 与补帧同时开启");
     }
     y += rowH;

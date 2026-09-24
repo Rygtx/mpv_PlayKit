@@ -97,6 +97,7 @@ static const short accumulativeOffsetsFrom0x4E00[] =
     static ImWchar baseRanges[] = {
         0x0020, 0x00FF,
         0x2000, 0x206F,
+        0x2264, 0x2265, // ≤ ≥(曾因缺字形渲染成 ?,UI 文案守则:能不用就不用)
         0x3000, 0x30FF,
         0x31F0, 0x31FF,
         0xFF00, 0xFFEF,
