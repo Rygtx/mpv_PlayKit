@@ -81,7 +81,10 @@ struct FilterData {
     bool initOk = false;
     int width = 0;
     int height = 0;
-    int depth = 0; // YUV 位深(8/10);同尺寸换深度必须走冷重建(hotMatch 拦截)
+    int depth = 0; // YUV 位深(8/10/12/14/16);同尺寸换深度必须走冷重建(hotMatch 拦截)
+    int subW = 1;  // 输入色度抽取档(420=(1,1) 422=(1,0) 444=(0,0));RGB=0
+    int subH = 1;
+    bool isRgb = false; // VS RGBP 计划族直读(零矩阵)
     // RTX Video 输出几何(init 后从 context 读回;输出帧按此建)。
     int outW = 0;
     int outH = 0;
@@ -143,6 +146,11 @@ struct HotContext {
     int width = 0;
     int height = 0;
     int depth = 0;
+    // 布局参与 hotMatch:同尺寸同深度换 420/422/444/RGB = 色度面几何/核
+    // 形态变化(槽纹理尺寸 baked),必须冷重建。
+    int subW = 1;
+    int subH = 1;
+    bool isRgb = false;
     // FG 状态参与 hotMatch:开关/代理路径变化 = 槽资源形态变化(FG 纹理
     // 有无),必须冷重建。fgHdrInterp(实验性 HDR 域插帧)同样参与:FG
     // 插值纹理格式与 post 分支随之变化。路由(route)进程级,重启生效,
@@ -193,8 +201,11 @@ static void CopyPlanes(const VSFrame *src, VSFrame *dst, const VSAPI *vsapi,
                        int width, int height) noexcept {
     const VSVideoFormat *fi = vsapi->getVideoFrameFormat(dst);
     const int bpp = fi->bytesPerSample;
-    const int cw = (width + 1) >> 1, ch = (height + 1) >> 1;
-    for (int p = 0; p < 3; ++p) {
+    // 色度平面尺寸按帧真实格式(subSampling 派生,VS ceil 规则):
+    // 420 半、422 半宽、444/RGB 全分辨率 —— 勿再自推半分辨率。
+    const int cw = fi->subSamplingW ? (width + 1) >> 1 : width;
+    const int ch = fi->subSamplingH ? (height + 1) >> 1 : height;
+    for (int p = 0; p < 3 && p < fi->numPlanes; ++p) {
         const int pw = p == 0 ? width : cw;
         const int ph = p == 0 ? height : ch;
         vsh::bitblt(vsapi->getWritePtr(dst, p), vsapi->getStride(dst, p),
@@ -373,8 +384,11 @@ static void CopyPlanesScaled(const VSFrame *src, VSFrame *dst, const VSAPI *vsap
                              int srcW, int srcH, int dstW, int dstH) noexcept {
     const VSVideoFormat *fi = vsapi->getVideoFrameFormat(dst);
     const int bpp = fi->bytesPerSample;
-    const int srcCw = (srcW + 1) >> 1, srcCh = (srcH + 1) >> 1;
-    const int dstCw = (dstW + 1) >> 1, dstCh = (dstH + 1) >> 1;
+    // 色度平面尺寸按帧真实格式(420 半 / 422 半宽 / 444+RGB 全分辨率)。
+    const int srcCw = fi->subSamplingW ? (srcW + 1) >> 1 : srcW;
+    const int srcCh = fi->subSamplingH ? (srcH + 1) >> 1 : srcH;
+    const int dstCw = fi->subSamplingW ? (dstW + 1) >> 1 : dstW;
+    const int dstCh = fi->subSamplingH ? (dstH + 1) >> 1 : dstH;
     for (int p = 0; p < 3; ++p) {
         const int sw = p == 0 ? srcW : srcCw;
         const int sh = p == 0 ? srcH : srcCh;
@@ -489,12 +503,17 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     const int nrPub = nrLive ? 1 : 0;
     if (d->nrPubState.exchange(nrPub) != nrPub) {
         char body[224];
-        if (!nrLive && !d->fgActive) {
+        // "NR off (panel)" 只允许已初始化会话发布(live 关、可 live 恢复)。
+        // 全关直通实例(initOk=false)首帧 nrPubState{-1} 边沿曾误发同款,
+        // 面板 NR 开关按前缀判定"live 可恢复"跳过重建 → 开 NR 永远无效
+        // (实测 4K 片源零条 nr=1 fg=0 create;FG 开关捎带重建才生效)。
+        if (!nrLive && !d->fgActive && d->initOk) {
             std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR off (panel)\"}",
                           vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
         } else if (nrLive && !d->initOk) {
-            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR on; seek to initialize\"}",
-                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
+            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"%s\"}",
+                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL,
+                          vsdlssnr::kStateNrSeekInit);
         } else {
             body[0] = '\0'; // 已初始化 / FG 仍在跑:常规逐帧 stats 接管,无需发布
         }
@@ -748,6 +767,9 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().width = d->width;
         Hot().height = d->height;
         Hot().depth = d->depth;
+        Hot().subW = d->subW;
+        Hot().subH = d->subH;
+        Hot().isRgb = d->isRgb;
         Hot().fgEnabled = d->fgActive;
         Hot().fgHdrInterp = d->fgHdrInterp;
         Hot().fgDllPath = std::move(d->fgDllPath);
@@ -773,16 +795,23 @@ static void VS_CC DlssnrCreate(
     }
     const VSVideoInfo *vi = vsapi->getVideoInfo(node);
 
-    // YUV 原生(全切 RGBS):仅 YUV420P8/P10,输出同格式。其它格式由 vpy
-    // 直通守卫(防不支持格式打断播放)。
-    const bool is420P8 = vi->format.colorFamily == cfYUV && vi->format.sampleType == stInteger &&
-                         vi->format.bitsPerSample == 8 && vi->format.subSamplingW == 1 &&
-                         vi->format.subSamplingH == 1;
-    const bool is420P10 = vi->format.colorFamily == cfYUV && vi->format.sampleType == stInteger &&
-                          vi->format.bitsPerSample == 10 && vi->format.subSamplingW == 1 &&
-                          vi->format.subSamplingH == 1;
-    if (!vsh::isConstantVideoFormat(vi) || (!is420P8 && !is420P10)) {
-        vsapi->mapSetError(out, "dlssnr.Enhance: clip must be YUV420P8 or YUV420P10 (constant format)");
+    // 原生格式收编(2026-09-24,撤 wrapper 自设的 420P8/P10 闸门):
+    //   YUV 计划族 × {420,422,444} × 8/10/12/14/16bit —— ConvertIn 按
+    //   subSampling/位深参数化采样(色度平面几何 = VS ceil 规则)。
+    //   RGB 计划族(RGBP*,平面序 G/B/R)—— 零矩阵直读直写。
+    // 其余(GRAY/packed RGB/YUVA 等)仍由 vpy 预转换或直通。
+    const VSVideoFormat &vf = vi->format;
+    const bool isYuv = vf.colorFamily == cfYUV && vf.sampleType == stInteger &&
+                       vf.bitsPerSample >= 8 && vf.bitsPerSample <= 16 &&
+                       vf.subSamplingW <= 1 && vf.subSamplingH <= 1;
+    const bool isRgbPlanar = vf.colorFamily == cfRGB && vf.sampleType == stInteger &&
+                             vf.subSamplingW == 0 && vf.subSamplingH == 0 &&
+                             vf.bitsPerSample >= 8 && vf.bitsPerSample <= 16 &&
+                             // 计划 RGB = 3 平面;packed(RGB24/48)单平面
+                             // 不接(vpy 兜底转换),避免交错打包路径。
+                             vf.numPlanes == 3;
+    if (!vsh::isConstantVideoFormat(vi) || (!isYuv && !isRgbPlanar)) {
+        vsapi->mapSetError(out, "dlssnr.Enhance: clip must be planar YUV (420/422/444, 8-16bit) or planar RGB (constant format)");
         vsapi->freeNode(node);
         return;
     }
@@ -792,6 +821,9 @@ static void VS_CC DlssnrCreate(
     d->width = vi->width;
     d->height = vi->height;
     d->depth = vi->format.bitsPerSample;
+    d->subW = vi->format.subSamplingW;
+    d->subH = vi->format.subSamplingH;
+    d->isRgb = isRgbPlanar;
     d->srcFrames = vi->numFrames; // FG 尾部映射;0 = 未知长度(尾部钳制禁用)
 
     DlssnrParams initial{}; // member initializers are the default authority
@@ -856,10 +888,15 @@ static void VS_CC DlssnrCreate(
     // "参数没生效/拖进度条回去了"类问题(#37)一行定位:ini/payload 哪层
     // 参与了、create-time 三元组最终是什么,一眼可查。
     {
+        // 布局标签:420/422/444/RGB(消费方几何/核形态的创建时事实)。
+        const char *layout = d->isRgb ? "RGB"
+                                      : d->subW == 0 && d->subH == 0 ? "444"
+                                      : d->subW == 1 && d->subH == 0 ? "422"
+                                      : d->subW == 1 && d->subH == 1 ? "420" : "?";
         char msg[288];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d fg_hdr=%d",
-                      d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
+                      "DLSSNR STATUS: create params %dx%dd%d %s ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d fg_hdr=%d",
+                      d->width, d->height, d->depth, layout, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.ffxQuality,
@@ -956,6 +993,10 @@ static void VS_CC DlssnrCreate(
                           Hot().ngxDllPath == d->ngxDllPath &&
                           Hot().width == d->width && Hot().height == d->height &&
                           Hot().depth == d->depth &&
+                          // 布局(420/422/444/RGB)参与:同尺寸同深度换布局 =
+                          // 色度面几何/核形态变化,必须冷重建。
+                          Hot().subW == d->subW && Hot().subH == d->subH &&
+                          Hot().isRgb == d->isRgb &&
                           Hot().fgEnabled == (initial.fgEnabled != 0) &&
                           Hot().fgHdrInterp == (initial.fgHdrInterp != 0) &&
                           Hot().fgDllPath == d->fgDllPath &&
@@ -1007,6 +1048,7 @@ static void VS_CC DlssnrCreate(
         if (d->d3d12->Initialize(err, sizeof(err)) &&
             d->ngx->Initialize(*d->d3d12, d->ngxDllPath.c_str(), d->fgDllPath.c_str(),
                                d->width, d->height, d->depth, d->params.get(), rtx,
+                               d->subW, d->subH, d->isRgb,
                                err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge

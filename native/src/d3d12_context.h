@@ -212,9 +212,13 @@ public:
     //   hdr     — TrueHDR:输出平面切 P10(PQ)
     //   fgHdrInterp — 实验性补帧 HDR 域插帧:fgInterp 切 FP16、hdrFg 不建
     //                 (插值输出即 FG 的 FP16 产物,无逐帧 TrueHDR)
+    //   subW/subH — 输入色度抽取档(0=全、1=半;420=(1,1)、422=(1,0)、
+    //                 444=(0,0))。SDR 输出同布局,HDR P10 输出恒 420。
+    //   rgb       — VS RGBP 计划族直读(零矩阵;平面序 G/B/R)
     bool CreateFrameResources(int width, int height, int depth, bool fg,
                               int pipeW, int pipeH, int outW, int outH,
                               bool vsr, bool hdr, bool fgHdrInterp,
+                              int subW, int subH, bool rgb,
                               char *err, size_t errLen) noexcept;
     bool FgSlots() const noexcept { return _fgSlots; }
     // RTX Video 管线几何(create-time 定格;ProcessFrame/插件侧共用)。
@@ -461,6 +465,14 @@ public:
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
     int BitDepth() const noexcept { return _bitDepth; }
+    // 输入色度平面尺寸(subW/H 派生;dump/校验侧按真实布局读,勿再自推)。
+    int ChromaWidth() const noexcept { return _chromaW; }
+    int ChromaHeight() const noexcept { return _chromaH; }
+    bool IsRgb() const noexcept { return _isRgb; }
+    // 管线色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit);RTX 会话
+    // BGRA8(TrueHDR 拒 FP16,否决制);VSDLSSNR_NR_FORMAT=fp16/bgra8 强制
+    // 覆盖。dump 侧必须与资源一致(CopyTextureRegion 跨格式 E_INVALIDARG)。
+    DXGI_FORMAT ColorFormat() const noexcept { return _inColorFmt; }
     ID3D12Resource *ReducedColor(FrameSlot &s) const noexcept { return s.reducedColor.Get(); }
     ID3D12Resource *ReducedDenoised(FrameSlot &s) const noexcept { return s.reducedDenoised.Get(); }
     ID3D12Resource *ControlledRes(FrameSlot &s) const noexcept { return s.controlledRes.Get(); }
@@ -518,6 +530,8 @@ private:
                             DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
                             D3D12_RESOURCE_FLAGS flags,
                             char *err, size_t errLen) noexcept;
+    // 管线色格式策略(实例:依赖 _bitDepth;allowFp16 = !hdr && !vsr)。
+    DXGI_FORMAT NrColorFormat(bool allowFp16) const noexcept;
     bool CreateComputeObjects(char *err, size_t errLen) noexcept;
     void SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept;
 
@@ -542,8 +556,11 @@ private:
 
     int _width = 0;
     int _height = 0;
-    int _bitDepth = 0;  // YUV 位深(8/10;不叫 _depth —— 那是零 guidance 深度纹理)
-    int _chromaW = 0;   // 色度平面尺寸 = (w+1)>>1 / (h+1)>>1(输入/源)
+    int _bitDepth = 0;  // YUV 位深(8/10/12/14/16;不叫 _depth —— 那是零 guidance 深度纹理)
+    int _subW = 1;      // 输入色度抽取档(1=半,0=全):420=(1,1) 422=(1,0) 444=(0,0)
+    int _subH = 1;
+    bool _isRgb = false; // VS RGBP 直读(零矩阵;平面序 G/B/R)
+    int _chromaW = 0;   // 色度平面尺寸(subW ? (w+1)>>1 : w,输入/源)
     int _chromaH = 0;
     // RTX Video 双尺寸(create-time 定格;无 RTX = 与源一致)。
     //   pipe  — VSR 输出 / TrueHDR / FG backbuffer
@@ -557,6 +574,7 @@ private:
     bool _vsrSlots = false;         // 槽池含 vsrColor / motionDense
     bool _hdrPipe = false;          // TrueHDR 激活(hdrColor/hdrFg FP16 / P10 输出)
     bool _fgHdrInterp = false;      // 实验性补帧 HDR 域插帧(fgInterp FP16 / hdrFg 不建)
+    DXGI_FORMAT _inColorFmt = DXGI_FORMAT_B8G8R8A8_UNORM; // 管线色(NR input/output 缓冲)
     DXGI_FORMAT _outFmt = DXGI_FORMAT_R8_UNORM;      // yuvOut/readback 平面格式
     UINT _outPlaneBytes = 1;
 
@@ -603,6 +621,9 @@ private:
     // u0、chroma 用 u0/u1,共享根签名,10 常量:系数 4 + 范围 4 + 尺寸 2)。
     ComPtr<ID3D12RootSignature> _rsConvertIn;
     ComPtr<ID3D12PipelineState> _psoConvertIn;
+    ComPtr<ID3D12PipelineState> _psoConvertInRgb; // VS RGBP 直读(零矩阵)
+    ComPtr<ID3D12PipelineState> _psoRgbOut;       // RGBP 直写(u0/u1/u2 = G/B/R)
+    ComPtr<ID3D12PipelineState> _psoRgbScaled;    // RGBP RTX 缩放版
     ComPtr<ID3D12RootSignature> _rsConvertOut;
     ComPtr<ID3D12PipelineState> _psoConvertOutLuma;
     ComPtr<ID3D12PipelineState> _psoConvertOutChroma;

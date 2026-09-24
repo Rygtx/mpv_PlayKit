@@ -109,6 +109,7 @@ struct AppState {
     int restoreFrames = 8;     // 恢复期重绘预算(帧);只在窗口可见时消耗
     double lastLiveWrite = 0.0;
     double lastStatsRead = 0.0;
+    double lastSeekInitReseek = 0.0; // kStateNrSeekInit 兜底 reseek 去抖
     char status[160]{};
     char statsBig[64]{};
     char statsRes[96]{};
@@ -2414,6 +2415,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (nowSec - g_app.lastStatsRead > 0.1) {
             g_app.lastStatsRead = nowSec;
             LoadStats();
+        }
+        // 闭环兜底:DLL 报 kStateNrSeekInit = NR 已开但会话未初始化(在
+        // 全关直通实例上开的 NR)。开关瞬间 stats 尚未到位等一切漏判路径
+        // 由此补触发重建;2.5s 去抖防重建窗口内对旧 body 重复 seek。
+        // 要求面板自身意图 nrEnabled:用户中途又关掉时旧 body 不得再触发。
+        if (g_app.params.nrEnabled &&
+            std::strcmp(g_app.filterState, "passthrough") == 0 &&
+            std::strcmp(g_app.stateDetail, vsdlssnr::kStateNrSeekInit) == 0 &&
+            nowSec - g_app.lastSeekInitReseek > 2.5) {
+            g_app.lastSeekInitReseek = nowSec;
+            if (TriggerMpvReseek()) {
+                snprintf(g_app.status, sizeof(g_app.status),
+                         "降噪待初始化:已通知 mpv 原地重载滤镜会话");
+            }
         }
 
         // Repaint only on input, pending edits, or changed stats: an idle

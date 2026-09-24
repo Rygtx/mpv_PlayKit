@@ -41,7 +41,8 @@ public:
                     const wchar_t *fgDllPath,
                     int width, int height, int depth, SharedParams *shared,
                     const RtxVideoParams &rtx,
-                    char *err, size_t errLen) noexcept;
+                    int subW = 1, int subH = 1, bool rgb = false,
+                    char *err = nullptr, size_t errLen = 0) noexcept;
     void Shutdown() noexcept;
 
     // Hot-context rebind: attach this kept-warm context (device, NGX feature,
@@ -203,7 +204,10 @@ private:
     wchar_t _appDataPath[MAX_PATH]{};
     int _width = 0;
     int _height = 0;
-    int _depth = 0; // YUV 位深(8/10;CreateFrameResources/resize 判据/日志)
+    int _depth = 0; // YUV 位深(8/10/12/14/16;CreateFrameResources/resize 判据/日志)
+    int _subW = 1;  // 输入色度抽取档(1=半,0=全):420=(1,1) 422=(1,0) 444=(0,0)
+    int _subH = 1;
+    bool _isRgb = false; // VS RGBP 直读
     // Adapter description in UTF-8, filled once in Initialize and reused by
     // every per-frame stats publish (GetDesc per frame is wasted work).
     char _gpuNameUtf8[160] = "UNAVAILABLE";

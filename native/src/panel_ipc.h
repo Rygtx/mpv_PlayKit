@@ -284,6 +284,10 @@ inline constexpr const char *SK_REMOVED_REASON = "removed_reason";
 inline constexpr const char *SK_FILTER_STATE = "filter_state";
 // 死亡状态的原因串(已经 SanitizeJsonDetail 消毒:无引号/控制字符)
 inline constexpr const char *SK_STATE_DETAIL = "state_detail";
+// 插件发布(state_detail)、面板消费的会话态字符串(单一出处,防两侧漂移):
+// NR 已开但会话未初始化(全关直通实例上开 NR)—— 面板见此应自动 reseek
+// 补触发重建(闭环兜底,覆盖开关瞬间 stats 漏判等一切误判路径)。
+inline constexpr const char *kStateNrSeekInit = "NR on; seek to initialize";
 // NVOF 实际模式(请求档位 ≠ 实际能力时在这里暴露,如 Turing 无 cost):
 // off | zero | forward | forward+cost | both | both+cost
 inline constexpr const char *SK_OF_MODE = "of_mode";

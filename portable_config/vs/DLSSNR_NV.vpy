@@ -8,9 +8,11 @@
 ###       处理为同分辨率 (非超分); 默认零 guidance, 可选硬件光流引导 (0-5 档)
 ###       DLSS 帧生成 (可选): 挂降噪之后, 输出帧率 x2 (插值帧由 DLSS FG 模型合成);
 ###       需要光流引导 (Motion_Vector_Quality > 0) 才有意义, 否则插值帧 = 复制真实帧
-###       YUV 原生: 直接吃 YUV420P8/P10 吐同格式, 无 CPU 格式往返;
-###       色彩矩阵/范围按源帧属性 (_Matrix/_ColorRange) 处理, 缺省 709 limited
-###       HDR (BT.2020/PQ/HLG) 与非 420P8/P10 内容自动直通 (正常播放, 不做增强)
+###       YUV 原生直吃: 计划族 {420,422,444} × 8-16bit 直传滤镜, 无 CPU
+###       格式往返; GRAY/packed RGB 由 709 矩阵转 YUV444 兜底;
+###       色彩矩阵/范围按源帧属性处理, 缺省 709 limited
+###       HDR (BT.2020/PQ/HLG) 照常处理 (NGX NR 不感知传输函数, 矩阵 709
+###       近似往返一致; 原直通守卫已撤)
 ### 调参_ 播放时托盘点击 DLSSNR 图标打开控制面板, 实时调节; 保存后下次自动生效
 
 import vapoursynth as vs
@@ -117,7 +119,7 @@ H_Max = 0
 ##          输出切换 YUV420P10 BT.2020 PQ, HDR10 元数据随帧 props,
 ##          HDR 上屏(打标 + 色彩空间 hint)由面板自动同步, 无需改 mpv.conf
 ##          (SDR 屏自动色调映射)
-##          依赖 vs-plugins\ngx\nvngx_truehdr.dll; HDR 源内容仍走 vpy 直通守卫
+##          依赖 vs-plugins\ngx\nvngx_truehdr.dll; HDR 源内容照常走全链
 ## <0-200> 整数, HDR 对比度 (默认 100)
 ## <0-200> 整数, HDR 饱和度 (默认 100)
 ## <10-100> 整数, HDR 中间灰 (默认 50)
@@ -129,29 +131,47 @@ H_Max = 0
 
 clip = video_in
 
-# HDR 守卫:BT.2020 矩阵(_Matrix=9)或 PQ/HLG 传输(_Transfer=16/18)的
-# 内容按 SDR 709 处理必错色 —— 直通。属性缺失(裸流)时无法判定,按 SDR
-# 处理(与旧行为一致)。
-def _is_hdr(c) :
+# 原生直吃(2026-09-24,vpy 预转换退役):插件已原生收编 YUV 计划族
+# {420,422,444} × 8/10/12/14/16bit,直传 Enhance,不做任何预转换。
+# HDR(BT.2020/PQ/HLG)照常处理 —— NGX NR 不感知传输函数,矩阵 709
+# 近似往返一致。本部署 VS(R73)无计划 RGB,packed RGB/GRAY 等由
+# 709 矩阵转 YUV444 兜底(转换失败原样直通)。
+def _to_native(c) :
+	f = c.format
+	bits = 16 if f.sample_type == vs.FLOAT else f.bits_per_sample
+	# 本部署 VS(R73)无计划 RGB(RGBP* 缺,RGB 恒 packed 单平面),mpv→VS
+	# 桥对 RGB 源也先行转 YUV —— packed RGB/GRAY 统一 709 矩阵转 YUV444。
+	out_fmt = vs.YUV444P10 if bits > 8 else vs.YUV444P8
+	conv = c.resize.Bicubic(format=out_fmt, matrix_s="709") \
+		if f.color_family == vs.RGB else c.resize.Bicubic(format=out_fmt)
+	# resize 不透传帧 props,DLL 读 _ColorRange 判 limited/full:从首帧
+	# 搬关键字段回填(属性流内恒定,静态回填足够)。
 	try :
-		f = c.get_frame(0)
-		props = f.props
-		m = props.get("_Matrix")
-		t = props.get("_Transfer")
-		return (m is not None and int(m) == 9) or (t is not None and int(t) in (16, 18))
+		props = c.get_frame(0).props
+		keep = {k : int(props[k]) for k in ("_ColorRange", "_Matrix") if k in props}
+		if keep :
+			conv = conv.std.SetFrameProps(**keep)
 	except Exception :
-		return False
+		pass
+	return conv
 
 if H_Max and clip.height > H_Max :
 	ret = clip
-elif _is_hdr(clip) :
-	ret = clip
-elif clip.format.id not in (vs.YUV420P8, vs.YUV420P10) :
-	# 非 420P8/P10 (422/444/RGB 等) 直通: 滤镜只收这两种格式
-	ret = clip
 else :
-	ret = core.dlssnr.Enhance(
-		clip,
+	f = clip.format
+	native = (f.color_family == vs.YUV
+	          and f.sample_type == vs.INTEGER
+	          and 8 <= f.bits_per_sample <= 16
+	          and f.subsampling_w <= 1 and f.subsampling_h <= 1) or \
+	         (f.color_family == vs.RGB and f.sample_type == vs.INTEGER
+	          and f.subsampling_w == 0 and f.subsampling_h == 0 and f.num_planes == 3)
+	try :
+		proc = clip if native else _to_native(clip)
+	except Exception :
+		proc = clip  # 极冷门族转换失败:回退原样,由下方格式门直通
+	if native or proc.format.id in (vs.YUV444P10, vs.YUV444P8) :
+		ret = core.dlssnr.Enhance(
+			proc,
 		nr_enabled = int(NR_Enabled),
 		preset = Preset,
 		style = Style,
@@ -179,5 +199,7 @@ else :
 		hdr_middle_gray = int(HDR_MiddleGray),
 		hdr_peak_nits = int(HDR_PeakNits),
 	)
+	else :
+		ret = clip  # 无法收编(Alpha 族等):原样直通,不挂脚本
 
 ret.set_output()

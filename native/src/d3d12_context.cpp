@@ -30,9 +30,14 @@ struct YuvCoeffs {
 
 YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept {
     YuvCoeffs c{};
+    // 容器字宽:8bit 单字节;>8bit(VS 10/12/14/16)统一 16bit 容器右对齐
+    // 采样字(VS 约定),R16 footprint 直传,无位移。
     c.containerMax = depth > 8 ? 65535.0f : 255.0f;
-    c.sampleMax = depth > 8 ? 1023.0f : 255.0f;
-    const float shift = depth > 8 ? 4.0f : 1.0f;
+    c.sampleMax = static_cast<float>((1 << depth) - 1);
+    // limited 阶梯 = 8bit 基准按位左移(10bit: 64/876/512/896;12bit:
+    // 256/3504/2048/3584 —— ITU 量化表同构)。注意是 ×(1<<(depth-8)) 而非
+    // ×(sampleMax/255):1023/255=4.0118 ≠ 4,等比会偏出 0.2 个码。
+    const float shift = depth > 8 ? static_cast<float>(1 << (depth - 8)) : 1.0f;
     if (range == ColorRange::Limited) {
         c.yLo = 16.0f * shift;
         c.ySpan = 219.0f * shift;
@@ -442,6 +447,27 @@ D3D12Context::PoolHold::~PoolHold() noexcept {
     }
 }
 
+DXGI_FORMAT D3D12Context::NrColorFormat(bool allowFp16) const noexcept {
+    // Phase C 管线色策略(2026-09-24):>8bit 源默认 RGBA16F(NR 全程 10bit,
+    // 消 P10→BGRA8 的 2bit 量化)。**否决制实证(320x180d10 探针)**:TrueHDR
+    // 对 FP16 输入 EvaluateFeature 失败(BGRA 对照通过)→ rtx 请求时回落
+    // BGRA8 并由调用方日志显形。VSDLSSNR_NR_FORMAT=fp16/bgra8 强制覆盖
+    // (全矩阵后续验证用)。FFX OF / FG / NVOF-downsample 均 SRV 消费,
+    // 格式无关,已随默认档实测。
+    static const int envOverride = [] {
+        char v[16]{};
+        const DWORD n = GetEnvironmentVariableA("VSDLSSNR_NR_FORMAT", v, sizeof(v));
+        if (n > 0 && n < sizeof(v)) {
+            if (_stricmp(v, "fp16") == 0) return 1;
+            if (_stricmp(v, "bgra8") == 0) return -1;
+        }
+        return 0;
+    }();
+    if (envOverride == 1) return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (envOverride == -1 || !allowFp16) return DXGI_FORMAT_B8G8R8A8_UNORM;
+    return _bitDepth > 8 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
 bool D3D12Context::CreateColorTexture(
     ID3D12Resource **out, int width, int height,
     DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
@@ -471,12 +497,17 @@ bool D3D12Context::CreateColorTexture(
 bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool fg,
                                         int pipeW, int pipeH, int outW, int outH,
                                         bool vsr, bool hdr, bool fgHdrInterp,
+                                        int subW, int subH, bool rgb,
                                         char *err, size_t errLen) noexcept {
     _width = width;
     _height = height;
     _bitDepth = depth;
-    _chromaW = (width + 1) >> 1;
-    _chromaH = (height + 1) >> 1;
+    _subW = subW;
+    _subH = subH;
+    _isRgb = rgb;
+    // 输入色度平面(VS 规则:ceil)—— 444 全分辨率、422 半宽、420 半宽半高。
+    _chromaW = subW ? (width + 1) >> 1 : width;
+    _chromaH = subH ? (height + 1) >> 1 : height;
     _fgSlots = fg;
     // 实验性补帧 HDR 域插帧:仅 HDR 会话有意义(HDR 关时本值无论真假管线
     // 等价 —— 插值输出恒经 SDR 域直通路径)。
@@ -501,11 +532,16 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     // 曾用 ceil:奇高输出时 UnpackOutput 多拷一行越界 VS 帧分配尾部
     // (静默堆腐蚀 → c0000005,2026-09-22 真机实锤)。几何入口已强制
     // 偶尺寸,此处 floor 是最后一道防线(即使漏进奇尺寸也只欠拷不越界)。
-    _outChromaW = _outW >> 1;
-    _outChromaH = _outH >> 1;
+    // SDR 输出 = 输入布局(420 半 / 422 半高宽全 / 444 全);HDR P10 恒 420。
+    _outChromaW = (_hdrPipe ? 1 : subW) ? _outW >> 1 : _outW;
+    _outChromaH = (_hdrPipe ? 1 : subH) ? _outH >> 1 : _outH;
     // HDR 输出 = 恒 P10(PQ BT.2020 limited);SDR 输出 = 源位深同格式。
     _outPlaneBytes = (_hdrPipe || _bitDepth > 8) ? 2u : 1u;
     _outFmt = _outPlaneBytes > 1 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
+    // 管线色格式(NR input/output 缓冲):>8bit 且无 RTX = RGBA16F(NR 全程
+    // 10bit,消 P10→BGRA8 的 2bit 量化);RTX 会话回落 BGRA8(TrueHDR 拒
+    // FP16,否决制实证 2026-09-24)。CreateSlotResources 按此建缓冲。
+    _inColorFmt = NrColorFormat(!hdr && !vsr);
 
     // 零 guidance 纹理:R16G16_FLOAT motion + R32_FLOAT depth,内容清 0。
     // RTV clear 要求 ALLOW_RENDER_TARGET 标志。clear 后常驻
@@ -776,12 +812,12 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         return false;
     }
 
-    // B8G8R8A8_UNORM(与 Magpie 渲染管线同款):NVOF 输入格式要求 BGRA8
-    // (ABGR8),NGX DLSSNR 的参考宿主也是 BGRA。ALLOW_UNORDERED_ACCESS:
-    // YUV→RGB 转换 dispatch UAV 直写(NGX 对 UAV-flag 纹理做 SRV 读有
-    // reducedColor/motion 生产前科)。
+    // 颜色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit,消 P10→BGRA8
+    // 的 2bit 量化);RTX 会话回落 BGRA8(TrueHDR 拒 FP16,否决制实证
+    // 2026-09-24)。ALLOW_UNORDERED_ACCESS:YUV→RGB 转换 dispatch UAV 直写
+    //(NGX 对 UAV-flag 纹理做 SRV 读有 reducedColor/motion 前科)。
     if (!CreateColorTexture(slot.inputColor.GetAddressOf(), width, height,
-                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            _inColorFmt, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }
@@ -789,7 +825,7 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     // ALLOW_UNORDERED_ACCESS (Magpie's D3D11-shared texture had no such flag
     // constraint, our native one does).
     if (!CreateColorTexture(slot.outputColor.GetAddressOf(), width, height,
-                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            _inColorFmt, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }
@@ -1136,7 +1172,7 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
     cl->ResourceBarrier(1, toUav);
     const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _bitDepth);
     cl->SetComputeRootSignature(_rsConvertIn.Get());
-    cl->SetPipelineState(_psoConvertIn.Get());
+    cl->SetPipelineState(_isRgb ? _psoConvertInRgb.Get() : _psoConvertIn.Get());
     ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
     cl->SetDescriptorHeaps(1, heaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
@@ -1147,6 +1183,13 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
                            1.0f / cf.cSpan, cf.kr, cf.kb, 0.0f };
     cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
     cl->SetComputeRoot32BitConstants(0, 8, consts, 2);
+    // ChromaExtent/ChromaScale(@10-13):420=(半,0.5) 与旧硬编码恒等;
+    // 422=(半宽,1)、444=(全,(1,1) 零插值)。PSO 由 _isRgb 选(RGB 核不
+    // 消费色度常量)。
+    const UINT chromaExtent[2]{ static_cast<UINT>(_chromaW), static_cast<UINT>(_chromaH) };
+    const float chromaScale[2]{ _subW ? 0.5f : 1.0f, _subH ? 0.5f : 1.0f };
+    cl->SetComputeRoot32BitConstants(0, 2, chromaExtent, 10);
+    cl->SetComputeRoot32BitConstants(0, 2, chromaScale, 12);
     cl->SetComputeRootDescriptorTable(1, gpu(25)); // t0 PlaneY
     cl->SetComputeRootDescriptorTable(2, gpu(26)); // t1 PlaneU
     cl->SetComputeRootDescriptorTable(3, gpu(27)); // t2 PlaneV
@@ -2010,29 +2053,32 @@ RWTexture2D<float4> OutputColor : register(u0);
 cbuffer ConvertInParams : register(b0) {
     uint2 DstExtent;      // inputColor 尺寸(dispatch 边界)
     float ContainerMax;   // 255 / 65535
-    float YLo;            // limited 16/64;full 0
-    float YScale;         // 1/219, 1/876, 1/255, 1/1023
-    float CMid;           // limited 128/512;full sampleMax/2
-    float CScale;         // 1/224, 1/896, 2/sampleMax
+    float YLo;            // limited 16/64/256…;full 0
+    float YScale;         // 1/ySpan
+    float CMid;           // limited 128/512/2048…;full sampleMax/2
+    float CScale;         // 1/cSpan
     float Kr;             // 0.2126(709) / 0.299(601)
     float Kb;             // 0.0722(709) / 0.114(601)
     float Pad0;
+    uint2 ChromaExtent;   // @10 色度平面尺寸(420=半、422=半宽、444=全)
+    float2 ChromaScale;   // @12 双线性映射比例(0.5 / 1)
 };
 
 [numthreads(8, 8, 1)]
 void ConvertYuvToBgra(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
-    // round(UNORM × containerMax) 精确还原整数采样字(8/10 位同构)。
+    // round(UNORM × containerMax) 精确还原整数采样字(8/10/12+ 位同构)。
     const float codeY = round(PlaneY[tid.xy].x * ContainerMax);
     const float nY = (codeY - YLo) * YScale;
 
-    // 色度半分辨率 → 双线性上采(与原 zimg Bilinear 对齐;siting (0,0.5))。
-    const int2 cExtent = (DstExtent + 1) >> 1;
-    const float2 fc = (tid.xy + 0.5) * 0.5 - 0.5;
+    // 色度子采样 → 双线性上采(与原 zimg Bilinear 对齐;siting (0,0.5))。
+    // ChromaScale=(0.5,0.5) 与旧硬编码逐式恒等;444 =(1,1) 时 fc=tid、
+    // wf=0 → 仅 s0 命中(零插值)。
+    const float2 fc = (tid.xy + 0.5) * ChromaScale - 0.5;
     const int2 c0 = int2(floor(fc));
     const float2 wf = fc - c0;
-    const int2 s0 = clamp(c0, int2(0, 0), cExtent - 1);
-    const int2 s1 = clamp(c0 + 1, int2(0, 0), cExtent - 1);
+    const int2 s0 = clamp(c0, int2(0, 0), ChromaExtent - 1);
+    const int2 s1 = clamp(c0 + 1, int2(0, 0), ChromaExtent - 1);
     const float w00 = (1.0 - wf.x) * (1.0 - wf.y), w10 = wf.x * (1.0 - wf.y);
     const float w01 = (1.0 - wf.x) * wf.y, w11 = wf.x * wf.y;
     const float codeU = round(PlaneU[s0].x * ContainerMax) * w00
@@ -2054,6 +2100,17 @@ void ConvertYuvToBgra(uint3 tid : SV_DispatchThreadID) {
     const float g = (nY - Kr * r - Kb * b) / Kg;
     OutputColor[tid.xy] = float4(saturate(r), saturate(g), saturate(b), 1.0);
 }
+
+// VS RGBP(计划 RGB,平面序 G/B/R)直读:零矩阵零插值打包。8bit 走
+// BGRA8 逐位精确;>8bit 容器(R16 采样)按输入Color 格式(见 Phase C)。
+[numthreads(8, 8, 1)]
+void ConvertRgbToRgba(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float g = PlaneY[tid.xy].x;
+    const float b = PlaneU[tid.xy].x;
+    const float r = PlaneV[tid.xy].x;
+    OutputColor[tid.xy] = float4(r, g, b, 1.0);
+}
 )";
 
 // RGB→YUV(YUV 原生化):outputColor(SRV,逻辑 RGBA)→ luma 全分辨率 +
@@ -2068,7 +2125,7 @@ RWTexture2D<float> OutputB : register(u1);  // chroma dispatch 绑 yuvOut[1](U)/
 
 cbuffer ConvertOutParams : register(b0) {
     uint2 DstExtent;      // luma: W,H;chroma: cw,ch(dispatch 边界)
-    uint2 SourceExtent;   // 全分辨率尺寸(chroma 2×2 块 clamp)
+    uint2 SourceExtent;   // 全分辨率尺寸(chroma 块 clamp)
     float Kr;
     float Kb;
     float LoOverCM;       // luma: yLo/CM;chroma: cMid/CM
@@ -2076,6 +2133,7 @@ cbuffer ConvertOutParams : register(b0) {
     float Pad0;
     float Pad1;
     float Pad2;
+    uint2 ChromaStep;     // @12 色度抽因子(420=(2,2)、422=(2,1)、444=(1,1))
 };
 
 float LumaOf(float3 rgb) {
@@ -2100,12 +2158,14 @@ void BgraToYuvLuma(uint3 tid : SV_DispatchThreadID) {
 [numthreads(8, 8, 1)]
 void BgraToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
-    // 2×2 box 平均:全程仿射,先平均后转换与逐点转换等价。
-    const int2 base = tid.xy * 2;
-    const int2 x1 = min(base + int2(1, 0), SourceExtent - 1);
-    const int2 y1 = min(base + int2(0, 1), SourceExtent - 1);
-    const int2 x1y1 = min(base + int2(1, 1), SourceExtent - 1);
-    const float3 rgb = saturate(0.25 * (CompositeColor[base].xyz
+    // box 平均(420=2×2、422=2×1、444=1×1):全程仿射,先平均后转换与
+    // 逐点转换等价。step=(2,2) 与旧硬编码逐式恒等;444 四样本同址 = 直写。
+    const int2 base = tid.xy * ChromaStep;
+    const int2 x1 = min(base + int2(ChromaStep.x - 1, 0), SourceExtent - 1);
+    const int2 y1 = min(base + int2(0, ChromaStep.y - 1), SourceExtent - 1);
+    const int2 x1y1 = min(base + int2(ChromaStep.x - 1, ChromaStep.y - 1), SourceExtent - 1);
+    const float invW = 1.0 / float(ChromaStep.x * ChromaStep.y);
+    const float3 rgb = saturate(invW * (CompositeColor[base].xyz
                                       + CompositeColor[x1].xyz
                                       + CompositeColor[y1].xyz
                                       + CompositeColor[x1y1].xyz));
@@ -2115,6 +2175,65 @@ void BgraToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     const float cr = (rgb.x - nY) * (0.5 / (1.0 - Kr));
     OutputA[tid.xy] = ChromaToCode(cb);  // u0 → U 平面
     OutputB[tid.xy] = ChromaToCode(cr);  // u1 → V 平面
+}
+)";
+
+// ---- RGB 出侧(Phase B):RGBP(平面序 G/B/R)直写,零矩阵 ----
+// SDR 同格式输出。8bit 全域 0-255(RGB 无 limited 概念,直写归一值);
+// >8bit 容器同理。RTX 缩放版(PIPE→OUT)用双线性,cbuffer 同 ConvertOut。
+constexpr char RGB_TO_PLANAR_HLSL[] = R"(
+Texture2D<float4> CompositeColor : register(t0);
+RWTexture2D<float> OutputA : register(u0);  // G(yuvOut[0])
+RWTexture2D<float> OutputB : register(u1);  // B(yuvOut[1])
+RWTexture2D<float> OutputC : register(u2);  // R(yuvOut[2])
+
+cbuffer ConvertOutParams : register(b0) {
+    uint2 DstExtent;
+    uint2 SourceExtent;
+    float Kr;
+    float Kb;
+    float LoOverCM;
+    float SpanOverCM;
+    float Pad0;
+    float Pad1;
+    float Pad2;
+    uint2 ChromaStep;
+};
+
+float3 SampleBilinear(float2 srcPos) {
+    const float2 f = floor(srcPos);
+    const int2 i0 = int2(f);
+    const float2 t = srcPos - f;
+    const int2 e = SourceExtent - 1;
+    const int2 a = clamp(i0, int2(0, 0), e);
+    const int2 b = clamp(i0 + int2(1, 0), int2(0, 0), e);
+    const int2 c = clamp(i0 + int2(0, 1), int2(0, 0), e);
+    const int2 d = clamp(i0 + int2(1, 1), int2(0, 0), e);
+    return CompositeColor[a].xyz * ((1 - t.x) * (1 - t.y))
+         + CompositeColor[b].xyz * (t.x * (1 - t.y))
+         + CompositeColor[c].xyz * ((1 - t.x) * t.y)
+         + CompositeColor[d].xyz * (t.x * t.y);
+}
+float2 ToSrcPos(float2 dstPos) {
+    return (dstPos + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
+}
+
+[numthreads(8, 8, 1)]
+void RgbaToRgbPlanes(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float3 rgb = saturate(CompositeColor[tid.xy].xyz);
+    OutputA[tid.xy] = rgb.g;  // RGBP 平面序 G,B,R
+    OutputB[tid.xy] = rgb.b;
+    OutputC[tid.xy] = rgb.r;
+}
+
+[numthreads(8, 8, 1)]
+void ScaledToRgbPlanes(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float3 rgb = saturate(SampleBilinear(ToSrcPos(float2(tid.xy))));
+    OutputA[tid.xy] = rgb.g;
+    OutputB[tid.xy] = rgb.b;
+    OutputC[tid.xy] = rgb.r;
 }
 )";
 
@@ -2140,6 +2259,7 @@ cbuffer ConvertOutParams : register(b0) {
     float Pad0;
     float Pad1;
     float Pad2;
+    uint2 ChromaStep;     // @12 色度抽因子(420=(2,2)、422=(2,1)、444=(1,1))
 };
 
 float LumaOf(float3 rgb) {
@@ -2166,13 +2286,14 @@ float3 SampleBilinear(float2 srcPos) {
 float2 ToSrcPos(float2 dstPos) {
     return (dstPos + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
 }
-// 色度域采样映射:入参为 out-luma 域坐标(chroma 侧 base = tid*2),映射
-// 分母必须是 out-luma 域 = 2*DstExtent(色度 dispatch 的 DstExtent=色度域;
-// 输出恒取偶故 2*DstExtent 精确)。误用 DstExtent = 2× 过采样 —— 色度
-// 右半平面 clamp 到源右缘,表现为大色块/失饱和(2026-09-22 真机实锤,
-// "只有一层分辨率放大了")。
+// 色度域采样映射:入参为 out-luma 域坐标(chroma 侧 base = tid*ChromaStep),
+// 映射分母必须是 out-luma 域 = ChromaStep*DstExtent(色度 dispatch 的
+// DstExtent=色度域;420 时 step=(2,2) 与旧 2*DstExtent 逐式恒等)。误用
+// DstExtent = 2× 过采样 —— 色度右半平面 clamp 到源右缘,表现为大色块/
+// 失饱和(2026-09-22 真机实锤,"只有一层分辨率放大了")。
 float2 ToSrcPosChroma(float2 lumaPos) {
-    return (lumaPos + 0.5) * float2(SourceExtent) / (2.0 * float2(DstExtent)) - 0.5;
+    return (lumaPos + 0.5) * float2(SourceExtent)
+         / (float2(ChromaStep) * float2(DstExtent)) - 0.5;
 }
 
 [numthreads(8, 8, 1)]
@@ -2186,12 +2307,15 @@ void ScaledToYuvLuma(uint3 tid : SV_DispatchThreadID) {
 [numthreads(8, 8, 1)]
 void ScaledToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
-    // luma 域 2×2 覆盖区四点采样(各点双线性)平均 → 转换。
-    const float2 base = tid.xy * 2;
-    const float3 rgb = saturate(0.25 * (SampleBilinear(ToSrcPosChroma(base + float2(0.5, 0.5)))
-                                      + SampleBilinear(ToSrcPosChroma(base + float2(1.5, 0.5)))
-                                      + SampleBilinear(ToSrcPosChroma(base + float2(0.5, 1.5)))
-                                      + SampleBilinear(ToSrcPosChroma(base + float2(1.5, 1.5)))));
+    // luma 域 ChromaStep 覆盖区四点采样(各点双线性)平均 → 转换。
+    // step=(2,2) 时与旧硬编码 0.25/2×2 逐式恒等;444=(1,1) 四点同址 = 直写。
+    const float2 base = tid.xy * ChromaStep;
+    const float invW = 1.0 / float(ChromaStep.x * ChromaStep.y);
+    const float2 h = float2(ChromaStep) * 0.5;
+    const float3 rgb = saturate(invW * (SampleBilinear(ToSrcPosChroma(base + float2(h.x, h.y)))
+                                      + SampleBilinear(ToSrcPosChroma(base + float2(ChromaStep.x - h.x, h.y)))
+                                      + SampleBilinear(ToSrcPosChroma(base + float2(h.x, ChromaStep.y - h.y)))
+                                      + SampleBilinear(ToSrcPosChroma(base + float2(ChromaStep.x - h.x, ChromaStep.y - h.y)))));
     const float nY = LumaOf(rgb);
     const float cb = (rgb.z - nY) * (0.5 / (1.0 - Kb));
     const float cr = (rgb.x - nY) * (0.5 / (1.0 - Kr));
@@ -2223,6 +2347,7 @@ cbuffer ConvertOutParams : register(b0) {
     float Pad0;
     float Pad1;
     float Pad2;
+    uint2 ChromaStep;     // @12 恒 (2,2):HDR 输出契约恒 P10 420
 };
 
 static const float3x3 M709To2020 = {
@@ -2892,7 +3017,7 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
         D3D12_ROOT_PARAMETER params[5]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 10; // extent(2)+C0(4)+C1(4)-1pad
+        params[0].Constants.Num32BitValues = 14; // extent(2)+C0(4)+C1(4)+chromaExtent(2)+chromaScale(2)
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         for (UINT i = 0; i < 3; ++i) {
             params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -2934,6 +3059,21 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert in) failed");
             return false;
         }
+        // Phase B:VS RGBP 直读核(同 RS/cbuffer,平面序 G/B/R 在核内换位)。
+        code.Reset();
+        if (FAILED(D3DCompile(YUV_TO_BGRA_HLSL, strlen(YUV_TO_BGRA_HLSL),
+                              nullptr, nullptr, nullptr, "ConvertRgbToRgba", "cs_5_0",
+                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
+            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(convert in rgb) failed");
+            return false;
+        }
+        // psoDesc.CS 在首次 PSO 后指向 blob1 旧地址(code.Reset 释放),
+        // 必须重指新 blob —— 否则 PSO 读悬垂指针 E_FAIL。
+        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
+        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoConvertInRgb.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert in rgb) failed");
+            return false;
+        }
     }
     {
         D3D12_DESCRIPTOR_RANGE srvRange{};
@@ -2941,17 +3081,17 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
         srvRange.NumDescriptors = 1;
         srvRange.BaseShaderRegister = 0;
         srvRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_DESCRIPTOR_RANGE uavRanges[2]{};
-        for (UINT i = 0; i < 2; ++i) {
+        D3D12_DESCRIPTOR_RANGE uavRanges[3]{};
+        for (UINT i = 0; i < 3; ++i) {
             uavRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
             uavRanges[i].NumDescriptors = 1;
             uavRanges[i].BaseShaderRegister = i;
             uavRanges[i].OffsetInDescriptorsFromTableStart = 0;
         }
-        D3D12_ROOT_PARAMETER params[4]{};
+        D3D12_ROOT_PARAMETER params[5]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
         params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 12; // extent(2)+srcExtent(2)+系数(4)+pad(4)
+        params[0].Constants.Num32BitValues = 14; // extent(2)+srcExtent(2)+系数(4)+pad(4)+chromaStep(2)
         params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
         params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -2965,9 +3105,14 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
         params[3].DescriptorTable.NumDescriptorRanges = 1;
         params[3].DescriptorTable.pDescriptorRanges = &uavRanges[1];
         params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        // u2 仅 RGB 出侧核消费(R 计划面);YUV 核不绑定此表,无害。
+        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[4].DescriptorTable.NumDescriptorRanges = 1;
+        params[4].DescriptorTable.pDescriptorRanges = &uavRanges[2];
+        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
         D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 4;
+        rsDesc.NumParameters = 5;
         rsDesc.pParameters = params;
         rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
         ComPtr<ID3DBlob> rsBlob, rsErr;
@@ -2991,11 +3136,15 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             { "ScaledToYuvChroma", _psoConvertScaledChroma.GetAddressOf() },
             { "PqToYuvLuma", _psoPqLuma.GetAddressOf() },
             { "PqToYuvChroma", _psoPqChroma.GetAddressOf() },
+            // Phase B:RGBP 出侧(直写 + RTX 缩放版;u0/u1/u2 = G/B/R)。
+            { "RgbaToRgbPlanes", _psoRgbOut.GetAddressOf() },
+            { "ScaledToRgbPlanes", _psoRgbScaled.GetAddressOf() },
         };
         constexpr const char *kOutHlslByEntry[] = {
             BGRA_TO_YUV_HLSL, BGRA_TO_YUV_HLSL,
             COLOR_TO_YUV_SCALED_HLSL, COLOR_TO_YUV_SCALED_HLSL,
             FP16_TO_YUV_PQ_HLSL, FP16_TO_YUV_PQ_HLSL,
+            RGB_TO_PLANAR_HLSL, RGB_TO_PLANAR_HLSL,
         };
         for (size_t ci = 0; ci < std::size(outCsos); ++ci) {
             const auto &cso = outCsos[ci];
@@ -3580,14 +3729,32 @@ void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &
     cl->ResourceBarrier(3, toUav);
 
     cl->SetComputeRootSignature(_rsConvertOut.Get());
-    cl->SetPipelineState(_psoConvertOutLuma.Get());
     ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
     cl->SetDescriptorHeaps(1, heaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
     const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    const UINT step[2]{ static_cast<UINT>(_subW ? 2 : 1), static_cast<UINT>(_subH ? 2 : 1) };
+
+    if (_isRgb) {
+        // Phase B:RGBP 直写单 pass(零矩阵;RGB 全域直码,无 limited 整形)。
+        cl->SetPipelineState(_psoRgbOut.Get());
+        const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+        const UINT srcExtent[2]{ extent[0], extent[1] };
+        const float consts[8]{};
+        cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+        cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+        cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+        cl->SetComputeRoot32BitConstants(0, 2, step, 12);
+        cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
+        cl->SetComputeRootDescriptorTable(2, gpu(28));          // u0 G
+        cl->SetComputeRootDescriptorTable(3, gpu(29));          // u1 B
+        cl->SetComputeRootDescriptorTable(4, gpu(30));          // u2 R
+        cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
+    } else {
 
     // luma:extent=W,H,Lo/Span = yLo/ySpan(÷CM 由调用侧折进常量)。
+    cl->SetPipelineState(_psoConvertOutLuma.Get());
     {
         const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
         const UINT srcExtent[2]{ extent[0], extent[1] };
@@ -3597,12 +3764,14 @@ void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &
         cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
         cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
         cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+        cl->SetComputeRoot32BitConstants(0, 2, step, 12);
         cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
         cl->SetComputeRootDescriptorTable(2, gpu(28)); // u0 yuvOut[0](Y)
         cl->SetComputeRootDescriptorTable(3, gpu(29)); // u1 绑定但本 pass 不写
         cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
     }
-    // chroma:extent=cw,ch,Lo/Span = cMid/cSpan;2×2 box 平均。u0=U,u1=V。
+    // chroma:extent=cw,ch,Lo/Span = cMid/cSpan;ChromaStep box 平均。
+    // u0=U,u1=V。step=(2,2) 与旧 2×2 硬编码恒等。
     cl->SetPipelineState(_psoConvertOutChroma.Get());
     {
         const UINT extent[2]{ static_cast<UINT>(_chromaW), static_cast<UINT>(_chromaH) };
@@ -3613,11 +3782,13 @@ void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &
         cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
         cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
         cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+        cl->SetComputeRoot32BitConstants(0, 2, step, 12);
         cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
         cl->SetComputeRootDescriptorTable(2, gpu(29)); // u0 yuvOut[1](U)
         cl->SetComputeRootDescriptorTable(3, gpu(30)); // u1 yuvOut[2](V)
         cl->Dispatch((static_cast<UINT>(_chromaW) + 7) / 8, (static_cast<UINT>(_chromaH) + 7) / 8, 1);
     }
+    } // !_isRgb
 
     // 色源归位 COMMON(yuvOut 留 UAV,由 RecordReadbackCopy 收尾)。
     D3D12_RESOURCE_BARRIER back[1]{
@@ -3660,7 +3831,28 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
     const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _outPlaneBytes > 1 ? 10 : 8);
     ID3D12PipelineState *lumaPso = isFp16 ? _psoPqLuma.Get() : _psoConvertScaledLuma.Get();
     ID3D12PipelineState *chromaPso = isFp16 ? _psoPqChroma.Get() : _psoConvertScaledChroma.Get();
-    if (!isFp16) {
+    // ChromaStep:SDR 输出 = 输入布局(同格式出);HDR P10 输出恒 (2,2)。
+    const UINT step[2]{
+        static_cast<UINT>(isFp16 ? 2 : (_subW ? 2 : 1)),
+        static_cast<UINT>(isFp16 ? 2 : (_subH ? 2 : 1)),
+    };
+    if (!isFp16 && _isRgb) {
+        // Phase B:RGBP SDR 输出(PIPE→OUT 双线性;1:1 时坐标恒等映射,
+        // 与直写逐位同价)。RGB 全域直码,零矩阵。
+        cl->SetPipelineState(_psoRgbScaled.Get());
+        const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
+        const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+        const float consts[8]{};
+        cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+        cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
+        cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+        cl->SetComputeRoot32BitConstants(0, 2, step, 12);
+        cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
+        cl->SetComputeRootDescriptorTable(2, gpu(28)); // u0 G
+        cl->SetComputeRootDescriptorTable(3, gpu(29)); // u1 B
+        cl->SetComputeRootDescriptorTable(4, gpu(30)); // u2 R
+        cl->Dispatch((static_cast<UINT>(_outW) + 7) / 8, (static_cast<UINT>(_outH) + 7) / 8, 1);
+    } else if (!isFp16) {
         cl->SetPipelineState(lumaPso);
         {
             const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
@@ -3671,6 +3863,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
             cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
             cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
             cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
             cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
             cl->SetComputeRootDescriptorTable(2, gpu(28));
             cl->SetComputeRootDescriptorTable(3, gpu(29));
@@ -3686,6 +3879,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
             cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
             cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
             cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
             cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
             cl->SetComputeRootDescriptorTable(2, gpu(29));
             cl->SetComputeRootDescriptorTable(3, gpu(30));
@@ -3706,6 +3900,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
             cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
             cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
             cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
             cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
             cl->SetComputeRootDescriptorTable(2, gpu(28));
             cl->SetComputeRootDescriptorTable(3, gpu(29));
@@ -3721,6 +3916,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
             cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
             cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
             cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
+            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
             cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
             cl->SetComputeRootDescriptorTable(2, gpu(29));
             cl->SetComputeRootDescriptorTable(3, gpu(30));

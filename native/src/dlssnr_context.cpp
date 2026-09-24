@@ -473,6 +473,7 @@ bool DlssnrContext::Initialize(
     D3D12Context &d3d12, const wchar_t *ngxDllPath, const wchar_t *fgDllPath,
     int width, int height, int depth, SharedParams *shared,
     const RtxVideoParams &rtx,
+    int subW, int subH, bool rgb,
     char *err, size_t errLen) noexcept {
     auto fail = [&](const char *what) {
         if (err && errLen) std::snprintf(err, errLen, "%s", what);
@@ -493,6 +494,9 @@ bool DlssnrContext::Initialize(
     _width = width;
     _height = height;
     _depth = depth;
+    _subW = subW;
+    _subH = subH;
+    _isRgb = rgb;
     _shared = shared;
     _rtx = rtx;
 
@@ -786,7 +790,18 @@ bool DlssnrContext::Initialize(
     if (!_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested,
                                       _pipeW, _pipeH, _outW, _outH,
                                       _vsrRequested, _hdrActive, _fgHdrInterp,
+                                      _subW, _subH, _isRgb,
                                       err, errLen)) return failWithExistingErr();
+    // 显形记账:管线色格式(">8bit 无 RTX = FP16")及其回落原因,防
+    // "10bit 源怎么不是 FP16"无头案(排查成本一次一行)。
+    {
+        const bool fp16 = _d3d12->ColorFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: color buffer %s (depth=%d rtx=%d)",
+                      fp16 ? "RGBA16F" : "BGRA8", _depth,
+                      (_vsrRequested || _hdrActive) ? 1 : 0);
+        TimingStatusLine(msg);
+    }
     if (_shared->Snapshot().scalingEnabled) {
         const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
         int iw = _width, ih = _height;
@@ -1099,6 +1114,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, newDepth, _fgRequested,
                                                 _pipeW, _pipeH, _outW, _outH,
                                                 _vsrRequested, _hdrActive, _fgHdrInterp,
+                                                _subW, _subH, _isRgb,
                                                 err, errLen)) {
         _ready.store(false, std::memory_order_release);
         return false;
@@ -2665,10 +2681,12 @@ bool DlssnrContext::ProcessFrame(
                     std::filesystem::path base = std::filesystem::path(dir).parent_path();
                     const bool scaling = _d3d12->HasScaling();
                     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
-                    // 管线色格式为 B8G8R8A8(BGRA 切换):CopyTextureRegion 的
+                    // 管线色格式:BGRA8 默认 / RGBA16F fp16 探针 —— dump 的
                     // footprint 格式必须与源一致,跨格式会 E_INVALIDARG
-                    // (memory #30 同族坑)。颜色 dump 统一显式传 BGRA8。
-                    constexpr DXGI_FORMAT kColorDump = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    // (memory #30 同族坑)。input/output 用 ColorFormat(),
+                    // reduced 系恒 BGRA8 保留 kColorDump。
+                    const DXGI_FORMAT kColorDump = DXGI_FORMAT_B8G8R8A8_UNORM;
+                    const DXGI_FORMAT kPipeDump = _d3d12->ColorFormat();
                     // 探针:dump 失败逐个留痕(footprint/格式不匹配时
                     // CopyTextureRegion 静默 E_INVALIDARG,#41-④ 同族坑;
                     // "dump 文件缺失/尺寸不对"从这行直接定位)。
@@ -2680,14 +2698,15 @@ bool DlssnrContext::ProcessFrame(
                             TimingStatusLine(msg);
                         }
                     };
-                    dumpOrLog(_d3d12->InputColor(*slot), width, height, L"dump_input.bin", kColorDump);
+                    dumpOrLog(_d3d12->InputColor(*slot), width, height, L"dump_input.bin", kPipeDump);
                     // YUV 输入平面(YUV→RGB 转换验收:python 参考按矩阵/范围
-                    // 重算 BGRA8 与 dump_input 对比 ≤1-2 LSB)。
+                    // 重算 BGRA8 与 dump_input 对比 ≤1-2 LSB)。色度尺寸按
+                    // 真实布局(444 全分辨率等),勿自推半分辨率。
                     {
                         const DXGI_FORMAT yuvDumpIn = _d3d12->BitDepth() > 8
                                                           ? DXGI_FORMAT_R16_UNORM
                                                           : DXGI_FORMAT_R8_UNORM;
-                        const int cw = (width + 1) >> 1, ch = (height + 1) >> 1;
+                        const int cw = _d3d12->ChromaWidth(), ch = _d3d12->ChromaHeight();
                         const int pw[3]{ width, cw, cw };
                         const int ph[3]{ height, ch, ch };
                         const wchar_t *names[3]{ L"dump_yuvin_y.bin", L"dump_yuvin_u.bin", L"dump_yuvin_v.bin" };
@@ -2712,7 +2731,7 @@ bool DlssnrContext::ProcessFrame(
                                   _d3d12->InternalHeight(), L"dump_horizontal.bin",
                                   DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
-                    dumpOrLog(_d3d12->OutputColor(*slot), width, height, L"dump_output.bin", kColorDump);
+                    dumpOrLog(_d3d12->OutputColor(*slot), width, height, L"dump_output.bin", kPipeDump);
                     // TrueHDR 输出本体(FP16 scRGB,PIPE 尺寸):黑屏排查的
                     // "没写 vs 写了零 vs 写了错值"判据(VSDLSSNR_DUMP=1)。
                     if (slot->hdrColor) {
