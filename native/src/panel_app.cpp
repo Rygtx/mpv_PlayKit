@@ -38,6 +38,10 @@ using namespace vsdlssnr;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+// 进程退出旗标:主循环(WM_QUIT)、看门狗与 HDR 打标线程轮询同一位。
+// 定义在匿名 namespace 之前 —— HdrTagProc 在文件前部,须能看到它。
+bool g_quit = false;
+
 namespace {
 
 constexpr wchar_t WINDOW_CLASS[] = L"vs_dlssnr_panel_app";
@@ -348,14 +352,18 @@ void WritePayload(bool saveRequest = false) noexcept {
 // 回落常见默认名。全程 best-effort:连接失败(未启用 IPC / mpv 未运行 /
 // 已退出)静默放弃,变动退化为插件的会话内 live 机制(降档复制真实帧)。
 // ---------------------------------------------------------------------------
-// 面板→mpv IPC 单条命令:候选管道(mpv.conf 解析值优先,默认名/umpv 兜底)
-// 逐个尝试,写命令 + 读回执。cmd 须自带行尾 \n。命中管道名经 hitOut 带回。
-bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
+// 候选管道名解析(mpv.conf 的 input-ipc-server 优先,默认名/umpv 兜底),
+// reseek 与 HDR 打标两条 IPC 路径共用。返回 _wcsdup 的解析名(可 nullptr,
+// free(nullptr) 恒安全),candidates[4] 就绪;返回值须活过使用期。
+static wchar_t *ResolveMpvPipeCandidates(const wchar_t **candidates) noexcept {
+    candidates[0] = nullptr;
+    candidates[1] = L"mpvpipe";
+    candidates[2] = L"mpvsocket";
+    candidates[3] = L"umpv";
     wchar_t base[MAX_PATH];
-    if (!BasePath(base, MAX_PATH)) return false;
+    if (!BasePath(base, MAX_PATH)) return nullptr;
 
     wchar_t *parsedName = nullptr; // _wcsdup;末尾 free(nullptr) 恒安全
-    const wchar_t *candidates[4] = { nullptr, L"mpvpipe", L"mpvsocket", L"umpv" };
     {
         wchar_t confPath[MAX_PATH];
         swprintf_s(confPath, L"%s\\..\\portable_config\\mpv.conf", base);
@@ -401,6 +409,15 @@ bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
         }
     }
 
+    return parsedName;
+}
+
+// 面板→mpv IPC 单条命令:候选管道逐个尝试,写命令 + 读回执。cmd 须自带
+// 行尾 \n。命中管道名经 hitOut 带回。
+bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
+    const wchar_t *candidates[4];
+    wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
+
     bool ok = false;
     for (int i = 0; i < 4 && !ok; ++i) {
         if (!candidates[i] || !candidates[i][0]) continue;
@@ -437,39 +454,6 @@ bool TriggerMpvReseek() noexcept {
     }
     PanelLog("panel: mpv IPC reseek unavailable (input-ipc-server off? mpv closed?); falling back to in-session live");
     return false;
-}
-
-// ---- HDR 输出打标同步 ----------------------------------------------------
-// vf_vapoursynth 不透传 VS 帧 props(mpv 源码实锤:vs_frame_done 只认
-// _DurationNum/_Den),插件 HDR 输出(YUV420P10 BT.2020 PQ)到 mpv 手里
-// 仍无标签 → 按 bt.709/bt.1886 解读 = 白/品红二色画面。面板按 SK_RTX 实态
-// 边缘触发 vf 标签滤镜增删(幂等;状态来自插件本体,不猜任何输出格式):
-//   hdr 实态(rtxState 含 hdr)→ 追加 @dlssnr-hdr-tag( lavfi setparams
-//   打 BT.2020 PQ 元数据);SDR 实态 → 移除该标签(8bit 输出不得标成 PQ)。
-// 失败不闩锁:下个 tick 静默重试(典型竞态 = mpv 刚起、IPC 未就绪)。
-void SyncHdrVfTag() noexcept {
-    static int lastTagState = -1; // -1 未同步 / 0 SDR / 1 HDR
-    const bool hdrActive = strstr(g_app.rtxState, "hdr") != nullptr;
-    const int want = hdrActive ? 1 : 0;
-    if (lastTagState == want) return;
-    char cmd[256];
-    if (want) {
-        snprintf(cmd, sizeof(cmd),
-                 "{\"command\":[\"vf\",\"add\","
-                 "\"@dlssnr-hdr-tag:lavfi=[setparams=colorspace=bt2020nc:"
-                 "color_primaries=bt2020:color_trc=smpte2084]\"]}\n");
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "{\"command\":[\"vf\",\"remove\",\"@dlssnr-hdr-tag\"]}\n");
-    }
-    wchar_t hit[64];
-    PanelLog("panel: hdr tag want=%d sending (rtxState=%s)", want, g_app.rtxState);
-    if (MpvIpcSendCmd(cmd, hit, 64)) {
-        lastTagState = want;
-        PanelLog("panel: hdr vf tag %ls via %ls", want ? L"added" : L"removed", hit);
-    } else {
-        PanelLog("panel: hdr tag send FAILED (mpv pipe unreachable?)");
-    }
 }
 
 bool WriteIniNow() noexcept {
@@ -542,12 +526,148 @@ bool JsonGetString(const char *body, const char *key, char *out, size_t outLen) 
     return true;
 }
 
+// Stats 映射一拍快照(seq 门校验)。返回:2=有效(已拷入 *st);1=映射在
+// 但快照未稳(seq 翻转中/未发布),*badMagic 带回 magic 是否失配;0=映射
+// 不存在(插件未运行)。多读者安全:LoadStats(主线程,UI)与 HdrTagProc
+// (打标线程)各自调用,seq 协议只保证"拷贝期间计数器不动",读侧互不干扰。
+static int ReadStatsSnapshot(StatsPayload *st, bool *badMagic) noexcept {
+    *badMagic = false;
+    const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
+    if (!m) return 0;
+    const StatsPayload *view =
+        static_cast<const StatsPayload *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
+    bool valid = false;
+    if (view) {
+        // 混部署(新面板 + 旧插件的小映射)时按映射实际区域钳制拷贝量:
+        // 直接 sizeof(*st) 是标准意义上的越界读,分页粒度通常掩盖但不该赌。
+        MEMORY_BASIC_INFORMATION mbi{};
+        size_t copy = sizeof(*st);
+        if (VirtualQuery(view, &mbi, sizeof(mbi)) && mbi.RegionSize > 0 &&
+            mbi.RegionSize < sizeof(*st)) {
+            copy = mbi.RegionSize;
+        }
+        memcpy(st, view, copy);
+        *badMagic = st->magic != 0 && st->magic != STATS_MAGIC;
+        valid = st->magic == STATS_MAGIC && st->seq != 0 &&
+                st->seq == static_cast<const volatile StatsPayload *>(view)->seq;
+        UnmapViewOfFile(view);
+    }
+    CloseHandle(m);
+    return valid ? 2 : 1;
+}
+
+// ---- HDR 输出打标同步(独立后台线程)-------------------------------------
+// vf_vapoursynth 不透传 VS 帧 props(mpv 源码实锤:vs_frame_done 只认
+// _DurationNum/_Den),插件 HDR 输出(YUV420P10 BT.2020 PQ)到 mpv 手里
+// 仍无标签 → 按 bt.709/bt.1886 解读 = 白/品红二色画面。插件 HDR 实态时给
+// mpv vf 链追加 @dlssnr-hdr-tag(lavfi setparams 打 BT.2020 PQ 元数据),
+// SDR 实态移除(8bit 输出不得标成 PQ)。标签参数 = 插件输出契约的镜像,
+// 固定不可配置。
+//
+// 2026-09-24 从主循环 stats tick 独立成线程:面板隐藏进托盘后主循环
+// WaitMessage 全休眠,stats tick 不可达 —— 曾表现为"开 HDR 不点托盘
+// 图标就永远打不上标"。worker 每 250ms 自读 stats 快照(不经 g_app:
+// 主线程只在窗口可见时刷新它,隐藏期间是陈旧值),快照无效(插件未跑)
+// 则本拍跳过,不闩锁。
+//
+// mpv 重启感知 = 持久 IPC 连接的句柄生命周期:管道实例随 mpv 进程销毁,
+// 任何 Write/Read 失败 → 关连接、lastTagState 打回 -1(未知);重连成功
+// 后必发一次(即使 want 未变)= 新实例补标。不需要轮询 vf / 实例 ID。
+// 已知残留:mpv 卡死时 ReadFile 等 ack 会挂住本线程(独立线程,不连坐
+// UI);用户手动 vf remove 不感知(覆盖需对账 ack,协议面不值),
+// hdr_tag_manual.py 是手动兜底。
+
+// 对已连接管道发一条命令并吞 ack。任一步失败 = 管道已断(mpv 死亡/重启),
+// 调用方关连接下拍重连。cmd 须自带行尾 \n。ok 判定只看写入+读回,不解析
+// ack 内容(维持原语义)。
+bool HdrTagSendOnPipe(HANDLE pipe, const char *cmd) noexcept {
+    DWORD written = 0, got = 0;
+    char ack[128]{};
+    return WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)), &written, nullptr) &&
+           written == strlen(cmd) &&
+           ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr) != FALSE;
+}
+
+struct HdrTagConn {
+    HANDLE pipe = nullptr; // 持久连接:句柄存活 = 同一 mpv 会话
+    wchar_t name[64]{};    // 当前管道名(conf 解析命中值,仅日志)
+    int lastTagState = -1; // -1 未知(连接建立前/断开后)→ 重连必发
+};
+
+// 连接(若无)并把打标状态推到 want。返回 true = 连接存活且状态已对齐。
+bool HdrTagTick(HdrTagConn &c, int want) noexcept {
+    if (!c.pipe) {
+        const wchar_t *candidates[4];
+        wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
+        for (int i = 0; i < 4 && !c.pipe; ++i) {
+            if (!candidates[i] || !candidates[i][0]) continue;
+            wchar_t pipePath[MAX_PATH];
+            swprintf_s(pipePath, L"\\\\.\\pipe\\%ls", candidates[i]);
+            c.pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
+                                 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (c.pipe == INVALID_HANDLE_VALUE) c.pipe = nullptr;
+            else wcsncpy_s(c.name, candidates[i], _TRUNCATE);
+        }
+        free(parsedName);
+        if (!c.pipe) return false; // mpv 不在/IPC 未起:下拍重试,不闩锁
+        c.lastTagState = -1;       // 新会话一律视为未知 → 必发
+        PanelLog("panel: hdr tag worker connected to pipe %ls", c.name);
+    }
+    if (c.lastTagState == want) return true;
+    char cmd[256];
+    if (want) {
+        snprintf(cmd, sizeof(cmd),
+                 "{\"command\":[\"vf\",\"add\","
+                 "\"@dlssnr-hdr-tag:lavfi=[setparams=colorspace=bt2020nc:"
+                 "color_primaries=bt2020:color_trc=smpte2084]\"]}\n");
+    } else {
+        snprintf(cmd, sizeof(cmd),
+                 "{\"command\":[\"vf\",\"remove\",\"@dlssnr-hdr-tag\"]}\n");
+    }
+    if (HdrTagSendOnPipe(c.pipe, cmd)) {
+        c.lastTagState = want;
+        PanelLog("panel: hdr vf tag %ls via %ls", want ? L"added" : L"removed", c.name);
+        return true;
+    }
+    PanelLog("panel: hdr tag pipe broken -> reconnect next tick");
+    CloseHandle(c.pipe);
+    c.pipe = nullptr;
+    c.lastTagState = -1;
+    return false;
+}
+
+// 打标 worker:want 来自插件本体的 SK_RTX 实态,与 UI 可见性完全解耦。
+// 退出轮询 g_quit(与看门狗同款);进程退出会硬杀本线程,残留管道句柄
+// 随进程回收,无需 join。
+DWORD WINAPI HdrTagProc(LPVOID) noexcept {
+    HdrTagConn conn;
+    for (;;) {
+        Sleep(250);
+        if (g_quit) break;
+        StatsPayload st{};
+        bool badMagic = false;
+        if (ReadStatsSnapshot(&st, &badMagic) != 2) continue; // 插件未跑/快照未稳
+        // rtx 缓冲对齐 AppState.rtxState[32](生产端封头 "vsr+hdr %dx%d")。
+        // rtx 键缺失 ≠ 死 body:NR+FG+RTX 皆关时插件发布 passthrough 简体,
+        // 本身无此键(2026-09-24 实锤:关 HDR 后标签残留)—— 缺键即 SDR
+        // 实态,与 LoadStats"缺键即清"同款语义,发 remove 摘标。
+        char rtx[32]{};
+        JsonGetString(st.json, SK_RTX, rtx, sizeof(rtx)); // 缺键 → 空 → want=0
+        HdrTagTick(conn, strstr(rtx, "hdr") ? 1 : 0);
+    }
+    if (conn.pipe) CloseHandle(conn.pipe);
+    return 0;
+}
+
 // Read the plugin's per-frame stats from named shared memory (zero disk IO).
 // Mapping absent = no live filter: clear the stats line. The mapping object
-// dies with the plugin process, so re-open each refresh (no stale handles).
+// dies with the plugin process, so re-open each refresh (no stale handles)
+// —— 快照读取本体在 ReadStatsSnapshot(HDR 打标线程共用同一份实现)。
 void LoadStats() noexcept {
-    const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
-    if (!m) {
+    StatsPayload st{};
+    bool badMagic = false;
+    const int snap = ReadStatsSnapshot(&st, &badMagic);
+    if (snap == 0) {
         const int prevConn = g_app.connState;
         g_app.statsDirty = prevConn != 0 ||
                            g_app.statsBig[0] != 0 || g_app.statsRes[0] != 0 ||
@@ -575,31 +695,7 @@ void LoadStats() noexcept {
         g_app.connState = 0; // 连接指示随之变化(statsDirty 已置)
         return;
     }
-    // Seq-gated snapshot (protocol mirrors PublishStatsJson): a copy whose
-    // counter moved mid-read, or a write still in progress (seq 0), is
-    // discarded — the next 100ms refresh repaints it.
-    const StatsPayload *view =
-        static_cast<const StatsPayload *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
-    StatsPayload st{};
-    bool valid = false;
-    bool badMagic = false;
-    if (view) {
-        // 混部署(新面板 + 旧插件的小映射)时按映射实际区域钳制拷贝量:
-        // 直接 sizeof(st) 是标准意义上的越界读,分页粒度通常掩盖但不该赌。
-        MEMORY_BASIC_INFORMATION mbi{};
-        size_t copy = sizeof(st);
-        if (VirtualQuery(view, &mbi, sizeof(mbi)) && mbi.RegionSize > 0 &&
-            mbi.RegionSize < sizeof(st)) {
-            copy = mbi.RegionSize;
-        }
-        memcpy(&st, view, copy);
-        badMagic = st.magic != 0 && st.magic != STATS_MAGIC;
-        valid = st.magic == STATS_MAGIC && st.seq != 0 &&
-                st.seq == static_cast<const volatile StatsPayload *>(view)->seq;
-        UnmapViewOfFile(view);
-    }
-    CloseHandle(m);
-    if (!valid) {
+    if (snap != 2) {
         // magic 不符 = 面板与插件版本未成对更新:不再静默冻结旧显示,
         // 连接指示红显("看起来活着但调参无效"的最短诊断路径)。
         if (badMagic) {
@@ -639,7 +735,8 @@ void LoadStats() noexcept {
         g_app.rtxState[0] = 0;
     if (!JsonGetString(body, SK_RTX_DETAIL, g_app.rtxDetail, sizeof(g_app.rtxDetail)))
         g_app.rtxDetail[0] = 0;
-    SyncHdrVfTag(); // HDR 实态边缘 → mpv vf 链打/摘 PQ 元数据(见函数注释)
+    // HDR 打标不再走这里:已独立为 HdrTagProc 线程(本函数只在窗口可见时
+    // 被调,曾把打标一并拖进"隐藏即休眠"的门里)。
     g_app.slotWait = static_cast<float>(JsonGetFloat(body, SK_SLOT_WAIT, 0));
     g_app.lockWait = static_cast<float>(JsonGetFloat(body, SK_LOCK_WAIT, 0));
     g_app.gateSkips = JsonGetInt(body, SK_GATE_SKIPS, 0);
@@ -1941,7 +2038,6 @@ ID3D11Device *g_device = nullptr;
 ID3D11DeviceContext *g_context = nullptr;
 IDXGISwapChain *g_swap = nullptr;
 ID3D11RenderTargetView *g_rtv = nullptr;
-bool g_quit = false;
 NOTIFYICONDATAW g_nid{};
 
 void CreateRenderTarget() noexcept {
@@ -2207,6 +2303,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
              static_cast<unsigned>(PAYLOAD_MAGIC));
 
     HANDLE watch = CreateThread(nullptr, 0, ExitWatchProc, nullptr, 0, nullptr);
+    // HDR 打标线程:独立于 UI 可见性(主循环隐藏即 WaitMessage 全休眠,
+    // 打标曾因此只在面板可见时工作)。见 HdrTagProc 注释。
+    HANDLE hdrTagThread = CreateThread(nullptr, 0, HdrTagProc, nullptr, 0, nullptr);
 
     LARGE_INTEGER freq{};
     QueryPerformanceFrequency(&freq);
@@ -2294,6 +2393,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
 
     if (watch) CloseHandle(watch);
+    if (hdrTagThread) CloseHandle(hdrTagThread);
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
