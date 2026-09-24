@@ -2325,9 +2325,9 @@ bool DlssnrContext::ProcessFrame(
             };
             fgCl->ResourceBarrier(1, msBack);
         }
-        // guidance 归位落帧尾最后一条主队列 CL:非 HDR = 本 CL;HDR 会话落
-        // postB(下方)。baseCl 兜底见上方 !fgOnFgCl && !rtxIn 分支。
-        if (!hdrRun) recordGuidancePark(*fgCl);
+        // guidance 归位落帧尾最后一条主队列 CL:非拆分形态(实验模式 postA
+        // 即最后主 CL)= 本 CL;hdrPostSplit 会话落 postB(下方)。
+        if (!hdrPostSplit) recordGuidancePark(*fgCl);
     }
     // 门关但 postA 已开(非拆分形态的 RTX 帧)的 guidance 归位:帧尾最后
     // 一条主队列 CL 规则 —— hdrPostSplit 会话落 postB。
