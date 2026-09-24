@@ -12,6 +12,9 @@ native/PORTING.md
 native/vendor/
 native/dist/
 
+# IDE 本地配置 (VSCode 生成的 cmake.sourceDirectory 为本机绝对路径, 不共享)
+.vscode/
+
 # AI 模型文件体积巨大 (nvngx_dlssnr.dll ~165MB), 随 Release 附件分发不入库
 *.dll
 !portable_config/**/*.dll
