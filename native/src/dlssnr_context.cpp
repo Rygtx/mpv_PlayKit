@@ -2771,6 +2771,11 @@ bool DlssnrContext::ProcessFrame(
         // 仅 HDR 会话非零),
         // 门关帧 fg 段 ≈ 0(WaitFrame 等的就是 base 值,立即满足)。
         const double gpuWaitMs = ms(t2, t3a, qpcFreq);
+        // NR 关直连帧:base CL 为空(零 NR 工作),t2→t3a = 等空栅栏的墙钟
+        // (3 槽流水下含其他槽的队列拥塞),不是 NR 处理时间 —— gpu 段上报
+        // 记 0(面板"NR 推理"段随之归零),原始窗口已折入 conv(见下),
+        // 总量仍恒真。skipEval 诊断模式保留直通拷贝成本(gpu = 拷贝)。
+        const double gpuSegMs = (nrOff && !skipEval) ? 0.0 : gpuWaitMs;
         // unpack 段 = 真实帧回读;插值帧回读(t3c→t4)= FG 输出搬运,
         // 并入 fg 段(无 FG 帧两者差 ≈0)。
         const double unpackMs = ms(t3b, t3c, qpcFreq);
@@ -2831,7 +2836,7 @@ bool DlssnrContext::ProcessFrame(
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
             const double slotWaitMs = ms(tSlot0, tSlot1, qpcFreq);
             const double lockWaitMs = ms(tLock0, tLock1, qpcFreq);
-            g_timing.Push(gpuWaitMs, packMs, nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
+            g_timing.Push(gpuSegMs, packMs, nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
             const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
             gpuLast = g_timing.gpu[lastIdx];
             gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
@@ -2951,7 +2956,7 @@ bool DlssnrContext::ProcessFrame(
 
         if (vsTiming) {
             std::snprintf(timingOut, timingLen, "pack=%.1f,nvof=%.1f,eval_cpu=%.1f,gpu=%.1f,fg=%.1f,conv=%.1f,unpack=%.1f",
-                          packMs, nvofMs, evalOnlyMs, gpuWaitMs, fgMs, convMs, unpackMs);
+                          packMs, nvofMs, evalOnlyMs, gpuSegMs, fgMs, convMs, unpackMs);
         }
     }
     return rb;

@@ -1786,7 +1786,7 @@ void DrawUi() noexcept {
                 { g_app.segDispPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
                 { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
                 { g_app.segDispEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
-                { g_app.segDispGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR+输出)" },
+                { g_app.segDispGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR 推理)" },
                 { g_app.segDispRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
                 hdrFirst ? segHdr : segFg,
                 hdrFirst ? segFg : segHdr,
