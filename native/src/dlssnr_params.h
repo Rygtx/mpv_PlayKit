@@ -179,12 +179,14 @@ struct DlssnrParams {
     int fgRoute = 0;
     // 实验性补帧 HDR 域插值(0/1,创建时,重建生效;仅 HDR+FG 会话有意义):
     //   0(默认)= DLSSG 在 SDR 域插帧,每个输出帧单独过一次 TrueHDR
-    //     (修复 DLSSG ColorBuffersHDR 插值压高光的闪烁,SM86 移植内核
-    //     实测定案 2026-09-23);
-    //   1 = 旧形态:TrueHDR 只做真实帧一次,DLSSG 直接吃其 FP16 scRGB
-    //     输出在 HDR 域插帧(ColorBuffersHDR=1)。省 TrueHDR ×(M-1) 的
-    //     GPU/提交成本,但部分驱动此路径插值帧压高光 = 亮处闪烁 —— 实验性,
-    //     闪烁即关闭。
+    //     (修复 DLSSG HDR 路径插值压高光的闪烁,实测定案 2026-09-23);
+    //   1 = TrueHDR 只做真实帧一次,其 FP16 scRGB 输出先编码成 **PQ 码域**
+    //     (BT.2020,≤1.0,HdrToPq 编码 pass)作 DLSSG backbuffer,DLSSG 在
+    //     感知域插帧(ColorBuffersHDR=0,原生 HDR 直通同域无损)。省 TrueHDR
+    //     ×(M-1) 的 GPU/提交成本;输出侧码域直读转换免逐像素 PqEncode。
+    //     (2026-09-24 定案:直吃 scRGB 线性 >1.0 会被 DLSSG HDR 路径钳在
+    //     ~0.875 = 插值帧高光塌陷 —— 根因是值域不是 HDR 与否;感知码域
+    //     ≤1.0 走 LDR 路径无损。)
     int fgHdrInterp = 0;
     // 光流后端(0=ffx 1=nvof,创建时,下一帧生效):见 kOfBackendMin 注释。
     // 切换只影响下一次光流会话建立,不改 NGX feature。

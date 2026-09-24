@@ -63,6 +63,10 @@ struct ResidualControls {
 // HDR 传输函数不在本滤镜范围(SDR 链)。
 enum class ColorMatrix : int { BT709 = 0, BT601 = 1 };
 enum class ColorRange : int { Full = 0, Limited = 1 };
+// RecordColorOutput 的源颜色形态(选 PSO 对;输出契约 Sdr=随源位深,
+// Hdr* = P10 420):Sdr = BGRA8 码域;HdrScRgb = FP16 scRGB 线性(逐像素
+// PqEncode);HdrPqCodes = FP16 PQ 码域(PQ 域插帧产物,码直读免 pow)。
+enum class ColorOutKind : int { Sdr = 0, HdrScRgb = 1, HdrPqCodes = 2 };
 
 // Per-frame-in-flight resources; acquired from the slot pool for the duration
 // of one getFrame call.
@@ -125,7 +129,15 @@ struct FrameSlot {
     // 下一 gen 覆写)。恒 BGRA8(DLSSG 恒在 SDR 域插值;HDR 会话由逐帧
     // TrueHDR 提升为 FP16 scRGB —— DLSSG 的 ColorBuffersHDR 路径实测压高光,
     // 2026-09-23 实验定案)。UAV(DLSSG 契约);NSR 化后供转换/HDR 输入。
+    // 实验 fgHdrInterp = FP16,内容 = **PQ 码域 BT.2020 RGB(≤1.0)**:DLSSG
+    // 的 HDR 路径对 >1.0 scRGB 线性值不保真(插值帧高光钳 ~0.875 = 70 nits),
+    // 感知码域走 LDR 路径无损(原生 HDR 直通同域实证,2026-09-24 定案)。
     ComPtr<ID3D12Resource> fgInterp[kFgGenSlots];
+    // PQ 域插帧的 DLSSG backbuffer(仅 _fgHdrInterp):TrueHDR 真实帧输出
+    // hdrColor(FP16 scRGB)经编码 pass(HdrToPq)写入 —— FP16 PQ 码 @PIPE,
+    // ColorBuffersHDR=0。插值输出 fgInterp[g] 同域,post 直读码做 BT.2020
+    // 矩阵(免逐像素 PqEncode)。UAV(编码写)→ NSR(DLSSG 读)。
+    ComPtr<ID3D12Resource> fgBack;
     // TrueHDR 逐插值帧输出(仅 _fgSlots && _hdrPipe):FP16 scRGB @PIPE,
     // postB 经 SRV(44-48)做 PQ 转换。NGX 写后衰减 COMMON。
     ComPtr<ID3D12Resource> hdrFg[kFgGenSlots];
@@ -210,8 +222,9 @@ public:
     //   outW/H  — YUV 输出平面尺寸(vsr 开 = 目标;关 = 源)
     //   vsr     — 建 vsrColor 槽纹理(PIPE≠src 时必有;=src 且 vsr 旁路时无)
     //   hdr     — TrueHDR:输出平面切 P10(PQ)
-    //   fgHdrInterp — 实验性补帧 HDR 域插帧:fgInterp 切 FP16、hdrFg 不建
-    //                 (插值输出即 FG 的 FP16 产物,无逐帧 TrueHDR)
+    //   fgHdrInterp — 实验性补帧 HDR 域插帧(PQ 域):fgInterp 切 FP16(PQ
+    //                 码域内容)、hdrFg 不建、fgBack 建立(DLSSG backbuffer;
+    //                 插值输出即 FG 的 FP16 产物,无逐帧 TrueHDR)
     //   subW/subH — 输入色度抽取档(0=全、1=半;420=(1,1)、422=(1,0)、
     //                 444=(0,0))。SDR 输出同布局,HDR P10 输出恒 420。
     //   rgb       — VS RGBP 计划族直读(零矩阵;平面序 G/B/R)
@@ -298,18 +311,30 @@ public:
                          ID3D12Resource *srcColor = nullptr,
                          UINT srcSrvIndex = kSrvOutputColor) noexcept;
     // RTX Video 管线的颜色输出(PIPE 尺寸源 → OUT 尺寸 YUV 平面):
-    //   isFp16 = false → BGRA8 源,归一化 uv 双线性缩放采样(SDR;矩阵/范围
-    //                    同 RecordYuvOutput);1:1 时与旧路径逐位同价。
-    //   isFp16 = true  → FP16 scRGB 线性源(HDR):709→2020 线性域转换 →
-    //                    PQ(ST 2084)编码 → BT.2020 limited → P10 平面。
-    //                    scRGB 语义:1.0 = 80 nits(SDR 参考白)。
+    //   Sdr       → BGRA8 源,归一化 uv 双线性缩放采样(SDR;矩阵/范围
+    //                同 RecordYuvOutput);1:1 时与旧路径逐位同价。
+    //   HdrScRgb  → FP16 scRGB 线性源(HDR):709→2020 线性域转换 →
+    //                PQ(ST 2084)编码 → BT.2020 limited → P10 平面。
+    //                scRGB 语义:1.0 = 80 nits(SDR 参考白)。
+    //   HdrPqCodes → FP16 PQ 码域源(真HDR 插帧的 fgInterp[g]):码直读,
+    //                免逐像素 PqEncode;BT.2020 limited → P10 平面。
     // 源状态契约与 RecordYuvOutput 相同:stateBefore(UAV/NSR)→ NSR 转换 →
     // 收尾归 COMMON;yuvOut 留 UAV 交 RecordReadbackCopy。dstW/H = OUT 尺寸。
     void RecordColorOutput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                            ID3D12Resource *srcColor, UINT srcSrvIndex,
-                           bool isFp16, int srcW, int srcH,
+                           ColorOutKind kind, int srcW, int srcH,
                            ColorMatrix matrix, ColorRange range,
                            D3D12_RESOURCE_STATES stateBefore) noexcept;
+    // PQ 域插帧的编码 pass(TrueHDR 真实帧产物 → DLSSG backbuffer):hdrColor
+    // (FP16 scRGB,stateBefore=NGX 衰减 COMMON)→ 码域 2020 编码 → fgBack
+    // (FP16 PQ 码 ≤1.0)→ NSR 作 DLSSG 输入。DLSSG 的 ColorBuffersHDR=1
+    // 路径对 >1.0 线性值不保真(插值帧高光钳 ~0.875),感知码域走 LDR 路径
+    // 无损(原生 HDR 直通同域实证);编码一次随真实帧,插值输出码域直读。
+    // 仅 fgHdrInterp 且 fg 段开启时被记录(fg CL 上、eval 前 —— SubmitFgFrame
+    // 等 TrueHDR 链尾栅栏,跨队列就绪已闭合)。
+    void RecordHdrToPq(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
+                       int w, int h,
+                       D3D12_RESOURCE_STATES stateBefore) noexcept;
     // 源尺寸稠密运动场 → PIPE 尺寸双线性放大(FG MVecs 契约 = backbuffer
     // 同尺寸,像素单位向量;双线性对 R16G16F 向量场 = 线性插值,语义保真)。
     // 状态契约:motion(NSR)→ 本 pass SRV 读;motionDense COMMON→UAV→NSR。
@@ -461,6 +486,7 @@ public:
     static constexpr UINT kSrvHdrColor = 37;     // hdrColor 的 SRV(FP16 scRGB → PQ)
     static constexpr UINT kUavMotionDense = 38;  // motionDense 的 UAV(mvec 放大写)
     static constexpr UINT kSrvHdrFgBase = 44;    // hdrFg[0..4] 的 SRV(PQ 转换读)
+    static constexpr UINT kUavFgBack = 51;       // fgBack 的 UAV(PQ 域插帧编码 pass 写)
     // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
@@ -635,6 +661,11 @@ private:
     ComPtr<ID3D12PipelineState> _psoConvertScaledChroma;
     ComPtr<ID3D12PipelineState> _psoPqLuma;
     ComPtr<ID3D12PipelineState> _psoPqChroma;
+    // PQ 域插帧(fgHdrInterp):scRGB→码域编码(HdrToPq)+ 码域→P10
+    // (PqCodesToYuv*,码直读免逐像素 PqEncode)。
+    ComPtr<ID3D12PipelineState> _psoHdrToPq;
+    ComPtr<ID3D12PipelineState> _psoPqCodesLuma;
+    ComPtr<ID3D12PipelineState> _psoPqCodesChroma;
     // mvec 放大(源→PIPE;CreateOfPso 通用形态:1 SRV + 1 UAV + 4 常量)。
     ComPtr<ID3D12RootSignature> _rsMotionScale;
     ComPtr<ID3D12PipelineState> _psoMotionScale;

@@ -736,6 +736,7 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         slot.fgInterp[g].Reset();
         slot.hdrFg[g].Reset();
     }
+    slot.fgBack.Reset();
     slot.srvUavHeap.Reset();
 
     const int width = _width;
@@ -941,7 +942,7 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         // 占位视图)+ 39-43(fgInterp 逐 gen SRV)+ 44-48(hdrFg 逐 gen SRV)。
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 51; // 0-34 原有 + 36-38(RTX)+ 39-48(FG/HDR 逐 gen)+ 49/50(FFX OF 后端)
+        heapDesc.NumDescriptors = 52; // 0-34 原有 + 36-38(RTX)+ 39-48(FG/HDR 逐 gen)+ 49/50(FFX OF 后端)+ 51(fgBack UAV)
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
@@ -1032,6 +1033,12 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
                                                             : slot.outputColor.Get(),
                                               nullptr, slotHandle(kSrvHdrFgBase + g));
         }
+        // 51:fgBack 的 UAV(PQ 域插帧编码 pass 写,HdrToPq)。非实验槽 =
+        // outputColor 占位(永不有效读取 —— 对应 Record 调用只在实验模式被
+        // 记录;资源带 UAV flag,满足"绝不写 NULL 描述符"惯例)。
+        _device->CreateUnorderedAccessView(slot.fgBack ? slot.fgBack.Get()
+                                                       : slot.outputColor.Get(),
+                                           nullptr, nullptr, slotHandle(kUavFgBack));
     }
     return true;
 }
@@ -1039,14 +1046,24 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
 // DLSS FG 槽资源(仅 _fgSlots):插值输出纹理(逐 gen)+ 第二组回读缓冲。
 // RTX 双尺寸:fgInterp[g] 在 PIPE 尺寸(backbuffer 同侧)。格式:默认恒
 // BGRA8(DLSSG 在 SDR 域插值,逐输出帧 TrueHDR 提升);实验开关 fgHdrInterp
-// = FP16 scRGB(DLSSG 直接 HDR 域插帧,hdrFg 不建 —— 插值输出即 FG 产物,
-// postA 内直接 PQ 转换)。回读缓冲 = OUT 尺寸(与真实帧一致)。
+// = FP16 **PQ 码域**(DLSSG 在感知码域插帧 —— ColorBuffersHDR=1 对 >1.0
+// scRGB 不保真,码域 ≤1.0 走 LDR 路径无损,2026-09-24 定案;hdrFg 不建 ——
+// 插值输出即 FG 产物,postA 后码域直读转换)。fgBack = 该模式的 DLSSG
+// backbuffer(HdrToPq 编码 pass 写入)。回读缓冲 = OUT 尺寸(与真实帧一致)。
 bool D3D12Context::CreateFgSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
     const DXGI_FORMAT fgInterpFmt = _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
                                                  : DXGI_FORMAT_B8G8R8A8_UNORM;
     for (int g = 0; g < kFgGenSlots; ++g) {
         if (!CreateColorTexture(slot.fgInterp[g].GetAddressOf(), _pipeW, _pipeH,
                                 fgInterpFmt,
+                                D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
+            return false;
+        }
+    }
+    if (_fgHdrInterp) {
+        if (!CreateColorTexture(slot.fgBack.GetAddressOf(), _pipeW, _pipeH,
+                                DXGI_FORMAT_R16G16B16A16_FLOAT,
                                 D3D12_RESOURCE_STATE_COMMON,
                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
             return false;
@@ -2422,6 +2439,133 @@ void PqToYuvChroma(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+// ---- PQ 域插帧(实验 fgHdrInterp,2026-09-24 定案)----
+// DLSSG 的 ColorBuffersHDR=1 路径对 >1.0 的 scRGB 线性值不保真(插值帧高光
+// 钳 ~0.875 = ~70 nits;≤1.0 内容逐位保真,HDR10 游戏的 PQ 码域 ≤1.0 天然
+// 免疫)。改为:TrueHDR 产物编码成 PQ 码(BT.2020,≤1.0)作 DLSSG backbuffer
+// (ColorBuffersHDR=0,原生 HDR 直通已验证的 LDR 路径),DLSSG 在感知域插帧
+// (HDR10 游戏标准形态),输出侧码直读免逐像素 pow。
+constexpr char HDR_TO_PQ_HLSL[] = R"(
+Texture2D<float4> HdrColor : register(t0);
+RWTexture2D<float4> OutputPq : register(u0);
+
+cbuffer ConvertOutParams : register(b0) {
+    uint2 DstExtent;
+    uint2 SourceExtent;
+    float Kr;
+    float Kb;
+    float LoOverCM;
+    float SpanOverCM;
+    float Pad0;
+    float Pad1;
+    float Pad2;
+    uint2 ChromaStep;
+};
+
+static const float3x3 M709To2020 = {
+    0.6274, 0.3293, 0.0433,
+    0.0690, 0.9195, 0.0112,
+    0.0164, 0.0880, 0.8955,
+};
+
+// ST 2084 PQ EOTF 逆(输入 nits → [0,1] PQ 码值;归一 10000 nits)。
+float PqEncode(float nits) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 4096.0 * 128.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 4096.0 * 32.0;
+    const float c3 = 2392.0 / 4096.0 * 32.0;
+    float p = pow(saturate(nits / 10000.0), m1);
+    return pow((c1 + c2 * p) / (1.0 + c3 * p), m2);
+}
+
+// 同 FP16_TO_YUV_PQ 的 ToPq2020:mul(矩阵, 向量) = 行和语义(灰保持);
+// 曾写 mul(向量, 矩阵) → 全画面青色罩(见该处注释)。
+float3 ToPq2020(float3 lin709) {
+    const float3 lin2020 = mul(M709To2020, max(lin709, 0.0)) * 80.0; // nits
+    return float3(PqEncode(lin2020.r), PqEncode(lin2020.g), PqEncode(lin2020.b));
+}
+
+// 1:1 编码(hdrColor 与 fgBack 同为 PIPE 尺寸):Load 直读,双线性无意义。
+// 越界负色度(out-of-2020-gamut)经 max(,0) 钳 0 —— 与 PqToYuv 的
+// PqEncode(saturate) 同语义,无行为回退。
+[numthreads(8, 8, 1)]
+void HdrToPq(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    OutputPq[tid.xy] = float4(ToPq2020(HdrColor[tid.xy].rgb), 1.0);
+}
+)";
+
+// PQ 码域(FG 插值产物)→ P10 420:布局与 FP16_TO_YUV_PQ 同款,仅输入已是
+// 感知码 —— 双线性/均值在码域做(感知域插值语义),BT.2020 矩阵 + limited
+// ladder 落 P10,零 PqEncode(逐像素 pow 省略 = 该模式转换成本的主项)。
+constexpr char PQ_CODES_TO_YUV_HLSL[] = R"(
+Texture2D<float4> HdrColor : register(t0);
+RWTexture2D<float> OutputA : register(u0);
+RWTexture2D<float> OutputB : register(u1);
+
+cbuffer ConvertOutParams : register(b0) {
+    uint2 DstExtent;
+    uint2 SourceExtent;
+    float Kr;
+    float Kb;
+    float LoOverCM;
+    float SpanOverCM;
+    float Pad0;
+    float Pad1;
+    float Pad2;
+    uint2 ChromaStep;
+};
+
+float4 SampleCodesBilinear(float2 srcPos) {
+    const float2 f = floor(srcPos);
+    const int2 i0 = int2(f);
+    const float2 t = srcPos - f;
+    const int2 e = SourceExtent - 1;
+    const int2 a = clamp(i0, int2(0, 0), e);
+    const int2 b = clamp(i0 + int2(1, 0), int2(0, 0), e);
+    const int2 c = clamp(i0 + int2(0, 1), int2(0, 0), e);
+    const int2 d = clamp(i0 + int2(1, 1), int2(0, 0), e);
+    return HdrColor[a] * ((1 - t.x) * (1 - t.y))
+         + HdrColor[b] * (t.x * (1 - t.y))
+         + HdrColor[c] * ((1 - t.x) * t.y)
+         + HdrColor[d] * (t.x * t.y);
+}
+float2 ToSrcPos(float2 dstPos) {
+    return (dstPos + 0.5) * float2(SourceExtent) / float2(DstExtent) - 0.5;
+}
+// 同 ScaledToYuvChroma 的 ToSrcPosChroma:色度侧入参为 out-luma 域坐标,
+// 分母 = 2*DstExtent(误用 DstExtent = 2× 过采样,色块/失饱和)。
+float2 ToSrcPosChroma(float2 lumaPos) {
+    return (lumaPos + 0.5) * float2(SourceExtent) / (2.0 * float2(DstExtent)) - 0.5;
+}
+
+[numthreads(8, 8, 1)]
+void PqCodesToYuvLuma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float3 pq = SampleCodesBilinear(ToSrcPos(float2(tid.xy))).rgb;
+    const float y = dot(pq, float3(Kr, 1.0 - Kr - Kb, Kb));
+    // P10 存储约定(与 BGRA_TO_YUV 同款):R16_UNORM 字 = 10-bit 采样值,
+    // shader 侧 ×1023/65535 精确缩放 —— 缺它 = 字 = 码×64,mpv 读出越界垃圾。
+    OutputA[tid.xy] = saturate(y * SpanOverCM + LoOverCM) * (1023.0 / 65535.0);
+}
+
+[numthreads(8, 8, 1)]
+void PqCodesToYuvChroma(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= DstExtent)) return;
+    const float2 base = tid.xy * 2;
+    const float3 pq = 0.25 * (SampleCodesBilinear(ToSrcPosChroma(base + float2(0.5, 0.5))).rgb
+                            + SampleCodesBilinear(ToSrcPosChroma(base + float2(1.5, 0.5))).rgb
+                            + SampleCodesBilinear(ToSrcPosChroma(base + float2(0.5, 1.5))).rgb
+                            + SampleCodesBilinear(ToSrcPosChroma(base + float2(1.5, 1.5))).rgb);
+    const float y = dot(pq, float3(Kr, 1.0 - Kr - Kb, Kb));
+    const float cb = (pq.b - y) * (0.5 / (1.0 - Kb));
+    const float cr = (pq.r - y) * (0.5 / (1.0 - Kr));
+    OutputA[tid.xy] = saturate(cb * SpanOverCM + LoOverCM) * (1023.0 / 65535.0);
+    OutputB[tid.xy] = saturate(cr * SpanOverCM + LoOverCM) * (1023.0 / 65535.0);
+}
+)";
+
 // ---- RTX Video + FG:源尺寸运动场 → PIPE 尺寸(mvec 放大)----
 // DLSSG MVecs 契约 = backbuffer 同尺寸、像素单位 current-to-previous。
 // R16G16F 向量场双线性 = 线性插值,语义保真。4 常量:dstExtent(2)+srcExtent(2)
@@ -3136,6 +3280,11 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             { "ScaledToYuvChroma", _psoConvertScaledChroma.GetAddressOf() },
             { "PqToYuvLuma", _psoPqLuma.GetAddressOf() },
             { "PqToYuvChroma", _psoPqChroma.GetAddressOf() },
+            // PQ 域插帧(fgHdrInterp):编码 + 码域→P10。共用 _rsConvertOut
+            // 布局;HdrToPq 只消费 u0,u1/u2 表绑占位描述符(根参数必须全绑)。
+            { "HdrToPq", _psoHdrToPq.GetAddressOf() },
+            { "PqCodesToYuvLuma", _psoPqCodesLuma.GetAddressOf() },
+            { "PqCodesToYuvChroma", _psoPqCodesChroma.GetAddressOf() },
             // Phase B:RGBP 出侧(直写 + RTX 缩放版;u0/u1/u2 = G/B/R)。
             { "RgbaToRgbPlanes", _psoRgbOut.GetAddressOf() },
             { "ScaledToRgbPlanes", _psoRgbScaled.GetAddressOf() },
@@ -3144,6 +3293,7 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             BGRA_TO_YUV_HLSL, BGRA_TO_YUV_HLSL,
             COLOR_TO_YUV_SCALED_HLSL, COLOR_TO_YUV_SCALED_HLSL,
             FP16_TO_YUV_PQ_HLSL, FP16_TO_YUV_PQ_HLSL,
+            HDR_TO_PQ_HLSL, PQ_CODES_TO_YUV_HLSL, PQ_CODES_TO_YUV_HLSL,
             RGB_TO_PLANAR_HLSL, RGB_TO_PLANAR_HLSL,
         };
         for (size_t ci = 0; ci < std::size(outCsos); ++ci) {
@@ -3800,7 +3950,7 @@ void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &
 
 void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
                                      ID3D12Resource *srcColor, UINT srcSrvIndex,
-                                     bool isFp16, int srcW, int srcH,
+                                     ColorOutKind kind, int srcW, int srcH,
                                      ColorMatrix matrix, ColorRange range,
                                      D3D12_RESOURCE_STATES stateBefore) noexcept {
     // RTX Video 管线的颜色输出(PIPE 尺寸源 → OUT 尺寸平面;契约同
@@ -3829,14 +3979,29 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
     auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
 
     const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _outPlaneBytes > 1 ? 10 : 8);
-    ID3D12PipelineState *lumaPso = isFp16 ? _psoPqLuma.Get() : _psoConvertScaledLuma.Get();
-    ID3D12PipelineState *chromaPso = isFp16 ? _psoPqChroma.Get() : _psoConvertScaledChroma.Get();
+    const bool fp16 = kind != ColorOutKind::Sdr; // P10 输出契约 + ChromaStep (2,2)
+    ID3D12PipelineState *lumaPso = nullptr;
+    ID3D12PipelineState *chromaPso = nullptr;
+    switch (kind) {
+    case ColorOutKind::HdrScRgb:
+        lumaPso = _psoPqLuma.Get();
+        chromaPso = _psoPqChroma.Get();
+        break;
+    case ColorOutKind::HdrPqCodes:
+        lumaPso = _psoPqCodesLuma.Get();
+        chromaPso = _psoPqCodesChroma.Get();
+        break;
+    default:
+        lumaPso = _psoConvertScaledLuma.Get();
+        chromaPso = _psoConvertScaledChroma.Get();
+        break;
+    }
     // ChromaStep:SDR 输出 = 输入布局(同格式出);HDR P10 输出恒 (2,2)。
     const UINT step[2]{
-        static_cast<UINT>(isFp16 ? 2 : (_subW ? 2 : 1)),
-        static_cast<UINT>(isFp16 ? 2 : (_subH ? 2 : 1)),
+        static_cast<UINT>(fp16 ? 2 : (_subW ? 2 : 1)),
+        static_cast<UINT>(fp16 ? 2 : (_subH ? 2 : 1)),
     };
-    if (!isFp16 && _isRgb) {
+    if (kind == ColorOutKind::Sdr && _isRgb) {
         // Phase B:RGBP SDR 输出(PIPE→OUT 双线性;1:1 时坐标恒等映射,
         // 与直写逐位同价)。RGB 全域直码,零矩阵。
         cl->SetPipelineState(_psoRgbScaled.Get());
@@ -3852,7 +4017,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
         cl->SetComputeRootDescriptorTable(3, gpu(29)); // u1 B
         cl->SetComputeRootDescriptorTable(4, gpu(30)); // u2 R
         cl->Dispatch((static_cast<UINT>(_outW) + 7) / 8, (static_cast<UINT>(_outH) + 7) / 8, 1);
-    } else if (!isFp16) {
+    } else if (kind == ColorOutKind::Sdr) {
         cl->SetPipelineState(lumaPso);
         {
             const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
@@ -3886,8 +4051,9 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
             cl->Dispatch((static_cast<UINT>(_outChromaW) + 7) / 8, (static_cast<UINT>(_outChromaH) + 7) / 8, 1);
         }
     } else {
-        // PQ:Kr/Kb = BT.2020(0.2627/0.0593);limited 10bit luma 64+876y、
-        // chroma 512+896c(÷CM 折进常量,与 SDR 路径同布局)。
+        // HDR(HdrScRgb / HdrPqCodes):Kr/Kb = BT.2020(0.2627/0.0593);
+        // limited 10bit luma 64+876y、chroma 512+896c(÷CM 折进常量,与 SDR
+        // 路径同布局)。两者常量组相同,仅 PSO 对不同(码域源免 PqEncode)。
         constexpr float kKr2020 = 0.2627f;
         constexpr float kKb2020 = 0.0593f;
         cl->SetPipelineState(lumaPso);
@@ -3929,6 +4095,58 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
     cl->ResourceBarrier(1, back);
+}
+
+void D3D12Context::RecordHdrToPq(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
+                                 int w, int h,
+                                 D3D12_RESOURCE_STATES stateBefore) noexcept {
+    // PQ 域插帧编码 pass(仅 fgHdrInterp 且 fg 段开启被记录):hdrColor(FP16
+    // scRGB,1:1 @PIPE)→ fgBack(FP16 PQ 码 ≤1.0,UAV)→ NSR 作 DLSSG
+    // backbuffer。DLSSG 的 ColorBuffersHDR=1 路径对 >1.0 线性值不保真,码域
+    // 走 LDR 路径无损(原生 HDR 直通同域实证);插值输出码域直读(post 侧
+    // PqCodesToYuv 免逐像素 PqEncode)。
+    ID3D12GraphicsCommandList *cl = &clRef;
+    if (stateBefore != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER toNsr[1]{
+            Transition(slot.hdrColor.Get(), stateBefore,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+        };
+        cl->ResourceBarrier(1, toNsr);
+    }
+    D3D12_RESOURCE_BARRIER toUav[1]{
+        Transition(slot.fgBack.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+    };
+    cl->ResourceBarrier(1, toUav);
+
+    cl->SetComputeRootSignature(_rsConvertOut.Get());
+    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+    cl->SetDescriptorHeaps(1, heaps);
+    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+
+    cl->SetPipelineState(_psoHdrToPq.Get());
+    {
+        // 编码只消费 t0/u0;u1/u2 表绑 yuvOut 占位(根签名必须全绑,本机
+        // 驱动对未绑定根参数的死法见 #41-①)。
+        const UINT extent[2]{ static_cast<UINT>(_pipeW), static_cast<UINT>(_pipeH) };
+        const float consts[14]{};
+        cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
+        cl->SetComputeRoot32BitConstants(0, 2, extent, 2); // SourceExtent:1:1
+        cl->SetComputeRoot32BitConstants(0, 10, consts, 4);
+        cl->SetComputeRootDescriptorTable(1, gpu(kSrvHdrColor));
+        cl->SetComputeRootDescriptorTable(2, gpu(kUavFgBack));
+        cl->SetComputeRootDescriptorTable(3, gpu(28)); // 占位(未消费)
+        cl->SetComputeRootDescriptorTable(4, gpu(29)); // 占位(未消费)
+        cl->Dispatch((static_cast<UINT>(_pipeW) + 7) / 8, (static_cast<UINT>(_pipeH) + 7) / 8, 1);
+    }
+    // UAV→NSR:fgBack 即 DLSSG backbuffer(eval 前 NSR 化,替代旧 fgBar)。
+    D3D12_RESOURCE_BARRIER toNsr[1]{
+        Transition(slot.fgBack.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+    };
+    cl->ResourceBarrier(1, toNsr);
 }
 
 void D3D12Context::RecordMotionScale(ID3D12GraphicsCommandList &cl, FrameSlot &slot,

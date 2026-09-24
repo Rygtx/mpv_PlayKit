@@ -853,10 +853,12 @@ bool DlssnrContext::Initialize(
                 _fg = std::make_unique<DlssfgContext>();
                 char fgErr[256]{};
                 // FG backbuffer = 管线色:**默认恒 BGRA8 SDR 域**(TrueHDR
-                // 后置:DLSSG 的 ColorBuffersHDR 路径实测压高光,2026-09-23
+                // 后置:DLSSG 的 HDR 路径对 >1.0 线性值不保真,2026-09-23
                 // 实验定案;插值在 SDR 域,逐输出帧 TrueHDR 提升)。实验开关
-                // fg_hdr_interp=1 时回到旧形态(FP16 scRGB backbuffer,DLSSG
-                // 直接在 HDR 域插帧 —— 可能闪烁,用户自担),尺寸 = PIPE。
+                // fg_hdr_interp=1 = FP16 backbuffer 载 **PQ 码域**(TrueHDR
+                // 产物经 HdrToPq 编码,ColorBuffersHDR=0;DLSSG 在感知域插帧
+                // —— 直吃 scRGB 线性 >1.0 会被钳 ~0.875,值域定案 2026-09-24),
+                // 尺寸 = PIPE。
                 if (_fg->Initialize(*_d3d12, officialDll, _fgParams,
                                     _pipeW, _pipeH,
                                     _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
@@ -2001,7 +2003,10 @@ bool DlssnrContext::ProcessFrame(
         pipeH = _pipeH;
     }
     if (hdrLegacyInterp) {
-        pipeColor = slot->hdrColor.Get();
+        // PQ 域插帧:DLSSG backbuffer = fgBack(PQ 码,HdrToPq 编码 pass 在
+        // fg CL 上由 hdrColor 产出 —— postA 等 TrueHDR 链尾栅栏,就绪闭合)。
+        // hdrColor 本体仍归真实帧转换(post CL PqToYuv)。
+        pipeColor = slot->fgBack.Get();
         pipeW = _pipeW;
         pipeH = _pipeH;
     }
@@ -2194,7 +2199,8 @@ bool DlssnrContext::ProcessFrame(
     // 队列(等 postA 栅栏),postB 等链尾栅栏做全部输出转换/回读。非 HDR
     // 会话:postA = 旧形态(FG 推理 + 逐 gen 转换/回读),无 postB。
     // backbuffer = 管线色 pipeColor(vsrRun → vsrColor,NGX 写后衰减 COMMON,
-    // fgBar 显式 COMMON→NSR;hdr-only → outputColor,base 尾已 NSR 直读),
+    // fgBar 显式 COMMON→NSR;hdr-only → outputColor,base 尾已 NSR 直读;
+    // 实验 fgHdrInterp → fgBack,由编码 pass 在本 CL 生成 PQ 码域内容),
     // MVecs = PIPE 尺寸稠密运动(motionDense;FG 激活时 follow 被忽略),
     // Depth = 静态零纹理(PIPE≠src 用 PIPE 版)。倍数 M:按序 eval 插值槽
     // 1..M-1(官方 MFG 契约)。播种帧只提交首个 eval(DLSSG.Reset=1,输出
@@ -2215,10 +2221,12 @@ bool DlssnrContext::ProcessFrame(
     }
     if (fgOnFgCl) {
         const bool fgResetEval = _fg->NeedsReset();
-        // fgBar:管线色 → NSR 作 DLSSG 输入。vsrColor/hdrColor = NGX 写后
-        // 衰减 COMMON;hdr-only 修复形态的 outputColor = base 尾已 NSR(免
-        // 屏障直读);无 RTX 的 outputColor = 常规 COMMON。
-        const bool pipeColorNeedsBar = vsrRun || !rtxIn || hdrLegacyInterp;
+        // fgBar:管线色 → NSR 作 DLSSG 输入。vsrColor/outputColor = NGX 写后
+        // 衰减 COMMON(hdrPostSplit 形态);无 RTX 的 outputColor = 常规 COMMON。
+        // 实验模式(PQ 域)恒不走 fgBar:backbuffer = fgBack(生产于编码
+        // pass,非 NGX 衰减路径),legacy+vsr 时 pipeColor 指向 fgBack 而
+        // 真正 NGX 衰减的 vsrColor 由 TrueHDR 输入侧 NSR 化、post 尾归位。
+        const bool pipeColorNeedsBar = !hdrLegacyInterp && (vsrRun || !rtxIn);
         if (pipeColorNeedsBar) {
             D3D12_RESOURCE_BARRIER fgBar[1]{
                 TransitionFromTo(pipeColor,
@@ -2226,6 +2234,15 @@ bool DlssnrContext::ProcessFrame(
                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             };
             fgCl->ResourceBarrier(1, fgBar);
+        }
+        if (hdrLegacyInterp) {
+            // PQ 域插帧编码(TrueHDR 真实帧产物 → DLSSG backbuffer):
+            // hdrColor NGX 衰减 COMMON → NSR;fgBack COMMON→UAV 编码 → NSR。
+            // 本段在 fg CL 上、SubmitFgFrame 等 TrueHDR 链尾栅栏之后执行,
+            // hdrColor 就绪闭合(修复:旧形态 fg CL 直读 hdrColor 只等 vsr/
+            // base 栅栏,与 RTX 队列的 TrueHDR eval 存在跨队列竞态)。
+            _d3d12->RecordHdrToPq(*fgCl, *slot, pipeW, pipeH,
+                                  D3D12_RESOURCE_STATE_COMMON);
         }
         // MVecs = PIPE 尺寸稠密运动场(FG 契约 = backbuffer 同尺寸、像素
         // 单位):PIPE≠src 时源尺寸 motion 双线性放大进 motionDense。
@@ -2325,9 +2342,16 @@ bool DlssnrContext::ProcessFrame(
     // postA 提交:等待 vsr 产出(vsrRun)或 base(hdr-only 的 DLSSG
     // backbuffer = outputColor/inputColor,等 base 尾 NSR 化完成)。
     if (fgBeginOk) {
+        // 实验模式(PQ 域)的 fg CL 首消费者 = 编码 pass 读 hdrColor(TrueHDR
+        // 专用队列产出)—— 必须等 HDR 链尾栅栏(vsr 经 RTX 链传递闭合);
+        // 其余形态 backbuffer = vsrColor/base 产物,等各自生产者。门关帧
+        // (fgOnFgCl=false)的 fg CL 只剩 inBack 屏障,无 hdrColor 依赖不白等。
+        const bool fgWaitHdr = fgOnFgCl && hdrLegacyInterp && hdrDoneFence;
         if (!_d3d12->SubmitFgFrame(*slot,
-                                   vsrRun ? vsrDoneFence : _d3d12->Fence(),
-                                   vsrRun ? vsrDoneVal : slot->baseFenceValue,
+                                   fgWaitHdr ? hdrDoneFence
+                                             : (vsrRun ? vsrDoneFence : _d3d12->Fence()),
+                                   fgWaitHdr ? hdrDoneVal
+                                             : (vsrRun ? vsrDoneVal : slot->baseFenceValue),
                                    err, errLen)) {
             if (err && errLen) {
                 TimingStatusLine(err); // 临时探针
@@ -2384,36 +2408,42 @@ bool DlssnrContext::ProcessFrame(
     {
         // 真实帧 C2(源 = 管线色;stateBefore 按生产者落点):
         //   hdrPostSplit   = hdrColor(TrueHDR 写后衰减 COMMON)
-        //   legacy / vsr   = hdrColor / vsrColor(fgOnFgCl 时 fgBar 转 NSR,
-        //                    否则 NGX 衰减 COMMON —— 统一 NSR 化,收尾归 COMMON)
+        //   legacy(PQ 域) = hdrColor(编码 pass 已 NSR 化;管线色 fgBack 是
+        //                    DLSSG backbuffer,不是转换源)
+        //   vsr            = vsrColor(fgOnFgCl 时 fgBar 转 NSR,否则 NGX 衰减
+        //                    COMMON —— 统一 NSR 化,收尾归 COMMON)
         //   NR 关直连      = inputColor(C1 落 COMMON,槽 0 SRV)
         //   NR 开无 RTX    = outputColor(fgOnFgCl 消费后归 COMMON,否则 UAV)
         if (hdrPostSplit) {
             _d3d12->RecordColorOutput(*postCl, *slot, slot->hdrColor.Get(),
-                                      D3D12Context::kSrvHdrColor, true,
+                                      D3D12Context::kSrvHdrColor,
+                                      ColorOutKind::HdrScRgb,
                                       pipeW, pipeH, matrix, range,
                                       D3D12_RESOURCE_STATE_COMMON);
         } else if (hdrRun) {
-            _d3d12->RecordColorOutput(*postCl, *slot, pipeColor,
-                                      D3D12Context::kSrvHdrColor, true,
+            _d3d12->RecordColorOutput(*postCl, *slot, slot->hdrColor.Get(),
+                                      D3D12Context::kSrvHdrColor,
+                                      ColorOutKind::HdrScRgb,
                                       pipeW, pipeH, matrix, range,
                                       fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                                : D3D12_RESOURCE_STATE_COMMON);
         } else if (vsrRun) {
             _d3d12->RecordColorOutput(*postCl, *slot, slot->vsrColor.Get(),
-                                      D3D12Context::kSrvVsrColor, false,
+                                      D3D12Context::kSrvVsrColor,
+                                      ColorOutKind::Sdr,
                                       pipeW, pipeH, matrix, range,
                                       fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                                : D3D12_RESOURCE_STATE_COMMON);
         } else if (nrOff) {
             _d3d12->RecordColorOutput(*postCl, *slot, pipeColor,
-                                      /* srvInput */ 0, false,
+                                      /* srvInput */ 0,
+                                      ColorOutKind::Sdr,
                                       width, height, matrix, range,
                                       D3D12_RESOURCE_STATE_COMMON);
         } else if (_rtxActive) {
             _d3d12->RecordColorOutput(*postCl, *slot,
                                       _d3d12->OutputColor(*slot), D3D12Context::kSrvOutputColor,
-                                      false, width, height, matrix, range,
+                                      ColorOutKind::Sdr, width, height, matrix, range,
                                       fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
                                                : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         } else {
@@ -2426,13 +2456,14 @@ bool DlssnrContext::ProcessFrame(
         }
         // 逐 gen C2:hdrPostSplit = hdrFg[g] PQ 转换(TrueHDR 产物)+
         // fgInterp[g] 归位;legacy/非 HDR = fgInterp[g] 直接转换(fg CL 只
-        // NSR 化;实验模式 isFp16 = FP16 scRGB → PQ)。
+        // NSR 化;实验模式 = FP16 PQ 码直读,免逐像素 PqEncode)。
         if (fgOnFgCl && fgGenOk) {
             for (int g = 0; g < fgM - 1; ++g) {
                 if (!fgGenOk[g]) continue;
                 if (hdrPostSplit) {
                     _d3d12->RecordColorOutput(*postCl, *slot, slot->hdrFg[g].Get(),
-                                              D3D12Context::kSrvHdrFgBase + g, true,
+                                              D3D12Context::kSrvHdrFgBase + g,
+                                              ColorOutKind::HdrScRgb,
                                               pipeW, pipeH, matrix, range,
                                               D3D12_RESOURCE_STATE_COMMON);
                     if (!_d3d12->RecordReadbackCopy(*postCl, *slot, err, errLen, g)) {
@@ -2448,7 +2479,9 @@ bool DlssnrContext::ProcessFrame(
                 } else {
                     if (_rtxActive) {
                         _d3d12->RecordColorOutput(*postCl, *slot, slot->fgInterp[g].Get(),
-                                                  D3D12Context::kSrvFgInterpBase + g, hdrLegacyInterp,
+                                                  D3D12Context::kSrvFgInterpBase + g,
+                                                  hdrLegacyInterp ? ColorOutKind::HdrPqCodes
+                                                                  : ColorOutKind::Sdr,
                                                   pipeW, pipeH, matrix, range,
                                                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                     } else {
@@ -2486,6 +2519,16 @@ bool DlssnrContext::ProcessFrame(
                                      D3D12_RESOURCE_STATE_COMMON),
                 };
                 postCl->ResourceBarrier(1, fgBack);
+            }
+            if (hdrLegacyInterp) {
+                // PQ 域插帧:DLSSG backbuffer(fgBack,编码 pass NSR 化)本帧
+                // 消费完毕,归位 COMMON 供下帧编码 pass 的 COMMON→UAV 屏障。
+                D3D12_RESOURCE_BARRIER fgBackPark[1]{
+                    TransitionFromTo(slot->fgBack.Get(),
+                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     D3D12_RESOURCE_STATE_COMMON),
+                };
+                postCl->ResourceBarrier(1, fgBackPark);
             }
         }
         recordGuidancePark(*postCl);

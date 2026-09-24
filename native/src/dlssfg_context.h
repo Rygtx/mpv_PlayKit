@@ -122,9 +122,10 @@ private:
     int _width = 0;
     int _height = 0;
     int _maxGen = kFgMultMax - 1; // 运行库插值帧上限(能力键覆写)
-    // HDR backbuffer(历史形态,2026-09-24 TrueHDR 后置后恒 false):DLSSG
-    // 恒在 SDR 域插值(ColorBuffersHDR 路径实测压高光),HDR 由逐帧 TrueHDR
-    // 承担。键面保留,随 create 格式定格。
+    // ColorBuffersHDR(恒 false,2026-09-24 PQ 域插帧定案):DLSSG 的 HDR
+    // 路径对 >1.0 的 scRGB 线性值不保真(插值帧高光钳 ~0.875);实验
+    // fgHdrInterp 的 backbuffer 改为 FP16 载 PQ 码域(≤1.0,感知域插值 =
+    // HDR10 游戏标准形态),走本 LDR 路径 —— 与 FP16 格式解耦。
     bool _colorHdr = false;
 };
 

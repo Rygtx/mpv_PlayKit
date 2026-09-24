@@ -244,9 +244,11 @@ private:
     std::unique_ptr<DlssfgContext> _fg;
     NVSDK_NGX_Parameter *_fgParams = nullptr; // FG 专用核心参数块(core 拥有)
     bool _fgRequested = false;
-    // 实验性补帧 HDR 域插帧(创建时定格):TrueHDR 前置 + DLSSG 直接吃
-    // FP16 scRGB backbuffer(ColorBuffersHDR=1)。部分驱动压高光 = 闪烁,
-    // 默认 0(SDR 域插帧 + 逐帧 TrueHDR)。参与槽资源/FG create 格式形态。
+    // 实验性补帧 HDR 域插帧(创建时定格):TrueHDR 前置 + DLSSG 吃其 FP16
+    // **PQ 码域** backbuffer(HdrToPq 编码 pass,ColorBuffersHDR=0 —— 直吃
+    // scRGB 线性 >1.0 会被 DLSSG HDR 路径钳在 ~0.875 = 插值帧高光塌陷,
+    // 2026-09-24 值域定案;感知码域走 LDR 路径无损)。默认 0(SDR 域插帧 +
+    // 逐帧 TrueHDR)。参与槽资源/FG create 格式形态。
     bool _fgHdrInterp = false;
     // RTX Video(VSR→TrueHDR,均挂 NR 之后、FG 之前):创建时参数快照
     // (_rtx;vpy/[rtxvideo] ini,面板 payload 不携带)。VSR/HDR feature

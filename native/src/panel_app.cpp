@@ -1622,11 +1622,12 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-    // 补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 闪烁警告。
+    // 补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 代价提示。
     // 标签 ≤5 中文字宽(标签列宽限制,超宽侵入控件列与开关重叠,#53e 同款)。
-    pairLabel(0, "HDR域插帧", "实验性:DLSSG 直接在 HDR 域插帧(直接吃 TrueHDR 的 FP16 输出)。\n"
-              "省 TrueHDR ×(M-1) 的 GPU/提交成本,但部分驱动(SM86 移植内核)\n"
-              "此路径插值帧压高光 = 亮处闪烁 —— 若闪烁请关闭。默认关。\n"
+    pairLabel(0, "HDR域插帧", "实验性:DLSSG 在感知码域(PQ)插帧 —— TrueHDR 输出先编码成\n"
+              "PQ 码(≤1.0,DLSSG 对 >1.0 的 scRGB 线性值不保真,2026-09-24\n"
+              "值域定案)作 backbuffer,省 TrueHDR ×(M-1) 的 GPU/提交成本,\n"
+              "插值帧质量口径与默认模式(逐帧 TrueHDR)不同 —— 异常即关闭。\n"
               "创建时参数:变化自动触发 mpv 原地重载,需 HDR 与补帧同时开启。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     {
@@ -1641,7 +1642,7 @@ void DrawUi() noexcept {
         if (!usable) ImGui::EndDisabled();
         ImGui::SameLine(0, 12 * s);
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
-                           usable ? "实验性 —— 可能闪烁,闪烁即关闭"
+                           usable ? "实验性 —— 插值走感知域,异常即关闭"
                                   : "需 HDR 与补帧同时开启");
     }
     y += rowH;
