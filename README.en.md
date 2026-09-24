@@ -12,8 +12,8 @@ _Who cares about logic, architecture, edge cases, or code style — vibe coding 
 
 **vs_dlssnr** — ports Magpie's DLSSNR (NVIDIA DLSS SDK 310.9.0 AI video enhancement, NGX Feature 18) into mpv as a native VapourSynth API4 plugin:
 
-- Pure D3D12 implementation; zero-guidance single-frame mode by default, optional **hardware optical-flow guidance** (FFX = AMD FidelityFX, cross-vendor, default / NVOF = NVIDIA engine, panel-switchable; automatically falls back to zero guidance when unsupported)
-- **YUV native**: processes YUV420P8/P10 directly and outputs the same format, zero pixel conversion on the CPU side (pure row copy); color matrix/range handled per source frame properties (_Matrix/_ColorRange, 709/601 + limited/full), defaults to 709 limited
+- Pure D3D12 implementation; zero-guidance single-frame mode by default, optional **hardware optical-flow guidance** (FFX = AMD FidelityFX, cross-vendor, default / NVOF = NVIDIA engine, panel-switchable; its only consumers are NR guidance and frame-gen motion — VSR/HDR never touch it)
+- **YUV native**: processes planar YUV {420, 422, 444} × 8–16bit directly and outputs the same format, zero pixel conversion on the CPU side (pure row copy); >8-bit sources run the pipeline color in RGBA16F (10-bit precision throughout inference); color matrix/range handled per source frame properties (_Matrix/_ColorRange, 709/601 + limited/full), defaults to 709 limited
 - Same-resolution processing (not upscaling)
 - Static NGX core + snippet direct linking + IAT hook, fully replicating the Magpie call chain
 - Residual pipeline: internal inference resolution adjustable 25–100%, Catmull-Rom residual reconstruction back to source resolution
@@ -23,16 +23,25 @@ _Who cares about logic, architecture, edge cases, or code style — vibe coding 
 
 | Content | Handling |
 |---|---|
-| YUV 4:2:0 8-bit (YUV420P8, nv12/yuv420p) | ✅ Enhanced (same format output) |
-| YUV 4:2:0 10-bit (YUV420P10, HEVC 10-bit, etc.) | ✅ Enhanced (same format output) |
+| YUV 4:2:0 / 4:2:2 / 4:4:4 × 8–16bit (420P8 / 420P10 / HEVC 10-bit / 422 / 444 / 12bit, etc.) | ✅ Enhanced (same format output; >8-bit runs a 10-bit-precision pipeline) |
+| HDR (BT.2020 matrix / PQ / HLG transfer, per frame properties) | ✅ Enhanced as-is (NGX NR ignores the transfer function; or switch to RTX TrueHDR for P10 PQ output) |
 | Color matrix BT.709 / BT.601 / XYZ (auto-detected per frame properties, defaults to 709) | ✅ |
 | Color range limited / full (per frame properties) | ✅ |
-| HDR (BT.2020 matrix or PQ/HLG transfer, per frame properties) | ⏭️ Passthrough (treating it as SDR would produce wrong colors) |
-| 4:2:2 / 4:4:4 / 12-bit and above / RGB | ⏭️ Passthrough |
+| GRAY / packed RGB (RGB24 etc., single plane) | 🔁 Auto-converted to YUV444 via the 709 matrix, then enhanced (vpy fallback) |
+| Planar RGB (RGBP, 3 planes) | 🟡 Natively accepted by the plugin (zero-matrix direct read); the deployed VS R73 has no such format, mechanism dormant |
 
-> "Passthrough" = normal playback without enhancement; bare streams with missing properties cannot determine color metadata and are handled as 709 limited (consistent with mainstream player defaults).
+> "Passthrough" = normal playback without enhancement, now limited to H_Max overflow and exotic families (alpha etc.); bare streams with missing properties cannot determine color metadata and are handled as 709 limited (consistent with mainstream player defaults).
 
 For general mpv tweaks from upstream (configuration guides, mpv-lazy usage, etc.), see the [upstream Wiki](https://github.com/hooke007/mpv_PlayKit/wiki) and the general mpv tutorial (Chinese).
+
+## RTX Video: VSR upscaling / TrueHDR (optional)
+
+Beyond the denoise/frame-gen chain, two NGX snippets from the NVIDIA RTX Video SDK 1.1 are integrated (requires `ngx\nvngx_vsr.dll` / `nvngx_truehdr.dll`, auto-fetched by fetch-deps; needs RTX 20-series+ and driver r550.58+, auto-degrades to passthrough if the capability check fails):
+
+- **VSR upscaling**: chained after denoise — denoise at source size → VSR upscale → (optional HDR) → frame generation; the temporal models only ever consume real source frames. `VSR_Mode`: 0 off / 1 auto (the plugin reads mpv's display rectangle, fits and clamps to the monitor, bypasses automatically when the source is taller — VSR only upscales) / 2 manual factor (`VSR_Scale` ≤4x, above 4x VSR first to a 4x intermediate size then linear finish); `VSR_Strength` 1–4 quality tiers (4 = Ultra)
+- **TrueHDR** (SDR→HDR): chained after VSR (the official contract forbids HDR input); output switches to YUV420P10 BT.2020 PQ with HDR10 metadata per frame props; **HDR display is fully automatic** — the panel tags the output and syncs `target-colorspace-hint` in the same breath (leave mpv.conf at its default no), SDR screens tone-map automatically; `HDR_Contrast / HDR_Saturation / HDR_MiddleGray / HDR_PeakNits` for fine-tuning
+- Tune on the panel's "RTX upscale/HDR" tab; VSR/HDR are create-time parameters — changes auto-trigger an in-place mpv reload; window moves/resizes take effect at the next chain rebuild (seek/file change)
+- HDR sources (BT.2020/PQ/HLG) run the full chain as-is (NR ignores the transfer function; the old "auto passthrough guard" is gone)
 
 ## Download
 
@@ -47,6 +56,8 @@ For general mpv tweaks from upstream (configuration guides, mpv-lazy usage, etc.
 | `vs-plugins\dlssnr_panel.exe` | Standalone ImGui tuning panel (optional, launched automatically when the filter loads) |
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR model (must reside in the `ngx\` subdirectory; the plugin resolves it by this relative path; taken from the RenoDX project) |
 | `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, official-chain carrier; selectable via "FG route") |
+| `vs-plugins\ngx\nvngx_vsr.dll` | RTX Video SDK 1.1 VSR snippet (auto-fetched by fetch-deps.ps1; optional via the panel's "RTX upscale/HDR" tab) |
+| `vs-plugins\ngx\nvngx_truehdr.dll` | RTX Video SDK 1.1 TrueHDR snippet (auto-fetched by fetch-deps.ps1; SDR→PQ HDR10 display) |
 | `vs-plugins\ngx\version.dll` | DLSS frame-generation hook proxy 0.3.x ([dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0, RTX 30/20; self-signed; intercepts the `nvngx_dlssg.dll` load and swaps in its embedded runtime) |
 | `vs-plugins\ngx\dlssg_sm86.ini` | Frame-generation proxy config (shipped as-is + `MaxGeneratedFrames=5` for the 6x cap; the panel "kernel tier" writes the `Optimized` key only, everything else stays untouched) |
 | `portable_config\vs\DLSSNR_NV.vpy` | Filter script (parameters in the table below) |
@@ -69,10 +80,10 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 - While playing, double-click `vs-plugins\dlssnr_panel.exe` to tune parameters in real time (the panel is also silently launched when the filter loads; it lives in the tray, click to summon)
   - Parameter changes take effect in real time; **"Save settings"** writes to `vs-plugins\dlssnr_ui.ini` and applies automatically on next filter load; **"Reset defaults"** restores factory parameters
   - **ini takes precedence over vpy parameters**; delete `dlssnr_ui.ini` to restore script defaults
-  - Optical-flow quality dropdown (0–5) and the "optical flow follows scaling" switch are live-adjustable; when optical flow is unavailable the panel shows "degraded to zero guidance"
+  - Optical-flow quality dropdown (per backend: NVOF 0–5 / FFX 0–2) and the "optical flow follows scaling" switch are live-adjustable; when optical flow is unavailable the panel shows "degraded to zero guidance"
   - Frame-generation tab **"kernel tier"** (dlssg_for_sm86 `Optimized` 0–3): 1 = bit-identical acceleration (default, exactly the official image), 2/3 = lossy faster tiers; writes `ngx\dlssg_sm86.ini`, the proxy reads it once at process load — **mpv restart required**
-  - **Diagnostics tab**: the single home for monitoring — the tuning tabs stay clean. Session facts (requested vs actual: optical flow degraded to zero guidance, effective FG route off / official NGX (0.3.x proxy takeover) / official NGX direct / duplicate-frames with the failure reason, panel multiplier above the session cap — all highlighted in red; **which backend "auto" actually picked is shown here, no log digging**) plus queueing details (slot-pool wait / NGX serialize wait / optical-flow gate skip·expired·reset counters) plus the **"debug view" dropdown** (diff ×20 grayscale: white = big change, flat gray = untouched; optical flow = direction → hue, brightness = speed, black = no motion data) and the **"write performance log" switch** (controls `dlssnr_timing.log`). No red on the page = the plugin is working
-  - Processing-time timeline chart (gpu / optical flow / inference segments)
+  - **Diagnostics tab**: the single home for monitoring — the tuning tabs stay clean. Session facts (requested vs actual: optical flow degraded to zero guidance **and its per-frame consumption state** (NR / FG / gated off — the "actual" field is a session-level mode, zero submissions with both NR and FG off), effective FG route off / official NGX (0.3.x proxy takeover) / official NGX direct / duplicate-frames with the failure reason, panel multiplier above the session cap — all highlighted in red; **which backend "auto" actually picked is shown here, no log digging**) plus queueing details (slot-pool wait / NGX serialize wait / optical-flow gate skip·expired·reset counters) plus the **"debug view" dropdown** (diff ×20 grayscale: white = big change, flat gray = untouched; optical flow = direction → hue, brightness = speed, black = no motion data) and the **"write performance log" switch** (controls `dlssnr_timing.log`). No red on the page = the plugin is working
+  - Processing-time timeline chart (pack / optical flow / eval_cpu / gpu (NR inference) / VSR / frame-gen / HDR / output conversion / unpack — nine segments; the chart shows as long as any segment has processing time, zero segments auto-collapse, fully-off collapses the whole chart)
   - The panel exits automatically when the filter is turned off / mpv exits
 
 ## Parameters (DLSSNR_NV.vpy)
@@ -97,6 +108,14 @@ This package does not include mpv.exe or the VapourSynth runtime; use the offici
 | `Fg_Enabled` | True/False | False | DLSS frame generation (chained after denoise, output fps ×2–×6; auto mode requires `ngx\version.dll` (dlssg_for_sm86 ≥0.3.0), falls back to 1:1 on init failure) |
 | `Fg_Multiplier` | 2–6 | 2 | Interpolation multiplier (output frame count/pacing is fixed per session; panel changes auto-trigger an in-place mpv reload via `input-ipc-server`; without IPC, off/down-grade falls back to in-session real-frame duplication and up-grade needs a manual seek; 24fps ×3 = 72fps). The runtime cap defaults to 6x (deployed ini `MaxGeneratedFrames=5` — a clamp only), so gear changes take effect via the in-place reload; output fps = source ×M, display refresh rate should be ≥ output fps) |
 | `Fg_Route` | 0–1 | 0 | FG route (0 = auto, GPU-family split — on RTX 30/20 it preloads the dlssg_for_sm86 0.3.x hook proxy which delivers DLSS-G over the official signed chain; on RTX 40 it drives the official runtime and automatically unlocks the mfg count gate for 3–6x (Ada only — 50-series ships native multi-frame and is left untouched), falling back to 2x when the pattern misses; 1 = pure official, no proxy preload, straight to the official runtime, 40-series gets the same unlock, no fallback when rejected on 30/20. Process-level, mpv restart required after switching; from v20 legacy values are incompatible — any of 1–3 clamps to 1, re-select auto in the panel after upgrading) |
+| `VSR_Mode` | 0–2 | 1 | RTX Video upscaling (0 = off; 1 = auto, fits mpv's display rectangle; 2 = manual factor). Create-time parameter; changes trigger an in-place reload |
+| `VSR_Scale` | 1.0–4.0 | 2.0 | VSR manual upscale factor (only consumed with `VSR_Mode = 2`; official single-pass cap 4x) |
+| `VSR_Strength` | 1–4 | 2 | VSR quality tier (4 = Ultra, best and slowest; off = `VSR_Mode = 0`) |
+| `HDR_Enabled` | True/False | False | RTX TrueHDR (SDR→HDR, chained after VSR); output switches to YUV420P10 BT.2020 PQ, display sync handled automatically by the panel |
+| `HDR_Contrast` | 0–200 | 100 | HDR contrast |
+| `HDR_Saturation` | 0–200 | 100 | HDR saturation |
+| `HDR_MiddleGray` | 10–100 | 50 | HDR middle gray |
+| `HDR_PeakNits` | 400–2000 | 1000 | HDR peak brightness (nits) |
 | `H_Max` | integer | 0 | Output height cap (sources above it skip processing; 0 = unlimited) |
 
 Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 1); lowering levels does not save much frame time (NGX fixed cost dominates) and mainly affects high-frequency detail — 50–75% is recommended for 1080p content, 25% only for extreme power-saving scenarios; for 4K sources pair with `Input_Resolution = 50`. 4K full-resolution (res=100%) inference is about 200ms/frame — a physical ceiling, not stuttering.
@@ -113,7 +132,8 @@ Tuning tips: 100% with scaling on ≈ scaling off (equivalent when multiplier = 
 | `Fg_Route` pure-official gear | `nvngx_dlssg.dll` exists and the hardware is in the official support range (RTX 40/50) | On 30/20 the architecture gate rejects it (0xBAD0000B) with **no fallback** — FG simply turns off (`fg_detail` on the diagnostics page carries the reason) |
 | RTX 40-series 3–6x frame generation | the machine's GPU is Ada (SM89, NVAPI AD100=0x190; Ada only — 50-series native MFG leaves the official runtime untouched) and the byte signature of the count gate inside the official `nvngx_dlssg.dll` matches (in-process unlock, same technique as RTX40MFG-Unlock; process memory only, nothing written to disk) | Non-Ada always skips; on a signature miss (driver update rewrites the runtime) it falls back to 2x automatically; the timing log carries the reason |
 | NR only off (`NR_Enabled = False`) | None (frame generation / optical flow work independently) | With frame generation **also** off → the whole filter initializes nothing at zero cost and every other parameter is moot |
-| DLSSNR filter as a whole | RTX GPU (Tensor Core) + `ngx\nvngx_dlssnr.dll` model + YUV420 8/10-bit SDR source | Any missing → automatic passthrough (normal playback, no enhancement) |
+| RTX VSR / TrueHDR | RTX 20-series+ and driver r550.58+ with `ngx\nvngx_vsr.dll` / `nvngx_truehdr.dll` (auto-fetched); TrueHDR chains after VSR | Capability failure auto-degrades to passthrough; denoise / frame-gen unaffected |
+| DLSSNR filter as a whole | RTX GPU (Tensor Core) + `ngx\nvngx_dlssnr.dll` model + a planar-YUV source (420/422/444 × 8–16bit) | Any missing → automatic passthrough (normal playback, no enhancement) |
 | Panel stats/status area | Filter loaded | The panel can run alone to tweak and save the ini (applied on next load); stats area stays blank |
 | Menu / `*` key DLSSNR toggle | Bound in both `input_uosc.conf` (uosc menu) and `menu.conf` (mpv context menu) | Custom key bindings must be updated in both places |
 
@@ -183,6 +203,8 @@ pwsh -File native\scripts\package.ps1 [-Version 2026.09.08]   # output: native\d
 ```
 
 For the porting checklist, architecture notes, and pitfall log, see [docs/PORTING.md](docs/PORTING.md).
+
+`native/testkit/` is a reusable test toolbox (end-to-end assertions over real mpv playback; see the README inside for usage). Synthetic test media is generated deterministically by `native/testkit/testmedia.py` into `native/testkit/media/` (binaries not committed — delete and rerun `python testmedia.py` to regenerate); the folder also works as manual-testing material.
 
 ## Credits & license
 

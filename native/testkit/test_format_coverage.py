@@ -11,81 +11,22 @@
 (y4m 的 Crgb 标记 ffmpeg 不认 —— RGB 载体只能用 PNG 这类图像容器。)
 断言:mpv 存活 + timing log 出现对应分辨率/位深且 nr=1 的 create 行
 (直通或 vpy 崩溃 = create 行缺失)。
+媒体:testmedia.CLIPS 统一定义,生成到 testkit/media/(共享,不删)。
 
 用法: <部署根>\\python.exe <仓库>\\native\\testkit\\test_format_coverage.py
 运行会临时改 vs-plugins\\dlssnr_ui.ini(nr_enabled=1, fg/rtx 关),结束恢复原值。
 """
 import os
 import re
-import struct
 import subprocess
 import sys
 import time
-import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import testenv
+import testenv  # noqa: E402
+import testmedia  # noqa: E402
 
-W, H, FPS, SECS = 320, 180, 24, 8
 VF = '--vf=vapoursynth="~~/vs/DLSSNR_NV.vpy"'
-
-
-def _row8(w, off):
-    return bytes(((x * 2 + off) & 0xFF) for x in range(w))
-
-
-def _row10(w, off):
-    return b"".join(struct.pack(">H", ((x * 4 + off) & 0x3FF)) for x in range(w))
-
-
-def gen_y4m(path, tag, pack):
-    with open(path, "wb") as f:
-        f.write(f"YUV4MPEG2 W{W} H{H} F{FPS}:1 Ip A1:1 {tag}\n".encode())
-        for n in range(FPS * SECS):
-            f.write(b"FRAME\n")
-            f.write(pack(n))
-
-
-def gen_y4m_444p8(path):
-    gen_y4m(path, "C444", lambda n: (_row8(W, n * 5) * H) + (_row8(W, 96 + n * 3) * H)
-            + (_row8(W, 160 + n * 3) * H))
-
-
-def gen_y4m_444p10(path):
-    gen_y4m(path, "C444p10", lambda n: (_row10(W, n * 5) * H) + (_row10(W, 384 + n * 3) * H)
-            + (_row10(W, 640 + n * 3) * H))
-
-
-def gen_y4m_mono8(path):
-    gen_y4m(path, "Cmono", lambda n: _row8(W, n * 5) * H)
-
-
-def gen_png_rgb24(path):
-    """单帧 PNG(mpv 按 image2 解码,--loop=inf 连续供帧)。"""
-    pw = ph = 96
-    raw = bytearray()
-    for y in range(ph):
-        raw += b"\x00"  # filter: none
-        for x in range(pw):
-            raw += bytes((((x * 2) & 0xFF), ((y * 2) & 0xFF), ((x + y) & 0xFF)))
-
-    def chunk(tag, data):
-        return (struct.pack(">I", len(data)) + tag + data
-                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
-
-    ihdr = struct.pack(">IIBBBBB", pw, ph, 8, 2, 0, 0, 0)  # 8bit truecolor
-    with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
-                + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b""))
-
-
-# (标签, 文件名, 生成函数, 断言宽, 断言高, create 位深, 是否用 --start)
-CLIPS = [
-    ("444P8直吃", "dlssnr_fmt_444.y4m", gen_y4m_444p8, W, H, 8, True),
-    ("444P10直吃", "dlssnr_fmt_444p10.y4m", gen_y4m_444p10, W, H, 10, True),
-    ("GRAY8->444P8", "dlssnr_fmt_mono.y4m", gen_y4m_mono8, W, H, 8, True),
-    ("RGB24->444P8", "dlssnr_fmt_rgb.png", gen_png_rgb24, 96, 96, 8, False),
-]
 
 
 def main():
@@ -114,19 +55,20 @@ def main():
     set_ini("rtxvideo", "vsr_mode", "0")
     set_ini("rtxvideo", "hdr_enabled", "0")
 
-    import tempfile
-    tmp = tempfile.gettempdir()
+    media = testmedia.ensure(names=[c[0] for c in testmedia.CLIPS
+                                    if c[0].startswith("dlssnr_fmt_")])
     failures = []
     try:
-        for label, fname, gen, aw, ah, depth, use_start in CLIPS:
-            media = os.path.join(tmp, fname)
-            gen(media)
+        for fname, _gen, aw, ah, depth, note in testmedia.CLIPS:
+            if not fname.startswith("dlssnr_fmt_"):
+                continue  # hdr_hint_sync_test.y4m = 420 基线载体,归各自的测试
+            use_start = not fname.endswith(".png")  # 单帧 PNG 用 --loop=inf 供帧即可
             wm = testenv.log_size(testenv.MPV_TIMING_LOG)
             args = [testenv.MPV_EXE, "--input-ipc-server=mpvpipe", "--really-quiet",
                     "--volume=0", "--loop=inf", "--geometry=640x360"]
             if use_start:
                 args.append("--start=2")
-            args += [VF, media]
+            args += [VF, media[fname]]
             errf = open(os.path.join(testenv.ROOT, "mpv_stderr.txt"), "a", encoding="utf-8")
             mpv = subprocess.Popen(args, cwd=testenv.ROOT, stderr=errf, stdout=subprocess.DEVNULL)
             time.sleep(10)
@@ -137,17 +79,16 @@ def main():
             except Exception:
                 testenv.kill_mpv_tree(mpv.pid)
             errf.close()
-            os.remove(media)
 
             lines = testenv.new_lines(wm, testenv.MPV_TIMING_LOG)
             pat = re.compile(rf"create params {aw}x{ah}d{depth}\b.*\bnr=1\b")
             hit = [l for l in lines if pat.search(l)]
             ok = alive and hit
-            print(f"{label}: mpv {'存活' if alive else '提前退出!'}; "
+            print(f"{fname} ({note}): mpv {'存活' if alive else '提前退出!'}; "
                   f"create(nr=1, {aw}x{ah}d{depth}) {'命中' if hit else '未命中'} "
                   f"(新增 {len(lines)} 行)")
             if not ok:
-                failures.append(label)
+                failures.append(fname)
                 for l in lines[:6]:
                     print(f"    | {l[:140]}")
     finally:

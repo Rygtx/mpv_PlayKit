@@ -12,8 +12,8 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 
 **vs_dlssnr** — 把 Magpie 的 DLSSNR(NVIDIA DLSS SDK 310.9.0 的 AI 视频增强,NGX Feature 18)移植为 VapourSynth API4 原生插件接入 mpv:
 
-- 纯 D3D12 实现;默认零 guidance 单帧模式,可选 **硬件光流引导**(0–5 档;FFX = AMD FidelityFX 跨厂商通用,默认 / NVOF = NVIDIA 引擎,面板切换)
-- **YUV 原生**:直接处理 YUV420P8/P10、输出同格式,CPU 侧零像素转换(纯行拷贝);色彩矩阵/范围按源帧属性(_Matrix/_ColorRange,709/601 + limited/full)处理,缺省 709 limited
+- 纯 D3D12 实现;默认零 guidance 单帧模式,可选 **硬件光流引导**(FFX = AMD FidelityFX 跨厂商通用,默认 / NVOF = NVIDIA 引擎,面板切换;消费者只有 NR guidance 与补帧运动场,VSR/HDR 不依赖光流)
+- **YUV 原生**:直接处理 YUV 计划族 {420, 422, 444} × 8–16bit、输出同格式,CPU 侧零像素转换(纯行拷贝);>8bit 源管线色走 RGBA16F(推理全程 10bit 精度);色彩矩阵/范围按源帧属性(_Matrix/_ColorRange,709/601 + limited/full)处理,缺省 709 limited
 - 同分辨率处理(非超分)
 - 静态 NGX core + snippet 直连 + IAT hook,完整复刻 Magpie 调用链
 - 残差管线:内部推理分辨率 25–100% 可调,Catmull-Rom 残差重建回源分辨率
@@ -23,16 +23,25 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 
 | 内容 | 处理 |
 |---|---|
-| YUV 4:2:0 8-bit(YUV420P8,nv12/yuv420p) | ✅ 增强(输出同格式) |
-| YUV 4:2:0 10-bit(YUV420P10,HEVC 10-bit 等) | ✅ 增强(输出同格式) |
+| YUV 4:2:0 / 4:2:2 / 4:4:4 × 8–16bit(420P8 / 420P10 / HEVC 10-bit / 422 / 444 / 12bit 等) | ✅ 增强(输出同格式;>8bit 内部 10bit 精度管线) |
+| HDR(BT.2020 矩阵 / PQ / HLG 传输,按帧属性) | ✅ 照常增强(NGX NR 不感知传输函数;亦可切 RTX TrueHDR 输出 P10 PQ) |
 | 色彩矩阵 BT.709 / BT.601 / XYZ(按帧属性自动识别,缺失按 709) | ✅ |
 | 色彩范围 limited / full(按帧属性) | ✅ |
-| HDR(BT.2020 矩阵或 PQ/HLG 传输,按帧属性) | ⏭️ 自动直通(按 SDR 处理会错色) |
-| 4:2:2 / 4:4:4 / 12-bit 及以上 / RGB | ⏭️ 自动直通 |
+| GRAY / packed RGB(RGB24 等,单平面) | 🔁 自动 709 矩阵转 YUV444 后增强(vpy 兜底) |
+| 计划 RGB(RGBP,3 平面) | 🟡 插件已原生收编(零矩阵直读);部署版 VS R73 无此格式,机制休眠 |
 
-> "直通" = 正常播放、不做增强;属性缺失的裸流无法判定色彩元数据,按 709 limited 处理(与主流播放器缺省一致)。
+> "直通" = 正常播放、不做增强,现仅剩 H_Max 超限与极冷门族(Alpha 等);属性缺失的裸流无法判定色彩元数据,按 709 limited 处理(与主流播放器缺省一致)。
 
 上游的 mpv 通用折腾内容(配置说明、mpv-lazy 使用等)仍见 [上游 Wiki](https://github.com/hooke007/mpv_PlayKit/wiki) 与 [《win10/11 mpv播放器通用教程》](https://hooke007.github.io/unofficial/mpv_start.html)。
+
+## RTX Video:VSR 超分 / TrueHDR(可选)
+
+在降噪/补帧链之外,接入 NVIDIA RTX Video SDK 1.1 的两段 NGX 片段(依赖 `ngx\nvngx_vsr.dll` / `nvngx_truehdr.dll`,fetch-deps 自动拉取;需 RTX 20 系+ 与 r550.58+ 驱动,capability 不过自动降级直通):
+
+- **VSR 超分**:挂降噪之后,源尺寸降噪 → VSR 放大 →(可选 HDR)→ 帧生成,temporal 模型全部只吃真实源帧。`VSR_Mode`:0 关 / 1 自动(插件直读 mpv 显示矩形自适应并 clamp 到所在显示器,源更高时自动旁路——VSR 只做放大)/ 2 手动倍率(`VSR_Scale` ≤4x,超 4x 先 VSR 到 4x 中间尺寸再线性收尾);`VSR_Strength` 1–4 质量档(4 = Ultra)
+- **TrueHDR**(SDR→HDR):挂 VSR 之后(官方契约不吃 HDR 输入);输出切换 YUV420P10 BT.2020 PQ,HDR10 元数据随帧 props;**HDR 上屏全自动**——面板同拍打标 + 同步 `target-colorspace-hint`(mpv.conf 保持默认 no 即可),SDR 屏自动色调映射;`HDR_Contrast / HDR_Saturation / HDR_MiddleGray / HDR_PeakNits` 微调
+- 面板「RTX 超分/HDR」页调参;VSR/HDR 为创建参数,改动自动触发 mpv 原地重载;窗口换屏/改尺寸的生效点 = 下一次链重建(seek/换片)
+- HDR 源内容(BT.2020/PQ/HLG)照常走全链(NR 不感知传输函数,原"自动直通守卫"已撤)
 
 ## 下载
 
@@ -47,6 +56,8 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `vs-plugins\dlssnr_panel.exe` | ImGui 独立调参面板(可选,滤镜加载时自动拉起) |
 | `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR 模型(必须位于 `ngx\` 子目录,插件按此相对路径寻找;取自 RenoDX 项目) |
 | `vs-plugins\ngx\nvngx_dlssg.dll` | DLSS 官方帧生成运行时(NVIDIA 签名,官方链载体;面板"FG 路由"可选) |
+| `vs-plugins\ngx\nvngx_vsr.dll` | RTX Video SDK 1.1 VSR 超分片段(fetch-deps.ps1 自动拉取;面板"RTX 超分/HDR"页可选) |
+| `vs-plugins\ngx\nvngx_truehdr.dll` | RTX Video SDK 1.1 TrueHDR 片段(fetch-deps.ps1 自动拉取;SDR→PQ HDR10 上屏) |
 | `vs-plugins\ngx\version.dll` | DLSS 帧生成 hook 代理 0.3.x([dlssg_for_sm86](https://github.com/sdli1995/dlssg_for_sm86) ≥0.3.0,RTX 30/20 系;自签名;拦截 `nvngx_dlssg.dll` 加载替换为内嵌运行库) |
 | `vs-plugins\ngx\dlssg_sm86.ini` | 帧生成代理配置(上游原样分发 + `MaxGeneratedFrames=5` 6x 上限常开;面板"内核档位"写 `Optimized` 单键,其余键保持原样) |
 | `portable_config\vs\DLSSNR_NV.vpy` | 滤镜脚本(参数见下表) |
@@ -69,11 +80,11 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 - 播放时双击 `vs-plugins\dlssnr_panel.exe` 实时调参(滤镜加载时面板也会自动静默拉起,托盘常驻,点击呼出)
   - 参数改动实时生效;**「保存设置」** 写入 `vs-plugins\dlssnr_ui.ini`,下次加载滤镜自动生效;**「重置默认」** 恢复出厂参数
   - **ini 优先于 vpy 参数**;删除 `dlssnr_ui.ini` 可恢复脚本默认值
-  - 光流质量下拉(0–5)与"光流降采样"开关实时可调;光流不可用时显示"已降级为零 guidance"
+  - 光流质量下拉(按后端:NVOF 0–5 / FFX 0–2)与"光流降采样"开关实时可调;光流不可用时显示"已降级为零 guidance"
   - 帧生成页 **「内核档位」**(dlssg_for_sm86 `Optimized` 0–3):1 = 逐位一致加速(默认,与官方画面完全相同),2/3 = 有损加速;写入 `ngx\dlssg_sm86.ini`,代理只在进程加载时读取,**重启 mpv 生效**
   - **「诊断」页**:监控与诊断集中地,调参页保持纯净 ——
-    会话事实(请求 vs 实际:光流降级零 guidance、FG 实际路由 off/官方 NGX(0.3.x 代理接管)/官方 NGX 直连/复制帧及失败原因、创建倍数与面板档位不符等一律红色高亮;**"自动"路由这次到底走了谁在此直读,不再翻日志**)+ 排队细分(槽池等待 / NGX 串行等待 / 光流门跳帧·过期·重置计数)+ **「调试视图」下拉**(差异 ×20 灰度 = 白改动画大/灰没动;光流场 = 方向→色相、亮度=速度、黑=无运动数据)+ **「写入性能日志」开关**(控制 `dlssnr_timing.log`)。全页无红 = 插件正常工作
-  - 处理用时时间线图(打包/光流/NGX 推理/NR+输出/RTX 超分/RTX HDR/补帧/解包八段,关闭项自动隐藏)
+    会话事实(请求 vs 实际:光流降级零 guidance 与**每帧消费态**(算 NR / 算 FG / 门控跳过——"实际"是会话级模式,NR/FG 均关时零提交)、FG 实际路由 off/官方 NGX(0.3.x 代理接管)/官方 NGX 直连/复制帧及失败原因、创建倍数与面板档位不符等一律红色高亮;**"自动"路由这次到底走了谁在此直读,不再翻日志**)+ 排队细分(槽池等待 / NGX 串行等待 / 光流门跳帧·过期·重置计数)+ **「调试视图」下拉**(差异 ×20 灰度 = 白改动画大/灰没动;光流场 = 方向→色相、亮度=速度、黑=无运动数据)+ **「写入性能日志」开关**(控制 `dlssnr_timing.log`)。全页无红 = 插件正常工作
+  - 处理用时时间线图(打包/光流/eval_cpu/gpu(NR 推理)/VSR 超分/补帧/HDR/输出转换/解包九段;任一段有处理时间即显示,零值段自动收缩,全关直通时整段收起)
   - 面板随滤镜关闭 / mpv 退出自动退出
 
 ## 参数(DLSSNR_NV.vpy)
@@ -98,6 +109,14 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×6;自动档依赖 `ngx\version.dll`(dlssg_for_sm86 ≥0.3.0),初始化失败自动回退 1:1) |
 | `Fg_Multiplier` | 2–6 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps)。运行库上限默认开到 6x(部署 ini `MaxGeneratedFrames=5`,上限只是钳位),改倍数原地重载即时生效;输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率) |
 | `Fg_Route` | 0–1 | 0 | FG 路由(0 = 自动,按 GPU 族分流——RTX 30/20 系预载 dlssg_for_sm86 0.3.x hook 代理接管 DLSS-G,仍走官方签名链;RTX 40 系走官方运行库并自动做 mfg gate 解锁放行 3–6x(仅 Ada 触发,50 系原生多帧不解锁),未命中回落 2x;1 = 纯官方,不预载代理,直连官方运行时,40 系同样解锁,30/20 系被拒载不回落。进程级,重启 mpv 生效;v20 起不兼容旧值,存量 1–3 按越界归 1,升级后在面板选回自动) |
+| `VSR_Mode` | 0–2 | 1 | RTX Video 超分(0 = 关;1 = 自动,直读 mpv 显示矩形自适应;2 = 手动倍率)。创建参数,改动触发原地重载 |
+| `VSR_Scale` | 1.0–4.0 | 2.0 | VSR 手动放大倍率(仅 `VSR_Mode = 2` 消费;官方单 pass 上限 4x) |
+| `VSR_Strength` | 1–4 | 2 | VSR 质量档(4 = Ultra 最优最慢;关闭走 `VSR_Mode = 0`) |
+| `HDR_Enabled` | True/False | False | RTX TrueHDR(SDR→HDR,挂 VSR 之后);输出切 YUV420P10 BT.2020 PQ,HDR 上屏由面板自动同步 |
+| `HDR_Contrast` | 0–200 | 100 | HDR 对比度 |
+| `HDR_Saturation` | 0–200 | 100 | HDR 饱和度 |
+| `HDR_MiddleGray` | 10–100 | 50 | HDR 中间灰 |
+| `HDR_PeakNits` | 400–2000 | 1000 | HDR 峰值亮度(nits) |
 | `H_Max` | 整数 | 0 | 输出高度限制(源超过该值跳过处理;0 = 不限制) |
 
 调参参考:100% 开缩放 ≈ 关闭缩放(multiplier = 1 时等价);降档位省不了多少帧耗(NGX 固定成本主导),主要影响高频细节,1080p 内容建议 50–75%,25% 仅极端省电场景;4K 源建议配合 `Input_Resolution = 50`。4K 全分辨率(res=100%)推理约 200ms/帧,物理性上限,非卡顿。
@@ -114,7 +133,8 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Fg_Route` 纯官方档 | `nvngx_dlssg.dll` 存在且硬件在官方支持范围(RTX 40/50) | 30/20 系被架构门禁拒载(0xBAD0000B)**不回落**,补帧直接关(诊断页 `fg_detail` 留因) |
 | RTX 40 系 3–6x 插帧 | 本机 GPU 为 Ada(SM89,NVAPI AD100=0x190;仅 Ada 触发,50 系原生 MFG 不碰官方运行库)+ 官方运行库 count gate 字节特征命中(进程内解锁,RTX40MFG-Unlock 同源手法;仅进程内存,不落盘) | 非 Ada 一律跳过;特征未命中(驱动升级改版)自动回落 2x,timing log 留因 |
 | 只关降噪 `NR_Enabled = False` | 无(帧生成/光流可独立工作) | 与帧生成**同时**全关 → 整个滤镜零初始化零开销,其余参数全部无效 |
-| DLSSNR 滤镜整体 | RTX 显卡(Tensor Core)+ `ngx\nvngx_dlssnr.dll` 模型 + YUV420 8/10bit SDR 源 | 缺任一自动直通(正常播放不增强) |
+| RTX VSR / TrueHDR | RTX 20 系+ 与 r550.58+ 驱动 + `ngx\nvngx_vsr.dll` / `nvngx_truehdr.dll`(fetch-deps 自动);TrueHDR 挂 VSR 之后 | capability 不过自动降级直通,降噪/补帧不受影响 |
+| DLSSNR 滤镜整体 | RTX 显卡(Tensor Core)+ `ngx\nvngx_dlssnr.dll` 模型 + YUV 计划族源(420/422/444 × 8–16bit) | 缺任一自动直通(正常播放不增强) |
 | 面板统计/状态区 | 滤镜已加载 | 面板可单独运行改参并保存 ini(下次加载生效),统计区空白 |
 | 菜单/`*` 键 DLSSNR 开关 | `input_uosc.conf`(uosc 菜单)与 `menu.conf`(mpv 右键菜单)两处各有一份绑定 | 自定义键位需两处同步修改 |
 
@@ -184,6 +204,8 @@ pwsh -File native\scripts\package.ps1 [-Version 2026.09.08]   # 产物: native\d
 ```
 
 移植清单、架构说明与踩坑记录见 [docs/PORTING.md](docs/PORTING.md)。
+
+`native/testkit/` 为可复用测试工具箱(真实 mpv 播放路径端到端断言,用法见目录内 README);合成测试媒体统一由 `native/testkit/testmedia.py` 确定性生成到 `native/testkit/media/`(二进制不入库,删除后重跑 `python testmedia.py` 即可),亦可用作手动验证素材。
 
 ## 致谢与许可
 

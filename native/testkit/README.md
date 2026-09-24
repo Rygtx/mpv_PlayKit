@@ -32,6 +32,30 @@
 4. **环境变量 `VSDLSSNR_MPV_PIPE`** —— mpv IPC 管道名覆盖(默认
    `mpvpipe`,须与 mpv.conf `input-ipc-server` 一致)。
 
+## 合成测试媒体(testmedia.py + media\)
+
+全部内置合成媒体(y4m/PNG)统一定义在 `testmedia.py` 的 `CLIPS`,
+生成到 `native/testkit/media/`(gitignore,可整目录删除重生成):
+
+```
+python testmedia.py            # 生成缺失的媒体(部署根 python 或系统 python 均可,纯 stdlib)
+python testmedia.py --list     # 清单与体积
+python testmedia.py --force    # 强制重生成(生成器确定性,重跑逐位一致)
+```
+
+| 媒体 | 内容 | 用途 |
+|---|---|---|
+| `dlssnr_fmt_444.y4m` | 320x180@24 8s C444 | 444P8 直吃(test_format_coverage) |
+| `dlssnr_fmt_444p10.y4m` | 同上 C444p10 | 444P10 直吃(test_format_coverage) |
+| `dlssnr_fmt_mono.y4m` | 同上 Cmono | GRAY8→444 兜底(test_format_coverage) |
+| `dlssnr_fmt_rgb.png` | 96x96 RGB24 单帧 | RGB→444 兜底(test_format_coverage;y4m 的 Crgb ffmpeg 不认) |
+| `hdr_hint_sync_test.y4m` | 640x360@24 15s 420jpeg 移动条纹 | HDR 打标/hint、全关态等通用 420P8 载体(test_hdr_hint_sync / test_alloff_state) |
+
+测试代码**不要自写生成器**:从 `testmedia.CLIPS` 取定义、用
+`testmedia.ensure()` 取路径(缺失自动生成,已存在复用 —— 反复跑测试
+不重复付合成成本)。为什么生成而非入库:y4m 无压缩,单片 11–124MB,
+二进制不入库;生成器是确定性纯函数,重生成逐位一致,断言稳定。
+
 ### 环境前提检查
 
 脚本开头调用 `testenv.require_env()` / `require_nvidia()`:部署根解析

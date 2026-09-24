@@ -21,6 +21,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv
+import testmedia
 
 STATS_MAPPING = "vs_dlssnr_stats"
 STATS_MAGIC = 0x354C5344  # "DSL5" (v24) — panel_ipc.h STATS_MAGIC
@@ -59,11 +60,8 @@ def read_stats():
 
 def main():
     k32 = ctypes.windll.kernel32
-    media = os.path.join(os.environ.get("TEMP", "."), "hdr_hint_sync_test.y4m")
-    if not os.path.isfile(media):
-        print(f"SKIP: 找不到合成测试媒体 {media}(先跑 test_hdr_hint_sync.py 生成)")
-        return 0
     testenv.require_env()
+    media = testmedia.ensure(names=["hdr_hint_sync_test.y4m"])["hdr_hint_sync_test.y4m"]
 
     # 备份/恢复 ini(全关状态由 ini 裁决:无面板 payload)
     touched = [("dlssnr", "nr_enabled"), ("dlssnr", "fg_enabled"),

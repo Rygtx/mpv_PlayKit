@@ -7,8 +7,9 @@
 两阶段断言(值域,不依赖 ini 回读):
   A. hdr_enabled=1 → vf 链含标签 且 get hint == true
   B. hdr_enabled=0 → vf 链无标签 且 get hint == false(还原 conf 实值)
-媒体:VSDLSSNR_TEST_MEDIA 优先;缺失时合成 y4m(640x360@24 移动条纹,
-15 秒,%TEMP% 生成;--start=5 + --loop=inf,不依赖真片源与播放不中断)。
+媒体:VSDLSSNR_TEST_MEDIA 优先;缺失时取 testkit/media/hdr_hint_sync_test.y4m
+(testmedia 统一生成,640x360@24 移动条纹 15 秒;--start=5 + --loop=inf,
+不依赖真片源与播放不中断)。
 运行: <部署根>\\python.exe testkit\\test_hdr_hint_sync.py
 """
 import json
@@ -19,6 +20,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402
+import testmedia  # noqa: E402
 
 testenv.require_env()
 testenv.kill_panel()
@@ -35,29 +37,12 @@ def set_ini(**kv):
         assert k32.WritePrivateProfileStringW("rtxvideo", k, v, testenv.INI), k
 
 
-def gen_y4m(path, w=640, h=360, fps=24, secs=15):
-    """移动竖条纹(全亮范围扫)+ 静态中灰色度;纯 bytes 旋转,无 numpy。"""
-    pat = bytes(16 + (x % 64) * 219 // 63 for x in range(64))
-    row0 = (pat * (w // 64 + 2))[:w]
-    csize = (w // 2) * (h // 2)
-    chroma = b"\x80" * csize
-    with open(path, "wb") as f:
-        f.write(f"YUV4MPEG2 W{w} H{h} F{fps}:1 Ip A1:1 C420jpeg\n".encode())
-        for n in range(fps * secs):
-            off = (n * 3) % w
-            row = row0[w - off:] + row0[:w - off]
-            f.write(b"FRAME\n" + row * h + chroma + chroma)
-
-
 MEDIA = os.environ.get("VSDLSSNR_TEST_MEDIA")
 if MEDIA and os.path.isfile(MEDIA):
     print("MEDIA:", MEDIA)
 else:
-    MEDIA = os.path.join(os.environ.get("TEMP", "."), "hdr_hint_sync_test.y4m")
-    if not os.path.exists(MEDIA):
-        print("合成媒体:", MEDIA)
-        gen_y4m(MEDIA)
-    assert os.path.getsize(MEDIA) > 0
+    MEDIA = testmedia.ensure(names=["hdr_hint_sync_test.y4m"])["hdr_hint_sync_test.y4m"]
+    print("MEDIA:", MEDIA)
 
 
 def launch(hdr):
