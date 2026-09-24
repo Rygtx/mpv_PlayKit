@@ -73,12 +73,17 @@ public:
 
 private:
     ComPtr<ID3D12CommandQueue> _queue;
-    // **双 allocator/CL 交替(0/1)**:单 allocator 下 back-to-back eval
+    // **六组 allocator/CL 轮转(0-5)**:单 allocator 下 back-to-back eval
     //(HDR 链逐插值帧)的 allocator Reset 必须等上一笔 GPU 完成(lookback
     // wait)→ CPU 提交链被 GPU 执行串行吸收(实测 sub=17ms,2026-09-24),
-    // vsr/fg 分段观测被填满塌 0。交替使用 = Reset 目标永不在飞(同 idx
-    // 间隔两笔,有界等待通常即刻满足),提交链回归纯录制。
-    static constexpr int kAltCount = 2;
+    // vsr/fg 分段观测被填满塌 0。双组(0/1)在 mult=4 HDR 链(每源帧 4 笔
+    // TrueHDR 背靠背)仍被同帧 GPU 顶住:第 2/3 笔插值 eval 各阻塞等上一笔
+    // GPU 完成(eval_cpu 16-18ms 实测,2026-09-24 日志定案)。**上限是 6x**
+    //(kFgMultMax=6,MaxGeneratedFrames=5):默认模式每源帧 ≤6 笔 TrueHDR,
+    // 六组轮转 = 同 idx 间隔 6 笔,跨帧的 Reset 目标永不在飞,提交链回归
+    // 纯录制;GPU 落后超 6 笔同 idx(>12 笔在飞)时 INFINITE 等待 = 背压
+    // 兜底。VSR 队列独立实例、每帧 ≤1 笔,不构成约束。
+    static constexpr int kAltCount = 6;
     ComPtr<ID3D12CommandAllocator> _allocator[kAltCount];
     ComPtr<ID3D12GraphicsCommandList> _commandList[kAltCount];
     // 每 idx 最近一次 Signal 的完成栅栏值(Reset 前有界等待它 —— 该 idx
