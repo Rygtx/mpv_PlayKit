@@ -1343,6 +1343,14 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     }
     _shared = shared;
     const DlssnrParams p = _shared->Snapshot();
+    // FG 会话创建倍数随每次 bind 重新落定 = 新滤镜实例的输出契约 M0
+    // (面板 payload 已先于此被新实例采纳,见下)。此前只写于 Initialize:
+    // 档位不属 CreateParamsChanged 三元组、换档恒走热复用,stats 里
+    // fg_mult_create 永远停在进程启动值 —— 面板"会话创建 Xx"红显永
+    // 不清除(2026-09-25 用户实测定案)。
+    _fgCreateMult = (p.fgEnabled != 0 && _fg && _fg->Enabled())
+                        ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
+                        : 0;
     // Snapshot already carries the ini overrides and the panel-payload adopt
     // the new filter instance loaded (BridgeLoadIni + BridgeAdoptPanelPayload
     // run in DlssnrCreate before this). Only a real create-time change needs
