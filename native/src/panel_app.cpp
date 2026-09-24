@@ -1803,15 +1803,18 @@ void DrawUi() noexcept {
                 // —— 此前这一事实无任何 stats 键,面板全绿,用户毫无感知。
                 if (g_app.params.fgEnabled && g_app.fgMultCreate > 0) {
                     const bool multClipped = g_app.params.fgMultiplier > g_app.fgMultCreate;
+                    // fg_mult_max 是插值帧数口径(M 倍 = M-1 插值):实效倍数
+                    // = 上限+1。直接拿它跟倍数比会把健康的 6x(上限 5 插值)
+                    // 误判成被压档红显 —— 曾致"5x 能开 6x 开不了"的假警。
                     const bool capped = g_app.fgMultMax >= 1 &&
-                                        g_app.fgMultMax < g_app.fgMultCreate;
+                                        g_app.fgMultMax + 1 < g_app.fgMultCreate;
                     if (capped) {
                         TextColoredWrapped(
                             kErrRed,
                             "FG 倍数: 会话创建 %dx | 面板 %dx | 运行库上限 %dx"
-                            "(实效 %dx,超出槽位为复制帧 —— gate 解锁失败?驱动更新后重试)",
+                            "(超出槽位为复制帧 —— gate 解锁失败?驱动更新后重试)",
                             g_app.fgMultCreate, g_app.params.fgMultiplier,
-                            g_app.fgMultMax, g_app.fgMultMax + 1);
+                            g_app.fgMultMax + 1);
                     } else {
                         TextColoredWrapped(multClipped ? kErrRed : kDimTxt,
                                            "FG 倍数: 会话创建 %dx | 面板 %dx%s",

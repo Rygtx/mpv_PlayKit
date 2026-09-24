@@ -311,8 +311,9 @@ inline constexpr const char *SK_FG_MULT_CREATE = "fg_mult_create";
 // FG 会话运行库插值帧上限(0-5;FG 未激活 = 0,含义与 fg_mult_create 的
 // 0 同语义)。MaxGeneratedFrames 查询值(含 mfg gate 解锁结果)。没有它,
 // 40 系 gate 解锁失败回落 2x 时创建/面板仍全绿显示 6x —— 输出按 6x 节拍
-// 但只有 2x 密度(超限槽复制真实帧),用户毫无感知。面板红显条件:
-// fg_mult_create > fg_mult_max > 0。
+// 但只有 2x 密度(超限槽复制真实帧),用户毫无感知。面板红显条件(注意
+// 口径:本键是插值帧数,创建键是倍数):fg_mult_max + 1 < fg_mult_create,
+// 即实效倍数低于创建倍数;直接拿本键与倍数比较会把健康的 6x 误报红显。
 inline constexpr const char *SK_FG_MULT_MAX = "fg_mult_max";
 // FG 最近一次初始化失败原因(消毒串;成功后清空)。"为什么没插帧"的
 // 面板侧直接答案,不再翻 timing log。
