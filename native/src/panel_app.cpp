@@ -110,7 +110,8 @@ struct AppState {
     char statsRes[96]{};
     char gpuName[128]{};
     char filterState[16]{};  // SK_FILTER_STATE: ok / nvof_zero / passthrough / ngx_faulted
-    char stateDetail[160]{}; // SK_STATE_DETAIL: 死亡状态的原因串
+    char stateDetail[208]{}; // SK_STATE_DETAIL: 死亡状态的原因串
+                             // (生产端 %.200s 封顶,缓冲须容 200+NUL,见 plugin.cpp)
     char ofMode[40]{};       // SK_OF_MODE: off / zero / 后端能力串(最长
                              // "fxof q5 qual 1920x1080" = 23+1;与插件 _ofModeBuf 同尺寸)
     char fgState[16]{};      // SK_FG: on / dup / off / unavailable
@@ -121,7 +122,9 @@ struct AppState {
     int fgMultMax = 0;       // SK_FG_MULT_MAX: 运行库插值帧上限(FG 未激活 = 0)。
                              // gate 解锁失败回落 2x 的唯一面板侧信号源
     char ofDetail[96]{};     // SK_OF_DETAIL: 光流会话创建失败原因(成功 = 空)
-    char rtxState[16]{};     // SK_RTX: off / vsr / hdr / vsr+hdr(RTX 管线实态)
+    char rtxState[32]{};     // SK_RTX: off / vsr / hdr / vsr+hdr + 实际输出分辨率
+                             // ("vsr+hdr 15360x8640" = 18+NUL;原 16 字节把分辨率
+                             // 截成 "7680x43" —— 诊断页"实际"显示不全的根因)
     char rtxDetail[96]{};    // SK_RTX_DETAIL: VSR/TrueHDR 最近失败原因(成功 = 空)
     int connState = 0;       // stats 通道连接态:0=未检测到插件 1=已连接
                              // 2=magic 不匹配(面板/插件版本未成对更新)
@@ -795,6 +798,25 @@ const char *FgRouteLabel(const char *v) noexcept {
 
 // 不一致红色(请求了但没在跑):状态带 / 帧生成页 / 诊断页共用。
 inline const ImVec4 kErrRed(1.0f, 0.42f, 0.42f, 1.0f);
+
+// 变长诊断串(state_detail/of_detail/rtx_detail 等,生产端上限 200 字节)在
+// 固定 648 窗宽下会被 ImGui 默认的"永不换行"在右缘裁掉 —— 一律经此换行;
+// 窗口高度每帧自适应(DrawUi 收口段),换行不丢内容。
+void TextDisabledWrapped(const char *s) noexcept {
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("%s", s);
+    ImGui::PopTextWrapPos();
+}
+
+// 同上,彩色版(诊断页"请求 vs 实际"行:格式串 + 变长 detail)。
+void TextColoredWrapped(const ImVec4 &col, const char *fmt, ...) noexcept {
+    va_list args;
+    va_start(args, fmt);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextColoredV(col, fmt, args);
+    ImGui::PopTextWrapPos();
+    va_end(args);
+}
 // 常规信息灰(状态带 FG 行/诊断页取值列)
 inline const ImVec4 kDimTxt(0.62f, 0.64f, 0.70f, 1.0f);
 
@@ -895,14 +917,14 @@ void DrawUi() noexcept {
         const ImVec4 errCol(1.0f, 0.45f, 0.45f, 1.0f);
         if (std::strcmp(g_app.filterState, "passthrough") == 0) {
             ImGui::TextColored(warnCol, "滤镜已回退直通(画面未增强)");
-            if (g_app.stateDetail[0]) ImGui::TextDisabled("%s", g_app.stateDetail);
+            if (g_app.stateDetail[0]) TextDisabledWrapped(g_app.stateDetail);
         } else if (std::strcmp(g_app.filterState, "ngx_faulted") == 0) {
             ImGui::TextColored(errCol, "NGX 故障,滤镜已停用 —— 重启 mpv 恢复");
-            if (g_app.stateDetail[0]) ImGui::TextDisabled("%s", g_app.stateDetail);
+            if (g_app.stateDetail[0]) TextDisabledWrapped(g_app.stateDetail);
         } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
             ImGui::TextColored(warnCol, "光流已降级为零 guidance(增强继续)");
             // 原因直达(of_detail):此前"为什么降级"只活在 timing log。
-            if (g_app.ofDetail[0]) ImGui::TextDisabled("%s", g_app.ofDetail);
+            if (g_app.ofDetail[0]) TextDisabledWrapped(g_app.ofDetail);
         }
         // 实际光流模式:请求档位 ≠ 实际能力(Turing 无 cost / 驱动拒双向)
         // 时在这里暴露;档位关闭(off)不显示。
@@ -1524,7 +1546,8 @@ void DrawUi() noexcept {
             // ---- 会话事实:请求 vs 实际(不一致 = 红)----
             ImGui::TextUnformatted("—— 会话 ——");
             {
-                char stDesc[96] = "未加载滤镜";
+                // 224 = "直通(画面未增强)" 前缀 + stateDetail 全长(207)+NUL
+                char stDesc[224] = "未加载滤镜";
                 bool stRed = false;
                 if (g_app.gpuName[0]) {
                     if (std::strcmp(g_app.filterState, "passthrough") == 0) {
@@ -1547,7 +1570,7 @@ void DrawUi() noexcept {
                                       g_app.params.nrEnabled ? "" : ";降噪已关(NR off,跳过评估)");
                     }
                 }
-                ImGui::TextColored(stRed ? kErrRed : kDimTxt, "滤镜状态: %s", stDesc);
+                TextColoredWrapped(stRed ? kErrRed : kDimTxt, "滤镜状态: %s", stDesc);
 
                 // 光流请求 vs 实际
                 char ofReq[64];
@@ -1563,7 +1586,7 @@ void DrawUi() noexcept {
                                                   : g_app.params.motionVectorQuality,
                                               0, kOfQualityMax);
                 const bool ofBroken = std::strcmp(g_app.ofMode, "zero") == 0 && ofqReq > 0;
-                ImGui::TextColored(ofBroken ? kErrRed : kDimTxt, "光流: 请求 %s | 实际 %s%s%s",
+                TextColoredWrapped(ofBroken ? kErrRed : kDimTxt, "光流: 请求 %s | 实际 %s%s%s",
                                    ofReq, g_app.ofMode[0] ? g_app.ofMode : "(未加载)",
                                    g_app.ofDetail[0] ? " —— " : "", g_app.ofDetail);
 
@@ -1580,7 +1603,7 @@ void DrawUi() noexcept {
                 const bool fgBroken = g_app.params.fgEnabled != 0 &&
                                       (std::strcmp(g_app.fgState, "unavailable") == 0 ||
                                        std::strcmp(g_app.fgRouteEff, "copy") == 0);
-                char fgEff[160];
+                char fgEff[192]; // 路由标签(≤34)+ " —— " + fgDetail(127)+NUL
                 if (!g_app.fgRouteEff[0]) {
                     std::snprintf(fgEff, sizeof(fgEff), "(未加载)");
                 } else if (std::strcmp(g_app.fgRouteEff, "off") == 0) {
@@ -1590,7 +1613,7 @@ void DrawUi() noexcept {
                     std::snprintf(fgEff, sizeof(fgEff), "%s%s%s", rl[0] ? rl : g_app.fgRouteEff,
                                   g_app.fgDetail[0] ? " —— " : "", g_app.fgDetail);
                 }
-                ImGui::TextColored(fgBroken ? kErrRed : kDimTxt, "帧生成: 请求 %s | 实际 %s",
+                TextColoredWrapped(fgBroken ? kErrRed : kDimTxt, "帧生成: 请求 %s | 实际 %s",
                                    fgReq, fgEff);
 
                 // 创建倍数 vs live 倍数 vs 运行库上限:上限 < 创建值 = gate
@@ -1601,14 +1624,14 @@ void DrawUi() noexcept {
                     const bool capped = g_app.fgMultMax >= 1 &&
                                         g_app.fgMultMax < g_app.fgMultCreate;
                     if (capped) {
-                        ImGui::TextColored(
+                        TextColoredWrapped(
                             kErrRed,
                             "FG 倍数: 会话创建 %dx | 面板 %dx | 运行库上限 %dx"
                             "(实效 %dx,超出槽位为复制帧 —— gate 解锁失败?驱动更新后重试)",
                             g_app.fgMultCreate, g_app.params.fgMultiplier,
                             g_app.fgMultMax, g_app.fgMultMax + 1);
                     } else {
-                        ImGui::TextColored(multClipped ? kErrRed : kDimTxt,
+                        TextColoredWrapped(multClipped ? kErrRed : kDimTxt,
                                            "FG 倍数: 会话创建 %dx | 面板 %dx%s",
                                            g_app.fgMultCreate, g_app.params.fgMultiplier,
                                            multClipped ? "(超出部分需重载生效)" : "");
@@ -1630,7 +1653,7 @@ void DrawUi() noexcept {
                     }
                     const bool rtxDown = (vsrReq || hdrReq) &&
                                          std::strcmp(g_app.rtxState, "off") == 0;
-                    ImGui::TextColored(rtxDown ? kErrRed : kDimTxt,
+                    TextColoredWrapped(rtxDown ? kErrRed : kDimTxt,
                                        "RTX Video: 请求 %s | 实际 %s%s%s",
                                        rtxReq,
                                        g_app.rtxState[0] ? g_app.rtxState : "(未加载)",
