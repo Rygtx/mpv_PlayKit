@@ -139,11 +139,13 @@ struct AppState {
     float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
     float segFg = 0.0f;
     float segRtxVsr = 0.0f, segRtxHdr = 0.0f; // SK_RTXVSR_LAST / SK_RTXHDR_LAST
+    float segConv = 0.0f;                     // SK_CONV_LAST(输出转换段,v24)
     // 分段显示值(EMA 平滑,用户裁定"显示平滑、真实数据不平滑"):上面
-    // 八段恒为插件上报的裸 last 值;时间线/列表/tooltip 用这里的平滑值,
+    // 九段恒为插件上报的裸 last 值;时间线/列表/tooltip 用这里的平滑值,
     // 避免 CPU 唤醒竞争造成的瞬时 0 让段忽隐忽现。
     float segDispPack = 0.0f, segDispEval = 0.0f, segDispGpu = 0.0f, segDispUnpack = 0.0f,
-          segDispNvof = 0.0f, segDispFg = 0.0f, segDispRtxVsr = 0.0f, segDispRtxHdr = 0.0f;
+          segDispNvof = 0.0f, segDispFg = 0.0f, segDispRtxVsr = 0.0f, segDispRtxHdr = 0.0f,
+          segDispConv = 0.0f;
     bool hasSegments = false;
     bool statsDirty = false; // LoadStats changed something on screen (redraw gate)
 };
@@ -703,6 +705,7 @@ void LoadStats() noexcept {
             g_app.segFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
             g_app.segRtxVsr = static_cast<float>(JsonGetFloat(body, SK_RTXVSR_LAST, 0));
             g_app.segRtxHdr = static_cast<float>(JsonGetFloat(body, SK_RTXHDR_LAST, 0));
+            g_app.segConv = static_cast<float>(JsonGetFloat(body, SK_CONV_LAST, 0));
             g_app.segDispPack = segSmooth(g_app.segDispPack, g_app.segPack);
             g_app.segDispEval = segSmooth(g_app.segDispEval, g_app.segEval);
             g_app.segDispGpu = segSmooth(g_app.segDispGpu, g_app.segGpu);
@@ -711,6 +714,7 @@ void LoadStats() noexcept {
             g_app.segDispFg = segSmooth(g_app.segDispFg, g_app.segFg);
             g_app.segDispRtxVsr = segSmooth(g_app.segDispRtxVsr, g_app.segRtxVsr);
             g_app.segDispRtxHdr = segSmooth(g_app.segDispRtxHdr, g_app.segRtxHdr);
+            g_app.segDispConv = segSmooth(g_app.segDispConv, g_app.segConv);
             g_app.hasSegments = g_app.segGpu > 0;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
             char gnPat[32];
@@ -731,9 +735,10 @@ void LoadStats() noexcept {
             g_app.statsBig[0] = 0;
             g_app.statsRes[0] = 0;
             g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = g_app.segNvof = 0.0f;
-            g_app.segFg = g_app.segRtxVsr = g_app.segRtxHdr = 0.0f;
+            g_app.segFg = g_app.segRtxVsr = g_app.segRtxHdr = g_app.segConv = 0.0f;
             g_app.segDispPack = g_app.segDispEval = g_app.segDispGpu = g_app.segDispUnpack =
-            g_app.segDispNvof = g_app.segDispFg = g_app.segDispRtxVsr = g_app.segDispRtxHdr = 0.0f;
+            g_app.segDispNvof = g_app.segDispFg = g_app.segDispRtxVsr = g_app.segDispRtxHdr =
+            g_app.segDispConv = 0.0f;
             g_app.hasSegments = false;
             g_app.fps = 0.0;
             g_app.fgRouteEff[0] = 0;
@@ -770,7 +775,8 @@ void LoadStats() noexcept {
                        before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
                        before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack ||
                        before.segNvof != g_app.segNvof || before.segFg != g_app.segFg ||
-                       before.segRtxVsr != g_app.segRtxVsr || before.segRtxHdr != g_app.segRtxHdr;
+                       before.segRtxVsr != g_app.segRtxVsr || before.segRtxHdr != g_app.segRtxHdr ||
+                       before.segConv != g_app.segConv;
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,23 +1763,26 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     const bool timingsOpen = ImGui::CollapsingHeader("处理用时", ImGuiTreeNodeFlags_DefaultOpen);
     if (timingsOpen && g_app.hasSegments) {
-        // 分段 = 帧内执行顺序,fg/hdr 相对顺序随处理形态:
+        // 分段 = 帧内执行顺序,fg/hdr 相对顺序随处理形态(管线全流程解耦,
+        // 转换独立成段恒在末尾):
         //   默认:gpu(base)→ fg(postA:DLSSG SDR 域推理)→
-        //         hdr(TrueHDR 链 + postB 转换,TrueHDR 后置)
+        //         hdr(TrueHDR 链)→ conv(post:全部输出转换 + 回读)
         //   HDR 域插帧(fg_hdr_interp):gpu → vsr →
-        //         hdr(TrueHDR 前置,真实帧一次)→ fg(HDR 域插帧 + 回读)
+        //         hdr(TrueHDR 前置,真实帧一次)→ fg(HDR 域插帧)→ conv
         // 显示值 = segDisp*(EMA 平滑);真实裸值在 seg*(诊断可用)。
-        // 关闭段恒 0(of=0 的 nvof、NR 关的 eval_cpu、RTX 关的 vsr/hdr),
-        // 零值段由下方 <1e-3f 跳过,时间线自动收缩。
+        // 关闭段恒 0(OF 无消费者的 nvof、NR 关的 eval_cpu、RTX 关的
+        // vsr/hdr),零值段由下方 <1e-3f 跳过,时间线自动收缩。conv 恒非 0
+        // (格式契约必需)。
         const bool hdrFirst = g_app.params.fgHdrInterp != 0;
         const float total = g_app.segDispPack + g_app.segDispNvof + g_app.segDispEval +
                             g_app.segDispGpu + g_app.segDispRtxVsr + g_app.segDispFg +
-                            g_app.segDispRtxHdr + g_app.segDispUnpack;
+                            g_app.segDispRtxHdr + g_app.segDispConv + g_app.segDispUnpack;
         if (total > 0.5f) {
             struct Seg { float v; ImU32 c; const char *name; };
             const Seg segFg{ g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" };
             const Seg segHdr{ g_app.segDispRtxHdr, IM_COL32(255, 152, 0, 255),  "hdr(RTX HDR)" };
-            const Seg segs[8]{
+            const Seg segConv{ g_app.segDispConv, IM_COL32(121, 85, 72, 255),   "conv(输出转换)" };
+            const Seg segs[9]{
                 { g_app.segDispPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
                 { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
                 { g_app.segDispEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
@@ -1781,9 +1790,10 @@ void DrawUi() noexcept {
                 { g_app.segDispRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
                 hdrFirst ? segHdr : segFg,
                 hdrFirst ? segFg : segHdr,
+                segConv,
                 { g_app.segDispUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
-            constexpr int kSegCount = 8;
+            constexpr int kSegCount = 9;
             // 实际要画的段数(零值段跳过)。BeginTable 的列数必须与之相等:
             // imgui 对本帧未 TableSetupColumn 的列按 SizingStretchSame 默认
             // 权重 1.0 补齐,而可见段权重和恒为 1.0 —— 空列恰好占掉一半

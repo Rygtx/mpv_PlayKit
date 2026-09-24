@@ -65,12 +65,18 @@ constexpr uint32_t PAYLOAD_SIZE = 1024;
 // 域插帧 + 逐帧 TrueHDR)。结构体尾部追加,新旧混跑按 magic 拒 —— 成对
 // 部署。
 constexpr uint32_t PAYLOAD_MAGIC = 0x4E4C5344u; // "DSLN" (v23, 版本位走 hex:9 之后是 A/B/C/D/E/F)
-// v23(stats DSSL4):stats JSON 新增 rtxvsr_last/rtxhdr_last(RTX Video
-// VSR/TrueHDR 专用队列 eval 分段拆账 —— 此前 RTX 时间无账目:CPU 录制混进
-// gpu 段窗口,GPU 执行经 post CL 的队列 Wait 全落 fg 段"补帧GPU"名下;
-// 同时 NR 关的直通帧 eval_cpu 归零)。键为纯增量,bump 理由同 v21:成对
-// 部署约束,两端都有明确信号。
-constexpr uint32_t STATS_MAGIC = 0x344C5344u;   // "DSSL4" (v23)
+// v23(stats "DSL4",hex 实际末字节 '4'):stats JSON 新增 rtxvsr_last/
+// rtxhdr_last(RTX Video VSR/TrueHDR 专用队列 eval 分段拆账 —— 此前 RTX
+// 时间无账目:CPU 录制混进 gpu 段窗口,GPU 执行经 post CL 的队列 Wait 全落
+// fg 段"补帧GPU"名下;同时 NR 关的直通帧 eval_cpu 归零)。键为纯增量,bump
+// 理由同 v21:成对部署约束,两端都有明确信号。
+// v24(stats "DSL5",0x354C5344):管线全流程解耦 —— stats JSON 新增
+// conv_last(输出转换段 = post CL 常驻转换窗口:C2 管线色→YUV420 + readback,
+// NR 关直连帧并入 C1 补做窗口;此前转换粘在 base/fg CL 被错记进 gpu/fg 段,
+// VSR-only 时 fg 段显示的 3.5-8.9ms 实为 VSR 输出转换)。同时 nvof 段语义
+// 变化:OF 门按消费者决定(NR 关 + FG 关 = 整段跳过,恒 0)。键为纯增量,
+// bump 理由同 v21:成对部署约束,两端都有明确信号。
+constexpr uint32_t STATS_MAGIC = 0x354C5344u;   // "DSL5" (v24;hex 按内存序实为 DSL5)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -246,14 +252,21 @@ inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
 // 全部(推理 + 转换/回读)。fg 关/门关帧 ≈ 0,面板零值段自动隐藏。
 inline constexpr const char *SK_FG_LAST = "fg_last";
 // RTX Video 分段(专用队列 eval 的 GPU 墙钟,t3a 后有界 CPU 等待完成栅栏
-// 拆账):vsr = VSR eval;hdr = TrueHDR 链(每输出帧一次:真实 + 逐插值
-// 帧)+ postB 转换/回读窗口。TrueHDR 后置(2026-09-24):DLSSG 恒 SDR 域
-// 插值(ColorBuffersHDR 路径实测压高光),逐帧 TrueHDR 提升为 FP16 scRGB。
-// vsr/hdr 关闭时恒 0,面板零值段自动隐藏(面板另有 EMA 平滑防忽隐忽现)。
+// 拆账):vsr = VSR eval;hdr = TrueHDR 真实帧/链窗口(每输出帧一次:真实
+// + 逐插值帧;post CL 转换窗口已拆入 conv_last)。TrueHDR 后置
+// (2026-09-24):DLSSG 恒 SDR 域插值(ColorBuffersHDR 路径实测压高光),
+// 逐帧 TrueHDR 提升为 FP16 scRGB。vsr/hdr 关闭时恒 0,面板零值段自动隐藏
+// (面板另有 EMA 平滑防忽隐忽现)。
 inline constexpr const char *SK_RTXVSR_LAST = "rtxvsr_last";
 inline constexpr const char *SK_RTXHDR_LAST = "rtxhdr_last";
+// 输出转换段(v24,管线全流程解耦):post CL 常驻转换窗口 —— C2(管线色
+// →YUV420 + readback)+ 逐 gen 转换;NR 关直连帧并入 base CL 的 C1 补做
+// 窗口。此前转换粘在 base/fg CL 被错记进 gpu/fg 段(VSR-only 时 fg 段
+// 3.5-8.9ms 实为 VSR 输出转换)。恒非 0(格式契约必需)。
+inline constexpr const char *SK_CONV_LAST = "conv_last";
 // NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
-// 时恒 0,面板零值段自动隐藏)。与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
+// 或无消费者(NR 关 + FG 关,解耦后整段跳过)时恒 0,面板零值段自动隐藏)。
+// 与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
 inline constexpr const char *SK_NVOF_LAST = "nvof_last";
 inline constexpr const char *SK_UNPACK_LAST = "unpack_last";
 inline constexpr const char *SK_INTERNAL_W = "internal_w";

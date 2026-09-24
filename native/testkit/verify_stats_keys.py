@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """stats 通道键位验证:filter_state / of_mode 等面板数据源字段。
 
-stats 通道是 512 字节映射:magic+seq 头 + JSON body。键位定义在
+stats 通道是 1024 字节映射:magic+seq 头 + JSON body。键位定义在
 native/src/panel_ipc.h(SK_* 常量)。本脚本覆盖三类场景:
   case 1: 默认(ofq=0,零 guidance 是用户选择)→ filter_state=ok, of_mode=off
   case 2: ofq=5(NVOF 会话建立)→ of_mode 上报实际档位
@@ -41,7 +41,8 @@ print("stats:", st[2] if st else "MAPPING MISSING")
 
 # v19+ 新键:实际路由 / 创建倍数 / 排队细分;v21(DSSL3)新增:
 # fg_mult_max(运行库插值帧上限)、of_detail(光流失败原因);RTX 分段键
-# rtxvsr_last/rtxhdr_last(VSR/TrueHDR 专用队列 eval 拆账,关闭时恒 0)。
+# rtxvsr_last/rtxhdr_last(VSR/TrueHDR 专用队列 eval 拆账,关闭时恒 0);
+# v24(DSL5,管线全流程解耦)新增 conv_last(输出转换段,恒非 0)。
 # 断言挂在 case 1 的存活 body 上 —— case 2/3 会因同进程第二个滤镜实例
 # 的 IAT hook 单例走 passthrough,边缘 body 不带 tick 键(环境特性,非回归)。
 # 真实部署机上 dlssnr_ui.ini(面板保存的设置优先于 VS 参数)可能开着
@@ -62,10 +63,11 @@ if st:
             and "slot_wait" in body and "lock_wait" in body
             and "gate_skips" in body and "gate_expired" in body and "gate_resets" in body
             and body.get("rtxvsr_last", -1) >= 0 and body.get("rtxhdr_last", -1) >= 0
+            and body.get("conv_last", -1) >= 0
         )
     except json.JSONDecodeError:
         new_keys_present = False
-print("v19/v21 keys (fg_route_eff/fg_mult_create/fg_mult_max/of_detail/slot_wait/lock_wait/gate_*):",
+print("v19/v21/v24 keys (fg_route_eff/fg_mult_create/fg_mult_max/of_detail/slot_wait/lock_wait/gate_*/conv_last):",
       "PASS" if new_keys_present else "FAIL")
 
 print("=== case 2: ofq=5(NVOF 会话建立,验证实际模式上报) ===")

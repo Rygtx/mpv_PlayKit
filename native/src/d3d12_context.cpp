@@ -1297,7 +1297,9 @@ bool D3D12Context::BeginPostRecording(FrameSlot &slot) noexcept {
     return SUCCEEDED(hr);
 }
 
-bool D3D12Context::SubmitPostFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+bool D3D12Context::SubmitPostFrame(FrameSlot &slot,
+                                   ID3D12Fence *waitFenceA, uint64_t waitValueA,
+                                   ID3D12Fence *waitFenceB, uint64_t waitValueB,
                                    char *err, size_t errLen) noexcept {
     HRESULT hr = slot.postCommandList->Close();
     if (FAILED(hr)) {
@@ -1305,10 +1307,16 @@ bool D3D12Context::SubmitPostFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint
         return false;
     }
     std::lock_guard<std::mutex> lock(_submitMutex);
-    // TrueHDR 专用队列的产出(hdrColor/hdrFg)是本段输入 —— 跨队列 Wait
-    // 排在执行前。
-    if (waitFence && waitValue) {
-        _queue->Wait(waitFence, waitValue);
+    // post CL = 常驻输出转换段(全部形态):消费 RTX 专用队列产出
+    // (vsrColor/hdrColor/hdrFg)与 RTX 链尾(TrueHDR 链)—— 跨队列 Wait
+    // 全部排在 Execute 前。A/B 双等待:legacy HDR 会话同时消费 hdrColor
+    // (A = hdrDoneFence)与 fgInterp 回读就绪(B = fgFence);单生产者形态
+    // B 留空。
+    if (waitFenceA && waitValueA) {
+        _queue->Wait(waitFenceA, waitValueA);
+    }
+    if (waitFenceB && waitValueB) {
+        _queue->Wait(waitFenceB, waitValueB);
     }
     ID3D12CommandList *lists[]{ slot.postCommandList.Get() };
     _queue->ExecuteCommandLists(1, lists);

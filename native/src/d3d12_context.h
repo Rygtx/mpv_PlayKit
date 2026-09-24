@@ -386,10 +386,15 @@ public:
     // (计时锚;WaitFrame 目标由后续 postB 或本值决定)。
     bool SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
                        char *err, size_t errLen) noexcept;
-    // postB 转换段(TrueHDR 后置)录制起点与提交:与 fg CL 同型。仅 HDR
-    // 会话录制(输出转换依赖 TrueHDR 逐帧产出)。
+    // post 转换段(常驻,全部形态)录制起点与提交:与 fg CL 同型。每帧录制
+    // 全部输出转换(真实帧 + 逐 gen;原 hdrPostSplit 的 postB 是其 HDR 特例),
+    // 提交 = 本帧最后一次主队列提交(slot->fenceValue 恒 = postFenceValue)。
+    // waitFenceA/B = 跨队列生产者栅栏(可选,排队在 Execute 前):legacy HDR
+    // 会话 A = hdrDoneFence(B = fgFence);单生产者形态 B 留空。
     bool BeginPostRecording(FrameSlot &slot) noexcept;
-    bool SubmitPostFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
+    bool SubmitPostFrame(FrameSlot &slot,
+                         ID3D12Fence *waitFenceA, uint64_t waitValueA,
+                         ID3D12Fence *waitFenceB, uint64_t waitValueB,
                          char *err, size_t errLen) noexcept;
     bool WaitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
