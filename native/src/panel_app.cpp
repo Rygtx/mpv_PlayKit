@@ -1437,8 +1437,9 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-    // 补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 闪烁警告
-    pairLabel(0, "补帧 HDR 域插帧", "DLSSG 直接在 HDR 域插帧(直接吃 TrueHDR 的 FP16 输出)。\n"
+    // 补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 闪烁警告。
+    // 标签 ≤5 中文字宽(标签列宽限制,超宽侵入控件列与开关重叠,#53e 同款)。
+    pairLabel(0, "HDR域插帧", "实验性:DLSSG 直接在 HDR 域插帧(直接吃 TrueHDR 的 FP16 输出)。\n"
               "省 TrueHDR ×(M-1) 的 GPU/提交成本,但部分驱动(SM86 移植内核)\n"
               "此路径插值帧压高光 = 亮处闪烁 —— 若闪烁请关闭。默认关。\n"
               "创建时参数:变化自动触发 mpv 原地重载,需 HDR 与补帧同时开启。");
@@ -1733,25 +1734,30 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     const bool timingsOpen = ImGui::CollapsingHeader("处理用时", ImGuiTreeNodeFlags_DefaultOpen);
     if (timingsOpen && g_app.hasSegments) {
-        // 分段 = 帧内执行顺序:nvof(光流等待)在 pack 之后、NGX 录制之前;
-        // gpu(base CL)→ vsr(专用队列)→ fg(postA:DLSSG 推理)→
-        // hdr(TrueHDR 链 + postB 转换,TrueHDR 后置在插帧之后)。
+        // 分段 = 帧内执行顺序,fg/hdr 相对顺序随处理形态:
+        //   默认:gpu(base)→ fg(postA:DLSSG SDR 域推理)→
+        //         hdr(TrueHDR 链 + postB 转换,TrueHDR 后置)
+        //   HDR 域插帧(fg_hdr_interp):gpu → vsr →
+        //         hdr(TrueHDR 前置,真实帧一次)→ fg(HDR 域插帧 + 回读)
         // 显示值 = segDisp*(EMA 平滑);真实裸值在 seg*(诊断可用)。
         // 关闭段恒 0(of=0 的 nvof、NR 关的 eval_cpu、RTX 关的 vsr/hdr),
         // 零值段由下方 <1e-3f 跳过,时间线自动收缩。
+        const bool hdrFirst = g_app.params.fgHdrInterp != 0;
         const float total = g_app.segDispPack + g_app.segDispNvof + g_app.segDispEval +
                             g_app.segDispGpu + g_app.segDispRtxVsr + g_app.segDispFg +
                             g_app.segDispRtxHdr + g_app.segDispUnpack;
         if (total > 0.5f) {
             struct Seg { float v; ImU32 c; const char *name; };
+            const Seg segFg{ g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" };
+            const Seg segHdr{ g_app.segDispRtxHdr, IM_COL32(255, 152, 0, 255),  "hdr(RTX HDR)" };
             const Seg segs[8]{
                 { g_app.segDispPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
                 { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
                 { g_app.segDispEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
                 { g_app.segDispGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR+输出)" },
                 { g_app.segDispRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
-                { g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" },
-                { g_app.segDispRtxHdr, IM_COL32(255, 152, 0, 255),   "hdr(RTX HDR)" },
+                hdrFirst ? segHdr : segFg,
+                hdrFirst ? segFg : segHdr,
                 { g_app.segDispUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
             };
             constexpr int kSegCount = 8;
