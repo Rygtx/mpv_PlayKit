@@ -502,20 +502,24 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     const bool nrLive = d->params->Snapshot().nrEnabled != 0;
     const int nrPub = nrLive ? 1 : 0;
     if (d->nrPubState.exchange(nrPub) != nrPub) {
-        char body[224];
-        // "NR off (panel)" 只允许已初始化会话发布(live 关、可 live 恢复)。
-        // 全关直通实例(initOk=false)首帧 nrPubState{-1} 边沿曾误发同款,
-        // 面板 NR 开关按前缀判定"live 可恢复"跳过重建 → 开 NR 永远无效
-        // (实测 4K 片源零条 nr=1 fg=0 create;FG 开关捎带重建才生效)。
-        if (!nrLive && !d->fgActive && d->initOk) {
-            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR off (panel)\"}",
-                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
-        } else if (nrLive && !d->initOk) {
+        // 解耦后(a2e6ae0)live 会话的真相恒由逐帧 stats 携带
+        //(filter_state="ok" + 关闭段归零 + conv/pack 胶水照常记账),
+        // 边沿发布只剩一种:no-session 实例收到 nr=1 —— 参数要 NR 但
+        // 会话不存在,面板闭环据此补 reseek。
+        // 旧 "NR off (panel)" 边沿体已删:其门(!nrLive && !fgActive)
+        // 是解耦前 "NR+FG 关 = 整管线停" 的假设,漏 RTX —— VSR/TrueHDR
+        // 仍在跑的会话关 NR 瞬间被误标 passthrough;且逐帧 stats 恒在
+        // 一帧内覆盖它,无真实职能。持久 passthrough 只来自 create 全关
+        // ("NR+FG+RTX disabled")/init 失败/死亡态 —— 那些状态 NR 本就
+        // 不可能 live 恢复,面板 needsReseek 判据随之简化为
+        // "passthrough 恒重建"。
+        char body[160];
+        if (nrLive && !d->initOk) {
             std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"%s\"}",
                           vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL,
                           vsdlssnr::kStateNrSeekInit);
         } else {
-            body[0] = '\0'; // 已初始化 / FG 仍在跑:常规逐帧 stats 接管,无需发布
+            body[0] = '\0';
         }
         if (body[0]) vsdlssnr::PublishStatsJson(body);
     }

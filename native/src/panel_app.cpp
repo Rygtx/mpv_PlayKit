@@ -1217,11 +1217,12 @@ void DrawUi() noexcept {
     {
         bool v = g_app.params.nrEnabled != 0;
         if (ImGui::Checkbox("##nr_enabled", &v)) {
-            // 会话未初始化(passthrough 且非 live 关)时开 NR 无法 live 恢复
-            // —— 需要重建,自动触发原地 seek;其余情况 live 门即时生效。
+            // passthrough = 本实例没有会话(全关 create / init 失败 / 死亡
+            // 态),开 NR 无法 live 恢复 —— 需要重建,自动触发原地 seek。
+            // live 会话(含 NR 已关)恒 filterState="ok"("NR off (panel)"
+            // 边沿体已随解耦删除),走 live 门即时生效。
             const bool needsReseek =
-                v && strcmp(g_app.filterState, "passthrough") == 0 &&
-                strncmp(g_app.stateDetail, "NR off", 6) != 0;
+                v && strcmp(g_app.filterState, "passthrough") == 0;
             g_app.params.nrEnabled = v ? 1 : 0;
             g_app.liveDirty = true;
             if (needsReseek) g_app.reseekDirty = true;
@@ -1713,9 +1714,12 @@ void DrawUi() noexcept {
                 bool stRed = false;
                 if (g_app.gpuName[0]) {
                     if (std::strcmp(g_app.filterState, "passthrough") == 0) {
+                        // deliberate = 用户主动全关("NR+FG+RTX disabled");
+                        // "NR off (panel)" 边沿体已删。原 "NR+FG disabled" 14
+                        // 字符前缀是加 RTX 前的老串,与现串第 5 字节起错位恒
+                        // 不命中 —— 全关实例曾被误标红色错误态。
                         const bool deliberate =
-                            std::strncmp(g_app.stateDetail, "NR off", 6) == 0 ||
-                            std::strncmp(g_app.stateDetail, "NR+FG disabled", 14) == 0;
+                            std::strncmp(g_app.stateDetail, "NR+FG+RTX disabled", 18) == 0;
                         std::snprintf(stDesc, sizeof(stDesc), "直通(画面未增强)%s%s",
                                       g_app.stateDetail[0] ? ": " : "", g_app.stateDetail);
                         stRed = !deliberate;
@@ -1748,8 +1752,23 @@ void DrawUi() noexcept {
                                                   : g_app.params.motionVectorQuality,
                                               0, kOfQualityMax);
                 const bool ofBroken = std::strcmp(g_app.ofMode, "zero") == 0 && ofqReq > 0;
-                TextColoredWrapped(ofBroken ? kErrRed : kDimTxt, "光流: 请求 %s | 实际 %s%s%s",
+                // 每帧消费态(解耦门控显形):OF 的消费者只有 NR(guidance)
+                // 与 FG(插值运动),VSR/HDR 不沾 —— "实际" of_mode 是会话级
+                // 照报,NR/FG 均关时 OF 已零提交但仍显示 forward/both,不能
+                // 当"每帧在算"的证据。此处按面板意图镜像 DLL 门控
+                // (ofNeeded = quality>0 && (!nrOff || fgM>0))补出每帧真相,
+                // 与时间线 nvof(光流) 段同源可互证。
+                const bool ofNr = g_app.params.nrEnabled != 0;
+                const bool ofFg = g_app.params.fgEnabled != 0 && g_app.params.fgMultiplier > 1;
+                const char *ofFrame = ofqReq == 0 ? "质量 0(关)"
+                                      : !g_app.ofMode[0] ? "未加载"
+                                      : (ofNr || ofFg) ? (ofNr && ofFg ? "算(NR+FG)"
+                                                          : ofNr ? "算(NR)" : "算(FG)")
+                                      : "门控跳过(NR/FG 均关,零提交)";
+                TextColoredWrapped(ofBroken ? kErrRed : kDimTxt,
+                                   "光流: 请求 %s | 实际 %s | 每帧:%s%s%s",
                                    ofReq, g_app.ofMode[0] ? g_app.ofMode : "(未加载)",
+                                   ofFrame,
                                    g_app.ofDetail[0] ? " —— " : "", g_app.ofDetail);
 
                 // FG 请求 vs 实际路由

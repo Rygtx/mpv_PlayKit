@@ -73,7 +73,7 @@
 | `test_fg_fallback.py` | DLSS 帧生成降级:fg_enabled=1 且官方链不可用(nvngx_dlssg.dll 缺失 / 无 hook 代理且被架构门禁拒载)-> 优雅回退 1:1,输出帧数/格式不变 |
 | `test_fg_live.py` | FG 激活(proxy 已部署):帧数/时长 ×M 契约(_DurationNum/Den 整数对 = mpv 节拍唯一来源);缺失时 SKIP |
 | `test_format_coverage.py` | 撤直通守卫后全格式收编:444P8/444P10/GRAY8(y4m)/RGB(PNG)真实 mpv 播放,create(nr=1) 行按位深命中;临时改 ini 结束恢复 |
-| `test_alloff_state.py` | 全关直通实例 state_detail = "NR+FG+RTX disabled","NR off (panel)" 误标(nrPubState{-1} 首帧边沿)不得再现;stats 映射 ctypes 直读 |
+| `test_alloff_state.py` | 全关直通实例 state_detail = "NR+FG+RTX disabled","NR off (panel)" 误标永久不得再现(边沿体已随解耦删除);stats 映射 ctypes 直读 |
 
 `panel_ipc.py` 是 `native/src/panel_ipc.h` 的 python 字节级镜像
 (92 字节 packed struct + 自检 assert)。**改头文件必须同步这里**——

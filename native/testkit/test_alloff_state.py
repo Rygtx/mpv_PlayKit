@@ -4,9 +4,10 @@
 2026-09-24 nrPubState{-1} 首帧边沿曾让全关直通实例(initOk=false)在首帧
 误发 "NR off (panel)"(该串本意只允许已初始化会话的 live 关发布),面板 NR
 开关按前缀判定 "live 可恢复" 跳过重建 → 全关实例上开 NR 永远无效(4K 片源
-日志零条 nr=1 fg=0 create;FG 开关捎带重建才生效)。
-修复后断言:全关实例的 state_detail 恒为 "NR+FG+RTX disabled (panel/vpy)",
-"NR off (panel)" 不得出现。
+日志零条 nr=1 fg=0 create;FG 开关捎带重建才生效)。该边沿体已随管线解耦
+整体删除(边沿发布只剩 kStateNrSeekInit 一种)。
+断言:全关实例的 state_detail 恒为 "NR+FG+RTX disabled (panel/vpy)",
+"NR off (panel)" 永久不得再现。
 
 用法: <部署根>\\python.exe <仓库>\\native\\testkit\\test_alloff_state.py
 """
