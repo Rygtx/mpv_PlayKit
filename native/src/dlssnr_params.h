@@ -176,6 +176,15 @@ struct DlssnrParams {
     // DLSS 帧生成路由(0=自动 预载 0.3.x hook 代理,1=纯官方 不预载;
     // 进程级,重启 mpv 生效):见 kFgRouteMin 注释。
     int fgRoute = 0;
+    // 实验性补帧 HDR 域插值(0/1,创建时,重建生效;仅 HDR+FG 会话有意义):
+    //   0(默认)= DLSSG 在 SDR 域插帧,每个输出帧单独过一次 TrueHDR
+    //     (修复 DLSSG ColorBuffersHDR 插值压高光的闪烁,SM86 移植内核
+    //     实测定案 2026-09-23);
+    //   1 = 旧形态:TrueHDR 只做真实帧一次,DLSSG 直接吃其 FP16 scRGB
+    //     输出在 HDR 域插帧(ColorBuffersHDR=1)。省 TrueHDR ×(M-1) 的
+    //     GPU/提交成本,但部分驱动此路径插值帧压高光 = 亮处闪烁 —— 实验性,
+    //     闪烁即关闭。
+    int fgHdrInterp = 0;
     // 光流后端(0=ffx 1=nvof,创建时,下一帧生效):见 kOfBackendMin 注释。
     // 切换只影响下一次光流会话建立,不改 NGX feature。
     int ofBackend = 0;

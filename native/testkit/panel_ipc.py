@@ -14,7 +14,7 @@ import ctypes
 import struct
 
 PAYLOAD_SIZE = 1024
-PAYLOAD_MAGIC = 0x4B4C5344  # "DSLK" (v20, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
+PAYLOAD_MAGIC = 0x4E4C5344  # "DSLN" (v23, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
@@ -24,11 +24,13 @@ ALIVE_EVENT = "vs_dlssnr_bridge_alive"
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
 # localStructure,skinStructure | 3i useAutoMask,uiCorrection(保留,恒 1),
 # inputResolution | 5f residualMultiplier,residualSaturation,residualLightness,
-# shadowStructure,reflectionGlow | 10i scalingEnabled,saveRequest,logEnabled,
-# motionVectorQuality,nvofFollowScaling,fgEnabled,fgMultiplier,fgRoute,
-# nrEnabled,debugView
-_STRUCT = struct.Struct("<3I2i4f3i5f10i")
-assert _STRUCT.size == 108, "PanelPayload 布局与 panel_ipc.h 不一致"
+# shadowStructure,reflectionGlow | 12i scalingEnabled,saveRequest,logEnabled,
+# motionVectorQuality,ffxQuality,nvofFollowScaling,fgEnabled,fgMultiplier,
+# fgRoute,nrEnabled,debugView,ofBackend | i f(vsrMode,vsrScale)| 7i
+# vsrStrength,hdrEnabled,hdrContrast,hdrSaturation,hdrMiddleGray,
+# hdrMaxLuminance,fgHdrInterp(v23 实验性补帧 HDR 域插值)
+_STRUCT = struct.Struct("<3I2i4f3i5f12iif7i")
+assert _STRUCT.size == 152, "PanelPayload 布局与 panel_ipc.h 不一致"
 
 DEFAULTS = dict(
     preset=0, style=0,
@@ -37,9 +39,13 @@ DEFAULTS = dict(
     residualMultiplier=1.0, residualSaturation=1.0, residualLightness=1.0,
     shadowStructure=1.0, reflectionGlow=1.0,
     scalingEnabled=1, saveRequest=0, logEnabled=1,
-    motionVectorQuality=0, nvofFollowScaling=0,
+    motionVectorQuality=0, ffxQuality=2, nvofFollowScaling=0,
     fgEnabled=0, fgMultiplier=2, fgRoute=0, nrEnabled=1,
-    debugView=0,
+    debugView=0, ofBackend=0,
+    vsrMode=0, vsrScale=2.0, vsrStrength=2,
+    hdrEnabled=0, hdrContrast=100, hdrSaturation=100,
+    hdrMiddleGray=50, hdrMaxLuminance=1000,
+    fgHdrInterp=0,
 )
 
 _FIELDS = ("magic", "seq", "generation", "preset", "style",
@@ -48,8 +54,11 @@ _FIELDS = ("magic", "seq", "generation", "preset", "style",
            "residualMultiplier", "residualSaturation", "residualLightness",
            "shadowStructure", "reflectionGlow",
            "scalingEnabled", "saveRequest", "logEnabled",
-           "motionVectorQuality", "nvofFollowScaling", "fgEnabled", "fgMultiplier",
-           "fgRoute", "nrEnabled", "debugView")
+           "motionVectorQuality", "ffxQuality", "nvofFollowScaling",
+           "fgEnabled", "fgMultiplier", "fgRoute", "nrEnabled", "debugView",
+           "ofBackend",
+           "vsrMode", "vsrScale", "vsrStrength", "hdrEnabled", "hdrContrast",
+           "hdrSaturation", "hdrMiddleGray", "hdrMaxLuminance", "fgHdrInterp")
 
 PAGE_READWRITE = 0x04
 FILE_MAP_READ = 0x0004

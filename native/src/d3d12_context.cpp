@@ -470,7 +470,7 @@ bool D3D12Context::CreateColorTexture(
 
 bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool fg,
                                         int pipeW, int pipeH, int outW, int outH,
-                                        bool vsr, bool hdr,
+                                        bool vsr, bool hdr, bool fgHdrInterp,
                                         char *err, size_t errLen) noexcept {
     _width = width;
     _height = height;
@@ -478,6 +478,9 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     _chromaW = (width + 1) >> 1;
     _chromaH = (height + 1) >> 1;
     _fgSlots = fg;
+    // 实验性补帧 HDR 域插帧:仅 HDR 会话有意义(HDR 关时本值无论真假管线
+    // 等价 —— 插值输出恒经 SDR 域直通路径)。
+    _fgHdrInterp = fgHdrInterp && hdr;
     // RTX Video 双尺寸定格。守卫:pipe/out 必须落在 [源, 合理上界] 内,
     // 越界 = 调用方换算 bug,按无 RTX 兜底(与占位视图语义一致)。
     _vsrSlots = vsr && pipeW >= width && pipeH >= height &&
@@ -998,20 +1001,22 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
 }
 
 // DLSS FG 槽资源(仅 _fgSlots):插值输出纹理(逐 gen)+ 第二组回读缓冲。
-// RTX 双尺寸:fgInterp[g] 在 PIPE 尺寸(backbuffer 同侧),**恒 BGRA8**
-// —— DLSSG 恒在 SDR 域插值(ColorBuffersHDR 路径实测压高光,2026-09-23
-// 定案),HDR 会话由逐帧 TrueHDR 提升为 FP16 scRGB(hdrFg[g])。
-// 回读缓冲 = OUT 尺寸(与真实帧一致)。
+// RTX 双尺寸:fgInterp[g] 在 PIPE 尺寸(backbuffer 同侧)。格式:默认恒
+// BGRA8(DLSSG 在 SDR 域插值,逐输出帧 TrueHDR 提升);实验开关 fgHdrInterp
+// = FP16 scRGB(DLSSG 直接 HDR 域插帧,hdrFg 不建 —— 插值输出即 FG 产物,
+// postA 内直接 PQ 转换)。回读缓冲 = OUT 尺寸(与真实帧一致)。
 bool D3D12Context::CreateFgSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept {
+    const DXGI_FORMAT fgInterpFmt = _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                 : DXGI_FORMAT_B8G8R8A8_UNORM;
     for (int g = 0; g < kFgGenSlots; ++g) {
         if (!CreateColorTexture(slot.fgInterp[g].GetAddressOf(), _pipeW, _pipeH,
-                                DXGI_FORMAT_B8G8R8A8_UNORM,
+                                fgInterpFmt,
                                 D3D12_RESOURCE_STATE_COMMON,
                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
             return false;
         }
     }
-    if (_hdrPipe) {
+    if (_hdrPipe && !_fgHdrInterp) {
         for (int g = 0; g < kFgGenSlots; ++g) {
             if (!CreateColorTexture(slot.hdrFg[g].GetAddressOf(), _pipeW, _pipeH,
                                     DXGI_FORMAT_R16G16B16A16_FLOAT,

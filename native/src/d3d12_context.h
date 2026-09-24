@@ -209,10 +209,12 @@ public:
     //             (vsr 开 = min(目标, 源×4);关 = 源)
     //   outW/H  — YUV 输出平面尺寸(vsr 开 = 目标;关 = 源)
     //   vsr     — 建 vsrColor 槽纹理(PIPE≠src 时必有;=src 且 vsr 旁路时无)
-    //   hdr     — TrueHDR:fgInterp 切 FP16、输出平面切 P10(PQ)
+    //   hdr     — TrueHDR:输出平面切 P10(PQ)
+    //   fgHdrInterp — 实验性补帧 HDR 域插帧:fgInterp 切 FP16、hdrFg 不建
+    //                 (插值输出即 FG 的 FP16 产物,无逐帧 TrueHDR)
     bool CreateFrameResources(int width, int height, int depth, bool fg,
                               int pipeW, int pipeH, int outW, int outH,
-                              bool vsr, bool hdr,
+                              bool vsr, bool hdr, bool fgHdrInterp,
                               char *err, size_t errLen) noexcept;
     bool FgSlots() const noexcept { return _fgSlots; }
     // RTX Video 管线几何(create-time 定格;ProcessFrame/插件侧共用)。
@@ -549,6 +551,7 @@ private:
     int _outChromaH = 0;
     bool _vsrSlots = false;         // 槽池含 vsrColor / motionDense
     bool _hdrPipe = false;          // TrueHDR 激活(hdrColor/hdrFg FP16 / P10 输出)
+    bool _fgHdrInterp = false;      // 实验性补帧 HDR 域插帧(fgInterp FP16 / hdrFg 不建)
     DXGI_FORMAT _outFmt = DXGI_FORMAT_R8_UNORM;      // yuvOut/readback 平面格式
     UINT _outPlaneBytes = 1;
 

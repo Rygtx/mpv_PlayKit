@@ -59,7 +59,12 @@ constexpr uint32_t PAYLOAD_SIZE = 1024;
 // 1=自动窗口适配 2=手动倍率)/ vsrScale(1.0-4.0)/ vsrStrength(1-4)/
 // hdrEnabled + HDR 四参。旧面板的 payload 无这些字段(结构体尾部缺段,
 // 读取按 magic 拒)—— 面板与插件必须成对部署。
-constexpr uint32_t PAYLOAD_MAGIC = 0x4D4C5344u; // "DSLM" (v22, 版本位走 hex:9 之后是 A/B/C/D/E/F)
+// v23(payload DSLN):fgHdrInterp(0/1,实验性补帧 HDR 域插值,创建时)
+// —— DLSSG 直接吃 TrueHDR 输出(FP16 scRGB backbuffer,ColorBuffersHDR=
+// 1)。部分驱动(SM86 移植内核)此路径插值帧压高光 = 闪烁,默认 0(SDR
+// 域插帧 + 逐帧 TrueHDR)。结构体尾部追加,新旧混跑按 magic 拒 —— 成对
+// 部署。
+constexpr uint32_t PAYLOAD_MAGIC = 0x4E4C5344u; // "DSLN" (v23, 版本位走 hex:9 之后是 A/B/C/D/E/F)
 // v23(stats DSSL4):stats JSON 新增 rtxvsr_last/rtxhdr_last(RTX Video
 // VSR/TrueHDR 专用队列 eval 分段拆账 —— 此前 RTX 时间无账目:CPU 录制混进
 // gpu 段窗口,GPU 执行经 post CL 的队列 Wait 全落 fg 段"补帧GPU"名下;
@@ -107,6 +112,7 @@ struct PanelPayload {
     int32_t hdrSaturation;       // 0-200(live)
     int32_t hdrMiddleGray;       // 10-100(live)
     int32_t hdrMaxLuminance;     // 400-2000 nits(live)
+    int32_t fgHdrInterp;         // 0/1 实验性补帧 HDR 域插值(v23,创建时)
 };
 #pragma pack(pop)
 
@@ -162,6 +168,8 @@ inline void LoadCreateParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.rtxVsrMode = std::clamp(pl.vsrMode, kVsrModeMin, kVsrModeMax);
     p.rtxVsrScale = std::clamp(pl.vsrScale, kVsrScaleMin, kVsrScaleMax);
     p.rtxHdrEnabled = pl.hdrEnabled != 0;
+    // v23:实验性补帧 HDR 域插值(创建时;仅 HDR+FG 会话有意义)。
+    p.fgHdrInterp = pl.fgHdrInterp != 0;
 }
 
 // Parameter fields only; the caller fills seq/generation/save/reset/log.
@@ -201,6 +209,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.hdrSaturation = std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
     pl.hdrMiddleGray = std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
     pl.hdrMaxLuminance = std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
+    pl.fgHdrInterp = p.fgHdrInterp ? 1 : 0;
     return pl;
 }
 

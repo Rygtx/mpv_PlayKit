@@ -1437,6 +1437,30 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
+    // 实验:补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 闪烁警告
+    pairLabel(0, "实验:HDR 域插帧", "实验性:DLSSG 直接在 HDR 域插帧(直接吃 TrueHDR 的 FP16 输出)。\n"
+              "省 TrueHDR ×(M-1) 的 GPU/提交成本,但部分驱动(SM86 移植内核)\n"
+              "此路径插值帧压高光 = 亮处闪烁 —— 若闪烁请关闭。游戏用官方 40 系\n"
+              "硬件 + 运行库,此路径经 NVIDIA 验证;本机 30 系为移植内核,默认关。\n"
+              "创建时参数:变化自动触发 mpv 原地重载,需 HDR 与补帧同时开启。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
+    {
+        const bool usable = g_app.params.rtxHdrEnabled != 0 && g_app.params.fgEnabled != 0;
+        if (!usable) ImGui::BeginDisabled(true);
+        bool hi = g_app.params.fgHdrInterp != 0;
+        if (ImGui::Checkbox("##fg_hdr_interp", &hi)) {
+            g_app.params.fgHdrInterp = hi ? 1 : 0;
+            g_app.liveDirty = true;
+            g_app.reseekDirty = true; // 槽资源/FG create 格式随创建定格
+        }
+        if (!usable) ImGui::EndDisabled();
+        ImGui::SameLine(0, 12 * s);
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                           usable ? "实验性 —— 可能闪烁,闪烁即关闭"
+                                  : "需 HDR 与补帧同时开启");
+    }
+    y += rowH;
+
             // 跨页依赖提示
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
             ImGui::TextDisabled("提示: 实际生效状态见\"诊断\"页;HDR 上屏需 mpv.conf target-colorspace-hint=true。");

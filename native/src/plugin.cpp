@@ -119,6 +119,7 @@ struct FilterData {
     bool fgActive = false;
     std::wstring fgDllPath;
     int fgCreateMult = 2;                     // 创建时倍数(vi.fps/帧数元数据 + 组槽位结构)
+    bool fgHdrInterp = false;                 // 创建时实验开关(HDR 域插帧,hotMatch 键)
     int srcFrames = 0;                        // 源帧数(vi.numFrames;0 = 未知,尾部钳制禁用)
     int fgCacheK = -1;                        // 缓存命中 = 同源帧的后继槽位请求
     int fgCacheM = 0;                         // 有效缓存条目上界(1 + 插值槽数;空位判 null)
@@ -143,8 +144,11 @@ struct HotContext {
     int height = 0;
     int depth = 0;
     // FG 状态参与 hotMatch:开关/代理路径变化 = 槽资源形态变化(FG 纹理
-    // 有无),必须冷重建。路由(route)进程级,重启生效,不参与。
+    // 有无),必须冷重建。fgHdrInterp(实验性 HDR 域插帧)同样参与:FG
+    // 插值纹理格式与 post 分支随之变化。路由(route)进程级,重启生效,
+    // 不参与。
     bool fgEnabled = false;
+    bool fgHdrInterp = false;
     std::wstring fgDllPath;
     // RTX Video 参与 hotMatch:mode/scale/autoHeight/hdrEnabled 变化 = 管
     // 线几何或输出格式变化,冷重建。RtxVideoParams 的 == 只覆盖这些
@@ -745,6 +749,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().height = d->height;
         Hot().depth = d->depth;
         Hot().fgEnabled = d->fgActive;
+        Hot().fgHdrInterp = d->fgHdrInterp;
         Hot().fgDllPath = std::move(d->fgDllPath);
         Hot().rtx = RtxFromParams(d->params->Snapshot());
         Hot().valid = true;
@@ -824,6 +829,9 @@ static void VS_CC DlssnrCreate(
     // FG 路由 0=自动(预载 0.3.x hook 代理)/1=纯官方(不预载;进程级,
     // 重启生效)
     ApplyIntArg(in, vsapi, "fg_route", initial.fgRoute, kFgRouteMin, kFgRouteMax);
+    // v23 实验性:补帧 HDR 域插帧(DLSSG 直接吃 TrueHDR 输出)。部分驱动
+    // 此路径插值帧压高光 = 闪烁,默认 0。仅 HDR+FG 会话有意义。
+    ApplyFlagArg(in, vsapi, "fg_hdr_interp", initial.fgHdrInterp);
     ApplyIntArg(in, vsapi, "of_backend", initial.ofBackend, kOfBackendMin, kOfBackendMax);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
@@ -850,14 +858,14 @@ static void VS_CC DlssnrCreate(
     {
         char msg[288];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d fg_hdr=%d",
                       d->width, d->height, d->depth, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.ffxQuality,
                       initial.nvofFollowScaling ? 1 : 0,
                       initial.fgEnabled ? 1 : 0,
-                      initial.fgMultiplier, initial.fgRoute);
+                      initial.fgMultiplier, initial.fgRoute, initial.fgHdrInterp ? 1 : 0);
         vsdlssnr::TimingStatusLine(msg);
     }
     d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
@@ -934,6 +942,8 @@ static void VS_CC DlssnrCreate(
     // 槽纹理按旧位深建,R8 纹理遇 P10 打包 = 数据撕裂(#40-① 同族)。
     // FG 状态(开关 + 代理路径)同样参与:槽资源形态(FG 纹理有无)随之
     // 变化,必须冷重建。路由(route)进程级,重启生效,不参与。
+    // fgHdrInterp(实验性 HDR 域插帧)参与:FG 插值纹理格式(BGRA8/FP16)
+    // 与 post 分支随之变化,必须冷重建。
     // NR+FG 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开秒回);
     // 仅 NR 关而 FG 开仍需热复用(设备与上下文都在用)。
     // RTX 请求开 = vsr_mode>0 或 hdr 开(初始化守卫参与;皆关 + NR/FG 皆关
@@ -947,6 +957,7 @@ static void VS_CC DlssnrCreate(
                           Hot().width == d->width && Hot().height == d->height &&
                           Hot().depth == d->depth &&
                           Hot().fgEnabled == (initial.fgEnabled != 0) &&
+                          Hot().fgHdrInterp == (initial.fgHdrInterp != 0) &&
                           Hot().fgDllPath == d->fgDllPath &&
                           Hot().rtx == rtx;
     if (hotMatch) {
@@ -1052,6 +1063,7 @@ static void VS_CC DlssnrCreate(
     // 否则 1:1(FG 失败的降级语义)。vi 副本按创建值倍增 fps —— 纯元数据
     // (mpv 不据此节拍,但下游工具/时长估算消费它)。
     d->fgActive = d->initOk && d->ngx && d->ngx->FgActive();
+    d->fgHdrInterp = initial.fgHdrInterp != 0;
     // RTX 输出几何(init 后从 context 读回 —— pipe/out 的最终裁决在
     // Initialize 内含 capability/倍率旁路)。未初始化实例 = 源几何直通。
     d->outW = d->width;
@@ -1160,6 +1172,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "fg_enabled:int:opt;"
         "fg_multiplier:int:opt;"
         "fg_route:int:opt;"
+        "fg_hdr_interp:int:opt;"
         "of_backend:int:opt;"
         "vsr_mode:int:opt;"
         "vsr_scale:float:opt;"

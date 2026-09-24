@@ -49,6 +49,7 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     writeInt(L"fg_enabled", p.fgEnabled ? 1 : 0);
     writeInt(L"fg_multiplier", std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax));
     writeInt(L"fg_route", std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax)); // v20 两档:保存即把存量 2/3 归一
+    writeInt(L"fg_hdr_interp", p.fgHdrInterp ? 1 : 0); // v23 实验性:HDR 域插帧,可能闪烁
     writeInt(L"of_backend", std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax));
     // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管;
     // 本函数是唯一写侧,面板"保存设置"与 bridge saveRequest 共用)。
@@ -139,6 +140,7 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
         *legacyFgRouteRaw = readInt(L"fg_route", p.fgRoute);
     }
     p.fgRoute = std::clamp(readInt(L"fg_route", p.fgRoute), kFgRouteMin, kFgRouteMax);
+    p.fgHdrInterp = readBool(L"fg_hdr_interp", p.fgHdrInterp != 0);
     p.ofBackend = std::clamp(readInt(L"of_backend", p.ofBackend), kOfBackendMin, kOfBackendMax);
     // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管,
     // 与 WriteDlssnrIni 同键表)。旧部署样例的 vsr_height 键已作废(语义
