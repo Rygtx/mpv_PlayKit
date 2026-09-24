@@ -863,7 +863,15 @@ void LoadStats() noexcept {
             g_app.segDispRtxVsr = segSmooth(g_app.segDispRtxVsr, g_app.segRtxVsr);
             g_app.segDispRtxHdr = segSmooth(g_app.segDispRtxHdr, g_app.segRtxHdr);
             g_app.segDispConv = segSmooth(g_app.segDispConv, g_app.segConv);
-            g_app.hasSegments = g_app.segGpu > 0;
+            // 时间线可见性 = 任一段有处理时间(平滑值合计 > 0):EMA 衰减
+            // 期内仍算"插件在运作",过渡平滑;全关直通/死亡 body 走下方
+            // 清零分支归 false。原判据 segGpu>0 与 9729c84 冲突 —— NR 关
+            // 直连帧 gpu 段恒 0(空栅栏等待不是 NR 处理时间),把仍真实
+            // 非零的 fg/conv/pack/unpack 连坐收起,表现为"NR 一关,其他
+            // 功能的处理用时全没了"。渲染侧无下限门:非 0ms 段全显示。
+            g_app.hasSegments = (g_app.segDispPack + g_app.segDispEval + g_app.segDispGpu +
+                                 g_app.segDispUnpack + g_app.segDispNvof + g_app.segDispFg +
+                                 g_app.segDispRtxVsr + g_app.segDispRtxHdr + g_app.segDispConv) > 0.0f;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
             char gnPat[32];
             snprintf(gnPat, sizeof(gnPat), "\"%s\":\"", SK_GPU_NAME);
@@ -1925,31 +1933,34 @@ void DrawUi() noexcept {
         const float total = g_app.segDispPack + g_app.segDispNvof + g_app.segDispEval +
                             g_app.segDispGpu + g_app.segDispRtxVsr + g_app.segDispFg +
                             g_app.segDispRtxHdr + g_app.segDispConv + g_app.segDispUnpack;
-        if (total > 0.5f) {
-            struct Seg { float v; ImU32 c; const char *name; };
-            const Seg segFg{ g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" };
-            const Seg segHdr{ g_app.segDispRtxHdr, IM_COL32(255, 152, 0, 255),  "hdr(RTX HDR)" };
-            const Seg segConv{ g_app.segDispConv, IM_COL32(121, 85, 72, 255),   "conv(输出转换)" };
-            const Seg segs[9]{
-                { g_app.segDispPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
-                { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
-                { g_app.segDispEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
-                { g_app.segDispGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR 推理)" },
-                { g_app.segDispRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
-                hdrFirst ? segHdr : segFg,
-                hdrFirst ? segFg : segHdr,
-                segConv,
-                { g_app.segDispUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
-            };
-            constexpr int kSegCount = 9;
-            // 实际要画的段数(零值段跳过)。BeginTable 的列数必须与之相等:
-            // imgui 对本帧未 TableSetupColumn 的列按 SizingStretchSame 默认
-            // 权重 1.0 补齐,而可见段权重和恒为 1.0 —— 空列恰好占掉一半
-            // 宽度(of=0 时长条右侧大片空白)。
-            int visibleSegs = 0;
-            for (int i = 0; i < kSegCount; ++i)
-                if (segs[i].v >= 1e-3f) ++visibleSegs;
-
+        struct Seg { float v; ImU32 c; const char *name; };
+        const Seg segFg{ g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" };
+        const Seg segHdr{ g_app.segDispRtxHdr, IM_COL32(255, 152, 0, 255),  "hdr(RTX HDR)" };
+        const Seg segConv{ g_app.segDispConv, IM_COL32(121, 85, 72, 255),   "conv(输出转换)" };
+        const Seg segs[9]{
+            { g_app.segDispPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
+            { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流)" },
+            { g_app.segDispEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
+            { g_app.segDispGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR 推理)" },
+            { g_app.segDispRtxVsr, IM_COL32(67, 160, 71, 255),   "vsr(RTX 超分)" },
+            hdrFirst ? segHdr : segFg,
+            hdrFirst ? segFg : segHdr,
+            segConv,
+            { g_app.segDispUnpack, IM_COL32(0, 137, 123, 255),   "unpack(解包)" },
+        };
+        constexpr int kSegCount = 9;
+        // 实际要画的段数(零值段跳过)。零值判定 = 显示精度下的 0:
+        // <1e-3ms 渲染出来就是 "0.000 ms",按用户裁定视作 0ms 不画;
+        // 除此之外无任何下限门(旧 total>0.5ms 会把真实存在但很小的
+        // 处理时间整段吞掉)。BeginTable 的列数必须与之相等:imgui 对
+        // 本帧未 TableSetupColumn 的列按 SizingStretchSame 默认权重 1.0
+        // 补齐,而可见段权重和恒为 1.0 —— 空列恰好占掉一半宽度(of=0
+        // 时长条右侧大片空白)。visibleSegs=0 时连表都不开(imgui 对
+        // 0 列 BeginTable 断言)。
+        int visibleSegs = 0;
+        for (int i = 0; i < kSegCount; ++i)
+            if (segs[i].v >= 1e-3f) ++visibleSegs;
+        if (total > 0.0f && visibleSegs > 0) {
             ImGui::Spacing();
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
             ImGui::PushStyleVar(ImGuiStyleVar_SelectableTextAlign, ImVec2(0.5f, 0.5f));
@@ -2397,6 +2408,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             // 重建的滤镜实例即采纳新值(免手动拖进度条)。
             if (g_app.reseekDirty) {
                 g_app.reseekDirty = false;
+                // 任意面板主动 reseek 都入闭环去抖戳:重建窗口内旧全关实例
+                // 会因 live 参数(nr=1)边沿发布 kStateNrSeekInit,下方闭环
+                // 若无此戳会对同一次开关重复 seek(幂等但多余)。
+                g_app.lastSeekInitReseek = nowSec;
                 // 失败不再无声:此前 IPC 不可达(mpv 未开 / input-ipc-server
                 // 未启用)时变动退化为"等下次手动 seek",面板零提示。
                 if (TriggerMpvReseek()) {
