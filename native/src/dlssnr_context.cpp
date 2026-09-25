@@ -2190,22 +2190,24 @@ bool DlssnrContext::ProcessFrame(
         return false;
     }
     if (ProbeEnabled()) TimingStatusLine("PROBE: base submitted"); // 临时探针(VSDLSSNR_PROBE=1)
-    // base 完成等待(= t3a 观测点)**必须在任何 RTX/post 提交之前**:它是
-    // 后续所有分段(vsr/fg/hdr)的计时起点 —— 若推到 post 提交之后,CPU
-    // 录制期足够 GPU 跑完 base+vsr+postA,醒来时各段早已完成,观测竞争把
-    // vsr/fg 段压成 0(2026-09-24 用户实测"VSR 段看不到"根因)。代价 =
-    // base 执行期 CPU 不再与 RTX/post 录制重叠(3 槽流水下由其他槽的
-    // GPU 工作填补空档)。栅栏超时 = GPU 挂起/设备移除,熔断停帧。
-    if (!_d3d12->WaitBaseFrame(*slot, err, errLen)) {
-        if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
-        if (err && errLen) {
-            TimingStatusLine(err); // 临时探针
-            std::snprintf(err, errLen, "Wait(base) failed");
+    // base 完成观测(t3a,2026-09-25 时间戳化):默认路径不再 CPU 阻塞 ——
+    // base GPU 执行与后续 RTX 提交链 + fg/post 录制重叠(此前阻塞把这段
+    // CPU 时间串在 base 之后,FG 模式下还撑大 fgMutex 持锁窗口)。t3a 由
+    // Finish 读 ts CL 的时间戳回读得出(精确免阻塞,SubmitBaseFrame 内已
+    // 提交);时间戳不可用/本帧 ts 失败时回退阻塞观测(旧行为,账目仍真,
+    // 只是不重叠)。栅栏超时 = GPU 挂起/设备移除,熔断停帧。
+    if (!_d3d12->GpuTsEnabled() || !slot->tsValid) {
+        if (!_d3d12->WaitBaseFrame(*slot, err, errLen)) {
+            if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
+            if (err && errLen) {
+                TimingStatusLine(err); // 临时探针
+                std::snprintf(err, errLen, "Wait(base) failed");
+            }
+            return false;
         }
-        return false;
+        if (ProbeEnabled()) TimingStatusLine("PROBE: base waited"); // 临时探针(VSDLSSNR_PROBE=1)
+        QueryPerformanceCounter(&t3a);
     }
-    if (ProbeEnabled()) TimingStatusLine("PROBE: base waited"); // 临时探针(VSDLSSNR_PROBE=1)
-    QueryPerformanceCounter(&t3a);
 
     // ---- RTX eval(专用队列;fence 链 base → vsr → postA → hdr 链)----
     // CPU 端不等 eval 完成:post 段提交时主队列 Wait(生产者 fence)保证
@@ -2774,6 +2776,26 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
     }
     if (ProbeEnabled()) TimingStatusLine("PROBE: waited"); // 临时探针(VSDLSSNR_PROBE=1)
     QueryPerformanceCounter(&t3b);
+    // t3a 观测点(2026-09-25 时间戳化):base 完成的 GPU 时间戳已在 ts CL
+    // 执行时写入 READBACK(post FIFO 在 ts 后,WaitFrame 蕴含数据就绪)。
+    // 换算:GetClockCalibration 校准点 + (tsEnd − gpuCal) 按 GPU 频率 →
+    // QPC 刻度。提交链与 base GPU 重叠后,阻塞观测会把 vsr/fg 段压成 0
+    // (2026-09-24 实测根因),时间戳免阻塞且精确。兜底默认 t3a := t2
+    // (gpu 段记 0,总量恒真):覆盖换算失败场景 —— 超快空 CL(nrOff)在
+    // 校准点采样前完成(tsEnd ≤ gpuCal)/时钟关联异常,不会让面板出现
+    // 负值/开机以来巨值。
+    if (ff->slot->tsValid) {
+        ff->t3a = ff->t2;
+        const UINT64 tsEnd = *static_cast<const UINT64 *>(ff->slot->tsReadbackMapped);
+        if (tsEnd > ff->slot->tsGpuCal) {
+            const double deltaQpc =
+                static_cast<double>(tsEnd - ff->slot->tsGpuCal) / _d3d12->GpuTsFreq() *
+                static_cast<double>(ff->qpcFreq.QuadPart);
+            LARGE_INTEGER t3aTs{};
+            t3aTs.QuadPart = ff->slot->tsCpuCal + static_cast<LONGLONG>(deltaQpc);
+            if (t3aTs.QuadPart > ff->t2.QuadPart) ff->t3a = t3aTs;
+        }
+    }
     const bool rb = _d3d12->UnpackOutput(*ff->slot, dstPlanes, dstStrides, _outW, _outH, err, errLen);
     // unpack 段 = 真实帧回读(t3b→t3c);插值帧回读(t3c→t4)是 FG 的
     // 输出搬运成本,归 fg 段 —— FG 4x 时 4 帧 P10 @OUT 几何可达 100MB+,

@@ -94,6 +94,22 @@ struct FrameSlot {
     // postB 栅栏等待统一走 WaitFenceValuePublic + 事件入参。
     uint64_t postFenceValue = 0;      // postB 段提交的栅栏值
     uint64_t fgFenceValue = 0;        // postA(fg CL)提交的栅栏值(计时锚)
+    // base 段 GPU 完成时间戳路径(2026-09-25:WaitBaseFrame CPU 阻塞删除,
+    // RTX/fg/post 提交链与 base GPU 执行重叠)。timestamp query 与 NGX 同 CL
+    // 会 SEH(2026-09-05 实锤)—— 独立微型 CL 紧随 base 提交(同一
+    // _submitMutex 保证队列序 [base][ts]),EndQuery + ResolveQueryData 写
+    // READBACK 缓冲;post CL FIFO 在其后,WaitFrame(post 栅栏)完成即蕴含
+    // ts 完成,Finish 无额外等待直接读。GetClockCalibration 在提交时采样,
+    // GPU tick → QPC 线性换算在 Finish 做(值存 tsGpuCal/tsCpuCal,随槽
+    // 生命周期稳定 —— Finish 读完后才 ReleaseSlot)。
+    ComPtr<ID3D12QueryHeap> tsQueryHeap;
+    ComPtr<ID3D12CommandAllocator> tsAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsCommandList;
+    ComPtr<ID3D12Resource> tsReadback;      // 8 字节 READBACK,persist-mapped
+    void *tsReadbackMapped = nullptr;
+    UINT64 tsGpuCal = 0;                    // 校准点 GPU tick(base 提交时)
+    UINT64 tsCpuCal = 0;                    // 校准点 QPC
+    bool tsValid = false;                   // ts CL 已提交且校准成功(失败帧回退阻塞观测)
 
     // YUV 原生管道:VS 帧(YUV420P8/P10 三平面)与 GPU 之间纯行拷贝。
     // [0]=Y 全分辨率,[1]=U [2]=V 半分辨率;pitch 256 对齐,persist-mapped。
@@ -448,6 +464,10 @@ public:
                          char *err, size_t errLen) noexcept;
     bool WaitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
+    // base 完成时间戳路径可用性(GetTimestampFrequency 失败 = 0,ProcessFrame
+    // 回退阻塞观测;真实 D3D12 驱动上恒可用)。
+    bool GpuTsEnabled() const noexcept { return _gpuTsEnabled; }
+    double GpuTsFreq() const noexcept { return _gpuTsFreq; }
     // 任意栅栏值的有界 CPU 等待(分段计时锚用;调用方保证 event 不与
     // WaitBase/WaitFrame 的并发使用交错 —— 帧路径内全部串行)。
     bool WaitFenceValuePublic(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept {
@@ -592,6 +612,9 @@ private:
     bool _debug = false;
     ComPtr<ID3D12CommandQueue> _queue;
     ComPtr<ID3D12Fence> _fence;
+    // GPU 时间戳频率(Hz;base 完成时间戳路径);0 = 不可用。
+    double _gpuTsFreq = 0.0;
+    bool _gpuTsEnabled = false;
     std::atomic<uint64_t> _fenceValue{0};
     std::atomic<bool> _deviceLost{false};
     // serializes fetch_add + Signal so the fence value order matches the

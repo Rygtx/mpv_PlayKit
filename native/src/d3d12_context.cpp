@@ -240,6 +240,13 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
         SetErr(err, errLen, E_FAIL, "Create fence event failed");
         return false;
     }
+    // GPU 时间戳频率(base 完成时间戳路径,2026-09-25):DIRECT 队列恒支持,
+    // 失败仅关闭该路径(ProcessFrame 回退阻塞观测),不判致命。
+    UINT64 tsFreq = 0;
+    if (SUCCEEDED(_queue->GetTimestampFrequency(&tsFreq)) && tsFreq > 0) {
+        _gpuTsFreq = static_cast<double>(tsFreq);
+        _gpuTsEnabled = true;
+    }
     // 计算 PSO 一次性构建(残差 + NVOF densify/guidance)。densify 不能等
     // scaling 路径才创建:OF 会话在 scaling_enabled=0 时同样要录 densify
     // (实测 2026-09-07:耦合在 CreateScalingForSlot 里导致 null PSO 崩溃)。
@@ -745,6 +752,16 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     slot.fgAllocator.Reset();
     slot.postCommandList.Reset();
     slot.postAllocator.Reset();
+    // base 完成时间戳路径资源(2026-09-25):persist-mapped READBACK 先解映射。
+    if (slot.tsReadback && slot.tsReadbackMapped) slot.tsReadback->Unmap(0, nullptr);
+    slot.tsReadbackMapped = nullptr;
+    slot.tsCommandList.Reset();
+    slot.tsAllocator.Reset();
+    slot.tsQueryHeap.Reset();
+    slot.tsReadback.Reset();
+    slot.tsGpuCal = 0;
+    slot.tsCpuCal = 0;
+    slot.tsValid = false;
     for (int i = 0; i < 3; ++i) {
         slot.uploadYuv[i].Reset();
         slot.readbackYuv[i].Reset();
@@ -1073,6 +1090,52 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
                                                        : slot.outputColor.Get(),
                                            nullptr, nullptr, slotHandle(kUavFgBack));
     }
+
+    // base 完成时间戳资源(2026-09-25;GpuTsEnabled 时):查询堆 + 微型 CL +
+    // READBACK 回读缓冲(8 字节 UINT64,persist-mapped,初始态 COPY_DEST =
+    // ResolveQueryData 目标契约,缓冲资源恒驻 COPY_DEST 无屏障)。
+    if (_gpuTsEnabled) {
+        D3D12_QUERY_HEAP_DESC qh{};
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = 1;
+        qh.NodeMask = 0;
+        if (FAILED(_device->CreateQueryHeap(&qh, IID_PPV_ARGS(slot.tsQueryHeap.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "CreateQueryHeap(ts) failed");
+            return false;
+        }
+        if (FAILED(_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(slot.tsAllocator.GetAddressOf()))) ||
+            FAILED(_device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.tsAllocator.Get(), nullptr,
+                IID_PPV_ARGS(slot.tsCommandList.GetAddressOf()))) ||
+            FAILED(slot.tsCommandList->Close())) {
+            SetErr(err, errLen, E_FAIL, "create ts command path failed");
+            return false;
+        }
+        D3D12_HEAP_PROPERTIES rbHeap{};
+        rbHeap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC rbDesc{};
+        rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rbDesc.Width = 8; // UINT64
+        rbDesc.Height = 1;
+        rbDesc.DepthOrArraySize = 1;
+        rbDesc.MipLevels = 1;
+        rbDesc.SampleDesc.Count = 1;
+        rbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(_device->CreateCommittedResource(
+                &rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(slot.tsReadback.GetAddressOf())))) {
+            SetErr(err, errLen, E_FAIL, "create ts readback buffer failed");
+            return false;
+        }
+        slot.tsReadback->Map(0, nullptr, &slot.tsReadbackMapped); // void 返回;persist-mapped
+        if (!slot.tsReadbackMapped) {
+            SetErr(err, errLen, E_FAIL, "map ts readback buffer failed");
+            return false;
+        }
+    }
     return true;
 }
 
@@ -1357,6 +1420,41 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence,
     _queue->ExecuteCommandLists(1, lists);
     slot.baseFenceValue = _fenceValue.fetch_add(1) + 1;
     _queue->Signal(_fence.Get(), slot.baseFenceValue);
+    // base 完成时间戳(2026-09-25):微型 CL 紧随 base 提交 —— 同一把
+    // _submitMutex 保证队列序 [base][ts](跨线程 ExecuteCommandLists 无
+    // 全序,无锁并发提交会让 ts 排到他人 base 之前)。EndQuery + Resolve
+    // 进 READBACK;无栅栏信号:post CL FIFO 在其后,WaitFrame 蕴含 ts 完成,
+    // Finish 读回零等待。校准点(GetClockCalibration)在提交时采样,tsEnd
+    // ≥ gpuCal 由 GPU 时钟单调保证(校准在 enqueue 后 ~µs,base 执行 ms 级)。
+    // 失败非致命:tsValid=false,调用方回退阻塞观测(旧行为)。
+    slot.tsValid = false;
+    if (_gpuTsEnabled) {
+        HRESULT tsHr = slot.tsAllocator->Reset();
+        if (FAILED(tsHr)) {
+            // force-close 自愈(BeginFrameRecording 同款):上次录制中途失败
+            // 遗留 open CL 会让 allocator Reset 永久 E_FAIL。
+            slot.tsCommandList->Close();
+            tsHr = slot.tsAllocator->Reset();
+        }
+        if (SUCCEEDED(tsHr) &&
+            SUCCEEDED(slot.tsCommandList->Reset(slot.tsAllocator.Get(), nullptr))) {
+            slot.tsCommandList->EndQuery(slot.tsQueryHeap.Get(),
+                                         D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            slot.tsCommandList->ResolveQueryData(
+                slot.tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 1,
+                slot.tsReadback.Get(), 0); // void 返回;参数错误走 debug layer
+            if (SUCCEEDED(slot.tsCommandList->Close())) {
+                ID3D12CommandList *tsLists[]{ slot.tsCommandList.Get() };
+                _queue->ExecuteCommandLists(1, tsLists);
+                UINT64 gpuCal = 0, cpuCal = 0;
+                if (SUCCEEDED(_queue->GetClockCalibration(&gpuCal, &cpuCal))) {
+                    slot.tsGpuCal = gpuCal;
+                    slot.tsCpuCal = cpuCal;
+                    slot.tsValid = true;
+                }
+            }
+        }
+    }
     return true;
 }
 
