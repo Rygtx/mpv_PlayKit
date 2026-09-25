@@ -1440,6 +1440,10 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence,
     slot.submitQpc = s0.QuadPart;
     const bool preBaseOk = RecordTsBracket(slot, slot.tsPreBaseAllocator.Get(),
                                            slot.tsPreBaseCommandList.Get(), 0);
+    if (preBaseOk) {
+        ID3D12CommandList *tsLists[]{ slot.tsPreBaseCommandList.Get() };
+        _queue->ExecuteCommandLists(1, tsLists);
+    }
     ID3D12CommandList *lists[]{ slot.commandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
     slot.baseFenceValue = _fenceValue.fetch_add(1) + 1;
@@ -1451,10 +1455,14 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence,
     // WaitFrame 蕴含全部 ts 完成,Finish 读回零等待。校准点
     // (GetClockCalibration)在提交时采样,GPU tick → QPC 线性换算在 Finish
     // 做。失败非致命:tsValid=false,Finish 回退栅栏差分账目(旧行为)。
+    // 2026-09-25 修:括号 CL 此前只录制未 ECL,EndQuery/Resolve 从未在 GPU
+    // 执行 → readback 恒零 → NR 开着 gpu 段恒 0(真机实锤)。
     slot.tsValid = false;
     if (_gpuTsEnabled && preBaseOk) {
         if (RecordTsBracket(slot, slot.tsAllocator.Get(),
                             slot.tsCommandList.Get(), 1)) {
+            ID3D12CommandList *tsLists[]{ slot.tsCommandList.Get() };
+            _queue->ExecuteCommandLists(1, tsLists);
             UINT64 gpuCal = 0, cpuCal = 0;
             if (SUCCEEDED(_queue->GetClockCalibration(&gpuCal, &cpuCal))) {
                 slot.tsGpuCal = gpuCal;
@@ -1500,11 +1508,18 @@ bool D3D12Context::SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64
     // preFg,不含冲刷点引擎等待与队列积压。失败仅放弃本段账目。
     const bool preFgOk = RecordTsBracket(slot, slot.tsPreFgAllocator.Get(),
                                          slot.tsPreFgCommandList.Get(), 2);
+    if (preFgOk) {
+        ID3D12CommandList *tsLists[]{ slot.tsPreFgCommandList.Get() };
+        _queue->ExecuteCommandLists(1, tsLists);
+    }
     ID3D12CommandList *lists[]{ slot.fgCommandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
     if (preFgOk) {
-        RecordTsBracket(slot, slot.tsPostFgAllocator.Get(),
-                        slot.tsPostFgCommandList.Get(), 3);
+        if (RecordTsBracket(slot, slot.tsPostFgAllocator.Get(),
+                            slot.tsPostFgCommandList.Get(), 3)) {
+            ID3D12CommandList *tsLists[]{ slot.tsPostFgCommandList.Get() };
+            _queue->ExecuteCommandLists(1, tsLists);
+        }
     }
     slot.fgFenceValue = _fenceValue.fetch_add(1) + 1;
     slot.fenceValue = slot.fgFenceValue;
