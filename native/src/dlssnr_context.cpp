@@ -3177,9 +3177,20 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         // 账归 conv;NR 关直连帧的 base CL 窗口 = C1 补做,也归 conv ——
         // gpu 段记 0 保持"各段不重叠、可加"):
         //   fg  段 = fgStart → tFgDone(FG 提交了才有)+ 插值帧回读;
-        //   hdr 段 = TrueHDR 真实帧/链窗口;
+        //   hdr 段 = TrueHDR 真实帧/链窗口(下方,两账目分支同式);
         //   conv 段 = convAnchor → t3b(post CL 窗口)+ ff->nrOff 的 base 窗口。
         double fgMs = 0.0, rtxHdrMs = 0.0, convMs = 0.0;
+        // hdr 段(TrueHDR 链,RTX 专用队列:无 ts 括号,墙钟账,语义同
+        // vsr 段 —— GPU-bound 时真实,CPU-bound 时被提交链覆盖 ≈0)。
+        // 必须放在 tsAcc 分支之外:ce6970b 后 tsValid 恒真,原账目只在
+        // 栅栏差分回退分支算 hdr —— 结果 TrueHDR 用时整段消失(面板/日志
+        // hdr 恒 0,2026-09-26 实测)。
+        if (ff->hdrPostSplit) {
+            const LARGE_INTEGER &fgStart = ff->vsrDoneFence ? tVsrDone : ff->tSub1;
+            rtxHdrMs = ms(ff->fgBeginOk ? tFgDone : fgStart, tHdrDone, ff->qpcFreq);
+        } else if (ff->hdrRun) {
+            rtxHdrMs = ms(ff->tSub1, tHdrDone, ff->qpcFreq);
+        }
         if (tsAcc) {
             // 时间戳括号:fg = DLSSG 纯执行(+ 回读拷贝见下);conv = post CL
             // 纯执行(CL 内嵌首尾打点,跨队列栅栏等待与队列积压不计入)。
@@ -3191,10 +3202,8 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             const LARGE_INTEGER &fgStart = ff->vsrDoneFence ? tVsrDone : ff->tSub1;
             if (ff->fgBeginOk) fgMs = ms(fgStart, tFgDone, ff->qpcFreq);
             if (ff->hdrPostSplit) {
-                rtxHdrMs = ms(ff->fgBeginOk ? tFgDone : fgStart, tHdrDone, ff->qpcFreq);
                 convMs = ms(tHdrDone, t3b, ff->qpcFreq);
             } else if (ff->hdrRun) {
-                rtxHdrMs = ms(ff->tSub1, tHdrDone, ff->qpcFreq);
                 const LARGE_INTEGER &convAnchor =
                     (ff->fgBeginOk ? tFgDone.QuadPart : fgStart.QuadPart) > tHdrDone.QuadPart
                         ? (ff->fgBeginOk ? tFgDone : fgStart) : tHdrDone;
