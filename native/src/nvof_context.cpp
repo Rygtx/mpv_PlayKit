@@ -123,6 +123,48 @@ bool NvofContext::WaitFenceReached(ID3D12Fence *fence, uint64_t value,
     }
 }
 
+bool NvofContext::AcquireCl(ID3D12CommandAllocator **allocator,
+                            ID3D12GraphicsCommandList **cl, LARGE_INTEGER freq) noexcept {
+    // 轮转池取 CL(RtxQueue/FfxofContext 同款纪律):idx = _submitSeq % 深度,
+    // Reset 前 CPU 等同位上一段提交 —— 4 段之前常态"等待即刻返回";GPU 落后
+    // 超 4 段 = 背压。等待期间设备丢失 = 永不满足,快速失败。全部段都 signal
+    // copyFence(单栅栏值空间单调),共享 _copyFenceEvent 无跨栅栏窃取
+    // (等待者只有门内串行线程与 WaitCopyIdle,后者在门外,事件分家见
+    // _copyFenceEvent/_doneFenceEvent 注释 —— copyFence 侧等待共用同一事件
+    // 是安全的:值空间单调,窃取后循环复查兜底)。
+    const int idx = static_cast<int>(_submitSeq % kClDepth);
+    if (_lastUseFence[idx] && _lastUseValue[idx] &&
+        !_d3d12->IsDeviceLost()) {
+        // 临时探针:轮转位等待(>0 = GPU 落后背压)。
+        LARGE_INTEGER tc0{}, tc1{};
+        QueryPerformanceCounter(&tc0);
+        const bool reached = WaitFenceReached(_lastUseFence[idx], _lastUseValue[idx],
+                                              _copyFenceEvent, 10000);
+        QueryPerformanceCounter(&tc1);
+        _lastCpyWaitMs = static_cast<double>(tc1.QuadPart - tc0.QuadPart) * 1000.0 /
+                         static_cast<double>(freq.QuadPart);
+        if (!reached) {
+            TimingStatusLine("DLSSNR STATUS: nvof cl rotator wait timeout; session retired");
+            _ready.store(false, std::memory_order_release);
+            return false;
+        }
+    } else {
+        _lastCpyWaitMs = 0.0;
+    }
+    HRESULT hr = _alloc[idx]->Reset();
+    if (FAILED(hr)) {
+        // force-close 自愈:上次录制中途失败遗留 open CL 会让 allocator
+        // Reset 永久 E_FAIL(BeginCtlRecording/FfxofContext 同款恢复模式)。
+        _cl[idx]->Close();
+        hr = _alloc[idx]->Reset();
+        if (FAILED(hr)) return false;
+    }
+    if (FAILED(_cl[idx]->Reset(_alloc[idx].Get(), nullptr))) return false;
+    *allocator = _alloc[idx].Get();
+    *cl = _cl[idx].Get();
+    return true;
+}
+
 NvofContext::~NvofContext() { Finalize(); }
 
 // 释放会话引用。绝不调用 nvOFDestroy/Unregister:实测销毁后进程内继续
@@ -152,8 +194,13 @@ void NvofContext::DestroySession() noexcept {
     _api = {};
     // 模块进程级缓存,永不 FreeLibrary(见 GetNvofModule 注释)。
     _module = nullptr;
-    _copyCommandList.Reset();
-    _copyAllocator.Reset();
+    for (int i = 0; i < kClDepth; ++i) {
+        _cl[i].Reset();
+        _alloc[i].Reset();
+        _lastUseFence[i] = nullptr;
+        _lastUseValue[i] = 0;
+    }
+    _submitSeq = 0;
     // 栅栏/事件是进程级单例(GetNvofFences):不释放,只解除本会话引用。
     _copyFence.Reset();
     _doneFence.Reset();
@@ -376,14 +423,16 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         _copySeq = _lastCopyFence = _copyFence->GetCompletedValue();
         _doneSeq = _lastDone = _doneFence->GetCompletedValue();
     }
-    if (FAILED(device->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_DIRECT,
-            IID_PPV_ARGS(_copyAllocator.GetAddressOf()))) ||
-        FAILED(device->CreateCommandList(
-            0, D3D12_COMMAND_LIST_TYPE_DIRECT, _copyAllocator.Get(), nullptr,
-            IID_PPV_ARGS(_copyCommandList.GetAddressOf()))) ||
-        FAILED(_copyCommandList->Close())) {
-        return fail("nvof: create copy command list failed");
+    for (int i = 0; i < kClDepth; ++i) {
+        if (FAILED(device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(_alloc[i].GetAddressOf()))) ||
+            FAILED(device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, _alloc[i].Get(), nullptr,
+                IID_PPV_ARGS(_cl[i].GetAddressOf()))) ||
+            FAILED(_cl[i]->Close())) {
+            return fail("nvof: create copy command list failed");
+        }
     }
 
     for (int i = 0; i < 6; ++i) {
@@ -539,29 +588,15 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         if (_lastDone) {
             queue->Wait(_doneFence.Get(), _lastDone);
         }
-        if (_lastCopyFence) {
-            // 临时探针:前帧拷贝(含 densify,同一 allocator)完成 CPU 等待。
-            LARGE_INTEGER tc0{}, tc1{};
-            QueryPerformanceCounter(&tc0);
-            const bool reached = WaitFenceReached(_copyFence.Get(), _lastCopyFence,
-                                                  _copyFenceEvent, 10000);
-            QueryPerformanceCounter(&tc1);
-            _lastCpyWaitMs = static_cast<double>(tc1.QuadPart - tc0.QuadPart) * 1000.0 /
-                             static_cast<double>(freq.QuadPart);
-            if (!reached)
-                TimingStatusLine("DLSSNR STATUS: nvof copy fence timeout");
-        } else {
-            _lastCpyWaitMs = 0.0; // 临时探针
-        }
-        // force-close 自愈:上次 Close 失败留下的 open CL 会让 allocator
-        // Reset 永久 E_FAIL(对齐 BeginCtlRecording 的恢复模式)。
-        bool copyOk = SUCCEEDED(_copyAllocator->Reset());
-        if (!copyOk) {
-            _copyCommandList->Close();
-            copyOk = SUCCEEDED(_copyAllocator->Reset());
-        }
-        copyOk = copyOk &&
-                 SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
+        // 轮转池取 CL(2026-09-25):Reset 等待迁入 AcquireCl(4 段之前常态
+        // 即刻返回)。单 allocator 时代的门内 _lastCopyFence CPU 等待随之
+        // 删除 —— 其语义(等上一帧 copy/densify 完成)由两层保证覆盖:
+        // 上一帧 copy 完成被上一帧 execute 的输入栅栏点蕴含,而 execute 输出
+        // CPU 等待本就是门内承重点;轮转位自身的历史提交由 AcquireCl 背压
+        // 等待兜底。
+        ID3D12CommandAllocator *copyAlloc = nullptr;
+        ID3D12GraphicsCommandList *copyCl = nullptr;
+        bool copyOk = AcquireCl(&copyAlloc, &copyCl, freq);
         if (copyOk) {
             // YUV 原生:postCopy 恒设 —— 回调在本 nvof CL 上记录 YUV→RGB
             // 转换(yuvUpload→yuvIn 拷贝 + dispatch → inputColor);follow 时
@@ -573,13 +608,13 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 Transition(_input[cur].Get(),
                            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
-            _copyCommandList->ResourceBarrier(1, toUav);
-            postCopy(_copyCommandList.Get(), cur);
+            copyCl->ResourceBarrier(1, toUav);
+            postCopy(copyCl, cur);
             D3D12_RESOURCE_BARRIER toCommon[1]{
                 Transition(_input[cur].Get(),
                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
             };
-            _copyCommandList->ResourceBarrier(1, toCommon);
+            copyCl->ResourceBarrier(1, toCommon);
             if (!inputWrittenByPostCopy) {
                 // 非 follow:回调只做了转换(srcTex=inputColor,NSR),把整帧
                 // 纹理拷进 _input[cur](目标 COMMON 靠隐式提升,与旧 buffer
@@ -589,7 +624,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                D3D12_RESOURCE_STATE_COPY_SOURCE),
                 };
-                _copyCommandList->ResourceBarrier(1, toSrc);
+                copyCl->ResourceBarrier(1, toSrc);
                 D3D12_TEXTURE_COPY_LOCATION csrc{};
                 csrc.pResource = srcTex;
                 csrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -598,23 +633,27 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 cdst.pResource = _input[cur].Get();
                 cdst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 cdst.SubresourceIndex = 0;
-                _copyCommandList->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
+                copyCl->CopyTextureRegion(&cdst, 0, 0, 0, &csrc, nullptr);
                 D3D12_RESOURCE_BARRIER backNsr[1]{
                     Transition(srcTex,
                                D3D12_RESOURCE_STATE_COPY_SOURCE,
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                 };
-                _copyCommandList->ResourceBarrier(1, backNsr);
+                copyCl->ResourceBarrier(1, backNsr);
             }
             // 播种帧不录 densify/清零:发布走静态零纹理(MotionResource),
             // per-slot motion 保持 COMMON 不被触碰(状态机按 realMotion 归位)。
-            copyOk = SUCCEEDED(_copyCommandList->Close());
+            copyOk = SUCCEEDED(copyCl->Close());
         }
         if (copyOk) {
-            ID3D12CommandList *lists[]{ _copyCommandList.Get() };
+            ID3D12CommandList *lists[]{ copyCl };
             queue->ExecuteCommandLists(1, lists);
             _lastCopyFence = ++_copySeq;
             queue->Signal(_copyFence.Get(), _lastCopyFence);
+            // 轮转位记账(FfxofContext 同款:先记后 ++,acquire 侧同式回读)。
+            _lastUseFence[_submitSeq % kClDepth] = _copyFence.Get();
+            _lastUseValue[_submitSeq % kClDepth] = _lastCopyFence;
+            ++_submitSeq;
         } else {
             // 拷贝失败:清零 + 重置(下帧重新播种)。失败必须进 timing log。
             char msg[128];
@@ -725,19 +764,25 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             // copy/execute(execute(n+1) 的输入栅栏点 k_{n+1} > k'_n),
             // 封死“下一帧覆写 flow 而本帧 densify 未读”的窗口。
             if (result.waitFenceValue && postExecute) {
-                // 分配器此刻应当空闲:doneFence m_n 蕴含 copyFence k_n
-                // (引擎先等输入再置输出);失败则按失败帧降级。
-                densifyPending = SUCCEEDED(_copyAllocator->Reset()) &&
-                                 SUCCEEDED(_copyCommandList->Reset(_copyAllocator.Get(), nullptr));
+                // 轮转池取 CL(2026-09-25):本位上一使用者 = 前一帧 densify,
+                // 其完成被 execute(n) 的输入栅栏点(copyFence >= k'_{n-1})
+                // 蕴含,而 execute 输出 CPU 等已落位 —— AcquireCl 常态即刻
+                // 返回;失败按失败帧降级。
+                ID3D12CommandAllocator *densAlloc = nullptr;
+                ID3D12GraphicsCommandList *densCl = nullptr;
+                densifyPending = AcquireCl(&densAlloc, &densCl, freq);
                 if (densifyPending) {
-                    postExecute(_copyCommandList.Get(), cur);
-                    densifyPending = SUCCEEDED(_copyCommandList->Close());
+                    postExecute(densCl, cur);
+                    densifyPending = SUCCEEDED(densCl->Close());
                 }
                 if (densifyPending) {
-                    ID3D12CommandList *lists[]{ _copyCommandList.Get() };
+                    ID3D12CommandList *lists[]{ densCl };
                     queue->ExecuteCommandLists(1, lists);
                     _lastCopyFence = ++_copySeq;
                     queue->Signal(_copyFence.Get(), _lastCopyFence);
+                    _lastUseFence[_submitSeq % kClDepth] = _copyFence.Get();
+                    _lastUseValue[_submitSeq % kClDepth] = _lastCopyFence;
+                    ++_submitSeq;
                 } else {
                     // densify 提交失败:本帧运动场未生成,按失败帧降级。
                     TimingStatusLine("DLSSNR STATUS: nvof densify submit failed");
