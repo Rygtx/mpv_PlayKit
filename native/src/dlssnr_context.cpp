@@ -3292,7 +3292,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             NvofContext *nvStats =
                 (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                     ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
-            char body[1016]; // 上限 = StatsPayload.json(1024-8);rtx 键入体后余量收紧
+            char body[2040]; // 上限 = StatsPayload.json(2048-8);v25 扩容后余量充足
             // FG 状态:on = 本帧有真插值(附当前倍数);dup = 复制真实帧
             // (复位/零光流/面板关/降级);off = 本会话未激活;unavailable =
             // official 初始化或 eval 失败闩停(帧率仍 ×M,内容为复制帧)。
@@ -3311,6 +3311,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      "{\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
+                     "\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
                      "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d,"
@@ -3324,6 +3325,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      SK_NVOF_LAST, nvofLast, SK_FG_LAST, fgLast,
                      SK_RTXVSR_LAST, rtxVsrLast, SK_RTXHDR_LAST, rtxHdrLast,
                      SK_CONV_LAST, convLast,
+                     SK_QUEUE_LAST, queueWaitMs, SK_OF_ENGINE_LAST, ff->ofEngineMs,
                      SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
                      SK_WIDTH, _width, SK_HEIGHT, _height,
                      SK_SCALING, _d3d12->HasScaling() ? 1 : 0,

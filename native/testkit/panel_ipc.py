@@ -32,6 +32,8 @@ SK = {
     "rtxvsr_last": "rtxvsr_last",
     "rtxhdr_last": "rtxhdr_last",
     "conv_last": "conv_last",
+    "queue_last": "queue_last",
+    "of_engine_last": "of_engine_last",
     "nvof_last": "nvof_last",
     "unpack_last": "unpack_last",
     "internal_w": "internal_w",

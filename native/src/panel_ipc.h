@@ -23,7 +23,9 @@ constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive"; // filter-lifetime 
 // v19 起 1024:stats JSON 加了 fg 路由/失败原因/排队细分等 8 个键,512 的
 // body 在长 GPU 名 + 能力串下已逼近截断线(PublishStatsJson 超长静默截断 =
 // 尾键丢失,面板读不到还不报错)。参数结构体本身 ~140B,扩容无布局影响。
-constexpr uint32_t PAYLOAD_SIZE = 1024;
+// v25 起 2048:账目诚实化新增 queue/of_engine 两键,1024 的 json 已无余量
+// (v19 同族截断风险)。混跑安全:小视图映射大对象合法,旧面板只看前 1024B。
+constexpr uint32_t PAYLOAD_SIZE = 2048;
 // "DSSL6": v3 added the four residual fine-control floats; v4 drops the
 // write-only resetRequest command field (a reset is just a payload full of
 // default values); v5 adds motionVectorQuality (NVOF 光流质量 0-5); v6 adds
@@ -263,7 +265,17 @@ inline constexpr const char *SK_RTXHDR_LAST = "rtxhdr_last";
 // →YUV420 + readback)+ 逐 gen 转换;NR 关直连帧并入 base CL 的 C1 补做
 // 窗口。此前转换粘在 base/fg CL 被错记进 gpu/fg 段(VSR-only 时 fg 段
 // 3.5-8.9ms 实为 VSR 输出转换)。恒非 0(格式契约必需)。
+// v25 账目诚实化:GPU 时间戳括号,本键 = post CL 纯执行(其跨队列栅栏
+// 等待与队列积压不再折入 —— 那归 queue_last)。
 inline constexpr const char *SK_CONV_LAST = "conv_last";
+// 帧间排队段(v25 账目诚实化):base CL 的 preBase 时间戳时刻 − base 提交
+// 时刻 = burst 等待上一帧尾部/队列空闲。引擎超预算(如 NVOF of=4/5)推挤
+// 下一帧时在此显形 —— 此前这笔账被 nrOff 折叠误记进 conv。
+inline constexpr const char *SK_QUEUE_LAST = "queue_last";
+// 冲刷点引擎等待(v25 账目诚实化):NVOF execute 输出栅栏在冲刷点
+// (FlushPendingDensify)的 CPU 墙钟,逐帧携带不跨帧。FFX 恒 0(无独立
+// 引擎);NVOF of=2 ≈11-13ms(已被 eval/FG 录制重叠吸收,不在关键路径)。
+inline constexpr const char *SK_OF_ENGINE_LAST = "of_engine_last";
 // NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
 // 或无消费者(NR 关 + FG 关,解耦后整段跳过)时恒 0,面板零值段自动隐藏)。
 // 与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
