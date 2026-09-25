@@ -92,9 +92,13 @@ class ParamsChannel:
             vals["residualMultiplier"], vals["residualSaturation"],
             vals["residualLightness"], vals["shadowStructure"], vals["reflectionGlow"],
             vals["scalingEnabled"], vals["saveRequest"], vals["logEnabled"],
-            vals["motionVectorQuality"], vals["nvofFollowScaling"],
+            vals["motionVectorQuality"], vals["ffxQuality"], vals["nvofFollowScaling"],
             vals["fgEnabled"], vals["fgMultiplier"], vals["fgRoute"],
-            vals["nrEnabled"], vals["debugView"])
+            vals["nrEnabled"], vals["debugView"], vals["ofBackend"],
+            vals["vsrMode"], vals["vsrScale"], vals["vsrStrength"],
+            vals["hdrEnabled"], vals["hdrContrast"], vals["hdrSaturation"],
+            vals["hdrMiddleGray"], vals["hdrMaxLuminance"], vals["fgHdrInterp"])
+        assert len(data) == _STRUCT.size, "PanelPayload pack 布局与 panel_ipc.h 不一致"
         ctypes.memmove(ctypes.c_void_p(self._view), data, len(data))
 
     def read(self):

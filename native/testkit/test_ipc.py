@@ -28,7 +28,10 @@ ch = panel_ipc.ParamsChannel()
 
 clip = core.std.BlankClip(width=640, height=480, length=100000,
                           format=vs.YUV420P8, color=[122, 142, 116])
-ret = core.dlssnr.Enhance(clip)  # scaling 默认 ON at res=100
+# 显式开 NR:出厂默认 nr=0(2026-09-23 改档)会让全关实例走纯直通
+# (ProcessFrame/ConsumeRebuild 不再执行)—— payload 的 create-time 参数
+# 无人消费,rebuild 契约就测不到了。
+ret = core.dlssnr.Enhance(clip, nr_enabled=1)  # scaling 默认 ON at res=100
 ret.get_frame(0)
 n = [5]
 

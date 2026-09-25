@@ -11,6 +11,13 @@ import vapoursynth as vs  # noqa: E402
 
 core = vs.core
 src = core.std.BlankClip(width=320, height=240, format=vs.YUV420P8, length=10, fpsnum=24)
+# 环境前提:proxy 未部署是本测试的触发条件。部署树带了 0.3.x hook 代理
+# (ngx/version.dll)时 FG 真激活(官方链经 hook 交付)→ 降级路径前提失效,
+# 交由部署无 proxy 的环境覆盖(对称于 fg_live 的官方链不可用 SKIP)。
+ngx_dir = os.path.join(os.path.dirname(testenv.INI), "ngx")
+if os.path.exists(os.path.join(ngx_dir, "version.dll")):
+    print("FG FALLBACK SKIP: 部署树带 hook 代理,FG 正常激活;降级路径需无 proxy 环境")
+    sys.exit(0)
 ret = core.dlssnr.Enhance(src, fg_enabled=1, motion_vector_quality=0)
 
 info = ret.get_frame(0)
