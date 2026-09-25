@@ -81,7 +81,7 @@ public:
     // 插值槽 1..M-1(同源帧内必须按序调用 —— 官方 MFG 契约)。cl = 槽命令
     // 列表;资源状态契约:backbuffer/mvec/depth = NSR,interpOut = UAV
     // (调用方负责屏障)。reset=true 的 eval 属于重置帧,输出不消费。返回
-    // false 时调用方降级复制真实帧;连续失败由本类闩锁(_ready=false)停用
+    // false 时调用方降级复制真实帧;eval 首败即由本类闩锁(_ready=false)停用
     // 整个 FG 会话。
     bool Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *backbuffer,
                   ID3D12Resource *mvec, ID3D12Resource *depth,
@@ -121,6 +121,7 @@ private:
     unsigned long long _frameId = 0; // DLSSG.BackbufferFrameID 单调计数
     int _width = 0;
     int _height = 0;
+    DXGI_FORMAT _format = DXGI_FORMAT_UNKNOWN; // feature 创建时的 backbuffer 格式(Rebuild 热复用键)
     int _maxGen = kFgMultMax - 1; // 运行库插值帧上限(能力键覆写)
     // ColorBuffersHDR(恒 false,2026-09-24 PQ 域插帧定案):DLSSG 的 HDR
     // 路径对 >1.0 的 scRGB 线性值不保真(插值帧高光钳 ~0.875);实验

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
 #include <new>
 
 #pragma comment(lib, "shell32.lib")
@@ -31,6 +32,44 @@ struct BridgeState {
 };
 
 BridgeState *g_bridge = nullptr; // one live bridge at a time (last filter wins)
+
+// Bridge 生命周期串行(2026-09-25):VS 的 filter free/create 顺序不保证,
+// 旧实例 Free 的 BridgeStop 与新实例 Create 的 handoff BridgeStop 可并发
+// 通过同一 params 检查 → 双 CloseHandle + double delete(堆损坏);摘除与
+// 置空之间的悬垂窗口还会让 Create 读到已释放指针。检查→停→delete→置空
+// 全体在本锁内串行(plugin.cpp 的 create/free 生命周期锁之外层,锁序
+// lifecycle → bridge 单向)。
+std::mutex g_bridgeMutex;
+
+// 锁内实现(BridgeStart 的 handoff 与 BridgeStop 共用;调用方持锁)。
+void BridgeStopLocked(BridgeState *state) noexcept {
+    state->running = false;
+    if (state->thread) {
+        const DWORD wait = WaitForSingleObject(state->thread, 5000);
+        CloseHandle(state->thread);
+        state->thread = nullptr;
+        if (wait != WAIT_OBJECT_0) {
+            // The thread is wedged (e.g. blocked writing the ini on a stalled
+            // disk). Deleting `state` now would free objects the resumed
+            // thread still dereferences — leak the tiny state block instead
+            // of risking a use-after-free; the thread exits on its own once
+            // the block clears. The alive event / mapping handles are
+            // process-lifetime either way.
+            TimingStatusLine("DLSSNR STATUS: bridge stop TIMED OUT (5s); state leaked, thread wedged");
+            if (g_bridge == state) g_bridge = nullptr;
+            return;
+        }
+    }
+    // The alive event and the params mapping are process-lifetime (see the
+    // globals): deliberately NOT closed here. mpv re-creates the whole VS
+    // core on every seek; a per-instance event made the panel watchdog exit
+    // and the relaunched panel push factory defaults mid-playback. When mpv
+    // exits, the kernel reclaims the handles and the panel's OpenEventW poll
+    // starts failing — the watchdog semantics are unchanged.
+    TimingStatusLine("DLSSNR STATUS: bridge stopped");
+    delete state;
+    if (g_bridge == state) g_bridge = nullptr;
+}
 
 // Process-lifetime handles (the DLL is pinned, so "process" == one mpv
 // playback session). The alive event, the edit-notification event and the
@@ -300,6 +339,14 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
 // 经 BridgeAdoptPanelPayload 覆盖 vpy 参数,哈希类测试必须无面板运行)。
 void LaunchPanelSilently() noexcept {
     if (GetEnvironmentVariableA("VSDLSSNR_NO_PANEL", nullptr, 0) != 0) return;
+    // 单实例预检(2026-09-25):面板在跑(单实例 mutex 存在)就跳过拉起。
+    // 原实现每次 seek 都真实 ShellExecute 一次新进程(面板侧撞 mutex 即退,
+    // "进程层面 no-op,成本层面不是")—— 每次约 5-20ms 进程创建 + 依赖加
+    // 载 + 一行日志写盘。mutex 消失的面板死亡场景自然穿透预检,照常拉起。
+    if (HANDLE exists = OpenMutexW(SYNCHRONIZE, FALSE, L"vs_dlssnr_panel_single")) {
+        CloseHandle(exists); // 仅作存在性探测
+        return;
+    }
     wchar_t dir[MAX_PATH], exePath[MAX_PATH];
     if (!GetSelfDir(dir, MAX_PATH)) return;
     if (wcslen(dir) + 1 + wcslen(PANEL_EXE) >= MAX_PATH) return;
@@ -317,6 +364,7 @@ void LaunchPanelSilently() noexcept {
 } // namespace
 
 bool BridgeStart(SharedParams *params) noexcept {
+    std::lock_guard<std::mutex> lock(g_bridgeMutex);
     if (g_bridge) {
         if (g_bridge->params == params) return true;
         // A newer filter instance is going live while the previous one is
@@ -325,7 +373,7 @@ bool BridgeStart(SharedParams *params) noexcept {
         // below would stop the only bridge and the new instance would never
         // see another panel edit.
         TimingStatusLine("DLSSNR STATUS: bridge ownership handoff (new filter instance)");
-        BridgeStop(g_bridge->params);
+        BridgeStopLocked(g_bridge);
     }
     auto *state = new (std::nothrow) BridgeState();
     if (!state) {
@@ -367,34 +415,10 @@ bool BridgeStart(SharedParams *params) noexcept {
 }
 
 void BridgeStop(SharedParams *params) noexcept {
+    std::lock_guard<std::mutex> lock(g_bridgeMutex);
     BridgeState *state = g_bridge;
     if (!state || state->params != params) return; // newer instance owns the bridge
-    state->running = false;
-    if (state->thread) {
-        const DWORD wait = WaitForSingleObject(state->thread, 5000);
-        CloseHandle(state->thread);
-        state->thread = nullptr;
-        if (wait != WAIT_OBJECT_0) {
-            // The thread is wedged (e.g. blocked writing the ini on a stalled
-            // disk). Deleting `state` now would free objects the resumed
-            // thread still dereferences — leak the tiny state block instead
-            // of risking a use-after-free; the thread exits on its own once
-            // the block clears. The alive event / mapping handles are
-            // process-lifetime either way.
-            TimingStatusLine("DLSSNR STATUS: bridge stop TIMED OUT (5s); state leaked, thread wedged");
-            g_bridge = nullptr;
-            return;
-        }
-    }
-    // The alive event and the params mapping are process-lifetime (see the
-    // globals): deliberately NOT closed here. mpv re-creates the whole VS
-    // core on every seek; a per-instance event made the panel watchdog exit
-    // and the relaunched panel push factory defaults mid-playback. When mpv
-    // exits, the kernel reclaims the handles and the panel's OpenEventW poll
-    // starts failing — the watchdog semantics are unchanged.
-    TimingStatusLine("DLSSNR STATUS: bridge stopped");
-    delete state;
-    g_bridge = nullptr;
+    BridgeStopLocked(state);
 }
 
 } // namespace vsdlssnr

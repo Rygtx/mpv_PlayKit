@@ -86,6 +86,9 @@ struct FilterData {
     int subW = 1;  // 输入色度抽取档(420=(1,1) 422=(1,0) 444=(0,0));RGB=0
     int subH = 1;
     bool isRgb = false; // VS RGBP 计划族直读(零矩阵)
+    // resize watcher 停事件句柄(匿名 auto-reset;Free 时 SetEvent+Close,
+    // watcher 线程生命周期与实例对齐)。
+    HANDLE resizeWatchStop = nullptr;
     // RTX Video 输出几何(init 后从 context 读回;输出帧按此建)。
     int outW = 0;
     int outH = 0;
@@ -182,6 +185,15 @@ HotContext &Hot() {
     static HotContext *inst = new HotContext();
     return *inst;
 }
+
+// create/free 生命周期串行(2026-09-25):VS 的 filter free/create 顺序不
+// 保证,旧实例 Free 的"停放"与新实例 Create 的"热匹配/冷初始化"可并发 ——
+// 热匹配摘取与停放是 check-then-act,并发可双摘/悬垂;冷初始化在旧上下文
+// 仍持 IAT hook owner 时强启会被 CAS 拒载(FG 代理链静默失效)+ 双设备短
+// 暂并存。create 侧从热匹配判定到冷初始化结束持锁,free 侧从 BridgeStop
+// 到停放完成持锁;冷初始化 ~1s,并发的对方最多等一个冷启动周期。
+// 锁序:本锁 → bridge::g_bridgeMutex(单向,无反向获取)。
+std::mutex g_lifecycleMutex;
 
 } // namespace
 
@@ -315,6 +327,7 @@ namespace {
 
 struct ResizeWatchCtx {
     int srcW, srcH, refH;
+    HANDLE stop; // 匿名停事件(FilterData 持句柄,Free 时 SetEvent+Close)
 };
 
 std::atomic<int> g_resizeWatchers{ 0 };
@@ -322,19 +335,48 @@ std::atomic<int> g_resizeWatchers{ 0 };
 bool ResizeWatchSendSeek() noexcept {
     // mpv.conf 自定义管道名不追(自动跟随随 IPC 缺失优雅降级);三个
     // 默认名覆盖 mpvpipe/mpvsocket/umpv 全部常规部署。
+    // 写/读 overlapped + 500ms 有界(2026-09-25):原同步 ReadFile 无超时,
+    // mpv 挂起时本线程永久滞留 —— watcher 名额上限 2,滞留 = 自动跟随静默
+    // 失效到进程退出。
     for (const wchar_t *name : { L"mpvpipe", L"mpvsocket", L"umpv" }) {
         wchar_t path[MAX_PATH];
         swprintf_s(path, L"\\\\.\\pipe\\%s", name);
         HANDLE pipe = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-                                  0, nullptr, OPEN_EXISTING, 0, nullptr);
+                                  0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
+                                  nullptr);
         if (pipe == INVALID_HANDLE_VALUE) continue;
+        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ev) {
+            CloseHandle(pipe);
+            continue;
+        }
+        OVERLAPPED ov{};
+        ov.hEvent = ev;
         const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
+        const DWORD cmdLen = static_cast<DWORD>(strlen(cmd));
         DWORD written = 0;
-        const bool ok = WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)),
-                                  &written, nullptr) && written == strlen(cmd);
-        char ack[128]{};
-        DWORD got = 0;
-        ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr);
+        bool ok =
+            WriteFile(pipe, cmd, cmdLen, &written, &ov) ||
+            (GetLastError() == ERROR_IO_PENDING &&
+             WaitForSingleObject(ev, 500) == WAIT_OBJECT_0 &&
+             GetOverlappedResult(pipe, &ov, &written, FALSE));
+        ok = ok && written == cmdLen;
+        if (ok) {
+            ResetEvent(ev);
+            char ack[128]{};
+            DWORD got = 0;
+            if (!ReadFile(pipe, ack, sizeof(ack) - 1, &got, &ov) &&
+                GetLastError() == ERROR_IO_PENDING &&
+                WaitForSingleObject(ev, 500) != WAIT_OBJECT_0) {
+                CancelIoEx(pipe, &ov);
+                GetOverlappedResult(pipe, &ov, &got, TRUE);
+            }
+        } else {
+            CancelIoEx(pipe, &ov);
+            DWORD got = 0;
+            GetOverlappedResult(pipe, &ov, &got, TRUE);
+        }
+        CloseHandle(ev);
         CloseHandle(pipe);
         if (ok) {
             char msg[128];
@@ -349,10 +391,14 @@ bool ResizeWatchSendSeek() noexcept {
 
 DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
     std::unique_ptr<ResizeWatchCtx> ctx(static_cast<ResizeWatchCtx *>(param));
-    HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, vsdlssnr::ALIVE_EVENT);
     int drift = 0;
+    // 停靠匿名事件(2026-09-25):此前等 ALIVE_EVENT 的 WAIT_OBJECT_0 分支
+    // 是死代码(该事件 manual-reset 初始非信号、全仓无 SetEvent),watcher
+    // 只能靠自己触发 seek 或进程退出结束,期间 2.5Hz 全量 EnumWindows 空转,
+    // 且线程生命周期不受实例释放约束。现在 FilterData 持停事件句柄,Free
+    // 时 SetEvent —— 实例与线程生命周期对齐。
     for (;;) {
-        const DWORD w = ev ? WaitForSingleObject(ev, 400) : WAIT_TIMEOUT;
+        const DWORD w = WaitForSingleObject(ctx->stop, 400);
         if (w == WAIT_OBJECT_0) break; // 滤镜已释放(重建/热停泊/关停)
         const DisplayPick d = DetectTargetSize(ctx->srcW, ctx->srcH);
         if (d.height <= 0) { drift = 0; continue; } // 窗口暂不可见,不积累
@@ -369,7 +415,6 @@ DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
         }
         break; // 重建带来新探测值与新 watcher
     }
-    if (ev) CloseHandle(ev);
     g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
     return 0;
 }
@@ -513,7 +558,10 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     // 的会话:NR 关由 ProcessFrame 内部门控(跳过降噪评估,补帧/光流照常
     // —— 输出仍是增强管线的产物),不走此直通。开关边沿向面板发一次状态
     // (见 nrPubState 注释)。
-    const bool nrLive = d->params->Snapshot().nrEnabled != 0;
+    // 单帧一次参数快照(2026-09-25:此前此处与 FG 段各取一次,缓存命中
+    // 路径的第二次全量拷贝+shared_lock 无效;单快照同时保证帧内语义同源)。
+    const DlssnrParams frameParams = d->params->Snapshot();
+    const bool nrLive = frameParams.nrEnabled != 0;
     const int nrPub = nrLive ? 1 : 0;
     if (d->nrPubState.exchange(nrPub) != nrPub) {
         // 解耦后(a2e6ae0)live 会话的真相恒由逐帧 stats 携带
@@ -552,7 +600,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         // 播种源帧(k=0)仅真实帧:无消费槽,不带插值平面(eval 门随之关闭,
         // 历史重置留给首个插值组,与其对齐 Magpie 的 reset 帧不发布插值)。
         const int m0 = d->fgCreateMult;
-        const DlssnrParams snap = d->params->Snapshot();
+        const DlssnrParams &snap = frameParams;
         int effM = snap.fgEnabled
                        ? (std::min)(std::clamp(snap.fgMultiplier, kFgMultMin, kFgMultMax), m0)
                        : 1;
@@ -870,6 +918,17 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
     // + NGX contexts themselves move into the hot context instead of being
     // destroyed: mpv re-runs the VS script on every seek, and a warm context
     // makes the next filter instance near-free to create.
+    // 生命周期锁:与并发 create 的热匹配/冷初始化串行(见 g_lifecycleMutex
+    // 定义处注释)。BridgeStop 的 5s 上限在此锁内,极端 wedge 场景会推迟
+    // 并发的 create —— 正确性优先。
+    std::lock_guard<std::mutex> lifecycleLock(g_lifecycleMutex);
+    // 停掉本实例的 resize watcher(实例与线程生命周期对齐;watcher 线程
+    // 检测到事件即自行退出,无需等待)。
+    if (d->resizeWatchStop) {
+        SetEvent(d->resizeWatchStop);
+        CloseHandle(d->resizeWatchStop);
+        d->resizeWatchStop = nullptr;
+    }
     vsdlssnr::BridgeStop(d->params.get());
     // FG 缓存帧:最后一个引用(缓存自留),先于 filter 释放。
     for (int i = 0; i < kFgMultMax; ++i) {
@@ -1102,6 +1161,9 @@ static void VS_CC DlssnrCreate(
     // = 纯直通零 GPU)。ctx 载荷从合并后的 DlssnrParams 折出(probe 已在
     // ResolveRtxParams 填入)。
     const RtxVideoParams rtx = RtxFromParams(initial);
+    // 生命周期锁:覆盖热匹配判定 → 冷初始化结束(见 g_lifecycleMutex 定义
+    // 处注释)。冷初始化 ~1s 在锁内 —— 并发的 Free 最多等一个冷启动周期。
+    std::lock_guard<std::mutex> lifecycleLock(g_lifecycleMutex);
     const bool rtxRequested = rtx.vsrMode > 0 || rtx.hdrEnabled != 0;
     const bool hotMatch = (initial.nrEnabled || initial.fgEnabled || rtxRequested) &&
                           Hot().valid &&
@@ -1253,14 +1315,20 @@ static void VS_CC DlssnrCreate(
         // 的探测值。
         if (d->params->Snapshot().rtxVsrMode == 1 &&
             g_resizeWatchers.load(std::memory_order_relaxed) < 2) {
-            g_resizeWatchers.fetch_add(1, std::memory_order_relaxed);
-            auto *wctx = new ResizeWatchCtx{ d->width, d->height, initial.rtxVsrAutoHeight };
-            HANDLE th = CreateThread(nullptr, 0, ResizeWatchProc, wctx, 0, nullptr);
-            if (th) {
-                CloseHandle(th);
-            } else {
-                delete wctx;
-                g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
+            HANDLE stop = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset 停旗
+            if (stop) {
+                g_resizeWatchers.fetch_add(1, std::memory_order_relaxed);
+                auto *wctx = new ResizeWatchCtx{ d->width, d->height,
+                                                 initial.rtxVsrAutoHeight, stop };
+                HANDLE th = CreateThread(nullptr, 0, ResizeWatchProc, wctx, 0, nullptr);
+                if (th) {
+                    CloseHandle(th);
+                    d->resizeWatchStop = stop; // 句柄归 FilterData,Free 时 SetEvent+Close
+                } else {
+                    delete wctx;
+                    CloseHandle(stop);
+                    g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
+                }
             }
         }
     }

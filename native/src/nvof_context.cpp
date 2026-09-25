@@ -782,12 +782,23 @@ void NvofContext::WaitCopyIdle() noexcept {
     if (!_lastCopyFence || _copyFence->GetCompletedValue() >= _lastCopyFence) return;
     LARGE_INTEGER t0{}, t1{}, tf{};
     QueryPerformanceCounter(&t0);
-    _copyFence->SetEventOnCompletion(_lastCopyFence, _copyFenceEvent);
-    WaitForSingleObject(_copyFenceEvent, 10000);
+    // 循环复查(对齐 FFX 同名等待):_copyFenceEvent 是门内 pre-copy 等待
+    // 共享的 auto-reset 事件,单次 Wait 的唤醒可能被窃取 —— 见
+    // WaitFenceReached 注释。超时 = 在途拷贝未排空,不得视同完成让宿主复用
+    // upload 缓冲:对齐 FFX 的超时语义,会话退役(2026-09-25)。
+    const bool reached = WaitFenceReached(_copyFence.Get(), _lastCopyFence,
+                                          _copyFenceEvent, 10000);
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&tf);
     const double waitMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
                           static_cast<double>(tf.QuadPart);
+    if (!reached) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "DLSSNR STATUS: nvof copy fence timeout at slot release (%.0fms); session retired", waitMs);
+        TimingStatusLine(buf);
+        _ready.store(false, std::memory_order_release);
+        return;
+    }
     if (waitMs > 50.0) {
         char buf[96];
         snprintf(buf, sizeof(buf), "DLSSNR STATUS: nvof copy idle wait=%.0fms (in-flight copy backlog)", waitMs);

@@ -108,6 +108,7 @@ struct AppState {
                                // 可见的旧页会把 ini 无痕改写。恢复期内抑制页签落盘。
     int restoreFrames = 8;     // 恢复期重绘预算(帧);只在窗口可见时消耗
     double lastLiveWrite = 0.0;
+    double lastReseekWrite = 0.0; // reseek 独立节流戳(不挂 liveDirty)
     double lastStatsRead = 0.0;
     double lastSeekInitReseek = 0.0; // kStateNrSeekInit 兜底 reseek 去抖
     char status[160]{};
@@ -356,11 +357,34 @@ void WritePayload(bool saveRequest = false) noexcept {
 // 候选管道名解析(mpv.conf 的 input-ipc-server 优先,默认名/umpv 兜底),
 // reseek 与 HDR 打标两条 IPC 路径共用。返回 _wcsdup 的解析名(可 nullptr,
 // free(nullptr) 恒安全),candidates[4] 就绪;返回值须活过使用期。
+// 解析结果缓存(2026-09-25):成功命中后恒定缓存(同名命中不再重读);
+// 失败(未启用 IPC 等)留 1s 失败戳 —— 打标线程未连接时 ~4Hz 全量重读并
+// 解析 16KB mpv.conf 是永久性文件 IO,降到 ≤1Hz。conf 中途改动需面板重启
+// 才被看到(此前是下拍生效 —— 差异可接受,该场景实为"面板先于 mpv 启动"
+// 的主路径,首次失败 1s 后照常重读,覆盖 mpv 晚起)。
+static wchar_t *g_pipeResolved = nullptr; // 成功命中缓存
+static LARGE_INTEGER g_pipeFailQpc{};
+static bool g_pipeFailStamped = false;
+
 static wchar_t *ResolveMpvPipeCandidates(const wchar_t **candidates) noexcept {
     candidates[0] = nullptr;
     candidates[1] = L"mpvpipe";
     candidates[2] = L"mpvsocket";
     candidates[3] = L"umpv";
+    if (g_pipeResolved) {
+        candidates[0] = g_pipeResolved;
+        return _wcsdup(g_pipeResolved);
+    }
+    {
+        LARGE_INTEGER now{}, tf{};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&tf);
+        if (g_pipeFailStamped &&
+            now.QuadPart - g_pipeFailQpc.QuadPart < tf.QuadPart) {
+            candidates[1] = candidates[2] = candidates[3] = nullptr;
+            return nullptr; // 失败后 1s 内连默认名都跳过(整拍零 IO)
+        }
+    }
     wchar_t base[MAX_PATH];
     if (!BasePath(base, MAX_PATH)) return nullptr;
 
@@ -410,11 +434,20 @@ static wchar_t *ResolveMpvPipeCandidates(const wchar_t **candidates) noexcept {
         }
     }
 
+    if (parsedName) {
+        g_pipeResolved = _wcsdup(parsedName); // 命中缓存(进程期有效)
+    } else {
+        QueryPerformanceCounter(&g_pipeFailQpc);
+        g_pipeFailStamped = true; // 失败戳:1s 内调用方短路
+    }
     return parsedName;
 }
 
 // 面板→mpv IPC 单条命令:候选管道逐个尝试,写命令 + 读回执。cmd 须自带
 // 行尾 \n。命中管道名经 hitOut 带回。
+// 写/读均为 overlapped + 500ms 有界等待(2026-09-25):原实现同步无超时,
+// mpv 活着但不回包(渲染挂起)时 ReadFile 永久阻塞 —— 主线程 reseek 路径
+// 与打标线程共用本函数,主线程被拖死 = 面板 UI 整体冻结。
 bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
     const wchar_t *candidates[4];
     wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
@@ -425,13 +458,42 @@ bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
         wchar_t pipePath[MAX_PATH];
         swprintf_s(pipePath, L"\\\\.\\pipe\\%s", candidates[i]);
         HANDLE pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
-                                  0, nullptr, OPEN_EXISTING, 0, nullptr);
+                                  0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
+                                  nullptr);
         if (pipe == INVALID_HANDLE_VALUE) continue;
-        DWORD written = 0, got = 0;
-        ok = WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)), &written, nullptr) &&
-             written == strlen(cmd);
-        char ack[128]{};
-        ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr);
+        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ev) {
+            CloseHandle(pipe);
+            continue;
+        }
+        OVERLAPPED ov{};
+        ov.hEvent = ev;
+        const DWORD cmdLen = static_cast<DWORD>(strlen(cmd));
+        DWORD written = 0;
+        // 写入有界等待:ERROR_IO_PENDING 后等事件,超时视为该候选失败。
+        const bool wrote =
+            WriteFile(pipe, cmd, cmdLen, &written, &ov) ||
+            (GetLastError() == ERROR_IO_PENDING &&
+             WaitForSingleObject(ev, 500) == WAIT_OBJECT_0 &&
+             GetOverlappedResult(pipe, &ov, &written, FALSE));
+        ok = wrote && written == cmdLen;
+        if (ok) {
+            // 回执只做排空,成败不影响 ok(原语义);超时按无回执放行。
+            ResetEvent(ev);
+            char ack[128]{};
+            DWORD got = 0;
+            if (!ReadFile(pipe, ack, sizeof(ack) - 1, &got, &ov) &&
+                GetLastError() == ERROR_IO_PENDING &&
+                WaitForSingleObject(ev, 500) != WAIT_OBJECT_0) {
+                CancelIoEx(pipe, &ov);
+                GetOverlappedResult(pipe, &ov, &got, TRUE); // 收割中止态,防悬悬
+            }
+        } else {
+            CancelIoEx(pipe, &ov);
+            DWORD got = 0;
+            GetOverlappedResult(pipe, &ov, &got, TRUE);
+        }
+        CloseHandle(ev);
         CloseHandle(pipe);
         if (ok && hitOut && hitLen) {
             swprintf_s(hitOut, hitLen, L"%ls", candidates[i]);
@@ -527,33 +589,92 @@ bool JsonGetString(const char *body, const char *key, char *out, size_t outLen) 
     return true;
 }
 
+// Stats 映射句柄/视图进程级缓存(2026-09-25):两个消费方(UI 10Hz + 打标
+// 线程 ~4Hz)此前每拍 Open/Map/Unmap/Close 全套内核往返 + 页表工作;与插件
+// 侧协议(映射句柄进程级保留,panel_ipc.h 注释明示)对齐。插件重启 = 同名
+// 新 section(旧对象随创建者退出改名),靠 1Hz 新鲜度探针检出句柄失配后
+// 重开 —— CompareObjectHandles 动态加载(Win10 1607+,拿不到则视为恒匹配,
+// 退化为老语义:重启后等面板重启恢复)。
+HANDLE g_statsMapping = nullptr;
+void *g_statsView = nullptr;
+LARGE_INTEGER g_statsProbeQpc{};
+bool g_statsCmpHandlesOk = true;
+std::mutex g_statsCacheMutex; // 缓存初建/换新互斥(LoadStats 主线程 + 打标线程并发)
+
+bool StatsCmpSameObject(HANDLE a, HANDLE b) noexcept {
+    if (!g_statsCmpHandlesOk) return true; // 探针不可用:退化为恒匹配
+    using Fn = BOOL(WINAPI *)(HANDLE, HANDLE);
+    static Fn fn = []() -> Fn {
+        HMODULE k = GetModuleHandleW(L"kernel32.dll");
+        return k ? reinterpret_cast<Fn>(GetProcAddress(k, "CompareObjectHandles")) : nullptr;
+    }();
+    if (!fn) {
+        g_statsCmpHandlesOk = false;
+        return true;
+    }
+    return fn(a, b) != FALSE;
+}
+
+// 调用方必须持 g_statsCacheMutex(ReadStatsSnapshot 全程持锁)。
+bool EnsureStatsViewLocked() noexcept {
+    if (g_statsView) {
+        // 1Hz 探针:插件重启后同名 section 是新对象,旧视图会永久读到冻结
+        // 快照 —— 检出句柄失配即换新。
+        LARGE_INTEGER now{}, tf{};
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&tf);
+        if (now.QuadPart - g_statsProbeQpc.QuadPart < tf.QuadPart) return true;
+        g_statsProbeQpc = now;
+        HANDLE fresh = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
+        if (!fresh) return true; // 暂时打不开:沿用旧视图(老语义也如此)
+        if (StatsCmpSameObject(fresh, g_statsMapping)) {
+            CloseHandle(fresh);
+            return true;
+        }
+        UnmapViewOfFile(g_statsView);
+        g_statsView = nullptr;
+        CloseHandle(g_statsMapping);
+        g_statsMapping = fresh;
+    }
+    if (!g_statsMapping) {
+        g_statsMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
+        if (!g_statsMapping) return false;
+    }
+    if (!g_statsView) {
+        g_statsView = MapViewOfFile(g_statsMapping, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE);
+        if (!g_statsView) {
+            CloseHandle(g_statsMapping);
+            g_statsMapping = nullptr;
+            return false;
+        }
+        QueryPerformanceCounter(&g_statsProbeQpc);
+    }
+    return true;
+}
+
 // Stats 映射一拍快照(seq 门校验)。返回:2=有效(已拷入 *st);1=映射在
 // 但快照未稳(seq 翻转中/未发布),*badMagic 带回 magic 是否失配;0=映射
 // 不存在(插件未运行)。多读者安全:LoadStats(主线程,UI)与 HdrTagProc
-// (打标线程)各自调用,seq 协议只保证"拷贝期间计数器不动",读侧互不干扰。
+// (打标线程)各自调用,seq 协议只保证"拷贝期间计数器不动";ensure+拷贝+
+// 校验整体在 g_statsCacheMutex 内 —— 防止本线程拷贝期间另一线程的插件
+// 重启换新路径 unmap 同一视图。10Hz+4Hz 的节拍下锁竞争可忽略。
 static int ReadStatsSnapshot(StatsPayload *st, bool *badMagic) noexcept {
     *badMagic = false;
-    const HANDLE m = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
-    if (!m) return 0;
-    const StatsPayload *view =
-        static_cast<const StatsPayload *>(MapViewOfFile(m, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE));
-    bool valid = false;
-    if (view) {
-        // 混部署(新面板 + 旧插件的小映射)时按映射实际区域钳制拷贝量:
-        // 直接 sizeof(*st) 是标准意义上的越界读,分页粒度通常掩盖但不该赌。
-        MEMORY_BASIC_INFORMATION mbi{};
-        size_t copy = sizeof(*st);
-        if (VirtualQuery(view, &mbi, sizeof(mbi)) && mbi.RegionSize > 0 &&
-            mbi.RegionSize < sizeof(*st)) {
-            copy = mbi.RegionSize;
-        }
-        memcpy(st, view, copy);
-        *badMagic = st->magic != 0 && st->magic != STATS_MAGIC;
-        valid = st->magic == STATS_MAGIC && st->seq != 0 &&
-                st->seq == static_cast<const volatile StatsPayload *>(view)->seq;
-        UnmapViewOfFile(view);
+    std::lock_guard<std::mutex> lock(g_statsCacheMutex);
+    if (!EnsureStatsViewLocked()) return 0;
+    const StatsPayload *view = static_cast<const StatsPayload *>(g_statsView);
+    // 混部署(新面板 + 旧插件的小映射)时按映射实际区域钳制拷贝量:
+    // 直接 sizeof(*st) 是标准意义上的越界读,分页粒度通常掩盖但不该赌。
+    MEMORY_BASIC_INFORMATION mbi{};
+    size_t copy = sizeof(*st);
+    if (VirtualQuery(view, &mbi, sizeof(mbi)) && mbi.RegionSize > 0 &&
+        mbi.RegionSize < sizeof(*st)) {
+        copy = mbi.RegionSize;
     }
-    CloseHandle(m);
+    memcpy(st, view, copy);
+    *badMagic = st->magic != 0 && st->magic != STATS_MAGIC;
+    const bool valid = st->magic == STATS_MAGIC && st->seq != 0 &&
+                       st->seq == static_cast<const volatile StatsPayload *>(view)->seq;
     return valid ? 2 : 1;
 }
 
@@ -2264,9 +2385,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     // Single instance: repeated launches (e.g. filter reload auto-start) are
     // silent no-ops; the user opens the panel via the panel's own tray icon.
-    CreateMutexW(nullptr, TRUE, L"vs_dlssnr_panel_single");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        PanelLog("panel: duplicate launch exits (single-instance guard)");
+    // 退避重试(2026-09-25):mpv 快速重启时,bridge 立即拉起新面板,可能撞上
+    // 尚在退出的旧实例的 mutex(看门狗 500ms 周期内)—— 新实例直接退出、旧
+    // 实例随后也退出,之后直到下一次 seek 都没有面板。mutex 随持有者进程死
+    // 而释放,短退避重试 3 次即覆盖该窗口。
+    bool owned = false;
+    for (int attempt = 0; attempt < 3 && !owned; ++attempt) {
+        if (attempt) Sleep(500);
+        CreateMutexW(nullptr, TRUE, L"vs_dlssnr_panel_single");
+        owned = GetLastError() != ERROR_ALREADY_EXISTS;
+        if (!owned) {
+            PanelLog("panel: duplicate launch (attempt %d), retrying briefly", attempt + 1);
+        }
+    }
+    if (!owned) {
+        PanelLog("panel: single-instance guard held by a live panel; exiting");
         return 0;
     }
 
@@ -2427,23 +2560,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             WritePayload();
             g_app.liveDirty = false;
             g_app.lastLiveWrite = nowSec;
-            // 需要重建会话的变动:payload 落地后立即触发 mpv 原地 seek,
-            // 重建的滤镜实例即采纳新值(免手动拖进度条)。
-            if (g_app.reseekDirty) {
-                g_app.reseekDirty = false;
-                // 任意面板主动 reseek 都入闭环去抖戳:重建窗口内旧全关实例
-                // 会因 live 参数(nr=1)边沿发布 kStateNrSeekInit,下方闭环
-                // 若无此戳会对同一次开关重复 seek(幂等但多余)。
-                g_app.lastSeekInitReseek = nowSec;
-                // 失败不再无声:此前 IPC 不可达(mpv 未开 / input-ipc-server
-                // 未启用)时变动退化为"等下次手动 seek",面板零提示。
-                if (TriggerMpvReseek()) {
-                    snprintf(g_app.status, sizeof(g_app.status),
-                             "已通知 mpv 原地重载滤镜会话");
-                } else {
-                    snprintf(g_app.status, sizeof(g_app.status),
-                             "mpv IPC 不可达 —— 该变动需手动 seek 后生效");
-                }
+        }
+        // reseek 独立消费(2026-09-25):此前挂在 liveDirty 节流分支内,而
+        // "写入性能日志"复选框无条件清 liveDirty —— 窗口内先动创建参数再点
+        // 日志开关会把待发 reseek 连坐丢失(创建参数已随 payload 发出但 mpv
+        // 不重载,静默降级为"等手动 seek")。reseek 有自己的节流戳。
+        if (g_app.reseekDirty && nowSec - g_app.lastReseekWrite > 0.1) {
+            g_app.reseekDirty = false;
+            g_app.lastReseekWrite = nowSec;
+            // 任意面板主动 reseek 都入闭环去抖戳:重建窗口内旧全关实例
+            // 会因 live 参数(nr=1)边沿发布 kStateNrSeekInit,下方闭环
+            // 若无此戳会对同一次开关重复 seek(幂等但多余)。
+            g_app.lastSeekInitReseek = nowSec;
+            // 失败不再无声:此前 IPC 不可达(mpv 未开 / input-ipc-server
+            // 未启用)时变动退化为"等下次手动 seek",面板零提示。
+            if (TriggerMpvReseek()) {
+                snprintf(g_app.status, sizeof(g_app.status),
+                         "已通知 mpv 原地重载滤镜会话");
+            } else {
+                snprintf(g_app.status, sizeof(g_app.status),
+                         "mpv IPC 不可达 —— 该变动需手动 seek 后生效");
             }
         }
 

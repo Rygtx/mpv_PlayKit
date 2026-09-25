@@ -807,11 +807,9 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         SetErr(err, errLen, hr, "Close initial slot post command list failed");
         return false;
     }
-    slot.postFenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
-    if (!slot.postFenceEvent) {
-        SetErr(err, errLen, E_FAIL, "Create slot post fence event failed");
-        return false;
-    }
+    // postB 段无专用事件:postB 栅栏值消费方经 WaitFenceValuePublic 用
+    // fenceEvent/调用方自备事件等待,postFenceEvent 从无消费者(2026-09-25
+    // 删除 —— 原实现还构成重建路径句柄泄漏)。
 
     // 颜色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit,消 P10→BGRA8
     // 的 2bit 量化);RTX 会话回落 BGRA8(TrueHDR 拒 FP16,否决制实证
@@ -1215,16 +1213,14 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
 
     // 3) inputColor → stateAfter(NSR=NGX 待读;COMMON=skipEval);
     //    yuvIn 归位 COMMON(帧末全 COMMON 不变量,下一帧重新 COPY_DEST)。
-    D3D12_RESOURCE_BARRIER outBar[1]{
-        Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, stateAfter),
-    };
-    cl->ResourceBarrier(1, outBar);
-    D3D12_RESOURCE_BARRIER inBack[3];
+    //    4 条屏障一批(不同资源,无依赖;2026-09-25 合批)。
+    D3D12_RESOURCE_BARRIER tail[4];
+    tail[0] = Transition(slot.inputColor.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, stateAfter);
     for (int i = 0; i < 3; ++i) {
-        inBack[i] = Transition(slot.yuvIn[i].Get(),
-                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        tail[1 + i] = Transition(slot.yuvIn[i].Get(),
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
-    cl->ResourceBarrier(3, inBack);
+    cl->ResourceBarrier(4, tail);
 }
 
 bool D3D12Context::RecordReadbackCopy(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
@@ -1239,16 +1235,20 @@ bool D3D12Context::RecordReadbackCopy(ID3D12GraphicsCommandList &clRef, FrameSlo
     const DXGI_FORMAT yuvFmt = _outFmt;
     const int planeW[3]{ _outW, _outChromaW, _outChromaW };
     const int planeH[3]{ _outH, _outChromaH, _outChromaH };
+    // 屏障合批(2026-09-25):三平面 UAV→COPY_SOURCE 一批、拷贝、
+    // COPY_SOURCE→COMMON 一批(此前逐平面 1+1,FG 6x 每帧 36 次驱动调用;
+    // 平面间无依赖,纯重排)。RecordConvertInput 同款写法。
+    D3D12_RESOURCE_BARRIER toCopySrc[3];
+    for (int i = 0; i < 3; ++i) {
+        toCopySrc[i] = Transition(slot.yuvOut[i].Get(),
+                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+    cl->ResourceBarrier(3, toCopySrc);
     for (int i = 0; i < 3; ++i) {
         ID3D12Resource *dstBuf = fgGen >= 0 ? slot.readbackFg[fgGen][i].Get()
                                             : slot.readbackYuv[i].Get();
         const size_t dstPitch = fgGen >= 0 ? slot.readbackPitchFg[fgGen][i]
                                            : slot.readbackPitchYuv[i];
-        D3D12_RESOURCE_BARRIER toCopySrc[1]{
-            Transition(slot.yuvOut[i].Get(),
-                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        };
-        cl->ResourceBarrier(1, toCopySrc);
         D3D12_TEXTURE_COPY_LOCATION src{};
         src.pResource = slot.yuvOut[i].Get();
         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -1263,12 +1263,13 @@ bool D3D12Context::RecordReadbackCopy(ID3D12GraphicsCommandList &clRef, FrameSlo
         dst.PlacedFootprint.Footprint.Depth = 1;
         dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(dstPitch);
         cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        D3D12_RESOURCE_BARRIER backToCommon[1]{
-            Transition(slot.yuvOut[i].Get(),
-                       D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-        };
-        cl->ResourceBarrier(1, backToCommon);
     }
+    D3D12_RESOURCE_BARRIER backToCommon[3];
+    for (int i = 0; i < 3; ++i) {
+        backToCommon[i] = Transition(slot.yuvOut[i].Get(),
+                                     D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
+    cl->ResourceBarrier(3, backToCommon);
     return true;
 }
 
@@ -3328,6 +3329,16 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
 bool D3D12Context::RebuildScaling(int internalW, int internalH, char *err, size_t errLen) noexcept {
     // Replaces every slot's scaling textures; the caller must hold a PoolHold
     // (all slots idle, pool sealed) so no frame can still reference them.
+    // 恒等归一(2026-09-25):内部尺寸 == 源尺寸时,缩放/残差管线退化为
+    // 恒等全分辨率搬运(等尺寸 Lanczos2/Catmull-Rom,产出与直连逐位相同),
+    // 归一为 scaling-off —— 不建 6 张全尺寸中间纹理,全部消费方经
+    // HasScaling()==false 自动走直连。InternalSize 对 >=100% 已返回原尺寸,
+    // 此处兜住"scalingEnabled=1 + res=100"组合(出厂默认)每帧白付的
+    // 4 个全分辨率 pass。请求侧参数不动(面板如实显示用户请求)。
+    if (internalW >= _width && internalH >= _height) {
+        ClearScalingResources();
+        return true;
+    }
     for (int i = 0; i < kSlotCount; ++i) {
         ClearScalingForSlot(_slots[i]);
         if (!CreateScalingForSlot(_slots[i], internalW, internalH, err, errLen)) {
@@ -3992,8 +4003,13 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
         chromaPso = _psoPqCodesChroma.Get();
         break;
     default:
-        lumaPso = _psoConvertScaledLuma.Get();
-        chromaPso = _psoConvertScaledChroma.Get();
+        // 1:1(PIPE==OUT)改派直写 PSO:双线性 4-tap 的权重在恒等映射下
+        // 退化为单位冲激,但 4 次 load 一次不少 —— 直写单 load 省 4 倍读
+        // 带宽。逐位同价由函数头注释背书(2026-09-25)。
+        lumaPso = (srcW == _outW && srcH == _outH)
+                      ? _psoConvertOutLuma.Get() : _psoConvertScaledLuma.Get();
+        chromaPso = (srcW == _outW && srcH == _outH)
+                        ? _psoConvertOutChroma.Get() : _psoConvertScaledChroma.Get();
         break;
     }
     // ChromaStep:SDR 输出 = 输入布局(同格式出);HDR P10 输出恒 (2,2)。

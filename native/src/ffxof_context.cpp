@@ -473,6 +473,17 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             _gate.InvalidateHistory();
         }
 
+        // 播种帧对齐 NVOF 播种语义(of_backend.h 契约):发布零运动 + 携带
+        // NGX 重置。此前播种成功路径返回 realMotion 且不带重置 —— PARAM_RESET
+        // 只由播种帧携带,FFX 后端(默认)下每次 seek NR 都缺重置,时域历史
+        // 跨时间线泄漏(2026-09-25 修复)。本帧 densify 已照录,输出仅下帧
+        // 起被消费,不影响。
+        if (seed) {
+            result.publishZero = true;
+            result.historyReset = true;
+            result.waitFenceValue = 0;
+        }
+
         if (seed && densifyOk) _gate.MarkSeeded();
         _gate.Advance(frameIndex);
     }

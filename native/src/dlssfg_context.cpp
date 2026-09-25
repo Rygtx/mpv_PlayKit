@@ -217,6 +217,12 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
             std::snprintf(msg, sizeof(msg),
                           "DLSSNR STATUS: dlssfg official maxGen=%u", maxGen);
             TimingStatusLine(msg);
+        } else {
+            // 能力键读取失败(预 MFG 运行库:Available=1 但无此键)= 上限
+            // 不可知。保持默认 5 会让高倍数槽首 eval 报错 → 整会话停用;
+            // 保守回落 2x 保底(2026-09-25)。
+            _maxGen = 1;
+            TimingStatusLine("DLSSNR STATUS: dlssfg MultiFrameCountMax key missing; clamp 2x");
         }
     }
     // 函数指针 = 静态 SDK(Init 免除 —— core 已由 NR 初始化,FG feature
@@ -227,6 +233,7 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
 
     _width = width;
     _height = height;
+    _format = backbufferFormat;
     // ColorBuffersHDR 恒 0(2026-09-24 PQ 域插帧定案,与 FP16 格式解耦):
     // DLSSG 的 HDR 路径对 >1.0 的 scRGB 线性值不保真(插值帧高光钳 ~0.875 =
     // ~70 nits)。实验 fgHdrInterp 的 backbuffer 是 FP16 载 **PQ 码域**(≤1.0,
@@ -310,8 +317,8 @@ bool DlssfgContext::Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,
         if (err && errLen) std::snprintf(err, errLen, "dlssfg: rebuild on dead session");
         return false;
     }
-    if (_width == width && _height == height) {
-        return true; // 同尺寸热复用,历史由调用方显式 ResetHistory
+    if (_width == width && _height == height && _format == backbufferFormat) {
+        return true; // 同尺寸同格式热复用,历史由调用方显式 ResetHistory
     }
     {
         const bool released = SehCall([&] {
@@ -328,6 +335,7 @@ bool DlssfgContext::Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,
     }
     _width = width;
     _height = height;
+    _format = backbufferFormat;
     _colorHdr = false; // 恒 0:PQ 域插帧定案(见 Initialize 同名注释)
     if (!CreateFeatureOnCtl(width, height, backbufferFormat, err, errLen)) {
         _ready.store(false, std::memory_order_release);

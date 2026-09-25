@@ -90,7 +90,8 @@ struct FrameSlot {
     // 不提交,资源闲置无害。
     ComPtr<ID3D12CommandAllocator> postAllocator;
     ComPtr<ID3D12GraphicsCommandList> postCommandList;
-    HANDLE postFenceEvent = nullptr;  // postB 段栅栏等待专用事件
+    // postB 段无专用等待事件(无消费者,已于 2026-09-25 删除);
+    // postB 栅栏等待统一走 WaitFenceValuePublic + 事件入参。
     uint64_t postFenceValue = 0;      // postB 段提交的栅栏值
     uint64_t fgFenceValue = 0;        // postA(fg CL)提交的栅栏值(计时锚)
 
@@ -494,6 +495,9 @@ public:
     // 输入色度平面尺寸(subW/H 派生;dump/校验侧按真实布局读,勿再自推)。
     int ChromaWidth() const noexcept { return _chromaW; }
     int ChromaHeight() const noexcept { return _chromaH; }
+    // 输出色度平面几何(OUT 尺寸;RTX VSR 会话 yuvOut 在目标尺寸,与源不同)。
+    int OutChromaWidth() const noexcept { return _outChromaW; }
+    int OutChromaHeight() const noexcept { return _outChromaH; }
     bool IsRgb() const noexcept { return _isRgb; }
     // 管线色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit);RTX 会话
     // BGRA8(TrueHDR 拒 FP16,否决制);VSDLSSNR_NR_FORMAT=fp16/bgra8 强制

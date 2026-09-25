@@ -416,6 +416,9 @@ void DlssnrContext::SetCreateParametersUnsafe() noexcept {
     p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
     p->Set(PARAM_INDICATOR_INVERT_X, 0);
     p->Set(PARAM_INDICATOR_INVERT_Y, 0);
+    // 参数块重建(Init/RecreateFeature)后 eval 侧 tuning 缓存失效,强制
+    // 首帧重写。此处特征创建期无并发 eval,直接置标志。
+    _lastEvalTuningValid = false;
 }
 
 bool DlssnrContext::SetCreateParametersSafely(DWORD *sehCode) noexcept {
@@ -425,44 +428,42 @@ bool DlssnrContext::SetCreateParametersSafely(DWORD *sehCode) noexcept {
     }, false, sehCode);
 }
 
-void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory, bool realMotion) noexcept {
+void DlssnrContext::SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory, bool realMotion,
+                                                const DlssnrParams &params) noexcept {
     NVSDK_NGX_Parameter *p = _parameters;
-    const DlssnrParams params = _shared->Snapshot();
     // With internal-resolution scaling, NGX consumes/produces the reduced
     // textures; the residual composite then reconstructs the full-size output.
     const bool scaling = _d3d12->HasScaling();
-    const int ew = scaling ? _d3d12->InternalWidth() : _width;
-    const int eh = scaling ? _d3d12->InternalHeight() : _height;
     p->Set(PARAM_COLOR, scaling ? _d3d12->ReducedColor(slot) : _d3d12->InputColor(slot));
     p->Set(PARAM_OUTPUT, scaling ? _d3d12->ReducedDenoised(slot) : _d3d12->OutputColor(slot));
     // 真光流:缩放启用时消费降采样后的运动(内部尺寸,向量已换算到内部
     // 像素单位,MVecScale 保持 1);否则直接消费 densify 输出(源尺寸)。
     // realMotion=false → 静态零纹理(零 guidance 路径)。
     p->Set(PARAM_MVEC, _d3d12->MotionResource(slot, realMotion, scaling));
-    p->Set(PARAM_DEPTH, _d3d12->Depth());
-    SetSubrect(p, RESOURCE_PARAMETERS[0], ew, eh);
-    SetSubrect(p, RESOURCE_PARAMETERS[1], ew, eh);
-    SetSubrect(p, RESOURCE_PARAMETERS[2], ew, eh);
-    SetSubrect(p, RESOURCE_PARAMETERS[3], ew, eh);
-    p->Set(PARAM_MVEC_SCALE_X, 1.0f);
-    p->Set(PARAM_MVEC_SCALE_Y, 1.0f);
-    p->Set(PARAM_DEPTH_INVERTED, 1);
-    p->Set(PARAM_ENABLED, 1);
     p->Set(PARAM_RESET, resetHistory ? 1 : 0);
-    p->Set(PARAM_STYLE, params.style);
-    p->Set(PARAM_INTENSITY, params.intensity);
-    p->Set(PARAM_LOCAL_TONE, params.localToneStrength);
-    p->Set(PARAM_LOCAL_STRUCTURE, params.localStructureStrength);
-    p->Set(PARAM_SKIN_STRUCTURE, params.skinStructureStrength);
-    p->Set(PARAM_AUTO_MASK, params.useAutoMask ? 1 : 0);
-    // UICorrection 退役(v13):视频管线无 UI 图层,结构性 no-op。恒写模型
-    // 默认 1,防参数块复用时残留旧值静默生效(OptiScaler 显式写入策略)。
-    p->Set(PARAM_UI_CORRECTION, 1);
+    // tuning 键脏检查:params 块在 eval 间持久,值不变不重写(首帧/feature
+    // 重建后必写;_evaluateMutex 串行,缓存无竞争)—— evaluate 侧写入是
+    // mpv 路径 A/B DIFF 实测生效机制(见 SetCreateParametersUnsafe 注释),
+    // 这里只省不变值重写,不改变"逐帧侧写入"的生效语义。
+    const EvalTuning tuning{params.style, params.intensity, params.localToneStrength,
+                            params.localStructureStrength, params.skinStructureStrength,
+                            params.useAutoMask ? 1 : 0};
+    if (!_lastEvalTuningValid || tuning != _lastEvalTuning) {
+        _lastEvalTuning = tuning;
+        _lastEvalTuningValid = true;
+        p->Set(PARAM_STYLE, tuning.style);
+        p->Set(PARAM_INTENSITY, tuning.intensity);
+        p->Set(PARAM_LOCAL_TONE, tuning.localTone);
+        p->Set(PARAM_LOCAL_STRUCTURE, tuning.localStructure);
+        p->Set(PARAM_SKIN_STRUCTURE, tuning.skin);
+        p->Set(PARAM_AUTO_MASK, tuning.autoMask);
+    }
 }
 
-bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion, DWORD *sehCode) noexcept {
+bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion,
+                                                const DlssnrParams &params, DWORD *sehCode) noexcept {
     return NgxRuntimeGuard::Invoke([&] {
-        SetEvaluateParametersUnsafe(slot, resetHistory, realMotion);
+        SetEvaluateParametersUnsafe(slot, resetHistory, realMotion, params);
         return true;
     }, false, sehCode);
 }
@@ -569,7 +570,7 @@ bool DlssnrContext::Initialize(
         std::filesystem::path dir = dll.parent_path();
         std::filesystem::create_directories(dir, ec);
         const std::wstring dirStr = dir.wstring();
-        if (dirStr.size() >= MAX_PATH) return false;
+        if (dirStr.size() >= MAX_PATH) return fail("NGX snippet dir path too long");
         std::memcpy(_appDataPath, dirStr.c_str(), (dirStr.size() + 1) * sizeof(wchar_t));
     }
 
@@ -1091,8 +1092,10 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     if (resize) {
         // RTX 几何随源尺寸换算(必须先于 CreateFrameResources —— 资源按
         // 新几何建)。vsr 开:输出目标 _outH 绝对(显示器适配/手动高度),
-        // 宽按新源宽高比重推,pipe = min(目标, 新源×4);仅 hdr:pipe/out
-        // 跟随新源(TrueHDR 不缩放)。
+        // 宽按新源宽高比重推,pipe = min(目标, 新源×4);否则 pipe/out
+        // 跟随新源(TrueHDR 不缩放;plain-NR 同样跟随 —— 此前只在 _hdrActive
+        // 时更新,plain-NR 会话换尺寸后 UnpackOutput 按旧 _outW/_outH 回读,
+        // 潜伏写穿/裁切)。
         if (_vsrRequested) {
             const double ratio = static_cast<double>(_outH) / static_cast<double>(newHeight);
             const double cap = static_cast<double>(kVsrMaxScale);
@@ -1107,11 +1110,17 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         } else {
             _pipeW = newWidth;
             _pipeH = newHeight;
-            if (_hdrActive) {
-                _outW = newWidth;
-                _outH = newHeight;
-            }
+            _outW = newWidth;
+            _outH = newHeight;
         }
+        // 420 输出契约:全形态输出/管线尺寸强制偶(同 Initialize 的注释:
+        // 奇高色度面 floor/ceil 错位 = 静默堆腐蚀,2026-09-22 真机实锤)。
+        // 原 resize 分支缺此步,是三处潜伏缺陷之一(2026-09-25 修复;分支
+        // 当前不可达 —— hotMatch 尺寸恒等,修复为将来放开铺路)。
+        _outW &= ~1;
+        _outH &= ~1;
+        _pipeW &= ~1;
+        _pipeH &= ~1;
     }
     if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, newDepth, _fgRequested,
                                                 _pipeW, _pipeH, _outW, _outH,
@@ -1161,6 +1170,12 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
                 _curOfBackend = std::clamp(sp.ofBackend, kOfBackendMin, kOfBackendMax);
             } else {
                 _nvofFailed = true;
+                // 尺寸重建失败:旧会话尺寸必然已失配(触发本次重建的原因),
+                // 退役它 —— 否则旧会话尺寸项在 ProcessFrame 触发条件里每帧
+                // 为真 → RebuildOf 每帧封池风暴(2026-09-25)。降级零 guidance,
+                // 重试通道由 _nvofFailed 保留。
+                _retiredOf.push_back(std::move(_ofBackend));
+                _ofBackend = nullptr;
                 char msg[288];
                 std::snprintf(msg, sizeof(msg),
                               "DLSSNR STATUS: of resize failed (%s); zero guidance", ofErr);
@@ -1255,6 +1270,25 @@ std::unique_ptr<IOpticalFlowBackend> DlssnrContext::CreateOfBackend(
     return b;
 }
 
+bool DlssnrContext::SyncOfSession(const DlssnrParams &p, int srcW, int srcH,
+                                  bool allowRetry, char *err, size_t errLen) noexcept {
+    // 光流会话同步的单一裁决点:此前三份拷贝(Rebind 热路径/RecreateFeature
+    // 补齐/ProcessFrame)已互相漂移 —— 前两份含 _nvofFailed 重试项,帧路径
+    // 不含。统一在此,帧路径经 allowRetry=false 保持防风暴不对称。
+    const bool fgLive = _fg && _fg->Enabled() && p.fgEnabled != 0;
+    const bool follow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgLive;
+    const int nvW = follow ? _d3d12->InternalWidth() : srcW;
+    const int nvH = follow ? _d3d12->InternalHeight() : srcH;
+    const int backendReq = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
+    const int ofq = ResolveOfQuality(p); // clamp 在 helper 内(按后端值域)
+    bool stale = ofq != _curOfQuality || backendReq != _curOfBackend ||
+                 (ofq > 0 && _ofBackend &&
+                  (_ofBackend->Width() != nvW || _ofBackend->Height() != nvH));
+    if (!stale && ofq > 0 && allowRetry && _nvofFailed) stale = true;
+    if (!stale) return true;
+    return RebuildOf(ofq, nvW, nvH, err, errLen); // 失败仅降级零 guidance(调用方语义)
+}
+
 bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept {
     // 光流会话重建(quality / of_backend / 会话输入尺寸变化;follow 模式下
     // 会话输入 = 内部尺寸,由调用方传入 dstW/dstH)。只重建光流会话,NGX
@@ -1300,6 +1334,16 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
                 _nvofFailed = true;
                 _curOfQuality = q;
                 _curOfBackend = backendReq;
+                // 新会话建立失败且旧会话尺寸已失配当前尺寸:退役旧会话
+                // (弃引用不销毁,同 _retiredOf 语义)。否则旧会话尺寸项在
+                // ProcessFrame 的重建触发条件里每帧为真 → 每帧 PoolHold 封池
+                // + 重建尝试风暴(2026-09-25)。尺寸仍匹配的失败(纯档位切换
+                // 失败)保留旧会话继续复用,降级语义由 _nvofFailed 表达。
+                if (_ofBackend &&
+                    (_ofBackend->Width() != dstW || _ofBackend->Height() != dstH)) {
+                    _retiredOf.push_back(std::move(_ofBackend));
+                    _ofBackend = nullptr;
+                }
                 char msg[288];
                 std::snprintf(msg, sizeof(msg),
                               "DLSSNR STATUS: of init failed backend=%d quality=%d (%s); zero guidance",
@@ -1372,20 +1416,8 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         ResetNvofHistory();
         // 会话输入尺寸同步(follow = 开关 + scaling 状态 + FG 未激活;热路
         // 径下内部尺寸未变,除非 ini/payload 同时带了 res% 变化 —— 那会走
-        // 下方重建分支)。档位按后端取对应字段。
-        const bool fgHot = _fg && _fg->Enabled();
-        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgHot;
-        const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
-        const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
-        const int backendReq =
-            std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
-        const int ofq = ResolveOfQuality(p); // clamp 在 helper 内(按后端值域)
-        if (ofq != _curOfQuality || backendReq != _curOfBackend ||
-            (ofq > 0 && _ofBackend &&
-                (_ofBackend->Width() != nvW || _ofBackend->Height() != nvH)) ||
-            (ofq > 0 && _nvofFailed)) {
-            RebuildOf(ofq, nvW, nvH, err, errLen); // 失败仅降级零 guidance,热复用不受影响
-        }
+        // 下方重建分支)。档位按后端取对应字段。单一裁决点见 SyncOfSession。
+        SyncOfSession(p, _width, _height, /*allowRetry=*/true, err, errLen);
         char msg[160];
         std::snprintf(msg, sizeof(msg),
                       "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%dd%d internal=%dx%d)",
@@ -1400,20 +1432,9 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
                                         dimsChanged ? depth : -1);
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
     // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。会话输
-    // 入尺寸同样在此对齐(follow 开关/res% 变化)。
+    // 入尺寸同样在此对齐(follow 开关/res% 变化)。单一裁决点见 SyncOfSession。
     if (nvofOk) {
-        const bool fgHot = _fg && _fg->Enabled();
-        const bool rbFollow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgHot;
-        const int nvW = rbFollow ? _d3d12->InternalWidth() : _width;
-        const int nvH = rbFollow ? _d3d12->InternalHeight() : _height;
-        const int backendReq =
-            std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
-        const int ofq = ResolveOfQuality(p); // clamp 在 helper 内(按后端值域)
-        if (ofq != _curOfQuality || backendReq != _curOfBackend ||
-            (ofq > 0 && _ofBackend &&
-                (_ofBackend->Width() != nvW || _ofBackend->Height() != nvH)) || (ofq > 0 && _nvofFailed)) {
-            RebuildOf(ofq, nvW, nvH, err, errLen);
-        }
+        SyncOfSession(p, _width, _height, /*allowRetry=*/true, err, errLen);
     }
     return nvofOk;
 }
@@ -1520,18 +1541,13 @@ bool DlssnrContext::ProcessFrame(
     const int fgM = fgGateLive && fgDstPlanes && _d3d12->FgSlots()
                         ? std::clamp(fgMultiplier, kFgMultMin, kFgMultMax)
                         : 0;
-    const bool nvofFollow = frameParams.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgGateLive;
-    const int nvDstW = nvofFollow ? _d3d12->InternalWidth() : width;
-    const int nvDstH = nvofFollow ? _d3d12->InternalHeight() : height;
-    // 档位按后端取对应字段(NVOF→motionVectorQuality,FFX→ffxQuality)。
-    const int ofBackendReq =
-        std::clamp(frameParams.ofBackend, kOfBackendMin, kOfBackendMax);
-    const int ofq = ResolveOfQuality(frameParams); // clamp 在 helper 内(按后端值域)
-    if (ofq != _curOfQuality ||
-        ofBackendReq != _curOfBackend ||
-        (ofq > 0 && _ofBackend && (_ofBackend->Width() != nvDstW || _ofBackend->Height() != nvDstH))) {
+    // 单一裁决点见 SyncOfSession(allowRetry=false:帧路径不重试失败会话,
+    // 防逐帧封池风暴;重试在 rebind/recreate 边界)。follow 尺寸换算在
+    // helper 内。
+    {
         char nvofErr[160]{};
-        RebuildOf(ofq, nvDstW, nvDstH, nvofErr, sizeof(nvofErr));
+        SyncOfSession(frameParams, width, height, /*allowRetry=*/false,
+                      nvofErr, sizeof(nvofErr));
     }
     const ResidualControls residual{
         std::clamp(frameParams.residualMultiplier, kResidualMultMin, kResidualMultMax),
@@ -1564,7 +1580,7 @@ bool DlssnrContext::ProcessFrame(
     // (VSR/HDR/FG/输出转换)直连 C1 产物 inputColor(解耦:关闭的中间级
     // 不中转)。与诊断的 skipEval 互不相同:skipEval 连 NVOF/补帧一起跳
     // (测管线底价,直通拷贝保留)。
-    const bool nrOff = _shared->Snapshot().nrEnabled == 0;
+    const bool nrOff = frameParams.nrEnabled == 0;
     // RTX 实态(管线级常量,原定义在 eval 段后;前置到 C1 补做状态
     // uploadPost 之前 —— 纯定义上移,无行为变化):
     const bool vsrLive = _vsrRequested && !skipEval;
@@ -1915,7 +1931,7 @@ bool DlssnrContext::ProcessFrame(
         if (ProbeEnabled()) TimingStatusLine("PROBE: eval-locked"); // 临时探针(VSDLSSNR_PROBE=1)
         DWORD sehCode = 0;
         // NGX PARAM_RESET 只由帧序门的播种帧携带(大跳/回退/缺口的恢复路径)。
-        if (!SetEvaluateParametersSafely(*slot, nvofHistoryReset, realMotion, &sehCode)) {
+        if (!SetEvaluateParametersSafely(*slot, nvofHistoryReset, realMotion, frameParams, &sehCode)) {
             if (err && errLen) {
                 if (NgxRuntimeGuard::IsFaulted() && !sehCode) {
                     std::snprintf(err, errLen,
@@ -2206,7 +2222,9 @@ bool DlssnrContext::ProcessFrame(
     uint64_t hdrChainVal = 0;
     // per-eval 参数走本帧快照(面板质量/HDR 滑块逐帧生效;几何/形态仍按
     // 创建时的 _rtx)。clamp 在 helper 内的常量引用,越界面板值安全。
-    const DlssnrParams rtxLive = _shared->Snapshot();
+    // 单一快照语义:RTX 键与帧内其它消费同源 frameParams(此前此处再取一次
+    // 快照,NR 键旧 RTX 键新的分叉语义已消除)。
+    const DlssnrParams &rtxLive = frameParams;
     // 提交链探针:t3a(RTX eval 提交起点)→ 等待区起点 = 本帧全部 NGX
     // eval 的 CPU 提交耗时(vsr/hdr/dlssg 的参数录制,专用队列逐笔串行)。
     LARGE_INTEGER tSub0{}, tSub1{};
@@ -2701,6 +2719,10 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                                        bool *fgGenOk,
                                        char *err, size_t errLen,
                                        char *timingOut, size_t timingLen) noexcept {
+    // 续体所有权归 Finish(2026-09-25 修复逐帧泄漏:此前任何出口都不释放,
+    // 同步/拆分两路径每帧稳漏)。任何出口(含失败提前 return)在此统一释放。
+    struct FinishSelfDelete { FrameFinish *ff; ~FinishSelfDelete() { delete ff; } };
+    FinishSelfDelete ffGuard{ff};
     const bool vsTiming = timingOut && timingLen > 0;
     // t3b/t3c/t4 仅在本半段采样(WaitFrame 后/真实帧 unpack 后/插值帧 unpack 后)。
     LARGE_INTEGER t3b{}, t3c{}, t4{};
@@ -2932,6 +2954,9 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     }
                     // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
                     // Y/U/V 与 dump 对比,≤1-2 LSB;P10 = 右对齐 word)。
+                    // 尺寸 = OUT 平面几何(2026-09-25 修:此前用源尺寸 ff->width/
+                    // height,RTX VSR 会话 yuvOut 在 OUT 尺寸 → footprint 与
+                    // 资源不符,dump 必败 —— RTX 会话的 P8 转换验收假阴)。
                     {
                         const DXGI_FORMAT yuvDump = _d3d12->BitDepth() > 8
                                                         ? DXGI_FORMAT_R16_UNORM
@@ -2939,9 +2964,17 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                         const int cw = (ff->width + 1) >> 1, ch = (ff->height + 1) >> 1;
                         const int pw[3]{ ff->width, cw, cw };
                         const int ph[3]{ ff->height, ch, ch };
+                        const int ow[3]{ _outW, _d3d12->OutChromaWidth(),
+                                         _d3d12->OutChromaWidth() };
+                        const int oh[3]{ _outH, _d3d12->OutChromaHeight(),
+                                         _d3d12->OutChromaHeight() };
+                        const bool outSized = _rtxActive &&
+                                              (_outW != ff->width || _outH != ff->height);
+                        const int *dw = outSized ? ow : pw;
+                        const int *dh = outSized ? oh : ph;
                         const wchar_t *names[3]{ L"dump_y_plane.bin", L"dump_u_plane.bin", L"dump_v_plane.bin" };
                         for (int i = 0; i < 3; ++i) {
-                            dumpOrLog(_d3d12->YuvOutPlane(*ff->slot, i), pw[i], ph[i], names[i], yuvDump);
+                            dumpOrLog(_d3d12->YuvOutPlane(*ff->slot, i), dw[i], dh[i], names[i], yuvDump);
                         }
                     }
                 }
@@ -3043,11 +3076,6 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             g_timing.Push(gpuSegMs, packMs, ff->nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
             const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
             gpuLast = g_timing.gpu[lastIdx];
-            gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
-            packEma = TimingWindow::Ema(g_timing.pack, g_timing.count);
-            nvofEma = TimingWindow::Ema(g_timing.nvof, g_timing.count);
-            evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
-            unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
             // perf 行按时间门(≥1s 一行)而非帧数:诊断日志的样本密度不应
             // 随源帧率漂(60fps=1s 一行而 30fps=2s 一行)。静态量在
             // g_timingMutex 内读写,fmParallel 并发安全;首帧立即落一行。
@@ -3058,6 +3086,13 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                                  (nowQpc.QuadPart - lastPerfQpc.QuadPart) >= ff->qpcFreq.QuadPart;
             if (perfDue) lastPerfQpc = nowQpc;
             if (perfDue) {
+                // EMA×5 只被 perf 行消费(≥1s 一次),挪进门内,不再每帧
+                // 在 g_timingMutex 内白算 600 次浮点(2026-09-25)。
+                gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
+                packEma = TimingWindow::Ema(g_timing.pack, g_timing.count);
+                nvofEma = TimingWindow::Ema(g_timing.nvof, g_timing.count);
+                evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
+                unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
                 const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
                 const double slotEma = TimingWindow::Ema(g_timing.slotW, g_timing.count);
                 const double lockEma = TimingWindow::Ema(g_timing.lockW, g_timing.count);

@@ -5,6 +5,9 @@
 // 语义契约一致:
 //   - StageFrame 帧序门:迟到/缺口帧一律播种(publishZero),会话内部
 //     历史只接受按帧序的连续输入;
+//   - 播种帧(Seed/历史无效)必须 publishZero = historyReset = true 且
+//     waitFenceValue = 0(2026-09-25 钉死契约;NGX PARAM_RESET 只由播种帧
+//     携带,后端漏带 = seek 后 NR 时域历史跨时间线泄漏);
 //   - waitFenceValue != 0 = 本帧真运动已产出(realMotion 判据);
 //   - inputIndex >= 0 = 本帧输入槽位(迟到帧 -1,调用方据此补转换);
 //   - LastStageMs = 门内等待 + 提交 + CPU 等待合计(nvof 段计时同语义)。

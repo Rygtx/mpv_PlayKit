@@ -51,10 +51,13 @@ public:
     void Shutdown() noexcept;
 
     // Hot-context rebind: attach this kept-warm context (device, NGX feature,
-    // slot pool all alive) to a new filter instance's SharedParams — including
-    // one for a different video size or bit depth (frame resources + feature
-    // rebuild under the pool seal; only a changed snippet DLL forces a full
-    // re-init at the caller). The feature is rebuilt only when a create-time
+    // slot pool all alive) to a new filter instance's SharedParams. The
+    // frame-resources/feature rebuild branch for a CHANGED video size/depth
+    // (newWidth > 0) is currently unreachable: the caller's hotMatch requires
+    // size/depth/layout equality (a different size always takes the cold
+    // path). The branch is kept correct (2026-09-25: even-aligned geometry,
+    // plain-NR out-size update) for future enablement — do not rely on it.
+    // The feature is rebuilt only when a create-time
     // parameter (preset / input_resolution / scaling_enabled) or the
     // size/depth actually differs; otherwise it is free. Returns false (and
     // leaves _ready false) when the rebuild fails; the caller then falls back
@@ -77,6 +80,12 @@ public:
     // FFX→ffxQuality)。内部自取 PoolHold:调用方必须尚未持有槽位,且不得
     // 已在 PoolHold 之中。
     bool RebuildOf(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept;
+    // 光流会话同步单一裁决点(2026-09-25 收敛):follow 判定/尺寸换算/档位
+    // 解析/触发条件/重建调用在此。allowRetry = 会话级边界(rebind/recreate)
+    // 才置 true —— 帧路径不带 _nvofFailed 重试项,否则失败会话每帧触发
+    // RebuildOf 封池风暴(该不对称是防风暴关键,不是漂移)。
+    bool SyncOfSession(const DlssnrParams &p, int srcW, int srcH, bool allowRetry,
+                       char *err, size_t errLen) noexcept;
     // 光流历史失效(seek = 新时间线)。热 Rebind 上调用;下一帧重新播种。
     void ResetNvofHistory() noexcept;
 
@@ -111,7 +120,8 @@ public:
     // 段 + 槽释放(含 OF 排空)。成功 = 帧内容就绪;失败 = 调用方对本帧输出
     // 做源拷贝兜底(帧已入缓存、可能已被消费方领引用,尚未交付)。fgGenOk
     // 与 ProcessFrame 传入同一数组(Submit 半段填写,Finish 半段的 unpack
-    // 循环消费,调用方在其后读取)。
+    // 循环消费,调用方在其后读取)。续体所有权归 Finish:任何出口(含失败
+    // 提前 return)都由 Finish 释放,调用方不得再触碰(2026-09-25 契约)。
     bool ProcessFrameFinish(FrameFinish *defer,
                             uint8_t **dstPlanes, int64_t *dstStrides,
                             uint8_t **fgDstPlanes, int64_t *fgDstStrides,
@@ -149,8 +159,26 @@ private:
     NVSDK_NGX_Result SnippetShutdownSafely(DWORD *sehCode) noexcept;
     void SetCreateParametersUnsafe() noexcept;
     bool SetCreateParametersSafely(DWORD *sehCode) noexcept;
-    void SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory, bool realMotion) noexcept;
-    bool SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion, DWORD *sehCode) noexcept;
+    // NGX tuning 键缓存(脏检查;仅 _evaluateMutex 内消费,无并发)。feature
+    // 重建置 _lastEvalTuningValid = false 强制首帧重写。
+    struct EvalTuning {
+        int style;
+        float intensity, localTone, localStructure, skin;
+        int autoMask;
+        bool operator!=(const EvalTuning &o) const noexcept {
+            return style != o.style || intensity != o.intensity ||
+                   localTone != o.localTone || localStructure != o.localStructure ||
+                   skin != o.skin || autoMask != o.autoMask;
+        }
+    };
+    // 参数快照由调用方传入(ProcessFrame 的 frameParams,单一快照语义):
+    // 此前在 _evaluateMutex 临界区内再取一次锁+拷贝,且与帧内其它键不同源。
+    void SetEvaluateParametersUnsafe(FrameSlot &slot, bool resetHistory, bool realMotion,
+                                     const DlssnrParams &params) noexcept;
+    bool SetEvaluateParametersSafely(FrameSlot &slot, bool resetHistory, bool realMotion,
+                                     const DlssnrParams &params, DWORD *sehCode) noexcept;
+    EvalTuning _lastEvalTuning{};
+    bool _lastEvalTuningValid = false; // feature 重建时置 false(SetCreateParametersUnsafe 尾)
 
     // 死亡状态边缘发布(state = "passthrough" | "ngx_faulted",detail 为原因
     // 串,内部消毒)。发布即替换共享内存里的旧统计 body —— 帧已不再成功,
