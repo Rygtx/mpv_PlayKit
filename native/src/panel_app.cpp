@@ -93,6 +93,10 @@ constexpr const char *kFfxQualityNames[] = { "无", "性能 (1/2 分辨率)", "�
 
 struct AppState {
     DlssnrParams params{};
+    int lastVsrMode = 1; // 最近一次非零 VSR 模式(1=自动 2=手动):取消勾选
+                         // 后重新勾选恢复它,而不是恒落回自动 —— 恒落回曾把
+                         // "手动倍率"选择静默丢弃,勾回后 VSR 在 4K 窗口旁路
+                         // 而用户以为还开着(2026-09-26 真机实锤)。
     float uiScale = 1.0f;
     int dpi = 96;
     bool liveDirty = false;
@@ -1602,9 +1606,14 @@ void DrawUi() noexcept {
               "需插件 ngx\\ 下有 nvngx_vsr.dll(RTX Video SDK 1.1)。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     {
+        // 勾选框记忆:非零模式恒同步进 lastVsrMode(ini 载入/payload
+        // adopt/下拉切换任何来源都经过这里,每帧校对免多点维护),重新
+        // 勾选恢复它 —— 此前恒落回自动,手动倍率选择被静默丢弃(勾回后
+        // VSR 在 4K 窗口旁路,用户以为还开着,2026-09-26)。
+        if (g_app.params.rtxVsrMode != 0) g_app.lastVsrMode = g_app.params.rtxVsrMode;
         bool vsrOn = g_app.params.rtxVsrMode != 0;
         if (ImGui::Checkbox("##rtx_vsr_enabled", &vsrOn)) {
-            g_app.params.rtxVsrMode = vsrOn ? (g_app.params.rtxVsrMode == 0 ? 1 : g_app.params.rtxVsrMode) : 0;
+            g_app.params.rtxVsrMode = vsrOn ? g_app.lastVsrMode : 0;
             g_app.liveDirty = true;
             // 槽资源几何(vsrColor/yuvOut 尺寸/输出格式)随创建定格,开关
             // 真变化只能链重建 —— 与帧生成开关同款 reseek 语义。
