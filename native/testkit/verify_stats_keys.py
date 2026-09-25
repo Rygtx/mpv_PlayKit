@@ -71,7 +71,7 @@ if st:
             and "gate_skips" in body and "gate_expired" in body and "gate_resets" in body
             and body.get("rtxvsr_last", -1) >= 0 and body.get("rtxhdr_last", -1) >= 0
             and body.get("conv_last", -1) >= 0
-            and body.get("queue_last", -1) >= 0
+            and body.get("queue_last", -1) >= 0 and body.get("of_last", -1) >= 0
         )
     except json.JSONDecodeError:
         new_keys_present = False

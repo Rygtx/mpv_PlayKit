@@ -3260,7 +3260,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                         ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%% of=%d %dx%d f=%d fps=%.0f",
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%% ofq=%d %dx%d f=%d fps=%.0f",
                          gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
                          nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
                          nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
@@ -3327,7 +3327,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      "\"%s\":%u,\"%s\":%u,\"%s\":%u}",
                      SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
                      SK_EVAL_CPU_LAST, evalCpuLast, SK_UNPACK_LAST, unpackLast,
-                     SK_NVOF_LAST, nvofLast, SK_FG_LAST, fgLast,
+                     SK_OF_LAST, nvofLast, SK_FG_LAST, fgLast,
                      SK_RTXVSR_LAST, rtxVsrLast, SK_RTXHDR_LAST, rtxHdrLast,
                      SK_CONV_LAST, convLast,
                      SK_QUEUE_LAST, queueWaitMs,
@@ -3356,7 +3356,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)
 
         if (vsTiming) {
-            std::snprintf(timingOut, timingLen, "pack=%.1f,nvof=%.1f,eval_cpu=%.1f,gpu=%.1f,fg=%.1f,conv=%.1f,unpack=%.1f",
+            std::snprintf(timingOut, timingLen, "pack=%.1f,of=%.1f,eval_cpu=%.1f,gpu=%.1f,fg=%.1f,conv=%.1f,unpack=%.1f",
                           packMs, ff->nvofSpanMs, evalOnlyMs, gpuSegMs, fgMs, convMs, unpackMs);
         }
     }

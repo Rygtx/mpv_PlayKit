@@ -97,6 +97,14 @@ void FxofContext::DestroySession() noexcept {
     _doneSeq = 0;
     _lastDone = 0;
     _submitSeq = 0;
+    // OF GPU 跨度括号资源(READBACK 先解映射)。
+    if (_tsReadback && _tsMapped) _tsReadback->Unmap(0, nullptr);
+    _tsMapped = nullptr;
+    _tsReadback.Reset();
+    _tsHeap.Reset();
+    _lastGpuSpanMs = 0.0;
+    _spanPending = false;
+    _spanFence = 0;
     _d3d12 = nullptr;
     {
         std::lock_guard<std::mutex> lock(_gate.Mutex);
@@ -230,6 +238,35 @@ bool FxofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         OutputDebugStringA("\n");
         TimingStatusLine(msg);
     }
+    // OF GPU 跨度括号资源(GpuTsEnabled 时):heap 2 查询 + 16B READBACK,
+    // 打点直接录在 main CL(dispatch 纯 compute,无 NGX,同 CL 合法)。
+    if (d3d12.GpuTsEnabled()) {
+        D3D12_QUERY_HEAP_DESC qh{};
+        qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qh.Count = 2;
+        if (FAILED(device->CreateQueryHeap(&qh, IID_PPV_ARGS(_tsHeap.GetAddressOf())))) {
+            TimingStatusLine("DLSSNR STATUS: fxof ts heap create failed; span fallback to submit");
+        } else {
+            D3D12_HEAP_PROPERTIES rbHeap{};
+            rbHeap.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rbDesc{};
+            rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rbDesc.Width = 16; // 2×UINT64
+            rbDesc.Height = 1;
+            rbDesc.DepthOrArraySize = 1;
+            rbDesc.MipLevels = 1;
+            rbDesc.SampleDesc.Count = 1;
+            rbDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(device->CreateCommittedResource(
+                    &rbHeap, D3D12_HEAP_FLAG_NONE, &rbDesc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(_tsReadback.GetAddressOf()))) ||
+                FAILED(_tsReadback->Map(0, nullptr, &_tsMapped)) || !_tsMapped) {
+                _tsReadback.Reset();
+                TimingStatusLine("DLSSNR STATUS: fxof ts readback failed; span fallback to submit");
+            }
+        }
+    }
     _ready.store(true, std::memory_order_release);
     return true;
 }
@@ -273,6 +310,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         if (decision == OfGateDecision::Expired) {
             result.publishZero = true;
             _lastStageMs = 0.0;
+            _lastGpuSpanMs = 0.0; // 过期帧无光流计算,nvof 段读 0
             return result;
         }
         if (_d3d12->IsDeviceLost()) {
@@ -280,6 +318,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             result.historyReset = true;
             _gate.InvalidateHistory();
             _lastStageMs = 0.0;
+            _lastGpuSpanMs = 0.0;
             return result;
         }
 
@@ -391,6 +430,9 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
                            static_cast<double>(freq.QuadPart);
             return result;
         }
+        // OF GPU 跨度括号:dispatch = FFX 光流计算本体(纯 compute,无
+        // NGX,同 CL 打点合法),首尾 EndQuery 量出纯执行时间。
+        if (_tsHeap) mainCl->EndQuery(_tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         FfxOpticalflowDispatchDescription dispatch{
             .commandList = ffxGetCommandListDX12(mainCl),
             .color = ffxGetResourceDX12(
@@ -412,6 +454,11 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             .minMaxLuminance = { 0.0f, 1.0f },
         };
         const FfxErrorCode dr = ffxOpticalflowContextDispatch(&_context, &dispatch);
+        if (_tsHeap) {
+            mainCl->EndQuery(_tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+            mainCl->ResolveQueryData(_tsHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     0, 2, _tsReadback.Get(), 0);
+        }
         if (dr != FFX_OK || FAILED(mainCl->Close())) {
             char msg[128];
             std::snprintf(msg, sizeof(msg),
@@ -441,6 +488,10 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         _lastUseFence[_submitSeq % kFfxClDepth] = _doneFence.Get();
         _lastUseValue[_submitSeq % kFfxClDepth] = _lastDone;
         ++_submitSeq;
+        if (_tsMapped) {
+            _spanPending = true;
+            _spanFence = _lastDone;
+        }
         _consecutiveFailures = 0;
         if (_executesLogged < 5) {
             ++_executesLogged;
@@ -558,6 +609,19 @@ void FxofContext::WaitCopyIdle() noexcept {
             return;
         }
     }
+}
+
+double FxofContext::LastStageTotalMs() const noexcept {
+    // dispatch GPU 跨度(括号已提交且 doneFence 达标 = READBACK 已落位)时
+    // 读精确值;未落位回退提交跨度(FFX GPU 计算量级 1-2ms,回退偏差小)。
+    // 过期/失败帧已在 StageFrame 清零,此处读到 0 = 本帧无光流计算。
+    if (_spanPending && _d3d12 && !_d3d12->IsDeviceLost() && _doneFence &&
+        _doneFence->GetCompletedValue() >= _spanFence && _tsMapped) {
+        const UINT64 *ts = static_cast<const UINT64 *>(_tsMapped);
+        _lastGpuSpanMs = static_cast<double>(ts[1] - ts[0]) * 1000.0 / _d3d12->GpuTsFreq();
+        _spanPending = false;
+    }
+    return _spanPending ? _lastStageMs : _lastGpuSpanMs;
 }
 
 } // namespace vsdlssnr

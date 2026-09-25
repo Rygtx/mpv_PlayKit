@@ -78,7 +78,7 @@ constexpr uint32_t PAYLOAD_MAGIC = 0x4E4C5344u; // "DSLN" (v23, 版本位走 hex
 // VSR-only 时 fg 段显示的 3.5-8.9ms 实为 VSR 输出转换)。同时 nvof 段语义
 // 变化:OF 门按消费者决定(NR 关 + FG 关 = 整段跳过,恒 0)。键为纯增量,
 // bump 理由同 v21:成对部署约束,两端都有明确信号。
-constexpr uint32_t STATS_MAGIC = 0x354C5344u;   // "DSL5" (v24;hex 按内存序实为 DSL5)
+constexpr uint32_t STATS_MAGIC = 0x364C5344u;   // "DSL6" (v25:PAYLOAD 2048 + queue_last + of_last 改名;hex 按内存序实为 DSL6)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -275,12 +275,15 @@ inline constexpr const char *SK_CONV_LAST = "conv_last";
 // 真实光流处理用时,含提交 + 引擎计算 + 暴露等待 —— 引擎计算不再以
 // "引擎等待"名义独立成段,独立段 = 与 nvof 重复计账,已撤销。)
 inline constexpr const char *SK_QUEUE_LAST = "queue_last";
-// NVOF 光流段(v25 语义修正:光流阶段全跨度 = 门入口 → 冲刷完成,含提交
-// + 引擎计算 + 暴露等待 —— 真实光流处理用时;档位越高值越大,与引擎吞吐
-// 单调一致。of=0 或无消费者(NR 关 + FG 关,解耦后整段跳过)时恒 0,面板
-// 零值段自动隐藏。与 eval_cpu 的窗口内提交部分互斥可加:eval_cpu 上报时
-// 已扣除提交,不扣引擎计算(引擎在独立硬件,与 eval 窗口并行)。
-inline constexpr const char *SK_NVOF_LAST = "nvof_last";
+// 光流段(v25 语义修正 + 后端中立改名:键名不再绑定 NVOF —— 后端有
+// NVIDIA NVOF 与 AMD FFX 两种,各自量出真实光流处理用时):
+//   NVOF = 阶段全跨度(门入口 → 冲刷完成:提交 + 专有引擎计算 + 暴露等待),
+//          随档位单调(of=1 ≈8ms / of=2 ≈12ms / of=5 ≈68ms @4K);
+//   FFX  = dispatch CL 纯执行(首尾同 CL 内嵌 EndQuery,自绘 compute 无
+//          NGX;copy/densify 胶水 µs 级不计),未落位时回退提交跨度。
+// of=0 或无消费者(NR 关 + FG 关,解耦后整段跳过)时恒 0,面板零值段自动
+// 隐藏。
+inline constexpr const char *SK_OF_LAST = "of_last";
 inline constexpr const char *SK_UNPACK_LAST = "unpack_last";
 inline constexpr const char *SK_INTERNAL_W = "internal_w";
 inline constexpr const char *SK_INTERNAL_H = "internal_h";

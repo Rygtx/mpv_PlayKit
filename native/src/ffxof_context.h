@@ -75,9 +75,9 @@ public:
     void ResetHistory() noexcept override;
     void WaitCopyIdle() noexcept override;
     double LastStageMs() const noexcept override { return _lastStageMs; }
-    // FFX 无独立引擎/无冲刷点:全跨度 = StageFrame 跨度(GPU 计算在主
-    // 队列,量级 1-2ms,与其他段重叠如实计入)。
-    double LastStageTotalMs() const noexcept override { return _lastStageMs; }
+    // OF GPU 跨度 = dispatch CL 纯执行(doneFence 达标时读回精确值,未落位
+    // 回退提交跨度);FFX 无独立引擎/无冲刷点,copy/densify 胶水 µs 级不计。
+    double LastStageTotalMs() const noexcept override;
     OfStageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
                              const OfPostExecuteFn &postExecute,
                              const OfPostCopyFn &postCopy,
@@ -159,6 +159,16 @@ private:
     int _executesLogged = 0; // 前 5 次 dispatch 的诊断日志计数
     std::atomic<bool> _ready{ false };
     double _lastStageMs = 0.0;
+    // OF GPU 跨度括号(v25 后端对等):main CL(dispatch,FFX 光流计算的
+    // 本体,纯 compute 无 NGX)首尾同 CL 内嵌 EndQuery,量出 dispatch 纯执
+    // 行 —— NVOF 段语义(阶段全跨度)的后端对等物。LastStageTotalMs 在
+    // doneFence 达标时从 READBACK 读精确值,未落位回退提交跨度。
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> _tsHeap;    // 2 查询
+    Microsoft::WRL::ComPtr<ID3D12Resource> _tsReadback; // 16B READBACK
+    void *_tsMapped = nullptr;
+    mutable double _lastGpuSpanMs = 0.0;
+    mutable bool _spanPending = false; // 已提交括号待 GPU 落位
+    uint64_t _spanFence = 0;           // 本帧 dispatch 的 doneFence 值
 };
 
 } // namespace vsdlssnr

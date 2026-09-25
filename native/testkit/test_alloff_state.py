@@ -25,7 +25,7 @@ import testmedia
 
 STATS_MAPPING = "vs_dlssnr_stats"
 STATS_MAGIC = 0x354C5344  # "DSL5" (v24) — panel_ipc.h STATS_MAGIC
-PAYLOAD_SIZE = 1024
+PAYLOAD_SIZE = 2048
 
 
 def read_stats():

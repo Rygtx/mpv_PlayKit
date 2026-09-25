@@ -971,7 +971,7 @@ void LoadStats() noexcept {
             g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
             g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_LAST, 0));
             g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_LAST, 0));
-            g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_NVOF_LAST, 0));
+            g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_OF_LAST, 0));
             g_app.segFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
             g_app.segRtxVsr = static_cast<float>(JsonGetFloat(body, SK_RTXVSR_LAST, 0));
             g_app.segRtxHdr = static_cast<float>(JsonGetFloat(body, SK_RTXHDR_LAST, 0));
@@ -2090,7 +2090,7 @@ void DrawUi() noexcept {
         const Seg segConv{ g_app.segDispConv, IM_COL32(121, 85, 72, 255),   "conv(输出转换)" };
         const Seg segs[10]{
             { g_app.segDispPack,   IM_COL32(229, 57, 53, 255),   "pack(打包)" },
-            { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "nvof(光流引擎)" },
+            { g_app.segDispNvof,   IM_COL32(156, 39, 176, 255),  "of(光流引擎)" },
             { g_app.segDispEval,   IM_COL32(63, 81, 181, 255),   "eval_cpu(NGX 调用)" },
             { g_app.segDispQueue,  IM_COL32(84, 110, 122, 255),  "queue(帧间排队)" },
             { g_app.segDispGpu,    IM_COL32(30, 136, 229, 255),  "gpu(NR 推理)" },

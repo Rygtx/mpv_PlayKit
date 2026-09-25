@@ -13,9 +13,9 @@ panel_ipc.h 是唯一权威;本文件是测试用的字节级镜像 —— 改�
 import ctypes
 import struct
 
-PAYLOAD_SIZE = 1024
+PAYLOAD_SIZE = 2048
 PAYLOAD_MAGIC = 0x4E4C5344  # "DSLN" (v23, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
-STATS_MAGIC = 0x354C5344  # "DSL5" (stats v24)
+STATS_MAGIC = 0x364C5344  # "DSL6" (stats v25: PAYLOAD 2048 + queue_last + of_last)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
@@ -33,7 +33,7 @@ SK = {
     "rtxhdr_last": "rtxhdr_last",
     "conv_last": "conv_last",
     "queue_last": "queue_last",
-    "nvof_last": "nvof_last",
+    "of_last": "of_last",
     "unpack_last": "unpack_last",
     "internal_w": "internal_w",
     "internal_h": "internal_h",
