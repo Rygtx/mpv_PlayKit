@@ -284,10 +284,7 @@ bool DlssfgContext::CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbu
                NVSDK_NGX_Result_Success;
     }, "CreateFeature", sehErr, sizeof(sehErr));
     if (ok && !_feature) ok = false;
-    if (!_d3d12->ExecuteCtlAndWait()) {
-        if (err && errLen) std::snprintf(err, errLen, "dlssfg: ctl execute failed");
-        return false;
-    }
+    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "fg create")) return false;
     if (!ok) {
         if (err && errLen) {
             // 官方 DLSS 同款:CreateFeature 失败后从同一参数块读核心记下的

@@ -207,7 +207,15 @@ public:
     std::mutex &CtlMutex() noexcept { return _ctlMutex; }
     bool BeginCtlRecording() noexcept;
     ID3D12GraphicsCommandList *CtlCommandList() const noexcept { return _ctlCommandList.Get(); }
-    bool ExecuteCtlAndWait() noexcept;
+    // err 非空时带出精确原因(Close 失败 hr / 等待失败原因);失败同时落
+    // timing log + info queue 消息(见 ReportInfoQueue)。where = 失败位置
+    // 标签(必填,7 个调用点全部显式传),进日志与 err
+    // ("guidance clear: ctl close failed hr=0x...")。
+    bool ExecuteCtlAndWait(char *err, size_t errLen, const char *where) noexcept;
+    // ctl 路径失败点把 info queue 存量(ERROR/CORRUPTION)拉进 timing log
+    // —— debug layer 报错此前只进调试器输出,mpv 进程内不可观测
+    // (VSDLSSNR_D3D12_DEBUG=1 时 _infoQueue 存在)。复用 DebugDumpInfoQueue。
+    void ReportInfoQueue(const char *where) noexcept;
     // True once a fence wait timed out (GPU hang / device removal): callers
     // should stop evaluating instead of stalling the full wait every frame.
     bool IsDeviceLost() const noexcept { return _deviceLost.load(std::memory_order_relaxed); }
@@ -241,6 +249,16 @@ public:
     int OutWidth() const noexcept { return _outW; }
     int OutHeight() const noexcept { return _outH; }
     bool HdrPipe() const noexcept { return _hdrPipe; }
+    // yuvOut/readback 平面资源格式(OUT 位深;HDR 会话 P10 = R16)。dump
+    // footprint 必须用这个 —— 按源 BitDepth 推格式在"8bit 源 + P10 出"的
+    // 混合会话(RTX VSR+HDR)恒错,R8 footprint 拷 R16 资源 = Close 报
+    // E_INVALIDARG(2026-09-25 dump 三连失败真因)。
+    DXGI_FORMAT OutFormat() const noexcept { return _outFmt; }
+    // fgInterp 槽纹理格式(SDR 域 BGRA8 / fgHdrInterp 会话 FP16)。
+    DXGI_FORMAT FgInterpFormat() const noexcept {
+        return _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                            : DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
     bool VsrPipe() const noexcept { return _vsrSlots; }
 
     // 诊断探针:把 InfoQueue 已存消息格式化进 buf(debug layer 开启时)。

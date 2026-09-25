@@ -1040,7 +1040,8 @@ bool DlssnrContext::Initialize(
                 return fail(msg);
             }
         }
-        if (!_d3d12->ExecuteCtlAndWait()) return fail("Execute(create) failed");
+        if (!_d3d12->ExecuteCtlAndWait(err, errLen, "nr create"))
+            return fail(err && err[0] ? err : "Execute(create) failed");
     }
 
     _ready = true;
@@ -1233,8 +1234,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             return false;
         }
     }
-    if (!_d3d12->ExecuteCtlAndWait()) {
-        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: Execute failed");
+    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "nr recreate")) {
         _ready.store(false, std::memory_order_release);
         return false;
     }
@@ -2966,7 +2966,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     // 恒 SDR 域 BGRA8 @PIPE(VSR 时 = _pipeW/H,else 源尺寸)。
                     if (ff->fgRan) {
                         dumpOrLog(_d3d12->FgInterp(*ff->slot, 0), ff->pipeW, ff->pipeH,
-                                  L"dump_fg_interp.bin", kColorDump);
+                                  L"dump_fg_interp.bin", _d3d12->FgInterpFormat());
                     }
                     // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
                     // Y/U/V 与 dump 对比,≤1-2 LSB;P10 = 右对齐 word)。
@@ -2974,9 +2974,12 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     // height,RTX VSR 会话 yuvOut 在 OUT 尺寸 → footprint 与
                     // 资源不符,dump 必败 —— RTX 会话的 P8 转换验收假阴)。
                     {
-                        const DXGI_FORMAT yuvDump = _d3d12->BitDepth() > 8
-                                                        ? DXGI_FORMAT_R16_UNORM
-                                                        : DXGI_FORMAT_R8_UNORM;
+                        // yuvOut 资源格式 = OutFormat()(OUT 位深;HDR 会话
+                        // P10 = R16)。按源 BitDepth 推在"8bit 源 + P10 出"
+                        // 混合会话(RTX VSR+HDR)恒错 —— R8 footprint 拷
+                        // R16 资源,Close 报 E_INVALIDARG 并楔死 allocator
+                        // (2026-09-25 RTX 会话 dump 三连失败真因)。
+                        const DXGI_FORMAT yuvDump = _d3d12->OutFormat();
                         const int cw = (ff->width + 1) >> 1, ch = (ff->height + 1) >> 1;
                         const int pw[3]{ ff->width, cw, cw };
                         const int ph[3]{ ff->height, ch, ch };

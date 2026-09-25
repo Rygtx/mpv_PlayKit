@@ -235,10 +235,7 @@ bool RtxVsrContext::CreateFeatureOnCtl(char *err, size_t errLen) noexcept {
                NVSDK_NGX_Result_Success;
     }, "CreateFeature(VSR)", sehErr, sizeof(sehErr));
     if (ok && !_feature) ok = false;
-    if (!_d3d12->ExecuteCtlAndWait()) {
-        if (err && errLen) std::snprintf(err, errLen, "rtx vsr: ctl execute failed");
-        return false;
-    }
+    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "vsr create")) return false;
     if (!ok) {
         unsigned int initResult = 0;
         const bool haveResult =
@@ -405,10 +402,7 @@ bool RtxHdrContext::CreateFeatureOnCtl(char *err, size_t errLen) noexcept {
                NVSDK_NGX_Result_Success;
     }, "CreateFeature(TrueHDR)", sehErr, sizeof(sehErr));
     if (ok && !_feature) ok = false;
-    if (!_d3d12->ExecuteCtlAndWait()) {
-        if (err && errLen) std::snprintf(err, errLen, "rtx hdr: ctl execute failed");
-        return false;
-    }
+    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "hdr create")) return false;
     if (!ok) {
         unsigned int initResult = 0;
         const bool haveResult =

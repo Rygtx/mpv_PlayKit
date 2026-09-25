@@ -331,9 +331,37 @@ bool D3D12Context::BeginCtlRecording() noexcept {
     return SUCCEEDED(hr);
 }
 
-bool D3D12Context::ExecuteCtlAndWait() noexcept {
+// ctl 路径失败点统一拉取:debug layer / 运行时的报错存进 info queue,
+// 此前只进调试器输出,mpv 进程内看不到 —— 这就是"dump 失败 debug layer
+// 无增量"的死结(观测手段缺位,非无错)。复用 DebugDumpInfoQueue 的
+// ERROR/CORRUPTION 过滤(INFO/WARNING 级良性告警一 dump 批能攒 20+ 条,
+// 会把真错挤出去);SetErr 自带的拉取(追加进 err,缓冲小恒截断)与其
+// 互补:这里负责完整进 timing log,拉完即清防累积。无 debug 时零开销。
+void D3D12Context::ReportInfoQueue(const char *where) noexcept {
+    if (!_infoQueue) return;
+    char buf[2048];
+    DebugDumpInfoQueue(buf, sizeof(buf));
+    if (!buf[0]) return;
+    char line[2304];
+    std::snprintf(line, sizeof(line), "DLSSNR INFOQ[%s]: %.2000s", where, buf);
+    TimingStatusLine(line);
+}
+
+bool D3D12Context::ExecuteCtlAndWait(char *err, size_t errLen, const char *where) noexcept {
     HRESULT hr = _ctlCommandList->Close();
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) {
+        // Close 失败此前完全静默(hr 丢弃、原因不可辨)—— dump 三连失败的
+        // "ctl execute/wait failed" 就是它。现在:hr + info queue 消息落日志,
+        // err 带回调用方。列表留 open,由 BeginCtlRecording 的 force-close
+        // 恢复路径回收。
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "%s: ctl close failed hr=0x%08lX",
+                      where, static_cast<unsigned long>(hr));
+        TimingStatusLine(msg);
+        ReportInfoQueue(where);
+        SetErr(err, errLen, hr, msg);
+        return false;
+    }
     // 与分段提交(SubmitBaseFrame/SubmitFgFrame)共享 _fence:fetch_add +
     // Signal 必须同锁,否则并发槽提交会让 Signal 值乱序(fence 值回退 =
     // 驱动未定义行为)。CtlMutex → _submitMutex 的加锁顺序与分段提交
@@ -343,8 +371,18 @@ bool D3D12Context::ExecuteCtlAndWait() noexcept {
     _queue->ExecuteCommandLists(1, lists);
     const uint64_t v = _fenceValue.fetch_add(1) + 1;
     _queue->Signal(_fence.Get(), v);
-    char ignore[96];
-    return WaitFenceValue(v, _ctlEvent, ignore, sizeof(ignore));
+    char reason[160]{};
+    if (!WaitFenceValue(v, _ctlEvent, reason, sizeof(reason))) {
+        // 等待原因此前写进丢弃缓冲 —— 连"超时还是信号失败"都无从分辨。
+        char msg[224];
+        std::snprintf(msg, sizeof(msg), "%s: ctl wait failed: %.150s",
+                      where, reason[0] ? reason : "unknown");
+        TimingStatusLine(msg);
+        ReportInfoQueue(where);
+        SetErr(err, errLen, E_FAIL, msg);
+        return false;
+    }
+    return true;
 }
 
 bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept {
@@ -620,10 +658,7 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
             Transition(_depthPipe.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         };
         _ctlCommandList->ResourceBarrier(_depthPipe ? 3u : 2u, toResident);
-        if (!ExecuteCtlAndWait()) {
-            SetErr(err, errLen, E_FAIL, "Execute(guidance clear) failed");
-            return false;
-        }
+        if (!ExecuteCtlAndWait(err, errLen, "guidance clear")) return false;
     }
 
     if (ProbeEnabled()) TimingStatusLine("PROBE: d3d12 frame-res before slot loop");
@@ -2688,35 +2723,47 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
     size_t pitch = 0;
     ComPtr<ID3D12Resource> buffer;
     char ignore[96];
+    // buffer 初始态传 COMMON(运行时对 buffer 忽略 InitialState 并告警,
+    // COPY_DEST 只是攒 INFOQ 噪音;拷入本就允许 COMMON 态 buffer)。
     if (!CreateRawBuffer(static_cast<UINT64>(height) * width * bpp, D3D12_HEAP_TYPE_READBACK,
-                         D3D12_RESOURCE_STATE_COPY_DEST, buffer.GetAddressOf(),
+                         D3D12_RESOURCE_STATE_COMMON, buffer.GetAddressOf(),
                          pitch, width * bpp, ignore, sizeof(ignore))) {
         SetErr(err, errLen, E_FAIL, "dump readback buffer create failed");
         return false;
     }
-    if (!BeginCtlRecording()) {
-        SetErr(err, errLen, E_FAIL, "dump begin ctl recording failed");
-        return false;
-    }
-    D3D12_RESOURCE_BARRIER b[1]{
-        Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-    };
-    _ctlCommandList->ResourceBarrier(1, b);
-    D3D12_TEXTURE_COPY_LOCATION src{ tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
-    D3D12_TEXTURE_COPY_LOCATION dst{ buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
-    dst.PlacedFootprint.Footprint.Format = format;
-    dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(width);
-    dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(height);
-    dst.PlacedFootprint.Footprint.Depth = 1;
-    dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(pitch);
-    _ctlCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    D3D12_RESOURCE_BARRIER back[1]{
-        Transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-    };
-    _ctlCommandList->ResourceBarrier(1, back);
-    if (!ExecuteCtlAndWait()) {
-        SetErr(err, errLen, E_FAIL, "dump ctl execute/wait failed");
-        return false;
+    // 失败自愈重试一次(2026-09-25):Close 静默失败曾把整批后续 dump 拖成
+    // "连环失败"(open 列表要等下次 force-close 才回收,当次已丢)。重试经
+    // BeginCtlRecording 的 force-close 恢复,当批内就地回收;首试失败在执行
+    // 之前(命令未生效),重录同样的屏障/拷贝状态一致。等待侧失败(GPU 级)
+    // 仍有 deviceLost 大声路径,重试不会掩盖。
+    char execErr[160]{};
+    for (int attempt = 1; ; ++attempt) {
+        if (!BeginCtlRecording()) {
+            SetErr(err, errLen, E_FAIL, "dump begin ctl recording failed");
+            return false;
+        }
+        D3D12_RESOURCE_BARRIER b[1]{
+            Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        };
+        _ctlCommandList->ResourceBarrier(1, b);
+        D3D12_TEXTURE_COPY_LOCATION src{ tex, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, 0 };
+        D3D12_TEXTURE_COPY_LOCATION dst{ buffer.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT };
+        dst.PlacedFootprint.Footprint.Format = format;
+        dst.PlacedFootprint.Footprint.Width = static_cast<UINT>(width);
+        dst.PlacedFootprint.Footprint.Height = static_cast<UINT>(height);
+        dst.PlacedFootprint.Footprint.Depth = 1;
+        dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(pitch);
+        _ctlCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER back[1]{
+            Transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+        };
+        _ctlCommandList->ResourceBarrier(1, back);
+        if (ExecuteCtlAndWait(execErr, sizeof(execErr), "dump")) break;
+        if (attempt >= 2) {
+            SetErr(err, errLen, E_FAIL, execErr[0] ? execErr : "dump ctl execute/wait failed");
+            return false;
+        }
+        TimingStatusLine("DLSSNR STATUS: dump ctl retry once");
     }
 
     void *mapped = nullptr;
