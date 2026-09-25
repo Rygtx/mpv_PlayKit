@@ -76,10 +76,12 @@ void FxofContext::DestroySession() noexcept {
     _ffxInput.Reset();
     _sparseFlow.Reset();
     _scd.Reset();
-    _commandListA.Reset();
-    _commandListB.Reset();
-    _allocatorA.Reset();
-    _allocatorB.Reset();
+    for (int i = 0; i < kFfxClDepth; ++i) {
+        _cl[i].Reset();
+        _alloc[i].Reset();
+        _lastUseFence[i] = nullptr;
+        _lastUseValue[i] = 0;
+    }
     _copyFence.Reset();
     _doneFence.Reset();
     if (_copyFenceEvent) {
@@ -94,6 +96,7 @@ void FxofContext::DestroySession() noexcept {
     _lastCopyFence = 0;
     _doneSeq = 0;
     _lastDone = 0;
+    _submitSeq = 0;
     _d3d12 = nullptr;
     {
         std::lock_guard<std::mutex> lock(_gate.Mutex);
@@ -184,22 +187,21 @@ bool FxofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         return fail("fxof: create session textures failed");
     }
 
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                              IID_PPV_ARGS(_allocatorA.GetAddressOf()))) ||
-        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                              IID_PPV_ARGS(_allocatorB.GetAddressOf()))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                         _allocatorA.Get(), nullptr,
-                                         IID_PPV_ARGS(_commandListA.GetAddressOf()))) ||
-        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                         _allocatorB.Get(), nullptr,
-                                         IID_PPV_ARGS(_commandListB.GetAddressOf()))) ||
-        FAILED(_commandListA->Close()) || FAILED(_commandListB->Close()) ||
-        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+    for (int i = 0; i < kFfxClDepth; ++i) {
+        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(_alloc[i].GetAddressOf()))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                             _alloc[i].Get(), nullptr,
+                                             IID_PPV_ARGS(_cl[i].GetAddressOf()))) ||
+            FAILED(_cl[i]->Close())) {
+            return fail("fxof: create command path failed");
+        }
+    }
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
                                    IID_PPV_ARGS(_copyFence.GetAddressOf()))) ||
         FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
                                    IID_PPV_ARGS(_doneFence.GetAddressOf())))) {
-        return fail("fxof: create command path failed");
+        return fail("fxof: create fence failed");
     }
     _copyFenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
     _doneFenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
@@ -281,29 +283,17 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         const bool seed = decision == OfGateDecision::Seed || !_gate.HistoryValid();
         ID3D12CommandQueue *queue = _d3d12->Queue();
 
-        // ---- copy CL(alloc A)----
-        // 防御性 queue Wait(与 NvofContext 同构;FIFO 下已满足,零成本)。
+        // ---- copy CL ----
+        // queue Wait(doneFence, 上帧 dispatch)承重:保护本帧 ffxInput 覆写
+        // 不早于上帧 dispatch 读完(普通栅栏,排队可靠;FIFO 下通常已满足)。
         if (_lastDone) queue->Wait(_doneFence.Get(), _lastDone);
-        if (_lastCopyFence) {
-            if (!WaitForFenceReached(_copyFence.Get(), _lastCopyFence,
-                                     _copyFenceEvent, 10000)) {
-                TimingStatusLine("DLSSNR STATUS: fxof copy fence timeout");
-            }
-        }
-        HRESULT hrA = _allocatorA->Reset();
-        bool copyOk = SUCCEEDED(hrA);
-        if (!copyOk) {
-            _commandListA->Close();
-            hrA = _allocatorA->Reset();
-            copyOk = SUCCEEDED(hrA);
-        }
-        HRESULT hrCL = copyOk ? _commandListA->Reset(_allocatorA.Get(), nullptr) : E_FAIL;
-        copyOk = copyOk && SUCCEEDED(hrCL);
+        ID3D12CommandAllocator *copyAlloc = nullptr;
+        ID3D12GraphicsCommandList *copyCl = nullptr;
+        bool copyOk = AcquireCl(&copyAlloc, &copyCl);
         if (!copyOk) {
             char msg[128];
             std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: fxof copy reset failed alloc=0x%08lx cl=0x%08lx",
-                          static_cast<unsigned long>(hrA), static_cast<unsigned long>(hrCL));
+                          "DLSSNR STATUS: fxof copy cl acquire failed (rotator)");
             TimingStatusLine(msg);
         }
         if (copyOk) {
@@ -325,17 +315,17 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
                 Transition(_ffxInput.Get(), D3D12_RESOURCE_STATE_COMMON,
                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
             };
-            _commandListA->ResourceBarrier(1, toUav);
+            copyCl->ResourceBarrier(1, toUav);
             probe("toUav");
-            postCopy(_commandListA.Get(), 0);
+            postCopy(copyCl, 0);
             probe("postCopy");
             D3D12_RESOURCE_BARRIER toCommon[1]{
                 Transition(_ffxInput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                            D3D12_RESOURCE_STATE_COMMON),
             };
-            _commandListA->ResourceBarrier(1, toCommon);
+            copyCl->ResourceBarrier(1, toCommon);
             probe("toCommon");
-            copyOk = SUCCEEDED(_commandListA->Close());
+            copyOk = SUCCEEDED(copyCl->Close());
             if (!copyOk) {
                 char dbg[1400];
                 _d3d12->DebugDumpInfoQueue(dbg, sizeof(dbg));
@@ -345,10 +335,13 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             }
         }
         if (copyOk) {
-            ID3D12CommandList *lists[]{ _commandListA.Get() };
+            ID3D12CommandList *lists[]{ copyCl };
             queue->ExecuteCommandLists(1, lists);
             _lastCopyFence = ++_copySeq;
             queue->Signal(_copyFence.Get(), _lastCopyFence);
+            _lastUseFence[_submitSeq % kFfxClDepth] = _copyFence.Get();
+            _lastUseValue[_submitSeq % kFfxClDepth] = _lastCopyFence;
+            ++_submitSeq;
         } else {
             TimingStatusLine("DLSSNR STATUS: fxof copy submit failed");
             result.publishZero = true;
@@ -364,107 +357,113 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             return result;
         }
 
-        // ---- main CL(alloc B):FFX dispatch ----
-        if (SUCCEEDED(_allocatorB->Reset()) &&
-            SUCCEEDED(_commandListB->Reset(_allocatorB.Get(), nullptr))) {
-            FfxOpticalflowDispatchDescription dispatch{
-                .commandList = ffxGetCommandListDX12(_commandListB.Get()),
-                .color = ffxGetResourceDX12(
-                    _ffxInput.Get(),
-                    ffxGetResourceDescriptionDX12(_ffxInput.Get()),
-                    L"vs_dlssnr fxof color", FFX_API_RESOURCE_STATE_COMMON),
-                .opticalFlowVector = ffxGetResourceDX12(
-                    _sparseFlow.Get(),
-                    ffxGetResourceDescriptionDX12(_sparseFlow.Get(),
-                                                  FFX_API_RESOURCE_USAGE_UAV),
-                    L"vs_dlssnr fxof vector", FFX_API_RESOURCE_STATE_COMMON),
-                .opticalFlowSCD = ffxGetResourceDX12(
-                    _scd.Get(),
-                    ffxGetResourceDescriptionDX12(_scd.Get(),
-                                                  FFX_API_RESOURCE_USAGE_UAV),
-                    L"vs_dlssnr fxof scd", FFX_API_RESOURCE_STATE_COMMON),
-                .reset = seed, // 播种帧重建金字塔/SCD 历史(Magpie 同语义)
-                .backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB,
-                .minMaxLuminance = { 0.0f, 1.0f },
-            };
-            const FfxErrorCode dr = ffxOpticalflowContextDispatch(&_context, &dispatch);
-            if (dr != FFX_OK || FAILED(_commandListB->Close())) {
-                char msg[128];
-                std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: fxof dispatch failed frame=%d err=%d",
-                              frameIndex, static_cast<int32_t>(dr));
-                OutputDebugStringA("vs_dlssnr: ");
-                OutputDebugStringA(msg);
-                OutputDebugStringA("\n");
-                TimingStatusLine(msg);
-                result.publishZero = true;
-                result.historyReset = true;
-                _gate.InvalidateHistory();
-                if (++_consecutiveFailures >= 3) {
-                    _ready.store(false, std::memory_order_release);
-                    TimingStatusLine("DLSSNR STATUS: fxof disabled after consecutive failures");
-                }
-                _gate.Advance(frameIndex);
-                QueryPerformanceCounter(&t1);
-                _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
-                               static_cast<double>(freq.QuadPart);
-                return result;
-            }
-            ID3D12CommandList *lists[]{ _commandListB.Get() };
-            queue->ExecuteCommandLists(1, lists);
-            _lastDone = ++_doneSeq;
-            queue->Signal(_doneFence.Get(), _lastDone);
-            // CPU 等 FFX 输出(与 NVOF execute 后 CPU 等同款;分配器复用
-            // 安全 + densify 录制时序与 nvof 段计时同语义)。超时 = 会话
-            // 状态不可信,停用待 RebuildOf 重建。
-            if (!WaitForFenceReached(_doneFence.Get(), _lastDone,
-                                     _doneFenceEvent, 10000)) {
-                TimingStatusLine("DLSSNR STATUS: fxof output fence timeout; session retired");
-                result.publishZero = true;
-                result.historyReset = true;
-                _gate.InvalidateHistory();
-                _ready.store(false, std::memory_order_release);
-                _gate.Advance(frameIndex);
-                QueryPerformanceCounter(&t1);
-                _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
-                               static_cast<double>(freq.QuadPart);
-                return result;
-            }
-            _consecutiveFailures = 0;
-            if (_executesLogged < 5) {
-                ++_executesLogged;
-                char msg[128];
-                std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: fxof dispatch ok frame=%d reset=%d",
-                              frameIndex, seed ? 1 : 0);
-                TimingStatusLine(msg);
-            }
-        } else {
-            TimingStatusLine("DLSSNR STATUS: fxof main cl reset failed");
+        // ---- main CL:FFX dispatch ----
+        // 门内不再 CPU 等 dispatch 完成(2026-09-25 重构):doneFence 是自家
+        // queue->Signal 的普通栅栏,densify 的读序由其提交前的 queue Wait
+        // 封闭,GPU 完成保证迁移到 WaitCopyIdle(槽释放点)。分配器复用由
+        // 轮转池的 Reset 等待保证(4 段之前)。
+        ID3D12CommandAllocator *mainAlloc = nullptr;
+        ID3D12GraphicsCommandList *mainCl = nullptr;
+        bool mainOk = AcquireCl(&mainAlloc, &mainCl);
+        if (!mainOk) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: fxof main cl acquire failed (rotator)");
+            TimingStatusLine(msg);
             result.publishZero = true;
             result.historyReset = true;
             _gate.InvalidateHistory();
+            if (++_consecutiveFailures >= 3) {
+                _ready.store(false, std::memory_order_release);
+                TimingStatusLine("DLSSNR STATUS: fxof disabled after consecutive failures");
+            }
             _gate.Advance(frameIndex);
             QueryPerformanceCounter(&t1);
             _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
                            static_cast<double>(freq.QuadPart);
             return result;
         }
+        FfxOpticalflowDispatchDescription dispatch{
+            .commandList = ffxGetCommandListDX12(mainCl),
+            .color = ffxGetResourceDX12(
+                _ffxInput.Get(),
+                ffxGetResourceDescriptionDX12(_ffxInput.Get()),
+                L"vs_dlssnr fxof color", FFX_API_RESOURCE_STATE_COMMON),
+            .opticalFlowVector = ffxGetResourceDX12(
+                _sparseFlow.Get(),
+                ffxGetResourceDescriptionDX12(_sparseFlow.Get(),
+                                              FFX_API_RESOURCE_USAGE_UAV),
+                L"vs_dlssnr fxof vector", FFX_API_RESOURCE_STATE_COMMON),
+            .opticalFlowSCD = ffxGetResourceDX12(
+                _scd.Get(),
+                ffxGetResourceDescriptionDX12(_scd.Get(),
+                                              FFX_API_RESOURCE_USAGE_UAV),
+                L"vs_dlssnr fxof scd", FFX_API_RESOURCE_STATE_COMMON),
+            .reset = seed, // 播种帧重建金字塔/SCD 历史(Magpie 同语义)
+            .backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB,
+            .minMaxLuminance = { 0.0f, 1.0f },
+        };
+        const FfxErrorCode dr = ffxOpticalflowContextDispatch(&_context, &dispatch);
+        if (dr != FFX_OK || FAILED(mainCl->Close())) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: fxof dispatch failed frame=%d err=%d",
+                          frameIndex, static_cast<int32_t>(dr));
+            OutputDebugStringA("vs_dlssnr: ");
+            OutputDebugStringA(msg);
+            OutputDebugStringA("\n");
+            TimingStatusLine(msg);
+            result.publishZero = true;
+            result.historyReset = true;
+            _gate.InvalidateHistory();
+            if (++_consecutiveFailures >= 3) {
+                _ready.store(false, std::memory_order_release);
+                TimingStatusLine("DLSSNR STATUS: fxof disabled after consecutive failures");
+            }
+            _gate.Advance(frameIndex);
+            QueryPerformanceCounter(&t1);
+            _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                           static_cast<double>(freq.QuadPart);
+            return result;
+        }
+        ID3D12CommandList *lists[]{ mainCl };
+        queue->ExecuteCommandLists(1, lists);
+        _lastDone = ++_doneSeq;
+        queue->Signal(_doneFence.Get(), _lastDone);
+        _lastUseFence[_submitSeq % kFfxClDepth] = _doneFence.Get();
+        _lastUseValue[_submitSeq % kFfxClDepth] = _lastDone;
+        ++_submitSeq;
+        _consecutiveFailures = 0;
+        if (_executesLogged < 5) {
+            ++_executesLogged;
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: fxof dispatch ok frame=%d reset=%d",
+                          frameIndex, seed ? 1 : 0);
+            TimingStatusLine(msg);
+        }
 
-        // ---- densify CL(alloc A 复用):稀疏流 → 稠密运动 ----
+        // ---- densify CL:稀疏流 → 稠密运动 ----
         // sparseFlow 经 main CL 的 UAV 写,FFX backend 收尾归 COMMON(声明
-        // 契约);densify SRV 读走隐式提升 —— debug layer 校验点。
-        bool densifyOk = SUCCEEDED(_allocatorA->Reset()) &&
-                         SUCCEEDED(_commandListA->Reset(_allocatorA.Get(), nullptr));
+        // 契约);densify SRV 读走隐式提升 —— debug layer 校验点。提交前
+        // queue Wait(doneFence, 本帧 main)承重:读序等本帧 dispatch 完成
+        // (普通栅栏,排队可靠)。
+        ID3D12CommandAllocator *densAlloc = nullptr;
+        ID3D12GraphicsCommandList *densCl = nullptr;
+        bool densifyOk = AcquireCl(&densAlloc, &densCl);
         if (densifyOk) {
-            postExecute(_commandListA.Get(), 0); // motion/conf 屏障 + RecordFfxDensify
-            densifyOk = SUCCEEDED(_commandListA->Close());
+            if (_lastDone) queue->Wait(_doneFence.Get(), _lastDone);
+            postExecute(densCl, 0); // motion/conf 屏障 + RecordFfxDensify
+            densifyOk = SUCCEEDED(densCl->Close());
         }
         if (densifyOk) {
-            ID3D12CommandList *lists[]{ _commandListA.Get() };
+            ID3D12CommandList *lists[]{ densCl };
             queue->ExecuteCommandLists(1, lists);
             _lastCopyFence = ++_copySeq;
             queue->Signal(_copyFence.Get(), _lastCopyFence);
+            _lastUseFence[_submitSeq % kFfxClDepth] = _copyFence.Get();
+            _lastUseValue[_submitSeq % kFfxClDepth] = _lastCopyFence;
+            ++_submitSeq;
             result.waitFenceValue = _lastDone; // 非 0 = realMotion
         } else {
             TimingStatusLine("DLSSNR STATUS: fxof densify submit failed");
@@ -484,11 +483,62 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
     return result;
 }
 
+bool FxofContext::AcquireCl(ID3D12CommandAllocator **allocator,
+                            ID3D12GraphicsCommandList **cl) noexcept {
+    // CL 池轮转(RtxQueue 同款纪律):idx = _submitSeq % depth,Reset 前
+    // CPU 等同 idx 上次使用的栅栏 —— 4 段之前,常态"等待即刻返回";GPU
+    // 落后超 4 段 = 背压。等待期间设备丢失 = 永不满足,快速失败。门内串行
+    // (OfFrameGate),会话级事件无并发等待者。
+    const int idx = static_cast<int>(_submitSeq % kFfxClDepth);
+    if (_lastUseFence[idx] && _lastUseValue[idx] &&
+        !_d3d12->IsDeviceLost()) {
+        HANDLE ev = _lastUseFence[idx] == _doneFence.Get() ? _doneFenceEvent
+                                                           : _copyFenceEvent;
+        if (!WaitForFenceReached(_lastUseFence[idx], _lastUseValue[idx], ev, 10000)) {
+            TimingStatusLine("DLSSNR STATUS: fxof cl rotator wait timeout; session retired");
+            _ready.store(false, std::memory_order_release);
+            return false;
+        }
+    }
+    HRESULT hr = _alloc[idx]->Reset();
+    if (FAILED(hr)) {
+        // force-close 自愈:上次录制中途失败遗留 open CL 会让 allocator
+        // Reset 永久 E_FAIL(BeginCtlRecording 同款恢复模式)。
+        _cl[idx]->Close();
+        hr = _alloc[idx]->Reset();
+        if (FAILED(hr)) return false;
+    }
+    if (FAILED(_cl[idx]->Reset(_alloc[idx].Get(), nullptr))) return false;
+    *allocator = _alloc[idx].Get();
+    *cl = _cl[idx].Get();
+    return true;
+}
+
 void FxofContext::WaitCopyIdle() noexcept {
+    // 槽释放点的排空保证(2026-09-25 承重化):门内 CPU 等 dispatch 已删,
+    // 本帧 copy(main 依赖)/dispatch(densify 依赖)/densify(slot->motion
+    // 的 GPU 写)在槽释放时可能仍在飞。两个栅栏都要等:copyFence 最后值
+    // 覆盖 copy+densify;doneFence 最后值覆盖 dispatch(densify 的读序
+    // queue Wait 排在其后,等它即覆盖全链)。upload 堆的 CPU 写(PackInput
+    // 下一帧)与 GPU 读(copy CL 的 RecordConvertInput)竞争由此排空。
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || _d3d12->IsDeviceLost()) return;
-    if (!_lastCopyFence || _copyFence->GetCompletedValue() >= _lastCopyFence) return;
-    _copyFence->SetEventOnCompletion(_lastCopyFence, _copyFenceEvent);
-    WaitForSingleObject(_copyFenceEvent, 10000);
+    bool ok = true;
+    if (_lastDone && _doneFence->GetCompletedValue() < _lastDone) {
+        ok = WaitForFenceReached(_doneFence.Get(), _lastDone, _doneFenceEvent, 10000);
+        if (!ok) {
+            TimingStatusLine("DLSSNR STATUS: fxof dispatch fence timeout at slot release; session retired");
+            _ready.store(false, std::memory_order_release);
+            return;
+        }
+    }
+    if (_lastCopyFence && _copyFence->GetCompletedValue() < _lastCopyFence) {
+        ok = WaitForFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000);
+        if (!ok) {
+            TimingStatusLine("DLSSNR STATUS: fxof copy fence timeout at slot release; session retired");
+            _ready.store(false, std::memory_order_release);
+            return;
+        }
+    }
 }
 
 } // namespace vsdlssnr

@@ -8,16 +8,26 @@
 // 用 dxc 生成)。质量档位映射(独立三档):1 = Performance
 // (OF extent = 会话/2),2 = Quality(全分辨率)。
 //
-// 三段 CL 模型(自有持久 CL×2 + allocator×2 + 栅栏对;FFX dispatch 只把
-// pass 命令录进我们的 CL,提交节奏完全由我们控制):
-//   copy CL(alloc A):queue Wait(doneFence) → CPU 等 copyFence →
-//     postCopy 回调(YUV→RGB 转换 + RecordFfxPrepare,由 dlssnr_context 的
-//     lambda 记录;本 context 在回调外围做 _ffxInput 的 UAV 屏障)→ 提交。
-//   main CL(alloc B):ffxOpticalflowContextDispatch(三资源 STATE_COMMON
-//     传入,backend 内部自管屏障)→ 提交 Signal(doneFence)。
-//   CPU 等 doneFence(main CL 完成;allocator 复用安全)→
-//   densify CL(alloc A 复用):postExecute 回调(RecordFfxDensify,由
-//     dlssnr_context lambda 记录,含 motion/conf 屏障)→ 提交。
+// 三段 CL 模型(2026-09-25 重构:4 深轮转池,门内 CPU 等 dispatch 已删):
+//   copy CL:queue Wait(doneFence, 上帧 dispatch;承重 —— 保护 ffxInput 不被
+//     本帧覆写早于上帧读取)→ postCopy 回调(YUV→RGB 转换 + RecordFfxPrepare,
+//     由 dlssnr_context 的 lambda 记录;本 context 在回调外围做 _ffxInput 的
+//     UAV 屏障)→ 提交 Signal(copyFence)。
+//   main CL:ffxOpticalflowContextDispatch(三资源 STATE_COMMON 传入,backend
+//     内部自管屏障)→ 提交 Signal(doneFence)。
+//   densify CL:提交前 queue Wait(doneFence, 本帧 main;承重 —— 读
+//     sparseFlow 等本帧 dispatch 完成)→ postExecute 回调(RecordFfxDensify,
+//     由 dlssnr_context lambda 记录,含 motion/conf 屏障)→ 提交
+//     Signal(copyFence)。
+//
+// 顺序模型:doneFence/copyFence 都是自家 queue->Signal 的普通 D3D12 栅栏,
+// 队列级 Wait 可靠(NVOF 引擎栅栏不可靠的约束不适用于 FFX)。三段全部在
+// 同一队列 FIFO 上提交,跨段依赖由 FIFO + 上述 queue Wait 封闭;GPU 完成
+// 保证迁移到 WaitCopyIdle(每帧槽释放点,upload 堆 CPU 写/GPU 读竞争的
+// 排空点),门内只保留轮转池的 Reset 等待(等同 idx 上次使用的栅栏 =
+// 4 段之前,常态即刻返回,RtxQueue 同款纪律;in-flight Reset = UB)。
+// dispatch 的 GPU 失败发现点从门内等待后移到 WaitCopyIdle 超时 → 会话退役,
+// 语义等价。
 //
 // 与 NVOF 的差异:无独立引擎(全部在自家队列 FIFO 上,queue Wait 仅作与
 // NvofContext 同构的防御);无 ping-pong 输入(FFX context 自持历史金字塔,
@@ -88,6 +98,11 @@ private:
                        char *err, size_t errLen) noexcept;
     static bool WaitForFenceReached(ID3D12Fence *fence, uint64_t value,
                                     HANDLE event, DWORD timeoutMs) noexcept;
+    // CL 池轮转:idx = _submitSeq % depth,CPU 等同 idx 上次使用的栅栏
+    // (4 段之前,常态即刻返回),Reset allocator + CL(含 force-close 自愈,
+    // 与 BeginCtlRecording 同款)。提交后由调用方记 _lastUse。
+    bool AcquireCl(ID3D12CommandAllocator **allocator,
+                   ID3D12GraphicsCommandList **cl) noexcept;
 
     D3D12Context *_d3d12 = nullptr;
     int _width = 0;
@@ -115,19 +130,23 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> _sparseFlow; // R16G16_SINT sparse
     Microsoft::WRL::ComPtr<ID3D12Resource> _scd;
 
-    // 持久命令路径(alloc A = copy + densify 复用,alloc B = FFX dispatch)。
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> _allocatorA;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> _allocatorB;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> _commandListA;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> _commandListB;
+    // 持久命令路径:copy/main/densify 三段统一 4 深轮转池。idx = 提交序 % 4,
+    // Reset 前 CPU 等同 idx 上次使用的栅栏(4 段之前;GPU 落后超 4 段 =
+    // 背压,RtxQueue 同款)。门内 CPU 等 dispatch 已删(见头注释时序模型)。
+    static constexpr int kFfxClDepth = 4;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> _alloc[kFfxClDepth];
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> _cl[kFfxClDepth];
     Microsoft::WRL::ComPtr<ID3D12Fence> _copyFence;  // copy/densify 完成(app 侧)
     Microsoft::WRL::ComPtr<ID3D12Fence> _doneFence;  // FFX dispatch 完成
     HANDLE _copyFenceEvent = nullptr;
     HANDLE _doneFenceEvent = nullptr;
-    uint64_t _copySeq = 0;
+    uint64_t _copySeq = 0;      // copyFence 计数(copy + densify 提交)
     uint64_t _lastCopyFence = 0;
-    uint64_t _doneSeq = 0;
+    uint64_t _doneSeq = 0;      // doneFence 计数(main CL 提交)
     uint64_t _lastDone = 0;
+    uint64_t _submitSeq = 0;                    // CL 池轮转计数(三段统一)
+    ID3D12Fence *_lastUseFence[kFfxClDepth] = {}; // 每槽最后一次使用的栅栏
+    uint64_t _lastUseValue[kFfxClDepth] = {};     // 及其 signal 值
 
     OfFrameGate _gate;
     uint32_t _consecutiveFailures = 0;
