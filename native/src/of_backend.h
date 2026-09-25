@@ -9,7 +9,9 @@
 //     waitFenceValue = 0(2026-09-25 钉死契约;NGX PARAM_RESET 只由播种帧
 //     携带,后端漏带 = seek 后 NR 时域历史跨时间线泄漏);
 //   - waitFenceValue != 0 = 本帧真运动已产出(realMotion 判据);
-//   - inputIndex >= 0 = 本帧输入槽位(迟到帧 -1,调用方据此补转换);
+//   - inputIndex >= 0 = 本帧输入准备(转换)已随成功提交的会话 CL 落地,
+//     调用方跳过槽 CL 的补转换;-1 = 本帧无转换(迟到/失败/OF 关),槽 CL
+//     补做(NVOF = ping-pong 槽位;FFX 恒 0,单输入纹理);
 //   - LastStageMs = 门内等待 + 提交 + CPU 等待合计(nvof 段计时同语义)。
 // PSO 与描述符槽位在 D3D12Context(BindOfResources/Record* 助手);context
 // 类只做编排(门、栅栏、FFX API 调用)。

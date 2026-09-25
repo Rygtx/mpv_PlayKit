@@ -342,6 +342,11 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             _lastUseFence[_submitSeq % kFfxClDepth] = _copyFence.Get();
             _lastUseValue[_submitSeq % kFfxClDepth] = _lastCopyFence;
             ++_submitSeq;
+            // 转换 + Prepare 已落在成功提交的 copy CL 上(of_backend.h 契约):
+            // 回填 inputIndex,调用方跳过槽 CL 的重复转换 —— 此前恒 -1,FFX
+            // 每帧多付一次全量 YUV→RGB dispatch,且槽 CL 对已 NSR 的
+            // inputColor 记 COMMON→UAV(from-state 错配,2026-09-25 审查)。
+            result.inputIndex = 0;
         } else {
             TimingStatusLine("DLSSNR STATUS: fxof copy submit failed");
             result.publishZero = true;

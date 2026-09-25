@@ -73,14 +73,15 @@ bool RtxQueue::Execute(ID3D12Fence *waitFence, uint64_t waitValue,
         return false;
     };
     if (waitFence && waitValue) _queue->Wait(waitFence, waitValue);
-    // 六组轮转:本笔 idx = fenceValue % 6,Reset 目标(同 idx 的 allocator)
-    // 最近一笔在 6 笔之前 —— 逐帧链(≤6 笔 = mult=6 默认模式的 TrueHDR 上限)
-    // 通常早已完成,等待即刻返回;GPU 落后超 6 笔同 idx(>12 笔在飞)时
-    // INFINITE 等待 = 背压兜底(单 allocator 时代的 lookback 是"等上一笔"=
-    // 背靠背 eval 时 CPU 逐笔等 GPU,提交链被 GPU 执行串行吸收 —— HDR 链
-    // sub=17ms 根因,2026-09-24 探针定案;双组在 mult=4 HDR 链仍被同帧
-    // 第 2/3 笔顶住,eval_cpu 16-18ms,同日日志定案;in-flight Reset 是 UB
-    // 且有 VSR 队列静默 wedge 前科,2026-09-22,背压语义保留)。
+    // 十二组轮转(kAltCount,深度依据见 rtx_video_context.h):本笔 idx =
+    // fenceValue % 12,Reset 目标(同 idx 的 allocator)最近一笔在 12 笔之前
+    // —— 逐帧链(≤6 笔/帧 = mult=6 的 TrueHDR 上限 × 2 帧在飞)通常早已
+    // 完成,等待即刻返回;GPU 落后超 12 笔同 idx(>24 笔在飞)时有界等待
+    // = 背压兜底(单 allocator 时代的 lookback 是"等上一笔"= 背靠背 eval
+    // 时 CPU 逐笔等 GPU,提交链被 GPU 执行串行吸收 —— HDR 链 sub=17ms
+    // 根因,2026-09-24 探针定案;双组在 mult=4 HDR 链仍被同帧第 2/3 笔顶住,
+    // eval_cpu 16-18ms,同日日志定案;in-flight Reset 是 UB 且有 VSR 队列
+    // 静默 wedge 前科,2026-09-22,背压语义保留)。
     const int idx = static_cast<int>(_fenceValue.load(std::memory_order_acquire) % kAltCount);
     if (const uint64_t pending = _lastSignal[idx]) {
         // 背压等待(GPU 落后超 6 笔同 idx 时触发):10s 上限,与 Finish 侧

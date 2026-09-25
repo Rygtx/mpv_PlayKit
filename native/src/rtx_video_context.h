@@ -80,10 +80,14 @@ private:
     // TrueHDR 背靠背)仍被同帧 GPU 顶住:第 2/3 笔插值 eval 各阻塞等上一笔
     // GPU 完成(eval_cpu 16-18ms 实测,2026-09-24 日志定案)。**上限是 6x**
     //(kFgMultMax=6,MaxGeneratedFrames=5):默认模式每源帧 ≤6 笔 TrueHDR,
-    // 六组轮转 = 同 idx 间隔 6 笔,跨帧的 Reset 目标永不在飞,提交链回归
-    // 纯录制;GPU 落后超 6 笔同 idx(>12 笔在飞)时 INFINITE 等待 = 背压
-    // 兜底。VSR 队列独立实例、每帧 ≤1 笔,不构成约束。
-    static constexpr int kAltCount = 6;
+    // 十二组轮转 = 同 idx 间隔 12 笔。HDR 链每帧笔数 = 1 真实 + (M-1) 插值,
+    // fgM=6 时 = 6 笔 —— 旧 6 组恰被单帧消费完,下一帧第一笔必撞同 idx 的
+    // Reset 前等待(等上一帧首笔 GPU 完成),吃掉 Submit 半段与上一帧 GPU
+    // 执行的重叠(2026-09-25 审查)。12 = 6 笔/帧 × 2 帧在飞(fgMutex 串行
+    // Submit、Finish 锁外,同队列最多 2 帧的链同时在飞)满额 + 余量;背压
+    // 语义不变(GPU 落后超 12 笔同 idx = >24 笔在飞时有界等待兜底)。VSR
+    // 队列独立实例、每帧 ≤1 笔,不构成约束。
+    static constexpr int kAltCount = 12;
     ComPtr<ID3D12CommandAllocator> _allocator[kAltCount];
     ComPtr<ID3D12GraphicsCommandList> _commandList[kAltCount];
     // 每 idx 最近一次 Signal 的完成栅栏值(Reset 前有界等待它 —— 该 idx

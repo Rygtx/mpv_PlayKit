@@ -2521,11 +2521,17 @@ bool DlssnrContext::ProcessFrame(
                                       fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                                : D3D12_RESOURCE_STATE_COMMON);
         } else if (nrOff) {
+            // pipeColor = inputColor(直连)。stateBefore 按实际落点:
+            // OF 会话已转换(inputIndex>=0,FFX/NVOF copy CL)= NSR;未转换
+            // (OF 关/失败)= 槽 CL RecordConvertInput 的 stateAfter(uploadPost)。
+            // 此前恒 COMMON,转换帧对已 NSR 的 inputColor 记错 from-state
+            // (2026-09-25 审查)。
             _d3d12->RecordColorOutput(*postCl, *slot, pipeColor,
                                       /* srvInput */ 0,
                                       ColorOutKind::Sdr,
                                       width, height, matrix, range,
-                                      D3D12_RESOURCE_STATE_COMMON);
+                                      convertedOnNvof ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                                      : uploadPost);
         } else if (_rtxActive) {
             _d3d12->RecordColorOutput(*postCl, *slot,
                                       _d3d12->OutputColor(*slot), D3D12Context::kSrvOutputColor,
@@ -2950,9 +2956,19 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
                     // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
                     if (_ofBackend && ff->nvofInputIndex >= 0) {
-                        dumpOrLog(_ofBackend->InputTexture(ff->nvofInputIndex),
-                                  _ofBackend->Width(), _ofBackend->Height(),
-                                  L"dump_nvof_input.bin", kColorDump);
+                        // 维度按纹理自身描述:FFX 的 _ffxInput 是 OF extent
+                        // (Performance 档 = 会话/2),后端 Width/Height 是会话
+                        // 尺寸 —— footprint 与资源不符 = CopyTextureRegion 静默
+                        // E_INVALIDARG(2026-09-25 审查;FFX inputIndex 回填后
+                        // 本 dump 首次对 FFX 生效)。
+                        if (ID3D12Resource *ofIn =
+                                _ofBackend->InputTexture(ff->nvofInputIndex)) {
+                            const D3D12_RESOURCE_DESC ofInDesc = ofIn->GetDesc();
+                            dumpOrLog(ofIn,
+                                      static_cast<int>(ofInDesc.Width),
+                                      static_cast<int>(ofInDesc.Height),
+                                      L"dump_nvof_input.bin", kColorDump);
+                        }
                     }
                     if (scaling) {
                         dumpOrLog(_d3d12->ReducedColor(*ff->slot), _d3d12->InternalWidth(),
