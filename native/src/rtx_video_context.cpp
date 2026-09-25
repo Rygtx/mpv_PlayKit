@@ -83,7 +83,16 @@ bool RtxQueue::Execute(ID3D12Fence *waitFence, uint64_t waitValue,
     // 且有 VSR 队列静默 wedge 前科,2026-09-22,背压语义保留)。
     const int idx = static_cast<int>(_fenceValue.load(std::memory_order_acquire) % kAltCount);
     if (const uint64_t pending = _lastSignal[idx]) {
-        Wait(pending, nullptr, 0);
+        // 背压等待(GPU 落后超 6 笔同 idx 时触发):10s 上限,与 Finish 侧
+        // RTX 栅栏等待同级。此前传 0 = 单次非阻塞检查,超时的 false 返回
+        // 被忽略 → 对在飞 allocator Reset = UB(上方注释声称的"INFINITE
+        // 等待"从未生效,2026-09-25 修复)。超时 = 专用队列 wedge/设备丢失
+        // (复查仍未达标),Reset 在飞 allocator 不可为,按失败退出 ——
+        // Evaluate 上报,帧失败归 WaitFrame 既有路径兜底。
+        char waitErr[160]{};
+        if (!Wait(pending, waitErr, sizeof(waitErr), 10000)) {
+            return fail(waitErr[0] ? waitErr : "rotator wait timed out");
+        }
     }
     if (FAILED(_allocator[idx]->Reset())) return fail("allocator Reset failed");
     if (FAILED(_commandList[idx]->Reset(_allocator[idx].Get(), nullptr))) return fail("CL Reset failed");
