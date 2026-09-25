@@ -13,10 +13,15 @@
 //         已经读完它(queue Wait,顺序无关)。
 //   2. execute(n) [NVOF 内部引擎]      waits copyFence >= k_n(输入内容就绪)
 //                                      + doneFence >= m_{同槽位上一次}
-//   3. execute 后 CPU 等 doneFence >= m_n(官方样例模式;队列级 Wait 实测
-//      不可靠),然后在门内把 densify 记录到轮转池的独立 CL 上二次提交并
-//      Signal(copyFence, k')—— execute(n+1) 的输入栅栏点含 k_{n+1} > k',
-//      GPU 队列 FIFO 保证 densify(n) 先于 copy(n+1) 先于 execute(n+1)。
+//   3. execute(n) 提交成功后 **CPU 等输出栅栏被延迟**(官方样例模式;队列级
+//      Wait 实测不可靠,故仍是 CPU 等):StageFrame 只做提交 + 门推进,门锁
+//      随 OfStageResult::pendingDensify 移交给调用方;调用方在首个 motion
+//      消费者 CL(NGX base / FG fg CL)提交前调 FlushPendingDensify ——
+//      CPU 等 doneFence >= m_n 在那里进行,与 eval/FG 录制重叠,醒来后把
+//      densify 记录到轮转池的独立 CL 上二次提交并 Signal(copyFence, k')。
+//      门锁全程由调用方持有 = 提交互斥/轮转簿记与旧"门内全程"形态等价,
+//      densify(n) 仍恒先于 copy(n+1) 先于 execute(n+1)(后两者的输入栅栏
+//      点含 k_{n+1} > k',GPU 队列 FIFO 保序)。
 //   4. 槽 CL(n) 的 NGX evaluate:与 densifyCL(n) 同队列、由同线程后提交,
 //      FIFO 顺序 ✓;跨 CL 状态链(UAV→NSR 于 nvofCL,NSR→COMMON 于槽 CL)
 //      合法(同队列保序)。
@@ -110,10 +115,12 @@ public:
     }
 
     // 帧路径:PackInput 之后、SubmitFrame 之前,在帧线程上调用。帧序门 →
-    // 拷贝 CL 提交 → (历史有效时) execute → CPU 等输出栅栏 → postExecute
-    // 回调(门内、同一 nvof CL 上二次提交,调用方在此记录 densify/清零 ——
-    // 与 execute 的完成构成栅栏链)。postExecute 为空(OF 停用帧)时跳过
-    // densify,其余语义不变。
+    // 拷贝 CL 提交 → (历史有效时) execute 提交 → 门推进 → **门锁移交**
+    // (execute 成功帧)返回。CPU 等引擎输出栅栏与 densify 提交(2026-09-25
+    // 延迟改造)在 FlushPendingDensify 进行:调用方在首个 motion 消费者 CL
+    // (NGX base / FG fg CL)提交前调用,与 eval/FG 录制重叠;失败路径由
+    // 调用方守卫析构兜底冲刷。postExecute 为空(OF 停用帧)时不延迟、按旧
+    // 语义跳过 densify。
     // YUV 原生:postCopy 恒设,回调在本 nvof CL 上记录 YUV→RGB 转换
     // (yuvUpload→yuvIn 拷贝 + dispatch → inputColor);inputWrittenByPostCopy
     // = follow(回调内含 RecordNvofDownsample,直接写 _input[cur])时为
@@ -126,7 +133,16 @@ public:
     // 回调签名 (cl, cur):cur 为本帧输入槽位(0/1,UAV 描述符 23/24)。
     OfStageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
                              const OfPostExecuteFn &postExecute,
-                             const OfPostCopyFn &postCopy, bool inputWrittenByPostCopy) noexcept override;
+                             const OfPostCopyFn &postCopy, bool inputWrittenByPostCopy,
+                             std::unique_lock<std::mutex> &gateOut) noexcept override;
+
+    // 冲刷延迟的 densify(见 StageFrame 注释)。前置条件:pendingDensify
+    // = true 且调用方持有 StageFrame 移出的门锁(提交互斥/轮转簿记串行)。
+    // CPU 等 doneFence >= m_n 在此(有界 10s,超时 = 会话退役);醒来后
+    // AcquireCl + postExecute 录制 + 提交 + Signal(copyFence)。幂等(无
+    // 待冲刷即刻返回);失败仅留痕/退役 + 清除待冲刷 —— 本帧已按
+    // realMotion 语义录完参数,运动场陈旧一帧可接受。
+    void FlushPendingDensify(const OfPostExecuteFn &postExecute) noexcept override;
 
     // 本帧 NVOF 拷贝的完成等待(early-return 路径释放槽位前调用,防宿主
     // 复用 upload 缓冲撕裂在途拷贝;正常路径已被 execute 栅栏覆盖,no-op)。
@@ -210,6 +226,12 @@ private:
     uint64_t _doneSeq = 0;        // doneFence 单调计数(注册 + execute 共用)
     uint64_t _lastDone = 0;       // 最近一次 execute 的 done 值(copy(n+1) 等它)
     uint64_t _doneByParity[2]{};  // 每个输入槽位最近一次被 execute 写入的 done 值
+    // 延迟 densify(2026-09-25):待冲刷帧的 execute done 值 + 输入槽位。
+    // 0 = 无待冲刷。仅单在飞:门锁由调用方从 StageFrame 持到冲刷,期间无
+    // 其它帧可入门置位。StageFrame 入门即清(失败路径残留作废 —— 其
+    // ProcessFrame 已退出, densify 不再有意义)。
+    uint64_t _pendingDensifyValue = 0;
+    int _pendingDensifyInput = 0;
 
     // 帧序门 + 会话状态(gateMutex 保护)。
     std::mutex _gateMutex;

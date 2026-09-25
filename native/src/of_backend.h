@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 
 #include "dlssnr_params.h" // kOfBackend* 常量(Kind() 返回值;params 为唯一权威)
 
@@ -30,17 +31,24 @@ namespace vsdlssnr {
 class D3D12Context;
 
 // StageFrame 回调(原 NvofContext 类内定义,上移共享):
-//   postExecute:真运动产出后在会话 CL 上录制 densify/估算(门内、同线程);
-//               inputIndex = 本帧写入的输入槽位(NVOF/FFX 忽略)。
+//   postExecute:真运动产出后在会话 CL 上录制 densify/估算(NVOF = 延迟到
+//               FlushPendingDensify,FFX = 门内即录);inputIndex = 本帧写入
+//               的输入槽位(NVOF/FFX 忽略)。
 //   postCopy:   拷贝/转换 CL 上的输入准备(RecordConvertInput 等)。
 using OfPostExecuteFn = std::function<void(ID3D12GraphicsCommandList *, int inputIndex)>;
 using OfPostCopyFn = std::function<void(ID3D12GraphicsCommandList *, int inputIndex)>;
 
 struct OfStageResult {
-    uint64_t waitFenceValue = 0; // 非 0 = 本帧真运动已产出(densify 已录)
+    uint64_t waitFenceValue = 0; // 非 0 = 本帧真运动已产出(densify 待录/已录)
     bool publishZero = false;    // 本帧清零发布 per-slot motion/confidence
     bool historyReset = false;   // 本帧对 NGX 置 PARAM_RESET
     int inputIndex = -1;         // 本帧写入的输入槽位(dump 用)
+    // NVOF 专属:execute 已提交、densify 录制延迟到 FlushPendingDensify。
+    // 调用方在首个 motion 消费者 CL 提交前(或帧失败路径的守卫析构里)必须
+    // 恰好冲刷一次;gateOut = 随之移出的会话门锁(冲刷全程由调用方持有,
+    // 提交互斥与轮转簿记的串行化不变)。false = 无待冲刷(FFX 恒 false,
+    // 其 densify 在门内即录即提交)。
+    bool pendingDensify = false;
 };
 
 class IOpticalFlowBackend {
@@ -63,10 +71,24 @@ public:
     // 在途拷贝排空(early-return 路径释放槽位前;防宿主复用 upload 撕裂)。
     virtual void WaitCopyIdle() noexcept = 0;
     virtual double LastStageMs() const noexcept = 0;
+    // gateOut:NVOF 在 execute 提交成功且 densify 延迟时把会话门锁移出
+    // (调用方持锁直到 FlushPendingDensify;锁持续持有 = 提交互斥/轮转簿记
+    // 与旧"门内全程"形态等价,只是 CPU 等引擎的位置挪到了首个 motion 消费
+    // 者提交前,与 eval/FG 录制重叠)。FFX 恒不动此锁(其内部 OfFrameGate
+    // 已在 StageFrame 内释放)。其它路径(播种/迟到/失败)NVOF 在门内解锁。
     virtual OfStageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
                                      const OfPostExecuteFn &postExecute,
                                      const OfPostCopyFn &postCopy,
-                                     bool inputWrittenByPostCopy) noexcept = 0;
+                                     bool inputWrittenByPostCopy,
+                                     std::unique_lock<std::mutex> &gateOut) noexcept = 0;
+    // 冲刷延迟的 densify(NVOF 专属;FFX 恒 no-op)。前置条件:pendingDensify
+    // = true 且调用方仍持有 StageFrame 移出的门锁。CPU 等引擎输出栅栏在此
+    // 进行(有界 10s),醒来后 AcquireCl + 录制 + 提交 + signal。幂等:无
+    // 待冲刷即刻返回。失败(等待超时/提交失败)仅退役/留痕 + 清除待冲刷,
+    // 不改变本帧已定的 realMotion 语义(运动场陈旧一帧,可接受)。
+    virtual void FlushPendingDensify(const OfPostExecuteFn &postExecute) noexcept {
+        (void)postExecute;
+    }
     // 诊断 dump 探针:本帧写入的输入纹理(index 0/1)。
     virtual ID3D12Resource *InputTexture(int index) const noexcept = 0;
     // SK_OF_MODE 能力串(backend 特有段;off/zero 前缀由 DlssnrContext 统一)。

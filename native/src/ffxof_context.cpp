@@ -248,11 +248,14 @@ void FxofContext::ResetHistory() noexcept {
 OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
                                       const OfPostExecuteFn &postExecute,
                                       const OfPostCopyFn &postCopy,
-                                      bool inputWrittenByPostCopy) noexcept {
+                                      bool inputWrittenByPostCopy,
+                                      std::unique_lock<std::mutex> &gateOut) noexcept {
     OfStageResult result{};
     // inputWrittenByPostCopy 为 NVOF ping-pong 语义(FFX 无 _input[],Prepare
-    // 恒由 postCopy lambda 记录),此处有意忽略。
+    // 恒由 postCopy lambda 记录),此处有意忽略;gateOut 同为 NVOF 延迟
+    // densify 契约(FFX 门内即录即提交),恒不动。
     (void)inputWrittenByPostCopy;
+    (void)gateOut;
     (void)srcTex; // 输入取材经 postCopy(RecordConvertInput → inputColor)
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue() ||
         !postExecute || !postCopy) {

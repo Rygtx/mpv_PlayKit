@@ -78,7 +78,10 @@ public:
     OfStageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
                              const OfPostExecuteFn &postExecute,
                              const OfPostCopyFn &postCopy,
-                             bool inputWrittenByPostCopy) noexcept override;
+                             bool inputWrittenByPostCopy,
+                             std::unique_lock<std::mutex> &gateOut) noexcept override;
+    // FlushPendingDensify 不覆写:FFX 的 densify 在 StageFrame 门内即录即
+    // 提交,无待冲刷态(默认 no-op 即正确)。
     ID3D12Resource *InputTexture(int index) const noexcept override {
         return index == 0 ? _ffxInput.Get() : nullptr;
     }

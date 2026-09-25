@@ -1657,6 +1657,14 @@ bool DlssnrContext::ProcessFrame(
     // 保留(live 重开无缝,RebuildOf 只在档位/尺寸变化时跑)。
     const bool ofNeeded = !skipEval && _ofBackend && _ofBackend->Enabled() &&
                           _curOfQuality > 0 && (!nrOff || fgM > 0);
+    // NVOF 延迟 densify 的载体(声明在 ofNeeded 块外:守卫须活到 ProcessFrame
+    // 出口或显式冲刷点 —— 块内声明会在块尾立即析构冲刷,延迟即失效)。
+    // ofGate = StageFrame 移出的门锁(持有至冲刷);ofDensifyPending = 待冲刷;
+    // post/postCopy 提升到块外供守卫与冲刷点引用。
+    OfPostExecuteFn post;
+    OfPostCopyFn postCopy;
+    std::unique_lock<std::mutex> ofGate;
+    bool ofDensifyPending = false;
     if (ofNeeded) {
         // 会话输入尺寸(follow 模式 = 内部尺寸);densify 的向量换算把流
         // 向量从会话输入像素单位换算回源像素单位(NVOF MotionScale /
@@ -1673,8 +1681,6 @@ bool DlssnrContext::ProcessFrame(
         densifyInternal =
             nvW != static_cast<uint32_t>(width) || nvH != static_cast<uint32_t>(height);
         const int ofKind = _ofBackend->Kind();
-        OfPostExecuteFn post;
-        OfPostCopyFn postCopy;
         if (ofKind == kOfBackendNvof) {
             // ---- NVOF:网格流(1/32 像素定点)densify(原 PORTING #6 路径)----
             NvofContext *nv = static_cast<NvofContext *>(_ofBackend.get());
@@ -1764,13 +1770,38 @@ bool DlssnrContext::ProcessFrame(
                                          static_cast<uint32_t>(height), ofW, ofH);
             };
         }
+        // NVOF 延迟 densify(2026-09-25):execute 提交后 StageFrame 即返回,
+        // CPU 等引擎 + densify 提交推迟到首个 motion 消费者 CL 提交前(下方
+        // 显式冲刷点),与 NGX eval / DLSSG 录制重叠 —— 真机 of=2 引擎等待
+        // 11-13ms 曾全额串进帧链(占 24fps 帧预算 ~30%)。门锁随 StageFrame
+        // 移出并持有至冲刷(守卫在块外,见 ofNeeded 块后),提交互斥/轮转簿
+        // 记与旧"门内全程"形态等价。FFX:门锁不动、densify 门内已提交,
+        // 冲刷恒 no-op。
         const OfStageResult st =
-            _ofBackend->StageFrame(n, _d3d12->InputColor(*slot), post, postCopy, densifyInternal);
+            _ofBackend->StageFrame(n, _d3d12->InputColor(*slot), post, postCopy, densifyInternal, ofGate);
         nvofHistoryReset = st.historyReset;
         nvofMs = _ofBackend->LastStageMs();
         realMotion = st.waitFenceValue != 0;
         nvofInputIndex = st.inputIndex;
+        ofDensifyPending = st.pendingDensify;
     }
+    // 冲刷守卫(ProcessFrame 出口前恒活):任何出口(含失败 early-return)
+    // 都冲刷待定 densify —— execute 在飞时返回会让下一帧 copy 的队列 Wait
+    // (doneFence)从"预满足"变成承重(NVOF 输出栅栏队列 Wait 不可靠,不
+    // 可赌)。显式冲刷点只优化等待位置;此处析构兜底其余路径。声明序保证
+    // 析构时 ofGate(门锁)仍被持有(先 ofFlushGuard 后 ofGate)。
+    // FlushPendingDensify 幂等,显式冲刷后此处即刻返回。
+    struct OfFlushGuard {
+        IOpticalFlowBackend *b;
+        const OfPostExecuteFn *post;
+        bool on;
+        ~OfFlushGuard() {
+            if (on && b) b->FlushPendingDensify(*post);
+        }
+    } ofFlushGuard{ _ofBackend.get(), &post, ofDensifyPending };
+    auto flushOfDensify = [&]() noexcept {
+        if (ofDensifyPending) _ofBackend->FlushPendingDensify(post);
+    };
     // 3 连败停用(会话内部闩锁)在帧线程侧只发现不重试,防风暴;
     // Rebind/换档时经 _nvofFailed 条目重试一次。
     if (_curOfQuality > 0 && _ofBackend && !_ofBackend->Enabled() && !_nvofFailed) {
@@ -2128,6 +2159,9 @@ bool DlssnrContext::ProcessFrame(
     // (follow 内部管线 = reducedMotion,否则源尺寸 motion;均已 NSR),
     // 播种/OF 关帧绑静态零纹理 —— 全黑 = 无光流数据,与差异视图
     // "一片灰 = 没动"同款语义。
+    // 冲刷点 A:光流场调试视图读 per-slot 运动场 —— densify 必须先于本 CL
+    // 的 FIFO(差异视图不读运动场,不触发)。
+    if (frameParams.debugView == 2) flushOfDensify();
     if (frameParams.debugView == 2) {
         _d3d12->RecordFlowView(*slot, realMotion && densifyInternal, realMotion);
     } else if (frameParams.debugView == 1 && !nrOff) {
@@ -2182,6 +2216,11 @@ bool DlssnrContext::ProcessFrame(
     // NVOF flow 已在 StageFrame 里 CPU 等待完成(execute 后的输出栅栏),
     // 槽 CL 提交时 GPU 侧 flow 已就绪 —— 不再需要队列级 Wait(实测该栅栏
     // 在队列 Wait 语义下可能永不满足,见 NvofContext::StageFrame 注释)。
+    // 冲刷点 B:NR 开时 base CL 的 NGX eval / guidance 降采样是首个 motion
+    // 消费者 —— densify CL 必须先于 base CL 入队(FIFO)。CPU 等引擎在 eval
+    // 录制期间已被消耗大半,此处常态所剩无几。NR 关帧跳过(base CL 无运动
+    // 消费),把重叠窗口让给 fg CL 录制(冲刷点 C)。
+    if (!nrOff) flushOfDensify();
     if (!_d3d12->SubmitBaseFrame(*slot, nullptr, 0, err, errLen)) {
         if (err && errLen) {
             TimingStatusLine(err); // 临时探针
@@ -2422,6 +2461,11 @@ bool DlssnrContext::ProcessFrame(
     // postA(VSR-only 时被错记进 fg 段)/ base CL,HDR 拆分形态才走 postB。
     // postA 提交:等待 vsr 产出(vsrRun)或 base(hdr-only 的 DLSSG
     // backbuffer = outputColor/inputColor,等 base 尾 NSR 化完成)。
+    // 冲刷点 C(兜底):NR 关 + FG 时 fg CL 的 DLSSG MVecs 是首个 motion
+    // 消费者 —— 在 fg CL 提交前冲刷,CPU 等引擎与 fg CL 录制(DLSSG 逐槽
+    // eval)重叠,这是本次延迟改造在 nrOff+FG 会话的主要收益位。其余路径
+    // (无消费者/已被 B 冲刷)幂等即刻返回。
+    flushOfDensify();
     if (fgBeginOk) {
         // 实验模式(PQ 域)的 fg CL 首消费者 = 编码 pass 读 hdrColor(TrueHDR
         // 专用队列产出)—— 必须等 HDR 链尾栅栏(vsr 经 RTX 链传递闭合);

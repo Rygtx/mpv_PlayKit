@@ -221,6 +221,7 @@ void NvofContext::DestroySession() noexcept {
         _curInput = 0;
         _consecutiveFailures = 0;
         _nextSeq = -1;
+        _pendingDensifyValue = 0;
         _gateCv.notify_all();
     }
     _ready.store(false, std::memory_order_release);
@@ -504,7 +505,8 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                                                  ID3D12Resource *srcTex,
                                                  const PostExecuteFn &postExecute,
                                                  const PostCopyFn &postCopy,
-                                                 bool inputWrittenByPostCopy) noexcept {
+                                                 bool inputWrittenByPostCopy,
+                                                 std::unique_lock<std::mutex> &gateOut) noexcept {
     StageResult result{};
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) {
         result.publishZero = true;
@@ -517,6 +519,10 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
 
     {
         std::unique_lock<std::mutex> lock(_gateMutex);
+        // 入门即清:上一帧失败路径(ProcessFrame 提前返回且守卫冲刷未跑,
+        // 理论上守卫恒跑,此为双保险)残留的待冲刷作废 —— 其帧已失败,
+        // densify 不再有意义。
+        _pendingDensifyValue = 0;
 
         // ---- 帧序门:_nextSeq = 上一完成帧 + 1,匹配才 execute ----
         if (_nextSeq < 0) _nextSeq = frameIndex;
@@ -578,8 +584,9 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         const bool seed = !_historyValid || gapSkip;
         bool execute = !seed;
         // densify/清零在本帧 nvof CL 上录制;execute 帧拆成两次提交
-        // (copy → execute → CPU 等 → densify),播种帧合并为一次。
-        bool densifyPending = false;
+        // (copy → execute 提交 → [延迟] CPU 等 → densify),播种帧合并为
+        // 一次。CPU 等 + densify 提交由 FlushPendingDensify 在调用方的
+        // 首个 motion 消费者提交点执行(2026-09-25 延迟改造)。
 
         ID3D12CommandQueue *queue = _d3d12->Queue();
 
@@ -696,38 +703,36 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
 
             const NV_OF_STATUS st = _api.nvOFExecuteD3D12(_session, &in, &out);
             if (st == NV_OF_SUCCESS) {
-                // 官方样例同款:execute 后 CPU 等输出栅栏(NVOF 自有引擎完成
-                // 后置位)。等待落位后再提交 densify —— 不用(也不可靠)队列
-                // 级 Wait:NVOF 的输出栅栏在队列 Wait 语义下可能永不满足。
-                // 输出栅栏超时 = 引擎状态不可信(僵尸 execute 会继续写
-                // 固定 flow 缓冲),会话立即作废,由 RebuildOf 重建。
-                // 临时探针:引擎输出完成 CPU 等待。
-                LARGE_INTEGER te0{}, te1{};
-                QueryPerformanceCounter(&te0);
-                const bool reached = WaitFenceReached(_doneFence.Get(), outFence.value,
-                                                      _doneFenceEvent, 10000);
-                QueryPerformanceCounter(&te1);
-                _lastExeWaitMs = static_cast<double>(te1.QuadPart - te0.QuadPart) * 1000.0 /
-                                 static_cast<double>(freq.QuadPart);
-                if (!reached) {
-                    TimingStatusLine("DLSSNR STATUS: nvof output fence timeout; session retired");
-                    result.publishZero = true;
-                    result.historyReset = true;
-                    _historyValid = false;
-                    _ready.store(false, std::memory_order_release);
+                // execute 已提交,CPU 等输出栅栏(NVOF 自有引擎完成后置位;
+                // 不用也不可靠队列级 Wait)**延迟到 FlushPendingDensify**:
+                // 与调用方的 eval/FG 录制重叠,引擎时间不再全额串进帧链
+                // (2026-09-25,真机 of=2 e≈11-13ms 占帧预算 ~30% 的定案)。
+                // 门锁随 result.pendingDensify 移交调用方,持锁至冲刷 ——
+                // 提交互斥/轮转簿记/densify-先于-copy(n+1) 的串行化与旧
+                // "门内全程"形态等价。输出栅栏超时(冲刷点)= 引擎状态不可信
+                // (僵尸 execute 会继续写固定 flow 缓冲),会话立即作废,由
+                // RebuildOf 重建。
+                result.waitFenceValue = outFence.value; // densify 录制判据
+                _lastDone = outFence.value;
+                _doneByParity[cur] = outFence.value;
+                _consecutiveFailures = 0;
+                if (_executesLogged < 5) {
+                    ++_executesLogged;
+                    char msg[128];
+                    std::snprintf(msg, sizeof(msg),
+                                  "DLSSNR STATUS: nvof execute ok frame=%d grid=%u bidir=%d cost=%d",
+                                  frameIndex, _gridSize, _bidirectional ? 1 : 0, _costEnabled ? 1 : 0);
+                    TimingStatusLine(msg);
+                }
+                if (postExecute) {
+                    // 延迟冲刷(门锁移出);无回调 = 按旧语义零 guidance,
+                    // 不留待冲刷态。
+                    _pendingDensifyValue = outFence.value;
+                    _pendingDensifyInput = cur;
+                    result.pendingDensify = true;
                 } else {
-                    result.waitFenceValue = outFence.value; // densify 录制判据
-                    _lastDone = outFence.value;
-                    _doneByParity[cur] = outFence.value;
-                    _consecutiveFailures = 0;
-                    if (_executesLogged < 5) {
-                        ++_executesLogged;
-                        char msg[128];
-                        std::snprintf(msg, sizeof(msg),
-                                      "DLSSNR STATUS: nvof execute ok frame=%d grid=%u bidir=%d cost=%d",
-                                      frameIndex, _gridSize, _bidirectional ? 1 : 0, _costEnabled ? 1 : 0);
-                        TimingStatusLine(msg);
-                    }
+                    result.waitFenceValue = 0;
+                    result.publishZero = true;
                 }
             } else {
                 char last[96]{};
@@ -759,42 +764,12 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 }
             }
 
-            // densify 二次提交:execute 的 flow 输出就绪(CPU 等已落位),
-            // 在门内、同一线程上追加提交 —— 队列 FIFO 保证它先于下一帧的
-            // copy/execute(execute(n+1) 的输入栅栏点 k_{n+1} > k'_n),
-            // 封死“下一帧覆写 flow 而本帧 densify 未读”的窗口。
-            if (result.waitFenceValue && postExecute) {
-                // 轮转池取 CL(2026-09-25):本位上一使用者 = 前一帧 densify,
-                // 其完成被 execute(n) 的输入栅栏点(copyFence >= k'_{n-1})
-                // 蕴含,而 execute 输出 CPU 等已落位 —— AcquireCl 常态即刻
-                // 返回;失败按失败帧降级。
-                ID3D12CommandAllocator *densAlloc = nullptr;
-                ID3D12GraphicsCommandList *densCl = nullptr;
-                densifyPending = AcquireCl(&densAlloc, &densCl, freq);
-                if (densifyPending) {
-                    postExecute(densCl, cur);
-                    densifyPending = SUCCEEDED(densCl->Close());
-                }
-                if (densifyPending) {
-                    ID3D12CommandList *lists[]{ densCl };
-                    queue->ExecuteCommandLists(1, lists);
-                    _lastCopyFence = ++_copySeq;
-                    queue->Signal(_copyFence.Get(), _lastCopyFence);
-                    _lastUseFence[_submitSeq % kClDepth] = _copyFence.Get();
-                    _lastUseValue[_submitSeq % kClDepth] = _lastCopyFence;
-                    ++_submitSeq;
-                } else {
-                    // densify 提交失败:本帧运动场未生成,按失败帧降级。
-                    TimingStatusLine("DLSSNR STATUS: nvof densify submit failed");
-                    result.publishZero = true;
-                    result.historyReset = true;
-                    result.waitFenceValue = 0;
-                    _historyValid = false;
-                }
-            } else if (result.waitFenceValue) {
-                result.waitFenceValue = 0; // 无回调:无 densify,按零 guidance
-                result.publishZero = true;
-            }
+            // densify 二次提交已迁往 FlushPendingDensify:execute 的 flow 输
+            // 出就绪(CPU 等在冲刷点落位)后录制 + 提交,Signal(copyFence,
+            // k')。调用方持门锁冲刷 → StageFrame(n+1) 被挡在门外 → FIFO
+            // 保证 densify(n) 先于 copy(n+1),execute(n+1) 的输入栅栏点
+            // k_{n+1} > k'_n 封死“下一帧覆写 flow 而本帧 densify 未读”的
+            // 窗口(时序模型见头注释 #3)。
         } else if (copyOk) {
             // 播种帧:发布零运动 + NGX 重置(首帧/重置后的第一帧)。
             // 清零已随拷贝合并为同一次提交(见上方 postExecute 调用)。
@@ -811,12 +786,72 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         if (seed && copyOk) _historyValid = true;
         _nextSeq = static_cast<int64_t>(frameIndex) + 1;
         _gateCv.notify_all();
+        if (result.pendingDensify) {
+            // 门锁移交:调用方持锁至 FlushPendingDensify —— 提交互斥/轮转
+            // 簿记/ densify-先于-copy(n+1) 的串行化与旧"门内全程"形态等价,
+            // StageFrame(n+1) 被挡在门外直到冲刷完成。其余路径(播种/迟到/
+            // 失败)在作用域尾正常解锁,与旧形态同。
+            gateOut = std::move(lock);
+        }
     }
 
     QueryPerformanceCounter(&t1);
     _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
                    static_cast<double>(freq.QuadPart);
     return result;
+}
+
+void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexcept {
+    if (!_pendingDensifyValue) return; // 幂等:无待冲刷(显式冲刷后的守卫兜底/FFX)
+    // 前置条件:调用方持有 StageFrame 移出的门锁 —— 提交互斥、轮转簿记、
+    // 门状态的串行化由它保证(与旧"门内全程"形态唯一的差别 = CPU 等引擎
+    // 的位置挪到了首个 motion 消费者提交点,与 eval/FG 录制重叠)。
+    const uint64_t doneValue = _pendingDensifyValue;
+    const int cur = _pendingDensifyInput;
+    _pendingDensifyValue = 0; // 先清:任何出口不复冲刷
+    if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) return;
+    // CPU 等引擎输出栅栏(官方样例模式;队列级 Wait 实测不可靠)。等待
+    // 落位后再提交 densify。超时 = 引擎状态不可信(僵尸 execute 会继续写
+    // 固定 flow 缓冲),会话立即作废,由 RebuildOf 重建。
+    LARGE_INTEGER freq{}, te0{}, te1{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&te0);
+    const bool reached = !_d3d12->IsDeviceLost() &&
+                         WaitFenceReached(_doneFence.Get(), doneValue,
+                                          _doneFenceEvent, 10000);
+    QueryPerformanceCounter(&te1);
+    _lastExeWaitMs = static_cast<double>(te1.QuadPart - te0.QuadPart) * 1000.0 /
+                     static_cast<double>(freq.QuadPart);
+    if (!reached) {
+        TimingStatusLine("DLSSNR STATUS: nvof output fence timeout at flush; session retired");
+        _historyValid = false; // 门锁由调用方持有,门状态可安全触碰
+        _ready.store(false, std::memory_order_release);
+        return;
+    }
+    if (!postExecute) return; // 契约兜底(StageFrame 已挡,正常不可达)
+    // densify 二次提交:flow 输出已就绪(CPU 等已落位),门锁串行下追加
+    // 提交 —— FIFO 保证先于下一帧 copy/execute(时序模型 #3)。轮转池取
+    // CL:本位上一使用者完成被 execute(n) 输入栅栏点蕴含,常态即刻返回。
+    // 失败仅留痕:本帧已按 realMotion 语义录完参数,运动场陈旧一帧可接受
+    // (与 execute 失败不同,flow 历史链完好,不强制播种)。
+    ID3D12CommandAllocator *densAlloc = nullptr;
+    ID3D12GraphicsCommandList *densCl = nullptr;
+    if (!AcquireCl(&densAlloc, &densCl, freq)) {
+        TimingStatusLine("DLSSNR STATUS: nvof densify acquire failed at flush");
+        return;
+    }
+    postExecute(densCl, cur);
+    if (FAILED(densCl->Close())) {
+        TimingStatusLine("DLSSNR STATUS: nvof densify close failed at flush");
+        return;
+    }
+    ID3D12CommandList *lists[]{ densCl };
+    _d3d12->Queue()->ExecuteCommandLists(1, lists);
+    _lastCopyFence = ++_copySeq;
+    _d3d12->Queue()->Signal(_copyFence.Get(), _lastCopyFence);
+    _lastUseFence[_submitSeq % kClDepth] = _copyFence.Get();
+    _lastUseValue[_submitSeq % kClDepth] = _lastCopyFence;
+    ++_submitSeq;
 }
 
 void NvofContext::WaitCopyIdle() noexcept {
