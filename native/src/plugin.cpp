@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -127,6 +128,19 @@ struct FilterData {
     int fgCacheK = -1;                        // 缓存命中 = 同源帧的后继槽位请求
     int fgCacheM = 0;                         // 有效缓存条目上界(1 + 插值槽数;空位判 null)
     const VSFrame *fgCache[kFgMultMax] = {};  // [0]=真实帧 [1..]=插值帧;持引用
+    // ---- 缓存内容就绪门(2026-09-25 持锁窗口缩小)----
+    // fgMutex 持锁窗口缩到"pack→提交→缓存存储";GPU 等待 + unpack 移到锁外
+    // (ProcessFrameFinish),使下一源帧的 CPU 链(pack/OF/NGX 录制/提交)
+    // 与上一帧的 GPU 执行重叠 —— FG 会话从"零重叠"回到 3 槽流水。内容与
+    // 交付的时序由世代门保证:处理线程锁内存缓存(引用仍 pending)时
+    // ++fgCacheGen,Finish 完成后把 fgReadyGen 追平并 notify;消费线程在
+    // fgMutex 内 addFrameRef 领引用(引用计数防逐出)+ 读世代,fgReadyGen
+    // 未追平则锁外等 cv —— 等的是自己那批帧的内容,不阻塞其它帧的处理。
+    // 锁序恒 fgMutex → fgReadyMutex,无环。
+    uint64_t fgCacheGen = 0;                  // 最近一次缓存存储的世代(fgMutex 内写)
+    uint64_t fgReadyGen = 0;                  // 内容已就绪的世代(fgReadyMutex 内写)
+    std::mutex fgReadyMutex;
+    std::condition_variable fgReadyCv;
 };
 
 // Process-lifetime hot context. mpv's vf_vapoursynth tears down and
@@ -529,8 +543,9 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         const int k = static_cast<int>(fd >> 4);
         const int slot = static_cast<int>(fd & 0xF);
         // fgMutex 串行处理与缓存(同源帧一次处理,各槽从缓存出;FG 链的
-        // NVOF/DLSSG 历史按处理序推进,乱序由 NVOF 帧序门自愈)。
-        std::lock_guard<std::mutex> fgLock(d->fgMutex);
+        // NVOF/DLSSG 历史按处理序推进,乱序由 NVOF 帧序门自愈)。持锁窗口
+        // = pack→提交→缓存存储;GPU 等待 + unpack 在锁外(见 Finish 段)。
+        std::unique_lock<std::mutex> fgLock(d->fgMutex);
         // 有效密度 = min(live 倍数, 结构倍数 M0)。M0(帧数/节奏契约)创建时
         // 定格;live 倍数只决定组内多少槽位产出真插值 —— 关闭/降档即时生效
         // (多余槽位回落真实帧引用),升档超过 M0 无槽可填(需下个 seek)。
@@ -547,13 +562,36 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             effGens = 0;
         }
         if (k == d->fgCacheK && d->fgCache[0]) {
-            // 缓存命中:同源帧已处理,任意槽位交一个新引用(缓存自留)。
+            // 缓存命中:先领引用再等内容(2026-09-25 持锁窗口缩小)。引用在
+            // fgMutex 内领 —— 引用计数使后续逐出(k+1 存储覆盖)不影响本引用;
+            // 内容可能仍在锁外 unpack(处理线程已提交、缓存标了 Pending)——
+            // 世代门等 fgReadyGen 追平本帧世代后交付。等待在两把锁外完成,
+            // 不阻塞其它源帧的处理线程。
             // 无缓存内容的槽位(密度下调的多余槽/播种帧/eval 降级)回落
             // 真实帧 —— 槽位照常占位,输出节奏不变。
             const VSFrame *out =
                 (slot >= 1 && slot < d->fgCacheM && d->fgCache[slot])
                     ? vsapi->addFrameRef(d->fgCache[slot])
                     : vsapi->addFrameRef(d->fgCache[0]);
+            const uint64_t myGen = d->fgCacheGen;
+            bool ready = false;
+            {
+                std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
+                ready = d->fgReadyGen >= myGen;
+            }
+            if (!ready) {
+                fgLock.unlock();
+                std::unique_lock<std::mutex> readyLock(d->fgReadyMutex);
+                if (!d->fgReadyCv.wait_for(readyLock, std::chrono::seconds(15),
+                                           [&] { return d->fgReadyGen >= myGen; })) {
+                    char msg[128];
+                    std::snprintf(msg, sizeof(msg),
+                                  "DLSSNR STATUS: fg gen-gate wait TIMEOUT frame=%d gen=%llu ready=%llu",
+                                  k, static_cast<unsigned long long>(myGen),
+                                  static_cast<unsigned long long>(d->fgReadyGen));
+                    vsdlssnr::TimingStatusLine(msg);
+                }
+            }
             return out;
         }
 
@@ -579,6 +617,13 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 d->fgCache[i] = nullptr;
             }
             d->fgCache[0] = dup;
+            // 纯 CPU 降级:内容同步就绪 —— 世代推进 + 就绪追平(无 pending 窗口)。
+            ++d->fgCacheGen;
+            {
+                std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
+                d->fgReadyGen = d->fgCacheGen;
+            }
+            d->fgReadyCv.notify_all();
             const VSFrame *ret = vsapi->addFrameRef(d->fgCache[0]);
             vsapi->freeFrame(src);
             return ret;
@@ -619,13 +664,26 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         // NGX history-reset policy (frame-gap heuristic) lives in DlssnrContext;
         // only the frame index is forwarded here. 有效密度 effM 与 genPlanes
         // 布局([gen][plane] 扁平)即 ProcessFrame 的多帧输出契约。
+        // 拆分模式(2026-09-25 持锁窗口缩小):ProcessFrame 只跑到提交
+        // (Submit 半段,锁内);等待 + unpack 在锁外 ProcessFrameFinish ——
+        // 下一源帧的 CPU 链与本帧 GPU 执行重叠,FG 会话恢复流水。
         bool fgGenOk[kFgGenSlots] = {};
+        vsdlssnr::FrameFinish *ff = nullptr;
         const bool procOk =
             d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
                                  effM, effGens > 0 ? genPlanes : nullptr,
                                  effGens > 0 ? genStrides : nullptr, fgGenOk,
                                  d->width, d->height, k, matrix, range, err, sizeof(err),
-                                 timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0);
+                                 timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0,
+                                 &ff);
+        // Submit 半段失败(含 oom)= ff 恒 null:锁内兜底 + 缓存(内容同步
+        // 就绪)+ 返回。失败/未评插值槽:释放帧(出帧时槽位回落真实帧引用)。
+        for (int g = 0; g < effGens; ++g) {
+            if (genFrame[g] && (!procOk || !fgGenOk[g])) {
+                vsapi->freeFrame(genFrame[g]);
+                genFrame[g] = nullptr;
+            }
+        }
         if (!procOk) {
             if (!d->failureLogged.exchange(true)) {
                 char msg[512];
@@ -646,13 +704,6 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             d->failureLogged.store(false);
             if (d->hdrOut) SetHdrFrameProps(out, vsapi);
         }
-        // 失败/未评插值槽:释放帧(出帧时槽位回落真实帧引用)。
-        for (int g = 0; g < effGens; ++g) {
-            if (genFrame[g] && (!procOk || !fgGenOk[g])) {
-                vsapi->freeFrame(genFrame[g]);
-                genFrame[g] = nullptr;
-            }
-        }
 
         if (timingEnabled && timing[0]) {
             // Throttle: log every 30th frame (fmParallel: order irrelevant).
@@ -667,7 +718,8 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         // 时长契约:每输出帧 = 源时长/M0(_DurationNum/_DurationDen 整数对
         // —— mpv 逐帧读回累加 pts、nominal_fps 也由它重算;vi.fps 只是元
         // 数据)。密度变化不改变节奏 —— 同源帧 M0 个输出时长求和恒等于源
-        // 时长。缓存帧各设一次(出帧交引用,props 随帧)。
+        // 时长。缓存帧各设一次(出帧交引用,props 随帧)。props/时长与内容
+        // 无关,在缓存存储(锁内)前设置。
         ScaleOutputDuration(out, vsapi, m0);
         for (int g = 0; g < effGens; ++g) {
             if (genFrame[g]) {
@@ -689,10 +741,69 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         for (int g = 0; g < effGens; ++g) {
             d->fgCache[g + 1] = genFrame[g];
         }
+        ++d->fgCacheGen;
+        const uint64_t myGen = d->fgCacheGen;
         const VSFrame *ret =
             (slot >= 1 && slot < d->fgCacheM && d->fgCache[slot])
                 ? vsapi->addFrameRef(d->fgCache[slot])
                 : vsapi->addFrameRef(d->fgCache[0]);
+        // src 引用持到 Finish 兜底拷贝之后(unpack 失败的降级路径还要读它)。
+        if (procOk) {
+            // ---- 锁外 Finish:GPU 等待 + unpack(真实帧 + 逐 gen)----
+            // 从这里到 Ready 通知之间不持 fgMutex:其它源帧的 CPU 链
+            // (pack/OF/录制/提交)与本帧 GPU 执行/unpack 重叠。消费方在
+            // 世代门等本帧内容,不阻塞流水。
+            fgLock.unlock();
+            if (timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin pre-finish");
+            const bool finOk =
+                d->ngx->ProcessFrameFinish(ff, dstPlanes, dstStrides,
+                                           effGens > 0 ? genPlanes : nullptr,
+                                           effGens > 0 ? genStrides : nullptr,
+                                           fgGenOk, err, sizeof(err),
+                                           timingEnabled ? timing : nullptr,
+                                           timingEnabled ? sizeof(timing) : 0);
+            if (timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin post-finish");
+            if (!finOk) {
+                // unpack 失败:帧已入缓存、引用可能已被消费方领走(尚未交付
+                // —— 世代门拦着)→ 内容兜底拷贝(fgGenOk 槽 + 真实帧),交付
+                // 的仍是可用内容。日志闩锁与 Submit 失败同惯例。
+                if (!d->failureLogged.exchange(true)) {
+                    char msg[512];
+                    std::snprintf(msg, sizeof(msg),
+                                  "vs_dlssnr frame %d failed at finish: %s", k, err);
+                    vsapi->logMessage(mtWarning, msg, core);
+                    vsdlssnr::TimingStatusLine(msg);
+                }
+                if (d->rtxActive) {
+                    CopyPlanesScaled(src, out, vsapi, d->width, d->height, d->outW, d->outH);
+                } else {
+                    CopyPlanes(src, out, vsapi, d->width, d->height);
+                }
+                for (int g = 0; g < effGens; ++g) {
+                    if (genFrame[g]) {
+                        if (d->rtxActive) {
+                            CopyPlanesScaled(src, genFrame[g], vsapi,
+                                             d->width, d->height, d->outW, d->outH);
+                        } else {
+                            CopyPlanes(src, genFrame[g], vsapi, d->width, d->height);
+                        }
+                    }
+                }
+            }
+            // 内容就绪:追平世代 + 唤醒等待中的消费方(失败也推进 —— 交付
+            // 的是兜底内容,等待不悬空)。
+            {
+                std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
+                d->fgReadyGen = myGen;
+            }
+            d->fgReadyCv.notify_all();
+        } else {
+            // Submit 半段失败:内容已同步兜底,无 pending 窗口 —— 就绪追平,
+            // 防消费者按本帧世代悬挂在 cv 上。
+            std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
+            d->fgReadyGen = myGen;
+            d->fgReadyCv.notify_all();
+        }
         vsapi->freeFrame(src);
         return ret;
     }

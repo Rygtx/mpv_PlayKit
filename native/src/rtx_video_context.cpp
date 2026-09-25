@@ -104,14 +104,19 @@ bool RtxQueue::Execute(ID3D12Fence *waitFence, uint64_t waitValue,
 }
 
 bool RtxQueue::Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs) noexcept {
-    if (_fence->GetCompletedValue() < value) {
+    // 共享 auto-reset 事件:多帧线程可并发等待不同栅栏值(fmParallel 锁外
+    // 等待窗口),fence 值跳变时唤醒可被合并 —— 单次 Wait 返回不代表本等待
+    // 的目标值已达成(被其它等待者窃取),超时误判 = 帧失败。循环复查完成
+    // 值:栅栏值单调 ⇒ 有界退出(NvofContext::WaitFenceReached 同款)。
+    while (_fence->GetCompletedValue() < value) {
         if (FAILED(_fence->SetEventOnCompletion(value, _event))) {
             if (err && errLen) std::snprintf(err, errLen, "rtx queue: SetEventOnCompletion failed");
             return false;
         }
         if (WaitForSingleObject(_event, timeoutMs) != WAIT_OBJECT_0) {
-            // 超时 = 专用队列 wedge/设备丢失:不闩错(帧的最终判定归
-            // WaitFrame 的栅栏超时路径),仅向调用方报告未完成。
+            // 超时(且复查仍未达标)= 专用队列 wedge/设备丢失:不闩错(帧的
+            // 最终判定归 WaitFrame 的栅栏超时路径),仅向调用方报告未完成。
+            if (_fence->GetCompletedValue() >= value) break;
             if (err && errLen) std::snprintf(err, errLen, "rtx queue: fence wait timed out (%lu ms)", timeoutMs);
             return false;
         }

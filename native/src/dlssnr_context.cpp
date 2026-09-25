@@ -1418,6 +1418,38 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     return nvofOk;
 }
 
+// 拆分执行续体:ProcessFrame(Submit 半段)成功后把等待/unpack/stats 所需
+// 的局部状态打包于此;ProcessFrameFinish(Finish 半段,调用方已释放其串行
+// 锁)消费。slot 所有权随打包移交(Submit 半段的 SlotGuard 让位)。
+struct FrameFinish {
+    FrameSlot *slot = nullptr;
+    LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3a{}, tSub0{}, tSub1{},
+                  tSlot0{}, tSlot1{}, tLock0{}, tLock1{};
+    ID3D12Fence *vsrDoneFence = nullptr;
+    uint64_t vsrDoneVal = 0;
+    ID3D12Fence *hdrDoneFence = nullptr;
+    uint64_t hdrDoneVal = 0;
+    bool fgBeginOk = false;
+    bool nrOff = false;
+    bool skipEval = false;
+    bool hdrPostSplit = false;
+    bool hdrRun = false;
+    bool dumpEnabled = false;
+    bool realMotion = false;
+    bool evalZeroed = false;
+    bool rtxIn = false;
+    bool ofNeeded = false;
+    bool fgRan = false;
+    int fgM = 0;
+    int fgEvaluatedCount = 0;
+    int nvofInputIndex = -1;
+    int width = 0;
+    int height = 0;
+    int pipeW = 0;
+    int pipeH = 0;
+    double nvofMs = 0.0;
+};
+
 bool DlssnrContext::ProcessFrame(
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
     uint8_t **dstPlanes, int64_t *dstStrides,
@@ -1426,10 +1458,15 @@ bool DlssnrContext::ProcessFrame(
     int width, int height, int n,
     ColorMatrix matrix, ColorRange range,
     char *err, size_t errLen,
-    char *timingOut, size_t timingLen) noexcept {
+    char *timingOut, size_t timingLen,
+    FrameFinish **deferOut) noexcept {
     if (fgGenOk) {
         for (int g = 0; g < kFgGenSlots; ++g) fgGenOk[g] = false;
     }
+    // 拆分模式(FFG 持锁窗口缩小):Submit 半段失败 = *deferOut 恒 NULL,
+    // 槽由本半段释放;成功 = 所有权移交续体,Finish 半段负责释放。
+    const bool deferMode = deferOut != nullptr;
+    if (deferOut) *deferOut = nullptr;
     // Faulted latch: every NGX entry returns instantly, so bail before
     // paying AcquireSlot + the full-frame CPU pack for a frame that can
     // never succeed.
@@ -1551,8 +1588,20 @@ bool DlssnrContext::ProcessFrame(
     struct SlotGuard {
         D3D12Context *ctx;
         FrameSlot *s;
-        ~SlotGuard() { if (s) ctx->ReleaseSlot(s); }
-    } guard{ _d3d12, slot };
+        IOpticalFlowBackend *of = nullptr;
+        bool drain = false;   // 拆分模式失败路径:槽释放前排空 OF 在飞拷贝
+        bool handoff = false; // 拆分模式 Submit 成功:所有权移交 FrameFinish
+        ~SlotGuard() {
+            if (s && !handoff) {
+                // 拆分模式的 CopyDrainGuard 被禁用(成功路径排空在 Finish 尾);
+                // 失败 early-return 仍会在此释放槽 —— FFX 的 copy CL 可能
+                // 在飞,upload 堆 CPU 写(下一帧 PackInput)竞争由此排空。
+                if (of && drain) of->WaitCopyIdle();
+                ctx->ReleaseSlot(s);
+            }
+        }
+    } guard{ _d3d12, slot, _ofBackend.get(), false };
+    // drain 标志在 ofNeeded 声明后补齐(声明序在后)。
     // The pool seal only serializes; it does not refresh readiness. A
     // concurrent RecreateFeature may have failed (leaving _parameters null)
     // or a device loss may have latched while this thread waited for a slot
@@ -1713,12 +1762,16 @@ bool DlssnrContext::ProcessFrame(
         TimingStatusLine("DLSSNR STATUS: of disabled (exhausted); zero guidance until rebind");
     }
     // early-return 路径释放槽位前排空在途拷贝(宿主复用 upload 缓冲;
-    // 正常路径已被 execute/完成栅栏覆盖,no-op)。
+    // 正常路径已被 execute/完成栅栏覆盖,no-op)。拆分模式下本半段不释放
+    // 槽 —— 排空迁移到 Finish 尾(槽真正释放点)。
     struct CopyDrainGuard {
         IOpticalFlowBackend *b;
         bool on;
         ~CopyDrainGuard() { if (b && on) b->WaitCopyIdle(); }
-    } drainGuard{ _ofBackend.get(), ofNeeded };
+    } drainGuard{ _ofBackend.get(), ofNeeded && !deferMode };
+    // 拆分模式失败路径的槽释放排空(SlotGuard.drain):与上同步 —— 成功
+    // 路径排空在 Finish 尾,失败 early-return 在 SlotGuard 析构点排空。
+    guard.drain = ofNeeded && deferMode;
 
     if (ProbeEnabled()) TimingStatusLine("PROBE: post-stage"); // 临时探针(VSDLSSNR_PROBE=1)
     if (!_d3d12->BeginFrameRecording(*slot)) {
@@ -2384,6 +2437,11 @@ bool DlssnrContext::ProcessFrame(
                                 _d3d12->Fence(), slot->fgFenceValue, &fv,
                                 rtxErr, sizeof(rtxErr))) {
                 if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
+                // 槽释放加固:fg CL 已提交在飞,失败 return 会让槽被下一帧
+                // 复用并 Reset fg allocator —— in-flight Reset = UB。有界等
+                // fg 完成再释放(超时 = 设备故障域,WaitFenceValue 已兜)。
+                _d3d12->WaitFenceValuePublic(slot->fgFenceValue, slot->fenceEvent,
+                                             nullptr, 0);
                 return false;
             }
             hdrDoneFence = _hdr->Queue().Fence();
@@ -2582,33 +2640,109 @@ bool DlssnrContext::ProcessFrame(
             TimingStatusLine(err); // 临时探针
             std::snprintf(err, errLen, "Submit(post) failed");
         }
+        // 槽释放加固(同 gen eval 失败路径):post CL Close 失败时 fg CL 已
+        // 提交在飞,补有界等待再释放槽,防下一帧 in-flight Reset fg allocator。
+        _d3d12->WaitFenceValuePublic(slot->fgFenceValue, slot->fenceEvent, nullptr, 0);
         return false;
     }
+    // Submit 半段收尾(2026-09-25 FG 持锁窗口缩小):把等待/unpack/stats
+    // 所需状态打包进续体并移交槽所有权。defer 模式在此返回(调用方释放
+    // 其串行锁后调 ProcessFrameFinish);同步模式就地完成后半段。
+    auto packFinish = [&]() -> FrameFinish * {
+        auto *ff = new (std::nothrow) FrameFinish();
+        if (!ff) return nullptr;
+        ff->slot = slot;
+        guard.handoff = true; // 槽所有权移交(含失败路径:Finish 负责释放)
+        ff->qpcFreq = qpcFreq;
+        ff->t0 = t0; ff->t1 = t1;
+        ff->t2 = t2; ff->t3a = t3a; ff->tSub0 = tSub0;
+        ff->tSlot0 = tSlot0; ff->tSlot1 = tSlot1;
+        ff->tLock0 = tLock0; ff->tLock1 = tLock1;
+        ff->vsrDoneFence = vsrDoneFence; ff->vsrDoneVal = vsrDoneVal;
+        ff->hdrDoneFence = hdrDoneFence; ff->hdrDoneVal = hdrDoneVal;
+        ff->fgBeginOk = fgBeginOk; ff->nrOff = nrOff; ff->skipEval = skipEval;
+        ff->hdrPostSplit = hdrPostSplit; ff->hdrRun = hdrRun;
+        ff->dumpEnabled = dumpEnabled; ff->realMotion = realMotion;
+        ff->evalZeroed = evalZeroed; ff->rtxIn = rtxIn;
+        ff->ofNeeded = ofNeeded; ff->fgRan = fgRan;
+        ff->fgM = fgM; ff->fgEvaluatedCount = fgEvaluatedCount;
+        ff->nvofInputIndex = nvofInputIndex;
+        ff->width = width; ff->height = height;
+        ff->pipeW = pipeW; ff->pipeH = pipeH;
+        ff->nvofMs = nvofMs;
+        return ff;
+    };
+    if (deferMode) {
+        FrameFinish *ff = packFinish();
+        if (!ff) {
+            if (err && errLen) std::snprintf(err, errLen, "oom: frame finish continuation");
+            return false; // SlotGuard 释放槽,与其它失败路径同语义
+        }
+        *deferOut = ff;
+        return true;
+    }
+    FrameFinish *ffSync = packFinish();
+    if (!ffSync) {
+        if (err && errLen) std::snprintf(err, errLen, "oom: frame finish continuation");
+        return false;
+    }
+    const bool rbSync = ProcessFrameFinish(ffSync, dstPlanes, dstStrides,
+                                           fgDstPlanes, fgDstStrides, fgGenOk,
+                                           err, errLen, timingOut, timingLen);
+    return rbSync;
+}
+// 拆分模式后半(2026-09-25 FG 持锁窗口缩小):全部栅栏有界等待 + unpack
+// (真实帧 + 逐 gen)+ dump/stats 段 + 槽释放(含 OF 排空)。调用方在释放
+// 其串行锁后调用恰好一次;成功 = 帧内容就绪,失败 = 调用方对本帧输出做
+// 源拷贝兜底(帧已入缓存,可能已被消费方领引用,尚未交付)。
+bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
+                                       uint8_t **dstPlanes, int64_t *dstStrides,
+                                       uint8_t **fgDstPlanes, int64_t *fgDstStrides,
+                                       bool *fgGenOk,
+                                       char *err, size_t errLen,
+                                       char *timingOut, size_t timingLen) noexcept {
+    const bool vsTiming = timingOut && timingLen > 0;
+    // t3b/t3c/t4 仅在本半段采样(WaitFrame 后/真实帧 unpack 后/插值帧 unpack 后)。
+    LARGE_INTEGER t3b{}, t3c{}, t4{};
+    // Finish 持有槽所有权(Submit 半段移交):本半段任何出口(含失败提前
+    // return)都排空 + 释放。OF 排空在释放前 —— FFX 的 upload 堆 CPU 写/
+    // GPU 读竞争排空点(WaitCopyIdle 承重化);NVOF 门内 execute CPU 等已
+    // 覆盖,此处常态即刻返回。
+    struct FinishSlotGuard {
+        D3D12Context *ctx;
+        FrameSlot *s;
+        IOpticalFlowBackend *of;
+        bool drain;
+        ~FinishSlotGuard() {
+            if (of && drain) of->WaitCopyIdle();
+            if (s) ctx->ReleaseSlot(s);
+        }
+    } fguard{ _d3d12, ff->slot, _ofBackend.get(), ff->ofNeeded };
     // RTX 分段拆账:CPU 有界等待专用队列完成栅栏(fence 链 base→vsr→postA
-    // →hdr 链;起点 t3a 已在 base 提交后立即观测,见上)。post CL 本就
+    // →hdr 链;起点 ff->t3a 已在 base 提交后立即观测,见上)。post CL 本就
     // Wait 链尾 fence —— 提前 CPU 等待不改变提交时序,只把墙钟拆回各段
     // 名下。10s 上限与 WaitFrame 同级:专用队列 wedge 时等待会超时落空,
     // 帧的最终判定仍归 WaitFrame 既有失败路径,此处不闩错。
-    QueryPerformanceCounter(&tSub1);
-    const double subWaitMs = rtxIn ? (tSub1.QuadPart - tSub0.QuadPart) * 1000.0 / qpcFreq.QuadPart
+    QueryPerformanceCounter(&ff->tSub1);
+    const double subWaitMs = ff->rtxIn ? (ff->tSub1.QuadPart - ff->tSub0.QuadPart) * 1000.0 / ff->qpcFreq.QuadPart
                                    : 0.0;
-    LARGE_INTEGER tVsrDone = t3a, tHdrDone = t3a, tFgDone = t3a;
-    if (vsrDoneFence) {
-        _vsr->Queue().Wait(vsrDoneVal, nullptr, 0, 10000);
+    LARGE_INTEGER tVsrDone = ff->t3a, tHdrDone = ff->t3a, tFgDone = ff->t3a;
+    if (ff->vsrDoneFence) {
+        _vsr->Queue().Wait(ff->vsrDoneVal, nullptr, 0, 10000);
         QueryPerformanceCounter(&tVsrDone);
     }
     // postA(fg CL 栅栏 ≤ post CL 栅栏 ≤ WaitFrame 目标栅栏,必不后完成 ——
-    // 等待近零开销;复用 slot.fenceEvent 与 WaitFrame 串行,无并发)。FG 未
+    // 等待近零开销;复用 ff->slot.fenceEvent 与 WaitFrame 串行,无并发)。FG 未
     // 提交(门关)帧不采样:fgFenceValue 是上一帧的陈旧值。
-    if (fgBeginOk) {
-        _d3d12->WaitFenceValuePublic(slot->fgFenceValue, slot->fenceEvent, nullptr, 0);
+    if (ff->fgBeginOk) {
+        _d3d12->WaitFenceValuePublic(ff->slot->fgFenceValue, ff->slot->fenceEvent, nullptr, 0);
         QueryPerformanceCounter(&tFgDone);
     }
-    if (hdrDoneFence) {
-        _hdr->Queue().Wait(hdrDoneVal, nullptr, 0, 10000);
+    if (ff->hdrDoneFence) {
+        _hdr->Queue().Wait(ff->hdrDoneVal, nullptr, 0, 10000);
         QueryPerformanceCounter(&tHdrDone);
     }
-    if (!_d3d12->WaitFrame(*slot, err, errLen)) {
+    if (!_d3d12->WaitFrame(*ff->slot, err, errLen)) {
         if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
         if (err && errLen) {
             TimingStatusLine(err); // 临时探针
@@ -2618,7 +2752,7 @@ bool DlssnrContext::ProcessFrame(
     }
     if (ProbeEnabled()) TimingStatusLine("PROBE: waited"); // 临时探针(VSDLSSNR_PROBE=1)
     QueryPerformanceCounter(&t3b);
-    const bool rb = _d3d12->UnpackOutput(*slot, dstPlanes, dstStrides, _outW, _outH, err, errLen);
+    const bool rb = _d3d12->UnpackOutput(*ff->slot, dstPlanes, dstStrides, _outW, _outH, err, errLen);
     // unpack 段 = 真实帧回读(t3b→t3c);插值帧回读(t3c→t4)是 FG 的
     // 输出搬运成本,归 fg 段 —— FG 4x 时 4 帧 P10 @OUT 几何可达 100MB+,
     // 混在 unpack 里会让"解包"凭空翻倍而"补帧"恒 0(2026-09-24 用户
@@ -2627,9 +2761,9 @@ bool DlssnrContext::ProcessFrame(
     // FG 插值帧回读(各组独立缓冲;eval 成功的槽才有内容)。失败按整体
     // 失败处理:调用方会对全部输出做源帧复制降级。
     if (rb && fgDstPlanes) {
-        for (int g = 0; g < fgM - 1; ++g) {
+        for (int g = 0; g < ff->fgM - 1; ++g) {
             if (fgGenOk && fgGenOk[g] &&
-                !_d3d12->UnpackOutput(*slot, &fgDstPlanes[g * 3], &fgDstStrides[g * 3],
+                !_d3d12->UnpackOutput(*ff->slot, &fgDstPlanes[g * 3], &fgDstStrides[g * 3],
                                       _outW, _outH, err, errLen, g)) {
                 return false;
             }
@@ -2646,19 +2780,19 @@ bool DlssnrContext::ProcessFrame(
         if (ProbeEnabled()) { // 临时探针
             char probe[96];
             std::snprintf(probe, sizeof(probe), "PROBE: dump-site realMotion=%d ofQ=%d",
-                          realMotion ? 1 : 0, _curOfQuality);
+                          ff->realMotion ? 1 : 0, _curOfQuality);
             TimingStatusLine(probe);
         }
         // VSDLSSNR_DUMP_SKIP=N:跳过前 N 个真运动帧再 dump(warmup 帧
         // 的流场未成熟,FFX/NVOF A/B 对照用)。
         static std::atomic<int> realCount{ 0 };
-        const int myIdx = realMotion ? realCount.fetch_add(1, std::memory_order_relaxed) : -1;
+        const int myIdx = ff->realMotion ? realCount.fetch_add(1, std::memory_order_relaxed) : -1;
         static const int dumpSkip = [] {
             char b[16]{};
             GetEnvironmentVariableA("VSDLSSNR_DUMP_SKIP", b, sizeof(b) - 1);
             return b[0] ? std::atoi(b) : 0;
         }();
-        if (dumpEnabled && realMotion && myIdx >= dumpSkip &&
+        if (ff->dumpEnabled && ff->realMotion && myIdx >= dumpSkip &&
             !dumpedMotion.load(std::memory_order_relaxed)) {
             static std::mutex dumpMotionMutex;
             std::lock_guard<std::mutex> dumpLock(dumpMotionMutex);
@@ -2674,12 +2808,12 @@ bool DlssnrContext::ProcessFrame(
                     bool motionDumped = false;
                     if (scaling) {
                         motionDumped = _d3d12->DumpTextureToFile(
-                            slot->reducedMotion.Get(), _d3d12->InternalWidth(),
+                            ff->slot->reducedMotion.Get(), _d3d12->InternalWidth(),
                             _d3d12->InternalHeight(), (base / L"dump_motion.bin").c_str(),
                             DXGI_FORMAT_R16G16_FLOAT);
                     } else {
                         motionDumped = _d3d12->DumpTextureToFile(
-                            slot->motion.Get(), width, height,
+                            ff->slot->motion.Get(), ff->width, ff->height,
                             (base / L"dump_motion.bin").c_str(),
                             DXGI_FORMAT_R16G16_FLOAT);
                     }
@@ -2723,7 +2857,7 @@ bool DlssnrContext::ProcessFrame(
                 }
             }
         }
-        if (dumpEnabled && !dumped.load(std::memory_order_relaxed)) {
+        if (ff->dumpEnabled && !dumped.load(std::memory_order_relaxed)) {
             static std::mutex dumpMutex;
             std::lock_guard<std::mutex> dumpLock(dumpMutex);
             if (!dumped.exchange(true)) {
@@ -2749,7 +2883,7 @@ bool DlssnrContext::ProcessFrame(
                             TimingStatusLine(msg);
                         }
                     };
-                    dumpOrLog(_d3d12->InputColor(*slot), width, height, L"dump_input.bin", kPipeDump);
+                    dumpOrLog(_d3d12->InputColor(*ff->slot), ff->width, ff->height, L"dump_input.bin", kPipeDump);
                     // YUV 输入平面(YUV→RGB 转换验收:python 参考按矩阵/范围
                     // 重算 BGRA8 与 dump_input 对比 ≤1-2 LSB)。色度尺寸按
                     // 真实布局(444 全分辨率等),勿自推半分辨率。
@@ -2758,42 +2892,42 @@ bool DlssnrContext::ProcessFrame(
                                                           ? DXGI_FORMAT_R16_UNORM
                                                           : DXGI_FORMAT_R8_UNORM;
                         const int cw = _d3d12->ChromaWidth(), ch = _d3d12->ChromaHeight();
-                        const int pw[3]{ width, cw, cw };
-                        const int ph[3]{ height, ch, ch };
+                        const int pw[3]{ ff->width, cw, cw };
+                        const int ph[3]{ ff->height, ch, ch };
                         const wchar_t *names[3]{ L"dump_yuvin_y.bin", L"dump_yuvin_u.bin", L"dump_yuvin_v.bin" };
                         for (int i = 0; i < 3; ++i) {
-                            dumpOrLog(_d3d12->YuvInPlane(*slot, i), pw[i], ph[i], names[i], yuvDumpIn);
+                            dumpOrLog(_d3d12->YuvInPlane(*ff->slot, i), pw[i], ph[i], names[i], yuvDumpIn);
                         }
                     }
                     // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):
                     // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
                     // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
-                    if (_ofBackend && nvofInputIndex >= 0) {
-                        dumpOrLog(_ofBackend->InputTexture(nvofInputIndex),
+                    if (_ofBackend && ff->nvofInputIndex >= 0) {
+                        dumpOrLog(_ofBackend->InputTexture(ff->nvofInputIndex),
                                   _ofBackend->Width(), _ofBackend->Height(),
                                   L"dump_nvof_input.bin", kColorDump);
                     }
                     if (scaling) {
-                        dumpOrLog(_d3d12->ReducedColor(*slot), _d3d12->InternalWidth(),
+                        dumpOrLog(_d3d12->ReducedColor(*ff->slot), _d3d12->InternalWidth(),
                                   _d3d12->InternalHeight(), L"dump_reduced_color.bin", kColorDump);
-                        dumpOrLog(_d3d12->ReducedDenoised(*slot), _d3d12->InternalWidth(),
+                        dumpOrLog(_d3d12->ReducedDenoised(*ff->slot), _d3d12->InternalWidth(),
                                   _d3d12->InternalHeight(), L"dump_reduced_denoised.bin", kColorDump);
-                        dumpOrLog(_d3d12->HorizontalRes(*slot), width,
+                        dumpOrLog(_d3d12->HorizontalRes(*ff->slot), ff->width,
                                   _d3d12->InternalHeight(), L"dump_horizontal.bin",
                                   DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
-                    dumpOrLog(_d3d12->OutputColor(*slot), width, height, L"dump_output.bin", kPipeDump);
+                    dumpOrLog(_d3d12->OutputColor(*ff->slot), ff->width, ff->height, L"dump_output.bin", kPipeDump);
                     // TrueHDR 输出本体(FP16 scRGB,PIPE 尺寸):黑屏排查的
                     // "没写 vs 写了零 vs 写了错值"判据(VSDLSSNR_DUMP=1)。
-                    if (slot->hdrColor) {
-                        dumpOrLog(slot->hdrColor.Get(), _pipeW, _pipeH,
+                    if (ff->slot->hdrColor) {
+                        dumpOrLog(ff->slot->hdrColor.Get(), _pipeW, _pipeH,
                                   L"dump_hdrcolor.bin", DXGI_FORMAT_R16G16B16A16_FLOAT);
                     }
                     // FG 插值输出(仅 eval 过的帧有内容;首帧必为播种,等
                     // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。
                     // 恒 SDR 域 BGRA8 @PIPE(VSR 时 = _pipeW/H,else 源尺寸)。
-                    if (fgRan) {
-                        dumpOrLog(_d3d12->FgInterp(*slot, 0), pipeW, pipeH,
+                    if (ff->fgRan) {
+                        dumpOrLog(_d3d12->FgInterp(*ff->slot, 0), ff->pipeW, ff->pipeH,
                                   L"dump_fg_interp.bin", kColorDump);
                     }
                     // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
@@ -2802,12 +2936,12 @@ bool DlssnrContext::ProcessFrame(
                         const DXGI_FORMAT yuvDump = _d3d12->BitDepth() > 8
                                                         ? DXGI_FORMAT_R16_UNORM
                                                         : DXGI_FORMAT_R8_UNORM;
-                        const int cw = (width + 1) >> 1, ch = (height + 1) >> 1;
-                        const int pw[3]{ width, cw, cw };
-                        const int ph[3]{ height, ch, ch };
+                        const int cw = (ff->width + 1) >> 1, ch = (ff->height + 1) >> 1;
+                        const int pw[3]{ ff->width, cw, cw };
+                        const int ph[3]{ ff->height, ch, ch };
                         const wchar_t *names[3]{ L"dump_y_plane.bin", L"dump_u_plane.bin", L"dump_v_plane.bin" };
                         for (int i = 0; i < 3; ++i) {
-                            dumpOrLog(_d3d12->YuvOutPlane(*slot, i), pw[i], ph[i], names[i], yuvDump);
+                            dumpOrLog(_d3d12->YuvOutPlane(*ff->slot, i), pw[i], ph[i], names[i], yuvDump);
                         }
                     }
                 }
@@ -2819,70 +2953,70 @@ bool DlssnrContext::ProcessFrame(
         const auto ms = [](LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f) {
             return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
         };
-        const double packMs = ms(t0, t1, qpcFreq);
-        // eval_cpu = "NGX 调用" 的 CPU 成本:NR eval 窗口(t1→t2,扣 nvof)
-        // **+ RTX evals 的 CPU 提交链(t3a→tSub1,vsr/TrueHDR/DLSSG 逐笔
+        const double packMs = ms(ff->t0, ff->t1, ff->qpcFreq);
+        // eval_cpu = "NGX 调用" 的 CPU 成本:NR eval 窗口(t1→ff->t2,扣 nvof)
+        // **+ RTX evals 的 CPU 提交链(ff->t3a→ff->tSub1,vsr/TrueHDR/DLSSG 逐笔
         // 参数录制,~1.8ms/次,全家桶 8 笔 ≈ 14ms,2026-09-24 探针定案)**。
         // 提交链与 GPU 执行并行,但它是真实的每帧 CPU 串行成本 —— 唯一
         // 诚实呈现的位置就是本段(NR 关时不再恒 0,RTX 关时仍 0)。
-        // 直通帧(evalZeroed)没有 NGX 调用,恒 0。
-        const double evalCpuMs = ms(t1, t2, qpcFreq);
-        const double evalBase = evalZeroed ? 0.0
-                                : evalCpuMs > nvofMs ? evalCpuMs - nvofMs
+        // 直通帧(ff->evalZeroed)没有 NGX 调用,恒 0。
+        const double evalCpuMs = ms(ff->t1, ff->t2, ff->qpcFreq);
+        const double evalBase = ff->evalZeroed ? 0.0
+                                : evalCpuMs > ff->nvofMs ? evalCpuMs - ff->nvofMs
                                                      : 0.0;
         const double evalOnlyMs = evalBase + subWaitMs;
         // 分段 GPU 时间 = 各提交的栅栏完成点差(timestamp query 与 NGX 同
         // CL 会 SEH,见 NOTE;栅栏差分是无损精确拆分):
         // gpu 段 = base CL(NR 推理/残差/直通),
-        // vsr 段 = VSR eval(t3a 后有界 CPU 等待完成栅栏),
+        // vsr 段 = VSR eval(ff->t3a 后有界 CPU 等待完成栅栏),
         // fg 段 = postA(HDR 会话 = 纯 DLSSG 推理;非 HDR = post 全部:
         // 推理 + 转换/回读 旧形态),
         // hdr 段 = TrueHDR 链 + postB 转换/回读窗口(每输出帧一次 eval;
         // 仅 HDR 会话非零),
         // 门关帧 fg 段 ≈ 0(WaitFrame 等的就是 base 值,立即满足)。
-        const double gpuWaitMs = ms(t2, t3a, qpcFreq);
-        // NR 关直连帧:base CL 为空(零 NR 工作),t2→t3a = 等空栅栏的墙钟
+        const double gpuWaitMs = ms(ff->t2, ff->t3a, ff->qpcFreq);
+        // NR 关直连帧:base CL 为空(零 NR 工作),ff->t2→ff->t3a = 等空栅栏的墙钟
         // (3 槽流水下含其他槽的队列拥塞),不是 NR 处理时间 —— gpu 段上报
         // 记 0(面板"NR 推理"段随之归零),原始窗口已折入 conv(见下),
-        // 总量仍恒真。skipEval 诊断模式保留直通拷贝成本(gpu = 拷贝)。
-        const double gpuSegMs = (nrOff && !skipEval) ? 0.0 : gpuWaitMs;
+        // 总量仍恒真。ff->skipEval 诊断模式保留直通拷贝成本(gpu = 拷贝)。
+        const double gpuSegMs = (ff->nrOff && !ff->skipEval) ? 0.0 : gpuWaitMs;
         // unpack 段 = 真实帧回读;插值帧回读(t3c→t4)= FG 输出搬运,
         // 并入 fg 段(无 FG 帧两者差 ≈0)。
-        const double unpackMs = ms(t3b, t3c, qpcFreq);
-        const double fgReadbackMs = ms(t3c, t4, qpcFreq);
-        // RTX 各段起点 = tSub1(提交链结束,CPU 开始按 GPU 完成序等待):
+        const double unpackMs = ms(t3b, t3c, ff->qpcFreq);
+        const double fgReadbackMs = ms(t3c, t4, ff->qpcFreq);
+        // RTX 各段起点 = ff->tSub1(提交链结束,CPU 开始按 GPU 完成序等待):
         // vsr 段 = 提交链后的真实 vsr 等待(GPU-bound 时 = vsr GPU 剩余;
         // CPU-bound 时 ≈0 = "vsr 不构成瓶颈",其 GPU 执行与提交链并行被
         // 覆盖);fg/hdr/conv 段同理。GPU-bound 才逐段真实,总量恒真。
-        const double rtxVsrMs = vsrDoneFence ? ms(tSub1, tVsrDone, qpcFreq) : 0.0;
+        const double rtxVsrMs = ff->vsrDoneFence ? ms(ff->tSub1, tVsrDone, ff->qpcFreq) : 0.0;
         // 解耦后四段拆账(fg CL = 纯 DLSSG 推理;post CL = 全部输出转换,
         // 账归 conv;NR 关直连帧的 base CL 窗口 = C1 补做,也归 conv ——
         // gpu 段记 0 保持"各段不重叠、可加"):
         //   fg  段 = fgStart → tFgDone(FG 提交了才有)+ 插值帧回读;
         //   hdr 段 = TrueHDR 真实帧/链窗口;
-        //   conv 段 = convAnchor → t3b(post CL 窗口)+ nrOff 的 base 窗口。
+        //   conv 段 = convAnchor → t3b(post CL 窗口)+ ff->nrOff 的 base 窗口。
         double fgMs = 0.0, rtxHdrMs = 0.0, convMs = 0.0;
         {
-            const LARGE_INTEGER &fgStart = vsrDoneFence ? tVsrDone : tSub1;
-            if (fgBeginOk) fgMs = ms(fgStart, tFgDone, qpcFreq);
-            if (hdrPostSplit) {
-                rtxHdrMs = ms(fgBeginOk ? tFgDone : fgStart, tHdrDone, qpcFreq);
-                convMs = ms(tHdrDone, t3b, qpcFreq);
-            } else if (hdrRun) {
-                rtxHdrMs = ms(tSub1, tHdrDone, qpcFreq);
+            const LARGE_INTEGER &fgStart = ff->vsrDoneFence ? tVsrDone : ff->tSub1;
+            if (ff->fgBeginOk) fgMs = ms(fgStart, tFgDone, ff->qpcFreq);
+            if (ff->hdrPostSplit) {
+                rtxHdrMs = ms(ff->fgBeginOk ? tFgDone : fgStart, tHdrDone, ff->qpcFreq);
+                convMs = ms(tHdrDone, t3b, ff->qpcFreq);
+            } else if (ff->hdrRun) {
+                rtxHdrMs = ms(ff->tSub1, tHdrDone, ff->qpcFreq);
                 const LARGE_INTEGER &convAnchor =
-                    (fgBeginOk ? tFgDone.QuadPart : fgStart.QuadPart) > tHdrDone.QuadPart
-                        ? (fgBeginOk ? tFgDone : fgStart) : tHdrDone;
-                convMs = ms(convAnchor, t3b, qpcFreq);
+                    (ff->fgBeginOk ? tFgDone.QuadPart : fgStart.QuadPart) > tHdrDone.QuadPart
+                        ? (ff->fgBeginOk ? tFgDone : fgStart) : tHdrDone;
+                convMs = ms(convAnchor, t3b, ff->qpcFreq);
             } else {
                 const LARGE_INTEGER &convAnchor =
-                    fgBeginOk ? tFgDone : (vsrDoneFence ? tVsrDone : t3a);
-                convMs = ms(convAnchor, t3b, qpcFreq);
+                    ff->fgBeginOk ? tFgDone : (ff->vsrDoneFence ? tVsrDone : ff->t3a);
+                convMs = ms(convAnchor, t3b, ff->qpcFreq);
             }
         }
         // NR 关直连帧:base CL 只剩 C1 补做(转换),gpu 段记 0、窗口归 conv。
         // NR 开帧的 C1(在 eval_cpu 窗口或 gpu 段内,微秒级)不入 conv。
-        if (nrOff && !skipEval) convMs += gpuWaitMs;
+        if (ff->nrOff && !ff->skipEval) convMs += gpuWaitMs;
         // 插值帧回读(FG 输出搬运,CPU 行拷贝)归入 fg 段:DLSSG 推理被
         // 提交链遮盖时,这里就是补帧成本的主要可见账目(4x @OUT 几何可达
         // 10ms+)。
@@ -2890,7 +3024,7 @@ bool DlssnrContext::ProcessFrame(
         // Magpie-style perf log line into dlssnr_timing.log (time-gated ≥1s,
         // see perfDue below). TimingLog takes g_timingMutex itself — format
         // the line under the lock, log outside of it, or this thread
-        // self-deadlocks on frame 1 and burns one slot forever.
+        // self-deadlocks on frame 1 and burns one ff->slot forever.
         char line[384] = "";
         // 九段 last(每帧值,面板"处理用时"数据源;五段管线 + vsr/hdr/conv
         // 分段)+ EMA(perf 日志行专用)。pack/nvof/eval_cpu/unpack/vsr/hdr/conv
@@ -2898,15 +3032,15 @@ bool DlssnrContext::ProcessFrame(
         // 锁内算,fmParallel 并发安全。
         double gpuLast = 0.0, gpuEma = 0.0, packEma = 0.0, nvofEma = 0.0,
                evalCpuEma = 0.0, unpackEma = 0.0;
-        const double packLast = packMs, nvofLast = nvofMs,
+        const double packLast = packMs, nvofLast = ff->nvofMs,
                      evalCpuLast = evalOnlyMs, unpackLast = unpackMs,
                      fgLast = fgMs, rtxVsrLast = rtxVsrMs, rtxHdrLast = rtxHdrMs,
                      convLast = convMs;
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
-            const double slotWaitMs = ms(tSlot0, tSlot1, qpcFreq);
-            const double lockWaitMs = ms(tLock0, tLock1, qpcFreq);
-            g_timing.Push(gpuSegMs, packMs, nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
+            const double slotWaitMs = ms(ff->tSlot0, ff->tSlot1, ff->qpcFreq);
+            const double lockWaitMs = ms(ff->tLock0, ff->tLock1, ff->qpcFreq);
+            g_timing.Push(gpuSegMs, packMs, ff->nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
             const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
             gpuLast = g_timing.gpu[lastIdx];
             gpuEma = TimingWindow::Ema(g_timing.gpu, g_timing.count);
@@ -2921,7 +3055,7 @@ bool DlssnrContext::ProcessFrame(
             LARGE_INTEGER nowQpc{};
             QueryPerformanceCounter(&nowQpc);
             const bool perfDue = lastPerfQpc.QuadPart == 0 ||
-                                 (nowQpc.QuadPart - lastPerfQpc.QuadPart) >= qpcFreq.QuadPart;
+                                 (nowQpc.QuadPart - lastPerfQpc.QuadPart) >= ff->qpcFreq.QuadPart;
             if (perfDue) lastPerfQpc = nowQpc;
             if (perfDue) {
                 const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
@@ -2950,7 +3084,7 @@ bool DlssnrContext::ProcessFrame(
                          _d3d12->FrameRateWindow());
                 // nvof=ema/last;后缀 g/c/e = 门等待/前帧拷贝等待/引擎输出等待,
                 // s/x/r = 门跳帧/过期帧/历史重置累计(探针保留:时序类问题的
-                // 第一手证据)。slot/lock = 槽池等待 / evaluate 互斥等待
+                // 第一手证据)。ff->slot/lock = 槽池等待 / evaluate 互斥等待
                 // (ema/last);f = 本行前一帧的帧号(与 STATUS 行对齐用);
                 // fps = 1s 窗口帧入口计数,处理帧率 < 源帧率 = 宿主侧没来帧。
             }
@@ -2960,11 +3094,11 @@ bool DlssnrContext::ProcessFrame(
         // 门 ≥1s 一行(与帧率无关)。Snapshot/FrameRateWindow 在锁外取
         // (各自持独立互斥,勿在 g_timingMutex 内叠锁)。
         {
-            // 排队细分 last(slot/lock 等待)与门累计:诊断页数据源。nvof
+            // 排队细分 last(ff->slot/lock 等待)与门累计:诊断页数据源。nvof
             // 探针仅 NVOF 后端存在(FFX 无引擎等待,恒 0);指针读法与上方
             // perf 行同款(仅读,换会话在 PoolHold 内,帧线程读不撕裂)。
-            const double slotWaitLast = ms(tSlot0, tSlot1, qpcFreq);
-            const double lockWaitLast = ms(tLock0, tLock1, qpcFreq);
+            const double slotWaitLast = ms(ff->tSlot0, ff->tSlot1, ff->qpcFreq);
+            const double lockWaitLast = ms(ff->tLock0, ff->tLock1, ff->qpcFreq);
             NvofContext *nvStats =
                 (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                     ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
@@ -2978,7 +3112,7 @@ bool DlssnrContext::ProcessFrame(
             // 走没走 hook 代理""4x 为什么只跑 2x"面板直读,不翻 timing log。
             const char *fgState = !_fg ? "off"
                 : (!_fg->Enabled() ? "unavailable"
-                                   : (fgEvaluatedCount > 0 ? "on" : "dup"));
+                                   : (ff->fgEvaluatedCount > 0 ? "on" : "dup"));
             // fg_mult_max = 运行库插值帧上限(gate 解锁结果定格值):40 系
             // 解锁失败回落 2x 时创建/面板仍报 6,没有它面板无从知道实际
             // 密度只有 (max+1)x。
@@ -3007,7 +3141,7 @@ bool DlssnrContext::ProcessFrame(
                      SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
                      SK_OF_MODE, OfModeString(),
                      SK_FG, fgState,
-                     SK_FG_MULT, fgM,
+                     SK_FG_MULT, ff->fgM,
                      SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
                      SK_FG_MULT_CREATE, _fgCreateMult,
                      SK_FG_DETAIL, _fgDetail,
@@ -3026,7 +3160,7 @@ bool DlssnrContext::ProcessFrame(
 
         if (vsTiming) {
             std::snprintf(timingOut, timingLen, "pack=%.1f,nvof=%.1f,eval_cpu=%.1f,gpu=%.1f,fg=%.1f,conv=%.1f,unpack=%.1f",
-                          packMs, nvofMs, evalOnlyMs, gpuSegMs, fgMs, convMs, unpackMs);
+                          packMs, ff->nvofMs, evalOnlyMs, gpuSegMs, fgMs, convMs, unpackMs);
         }
     }
     return rb;

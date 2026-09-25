@@ -21,6 +21,11 @@
 
 namespace vsdlssnr {
 
+// ProcessFrame 拆分执行的续体(实现在 cpp;FG 持锁窗口缩小用):Submit 半段
+// 把等待/unpack/stats 所需的全部状态打包于此,调用方释放串行锁后交还
+// ProcessFrameFinish。不透明指针,调用方不得解引用。
+struct FrameFinish;
+
 // Panel toggle for the periodic perf log (dlssnr_timing.log)
 void SetTimingLogEnabled(bool enabled) noexcept;
 
@@ -88,6 +93,11 @@ public:
     // 方定格),每源帧产出 1 真实 + M-1 插值帧。fgDst*/fgStrides 为扁平
     // 数组 [gen][plane](gen 0..M-2,元素 = gen*3+plane);fgGenOk 出参逐
     // 槽告知真插值/false = 复制真实帧(复位/零光流/面板关/eval 降级)。
+    // deferOut 非 NULL = 拆分模式:执行到 SubmitPostFrame 为止,把继续执行
+    // (等待+unpack+stats)打包进 *deferOut 后返回 true;调用方释放其串行锁
+    // 后必须对同一帧调用恰好一次 ProcessFrameFinish。Submit 半段任何失败 =
+    // 返回 false 且 *deferOut = NULL(槽已释放,无后续)。deferOut = NULL =
+    // 原同步语义(单方法完成全部,非 FG 路径照旧)。
     bool ProcessFrame(const uint8_t *const *srcPlanes, const int64_t *srcStrides,
                       uint8_t **dstPlanes, int64_t *dstStrides,
                       int fgMultiplier,
@@ -95,7 +105,19 @@ public:
                       int width, int height, int n,
                       ColorMatrix matrix, ColorRange range,
                       char *err, size_t errLen,
-                      char *timingOut = nullptr, size_t timingLen = 0) noexcept;
+                      char *timingOut = nullptr, size_t timingLen = 0,
+                      FrameFinish **deferOut = nullptr) noexcept;
+    // 拆分模式后半:全部栅栏有界等待 + unpack(真实帧 + 逐 gen)+ dump/stats
+    // 段 + 槽释放(含 OF 排空)。成功 = 帧内容就绪;失败 = 调用方对本帧输出
+    // 做源拷贝兜底(帧已入缓存、可能已被消费方领引用,尚未交付)。fgGenOk
+    // 与 ProcessFrame 传入同一数组(Submit 半段填写,Finish 半段的 unpack
+    // 循环消费,调用方在其后读取)。
+    bool ProcessFrameFinish(FrameFinish *defer,
+                            uint8_t **dstPlanes, int64_t *dstStrides,
+                            uint8_t **fgDstPlanes, int64_t *fgDstStrides,
+                            bool *fgGenOk,
+                            char *err, size_t errLen,
+                            char *timingOut, size_t timingLen) noexcept;
 
     // ---- RTX Video(VSR / TrueHDR)会话事实(create-time 定格)----
     // 输出几何的单一权威(plugin.cpp 建 vi/输出帧、D3D12Context 建平面、
