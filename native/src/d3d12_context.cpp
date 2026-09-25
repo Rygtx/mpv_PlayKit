@@ -8,6 +8,7 @@
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
 #include <dxgidebug.h>
+#include <thread>
 
 namespace vsdlssnr {
 
@@ -1223,6 +1224,57 @@ bool D3D12Context::CreateFgSlotResources(FrameSlot &slot, char *err, size_t errL
     return true;
 }
 
+// pack/unpack 并行行拷贝:最小工作单元 = 平面(或 Y 的上下对半)。
+struct CopyRowSpan {
+    const uint8_t *src;
+    int64_t srcStride;
+    uint8_t *dst;
+    int64_t dstStride;
+    int rows;
+    size_t rowBytes;
+};
+
+void CopyRows(const CopyRowSpan &s) noexcept {
+    // 行距相等且等于行宽 = 区间内存连续 → 整块一次 memcpy(常见宽度
+    // 3840/1920 的行宽天然 256 对齐,upload/readback pitch 与 VS stride
+    // 相等,几乎总走这条;奇宽等不连续场景才逐行)。
+    if (s.srcStride == s.dstStride && static_cast<int64_t>(s.rowBytes) == s.srcStride) {
+        memcpy(s.dst, s.src, s.rowBytes * static_cast<size_t>(s.rows));
+        return;
+    }
+    const uint8_t *srcRow = s.src;
+    uint8_t *dstRow = s.dst;
+    for (int y = 0; y < s.rows; ++y, srcRow += s.srcStride, dstRow += s.dstStride) {
+        memcpy(dstRow, srcRow, s.rowBytes);
+    }
+}
+
+// 区间拆分:每平面对半,恒 6 区间。最大区间 = 最大平面的一半(并行
+// 总耗时由它决定),与采样族无关:420 杆 = Y/2 = 总量 1/3;422 = 1/4;
+// 444/RGBP 三平面等大 = 各 1/6。无需统计帧大小。
+constexpr int kMaxCopySpans = 6;
+
+// 恒并行(线程创建 ~20µs/个,拷贝本体数百 µs 起,恒为正收益)。最后
+// 一个区间留在调用线程;线程创建失败(资源耗尽,极罕见)时该区间由
+// 调用线程就地串行补拷 —— 区间不跳过,输出内容不缺。
+void CopyPlanesRows(CopyRowSpan *spans, int count) noexcept {
+    if (count < 2) {
+        for (int i = 0; i < count; ++i) CopyRows(spans[i]);
+        return;
+    }
+    std::thread workers[kMaxCopySpans - 1];
+    int launched = 0;
+    for (int i = 0; i < count - 1; ++i) {
+        try {
+            workers[launched++] = std::thread(CopyRows, spans[i]);
+        } catch (...) {
+            CopyRows(spans[i]); // 线程创建失败:就地拷,内容不丢
+        }
+    }
+    CopyRows(spans[count - 1]);
+    for (int i = 0; i < launched; ++i) workers[i].join();
+}
+
 bool D3D12Context::PackInput(
     FrameSlot &slot,
     const uint8_t *const *srcPlanes, const int64_t *srcStrides,
@@ -1232,17 +1284,24 @@ bool D3D12Context::PackInput(
         return false;
     }
     // YUV 原生:纯行拷贝,零像素算术(YUV→RGB 在 GPU 转换 pass)。
-    // [0]=Y 全分辨率,[1]/[2]=U/V 半分辨率;行距 256 对齐,VS stride 对齐。
+    // [0]=Y 全分辨率,[1]/[2]=U/V 采样平面;行距 256 对齐,VS stride 对齐。
+    // 恒并行拷贝:每平面对半拆(拆分规则见 kMaxCopySpans)。4K P10 单线程
+    // ~1.5ms → 并行 ~0.5ms。
+    CopyRowSpan spans[kMaxCopySpans];
+    int count = 0;
     for (int p = 0; p < 3; ++p) {
         const int pw = p == 0 ? width : _chromaW;
         const int ph = p == 0 ? height : _chromaH;
         const size_t rowBytes = static_cast<size_t>(pw) * (_bitDepth > 8 ? 2u : 1u);
         const uint8_t *srcRow = srcPlanes[p];
         uint8_t *dstRow = static_cast<uint8_t *>(slot.uploadYuvMapped[p]);
-        for (int y = 0; y < ph; ++y, srcRow += srcStrides[p], dstRow += slot.uploadPitchYuv[p]) {
-            memcpy(dstRow, srcRow, rowBytes);
-        }
+        const int64_t dstPitch = static_cast<int64_t>(slot.uploadPitchYuv[p]);
+        const int half = ph / 2;
+        spans[count++] = { srcRow, srcStrides[p], dstRow, dstPitch, half, rowBytes };
+        spans[count++] = { srcRow + srcStrides[p] * half, srcStrides[p],
+                           dstRow + dstPitch * half, dstPitch, ph - half, rowBytes };
     }
+    CopyPlanesRows(spans, count);
     return true;
 }
 
@@ -1618,19 +1677,26 @@ bool D3D12Context::UnpackOutput(
     // (shader 侧 w=n*1023/65535 精确缩放,见 BGRA_TO_YUV_HLSL),与 VS
     // P10 word 逐位一致 —— 所以是纯拷贝。
     // fgGen >= 0 = 读 FG 插值帧第 fgGen 组回读缓冲。
+    // 源是 WC(write-combined)映射内存:单核读串行化严重,并行收益比
+    // Pack 侧更大。写法与 PackInput 同款(每平面对半,恒并行,见
+    // kMaxCopySpans;4K P10 ~25MB)。
+    CopyRowSpan spans[kMaxCopySpans];
+    int count = 0;
     for (int p = 0; p < 3; ++p) {
         const int pw = p == 0 ? width : _outChromaW;
         const int ph = p == 0 ? height : _outChromaH;
         const size_t rowBytes = static_cast<size_t>(pw) * _outPlaneBytes;
         const uint8_t *srcRow = static_cast<const uint8_t *>(
             fgGen >= 0 ? slot.readbackFgMapped[fgGen][p] : slot.readbackYuvMapped[p]);
-        const size_t srcPitch = fgGen >= 0 ? slot.readbackPitchFg[fgGen][p]
-                                           : slot.readbackPitchYuv[p];
-        uint8_t *dstRow = dstPlanes[p];
-        for (int y = 0; y < ph; ++y, srcRow += srcPitch, dstRow += dstStrides[p]) {
-            memcpy(dstRow, srcRow, rowBytes);
-        }
+        const int64_t srcPitch64 = static_cast<int64_t>(
+            fgGen >= 0 ? slot.readbackPitchFg[fgGen][p] : slot.readbackPitchYuv[p]);
+        const int half = ph / 2;
+        spans[count++] = { srcRow, srcPitch64, dstPlanes[p], dstStrides[p], half, rowBytes };
+        spans[count++] = { srcRow + srcPitch64 * half, srcPitch64,
+                           dstPlanes[p] + dstStrides[p] * half, dstStrides[p],
+                           ph - half, rowBytes };
     }
+    CopyPlanesRows(spans, count);
     return true;
 }
 
