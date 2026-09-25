@@ -96,19 +96,35 @@ struct FrameSlot {
     uint64_t fgFenceValue = 0;        // postA(fg CL)提交的栅栏值(计时锚)
     // base 段 GPU 完成时间戳路径(2026-09-25:WaitBaseFrame CPU 阻塞删除,
     // RTX/fg/post 提交链与 base GPU 执行重叠)。timestamp query 与 NGX 同 CL
-    // 会 SEH(2026-09-05 实锤)—— 独立微型 CL 紧随 base 提交(同一
-    // _submitMutex 保证队列序 [base][ts]),EndQuery + ResolveQueryData 写
-    // READBACK 缓冲;post CL FIFO 在其后,WaitFrame(post 栅栏)完成即蕴含
-    // ts 完成,Finish 无额外等待直接读。GetClockCalibration 在提交时采样,
-    // GPU tick → QPC 线性换算在 Finish 做(值存 tsGpuCal/tsCpuCal,随槽
-    // 生命周期稳定 —— Finish 读完后才 ReleaseSlot)。
-    ComPtr<ID3D12QueryHeap> tsQueryHeap;
-    ComPtr<ID3D12CommandAllocator> tsAllocator;
+    // 会 SEH(2026-09-05 实锤)—— 独立微型 CL 括号对夹住各段(同一
+    // _submitMutex 保证队列序),EndQuery + ResolveQueryData 写 READBACK 缓冲;
+    // post CL FIFO 在其后,WaitFrame(post 栅栏)完成即蕴含全部 ts 完成,
+    // Finish 无额外等待直接读。GetClockCalibration 在提交时采样,GPU tick →
+    // QPC 线性换算在 Finish 做(值存 tsGpuCal/tsCpuCal,随槽生命周期稳定
+    // —— Finish 读完后才 ReleaseSlot)。
+    //
+    // 括号布局(2026-09-25 账目诚实化:每段只记自己名下的 GPU 执行时间,
+    // 队列积压单独成段,不折进任何处理段):
+    //   [preBase][base][postBase]          base 纯执行 = postBase−preBase
+    //   [preFg][fg][postFg]                DLSSG 纯执行(SumbitFgFrame 内)
+    //   post CL 首尾内嵌 EndQuery(4/5)    post 纯执行(自绘 shader 无 NGX,
+    //                                      可同 CL 打点;其跨队列栅栏等待
+    //                                      属于排队,不属 conv)
+    //   0=preBase 1=postBase 2=preFg 3=postFg 4=post0 5=post1(readback 布局)
+    ComPtr<ID3D12QueryHeap> tsQueryHeap;    // 6 查询(容量 8 取整)
+    ComPtr<ID3D12CommandAllocator> tsAllocator;   // postBase 括号
     ComPtr<ID3D12GraphicsCommandList> tsCommandList;
-    ComPtr<ID3D12Resource> tsReadback;      // 8 字节 READBACK,persist-mapped
+    ComPtr<ID3D12CommandAllocator> tsPreBaseAllocator; // preBase 括号
+    ComPtr<ID3D12GraphicsCommandList> tsPreBaseCommandList;
+    ComPtr<ID3D12CommandAllocator> tsPreFgAllocator;   // preFg/postFg 括号
+    ComPtr<ID3D12GraphicsCommandList> tsPreFgCommandList;
+    ComPtr<ID3D12CommandAllocator> tsPostFgAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsPostFgCommandList;
+    ComPtr<ID3D12Resource> tsReadback;      // 64 字节 READBACK(6×UINT64),persist-mapped
     void *tsReadbackMapped = nullptr;
     UINT64 tsGpuCal = 0;                    // 校准点 GPU tick(base 提交时)
     UINT64 tsCpuCal = 0;                    // 校准点 QPC
+    UINT64 submitQpc = 0;                   // SubmitBaseFrame 入口 QPC(排队段锚)
     bool tsValid = false;                   // ts CL 已提交且校准成功(失败帧回退阻塞观测)
 
     // YUV 原生管道:VS 帧(YUV420P8/P10 三平面)与 GPU 之间纯行拷贝。
@@ -574,6 +590,12 @@ private:
     // FG 槽纹理/回读缓冲/描述符(仅 _fgSlots);CreateSlotResources 尾部调用。
     bool CreateFgSlotResources(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept;
+    // 微型括号 CL:Reset(含 force-close 自愈)→ EndQuery(tsIdx) →
+    // ResolveQueryData 写 readback 第 tsIdx 槽(字节偏移 tsIdx*8)→ Close。
+    // 调用方负责在 _submitMutex 内 ECL(队列序紧贴被测段)。失败仅放弃本帧
+    // 该括号(Finish 回退旧栅栏差分账目),不致命。
+    bool RecordTsBracket(FrameSlot &slot, ID3D12CommandAllocator *alloc,
+                         ID3D12GraphicsCommandList *cl, UINT tsIdx) noexcept;
     // Shared body of the three raw buffer creations (upload / readback /
     // diagnostics dump): heap type, initial state and the 256-aligned pitch
     // are the only differences between them.

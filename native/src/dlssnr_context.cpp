@@ -1482,6 +1482,8 @@ struct FrameFinish {
     int pipeW = 0;
     int pipeH = 0;
     double nvofMs = 0.0;
+    double ofEngineMs = 0.0; // 冲刷点引擎等待(逐帧携带 —— 共享探针会被
+                             // 下一帧种子帧覆盖,污染前帧读数)
 };
 
 bool DlssnrContext::ProcessFrame(
@@ -1678,6 +1680,7 @@ bool DlssnrContext::ProcessFrame(
     OfPostCopyFn postCopy;
     std::unique_lock<std::mutex> ofGate;
     bool ofDensifyPending = false;
+    double ofEngineMs = 0.0; // 冲刷点引擎等待(逐帧,packFinish 带入 FrameFinish)
     if (ofNeeded) {
         // 会话输入尺寸(follow 模式 = 内部尺寸);densify 的向量换算把流
         // 向量从会话输入像素单位换算回源像素单位(NVOF MotionScale /
@@ -1797,6 +1800,9 @@ bool DlssnrContext::ProcessFrame(
         realMotion = st.waitFenceValue != 0;
         nvofInputIndex = st.inputIndex;
         ofDensifyPending = st.pendingDensify;
+        // 种子/迟到帧(无待冲刷)显式归零:共享探针 _lastExeWaitMs 可能残留
+        // 上一帧的等待值,不能代表本帧。
+        ofEngineMs = 0.0;
     }
     // 冲刷守卫(ProcessFrame 出口前恒活):任何出口(含失败 early-return)
     // 都冲刷待定 densify —— execute 在飞时返回会让下一帧 copy 的队列 Wait
@@ -1813,7 +1819,10 @@ bool DlssnrContext::ProcessFrame(
         }
     } ofFlushGuard{ _ofBackend.get(), &post, ofDensifyPending };
     auto flushOfDensify = [&]() noexcept {
-        if (ofDensifyPending) _ofBackend->FlushPendingDensify(post);
+        if (ofDensifyPending) {
+            _ofBackend->FlushPendingDensify(post);
+            ofEngineMs = _ofBackend->LastExeWaitMs();
+        }
     };
     // 3 连败停用(会话内部闩锁)在帧线程侧只发现不重试,防风暴;
     // Rebind/换档时经 _nvofFailed 条目重试一次。
@@ -2753,6 +2762,7 @@ bool DlssnrContext::ProcessFrame(
         ff->width = width; ff->height = height;
         ff->pipeW = pipeW; ff->pipeH = pipeH;
         ff->nvofMs = nvofMs;
+        ff->ofEngineMs = ofEngineMs;
         return ff;
     };
     if (deferMode) {
@@ -2849,7 +2859,8 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
     // 负值/开机以来巨值。
     if (ff->slot->tsValid) {
         ff->t3a = ff->t2;
-        const UINT64 tsEnd = *static_cast<const UINT64 *>(ff->slot->tsReadbackMapped);
+        // postBase 括号 = 索引 1(索引 0 已被 preBase 占用,见 d3d12_context.h 布局)
+        const UINT64 tsEnd = static_cast<const UINT64 *>(ff->slot->tsReadbackMapped)[1];
         if (tsEnd > ff->slot->tsGpuCal) {
             const double deltaQpc =
                 static_cast<double>(tsEnd - ff->slot->tsGpuCal) / _d3d12->GpuTsFreq() *
@@ -2858,6 +2869,27 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             t3aTs.QuadPart = ff->slot->tsCpuCal + static_cast<LONGLONG>(deltaQpc);
             if (t3aTs.QuadPart > ff->t2.QuadPart) ff->t3a = t3aTs;
         }
+    }
+    // 时间戳括号账目(2026-09-25 账目诚实化):每段只记自己名下的 GPU 执行
+    // 时间 —— 段间/帧间排队(queue)与冲刷点引擎等待(of_engine)单独成段,
+    // 不折进任何处理段。段差异用 GPU tick 直接换算(同钟,免校准);排队
+    // 需要绝对墙钟锚(preBase − 提交时刻),走校准点换算。
+    double baseGpuMs = 0.0, queueWaitMs = 0.0, fgGpuMs = 0.0, convGpuMs = 0.0;
+    const bool tsAcc = ff->slot->tsValid;
+    if (tsAcc) {
+        const UINT64 *tsq = static_cast<const UINT64 *>(ff->slot->tsReadbackMapped);
+        const double tickMs = 1000.0 / _d3d12->GpuTsFreq();
+        baseGpuMs = static_cast<double>(tsq[1] - tsq[0]) * tickMs;
+        convGpuMs = static_cast<double>(tsq[5] - tsq[4]) * tickMs;
+        if (ff->fgBeginOk) fgGpuMs = static_cast<double>(tsq[3] - tsq[2]) * tickMs;
+        const double qpcPerGpuTick =
+            static_cast<double>(ff->qpcFreq.QuadPart) / _d3d12->GpuTsFreq();
+        const double preBaseQpc = static_cast<double>(ff->slot->tsCpuCal) +
+            static_cast<double>(static_cast<LONGLONG>(tsq[0]) -
+                                static_cast<LONGLONG>(ff->slot->tsGpuCal)) * qpcPerGpuTick;
+        queueWaitMs = (preBaseQpc - static_cast<double>(ff->slot->submitQpc)) *
+                      1000.0 / static_cast<double>(ff->qpcFreq.QuadPart);
+        if (queueWaitMs < 0.0) queueWaitMs = 0.0; // 时钟换算噪声钳零
     }
     const bool rb = _d3d12->UnpackOutput(*ff->slot, dstPlanes, dstStrides, _outW, _outH, err, errLen);
     // unpack 段 = 真实帧回读(t3b→t3c);插值帧回读(t3c→t4)是 FG 的
@@ -3122,11 +3154,11 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         // 仅 HDR 会话非零),
         // 门关帧 fg 段 ≈ 0(WaitFrame 等的就是 base 值,立即满足)。
         const double gpuWaitMs = ms(ff->t2, ff->t3a, ff->qpcFreq);
-        // NR 关直连帧:base CL 为空(零 NR 工作),ff->t2→ff->t3a = 等空栅栏的墙钟
-        // (3 槽流水下含其他槽的队列拥塞),不是 NR 处理时间 —— gpu 段上报
-        // 记 0(面板"NR 推理"段随之归零),原始窗口已折入 conv(见下),
-        // 总量仍恒真。ff->skipEval 诊断模式保留直通拷贝成本(gpu = 拷贝)。
-        const double gpuSegMs = (ff->nrOff && !ff->skipEval) ? 0.0 : gpuWaitMs;
+        // NR 关直连帧:base CL 为空(零 NR 工作)。时间戳括号路径 base 纯执行
+        // 自然 ≈0,无需特判;栅栏差分回退路径保留原约定(等空栅栏的墙钟含
+        // 队列拥塞,记 0 防止"NR 推理"段被拥塞污染)。
+        const double gpuSegMs = tsAcc ? baseGpuMs
+                                      : ((ff->nrOff && !ff->skipEval) ? 0.0 : gpuWaitMs);
         // unpack 段 = 真实帧回读;插值帧回读(t3c→t4)= FG 输出搬运,
         // 并入 fg 段(无 FG 帧两者差 ≈0)。
         const double unpackMs = ms(t3b, t3c, ff->qpcFreq);
@@ -3143,7 +3175,14 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         //   hdr 段 = TrueHDR 真实帧/链窗口;
         //   conv 段 = convAnchor → t3b(post CL 窗口)+ ff->nrOff 的 base 窗口。
         double fgMs = 0.0, rtxHdrMs = 0.0, convMs = 0.0;
-        {
+        if (tsAcc) {
+            // 时间戳括号:fg = DLSSG 纯执行(+ 回读拷贝见下);conv = post CL
+            // 纯执行(CL 内嵌首尾打点,跨队列栅栏等待与队列积压不计入)。
+            // NR 关直连帧的 base 窗口(队列积压)归 queue 段,不折进 conv。
+            fgMs = ff->fgBeginOk ? fgGpuMs : 0.0;
+            convMs = convGpuMs;
+        } else {
+            // 栅栏差分回退(旧账目;段间含队列空闲/等待,不精确)
             const LARGE_INTEGER &fgStart = ff->vsrDoneFence ? tVsrDone : ff->tSub1;
             if (ff->fgBeginOk) fgMs = ms(fgStart, tFgDone, ff->qpcFreq);
             if (ff->hdrPostSplit) {
@@ -3160,10 +3199,11 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     ff->fgBeginOk ? tFgDone : (ff->vsrDoneFence ? tVsrDone : ff->t3a);
                 convMs = ms(convAnchor, t3b, ff->qpcFreq);
             }
+            // NR 关直连帧:base CL 只剩 C1 补做(转换),gpu 段记 0、窗口归
+            // conv。NR 开帧的 C1(在 eval_cpu 窗口或 gpu 段内,微秒级)不入
+            // conv。(仅回退路径;时间戳路径排队单独成段。)
+            if (ff->nrOff && !ff->skipEval) convMs += gpuWaitMs;
         }
-        // NR 关直连帧:base CL 只剩 C1 补做(转换),gpu 段记 0、窗口归 conv。
-        // NR 开帧的 C1(在 eval_cpu 窗口或 gpu 段内,微秒级)不入 conv。
-        if (ff->nrOff && !ff->skipEval) convMs += gpuWaitMs;
         // 插值帧回读(FG 输出搬运,CPU 行拷贝)归入 fg 段:DLSSG 推理被
         // 提交链遮盖时,这里就是补帧成本的主要可见账目(4x @OUT 几何可达
         // 10ms+)。
@@ -3215,17 +3255,18 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                         ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f | res=%d%% of=%d %dx%d f=%d fps=%.0f",
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f nvof=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%% of=%d %dx%d f=%d fps=%.0f",
                          gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
                          nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
                          nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
-                         nvProbe ? nvProbe->LastExeWaitMs() : 0.0,
+                         ff->ofEngineMs,
                          nvProbe ? nvProbe->GateSkips() : 0u,
                          nvProbe ? nvProbe->GateExpired() : 0u,
                          nvProbe ? nvProbe->ResetCount() : 0u,
                          evalCpuEma, fgLast, rtxVsrLast, rtxHdrLast, convLast, unpackEma, subWaitMs,
                          slotEma, g_timing.slotW[lastIdx],
                          lockEma, g_timing.lockW[lastIdx],
+                         queueWaitMs,
                          std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
                          _curOfQuality,
                          _width, _height,

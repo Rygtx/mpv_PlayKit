@@ -89,6 +89,8 @@ public:
     virtual void FlushPendingDensify(const OfPostExecuteFn &postExecute) noexcept {
         (void)postExecute;
     }
+    // 最近一次冲刷的引擎输出等待 ms(逐帧账目用;FFX 无引擎,恒 0)。
+    virtual double LastExeWaitMs() const noexcept { return 0.0; }
     // 诊断 dump 探针:本帧写入的输入纹理(index 0/1)。
     virtual ID3D12Resource *InputTexture(int index) const noexcept = 0;
     // SK_OF_MODE 能力串(backend 特有段;off/zero 前缀由 DlssnrContext 统一)。
