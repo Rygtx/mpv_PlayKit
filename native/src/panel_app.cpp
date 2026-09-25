@@ -2085,7 +2085,7 @@ void DrawUi() noexcept {
                             g_app.segDispFg + g_app.segDispRtxHdr + g_app.segDispConv +
                             g_app.segDispUnpack;
         struct Seg { float v; ImU32 c; const char *name; };
-        const Seg segFg{ g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧GPU)" };
+        const Seg segFg{ g_app.segDispFg,     IM_COL32(0, 150, 136, 255),   "fg(补帧链)" };
         const Seg segHdr{ g_app.segDispRtxHdr, IM_COL32(255, 152, 0, 255),  "hdr(RTX HDR)" };
         const Seg segConv{ g_app.segDispConv, IM_COL32(121, 85, 72, 255),   "conv(输出转换)" };
         const Seg segs[10]{
