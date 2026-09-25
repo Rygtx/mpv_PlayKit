@@ -516,6 +516,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
     LARGE_INTEGER freq{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
+    _stageStartQpc = t0.QuadPart; // 全跨度锚(门入口 → 冲刷完成,LastStageTotalMs)
 
     {
         std::unique_lock<std::mutex> lock(_gateMutex);
@@ -798,6 +799,11 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
     QueryPerformanceCounter(&t1);
     _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
                    static_cast<double>(freq.QuadPart);
+    if (!result.pendingDensify) {
+        // 非延迟帧(播种/迟到/execute 失败):全跨度 = StageFrame 跨度;
+        // 延迟帧留待 FlushPendingDensify 落位(调用方持门锁串行,无竞争)。
+        _lastOfWallMs = _lastStageMs;
+    }
     return result;
 }
 
@@ -822,6 +828,11 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
     QueryPerformanceCounter(&te1);
     _lastExeWaitMs = static_cast<double>(te1.QuadPart - te0.QuadPart) * 1000.0 /
                      static_cast<double>(freq.QuadPart);
+    // 光流阶段全跨度落位(门入口 → 冲刷完成)= 真实光流处理用时(nvof 段
+    // 上报值,含提交 + 引擎计算 + 暴露等待)。2026-09-25 语义修正:此前
+    // nvof 段只剩提交胶水、引擎计算顶着"引擎等待"的名字,因果倒置。
+    _lastOfWallMs = static_cast<double>(te1.QuadPart - _stageStartQpc) * 1000.0 /
+                    static_cast<double>(freq.QuadPart);
     if (!reached) {
         TimingStatusLine("DLSSNR STATUS: nvof output fence timeout at flush; session retired");
         _historyValid = false; // 门锁由调用方持有,门状态可安全触碰

@@ -75,6 +75,9 @@ public:
     void ResetHistory() noexcept override;
     void WaitCopyIdle() noexcept override;
     double LastStageMs() const noexcept override { return _lastStageMs; }
+    // FFX 无独立引擎/无冲刷点:全跨度 = StageFrame 跨度(GPU 计算在主
+    // 队列,量级 1-2ms,与其他段重叠如实计入)。
+    double LastStageTotalMs() const noexcept override { return _lastStageMs; }
     OfStageResult StageFrame(int frameIndex, ID3D12Resource *srcTex,
                              const OfPostExecuteFn &postExecute,
                              const OfPostCopyFn &postCopy,

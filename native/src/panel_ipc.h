@@ -271,14 +271,15 @@ inline constexpr const char *SK_CONV_LAST = "conv_last";
 // 帧间排队段(v25 账目诚实化):base CL 的 preBase 时间戳时刻 − base 提交
 // 时刻 = burst 等待上一帧尾部/队列空闲。引擎超预算(如 NVOF of=4/5)推挤
 // 下一帧时在此显形 —— 此前这笔账被 nrOff 折叠误记进 conv。
+// (nvof_last 同批语义修正:上报值 = 光流阶段全跨度 LastStageTotalMs,即
+// 真实光流处理用时,含提交 + 引擎计算 + 暴露等待 —— 引擎计算不再以
+// "引擎等待"名义独立成段,独立段 = 与 nvof 重复计账,已撤销。)
 inline constexpr const char *SK_QUEUE_LAST = "queue_last";
-// 冲刷点引擎等待(v25 账目诚实化):NVOF execute 输出栅栏在冲刷点
-// (FlushPendingDensify)的 CPU 墙钟,逐帧携带不跨帧。FFX 恒 0(无独立
-// 引擎);NVOF of=2 ≈11-13ms(已被 eval/FG 录制重叠吸收,不在关键路径)。
-inline constexpr const char *SK_OF_ENGINE_LAST = "of_engine_last";
-// NVOF 光流段(门等待+拷贝/降采样提交+execute+输出栅栏的 CPU 墙钟;of=0
-// 或无消费者(NR 关 + FG 关,解耦后整段跳过)时恒 0,面板零值段自动隐藏)。
-// 与 eval_cpu 互斥可加:eval_cpu 上报时已扣除。
+// NVOF 光流段(v25 语义修正:光流阶段全跨度 = 门入口 → 冲刷完成,含提交
+// + 引擎计算 + 暴露等待 —— 真实光流处理用时;档位越高值越大,与引擎吞吐
+// 单调一致。of=0 或无消费者(NR 关 + FG 关,解耦后整段跳过)时恒 0,面板
+// 零值段自动隐藏。与 eval_cpu 的窗口内提交部分互斥可加:eval_cpu 上报时
+// 已扣除提交,不扣引擎计算(引擎在独立硬件,与 eval 窗口并行)。
 inline constexpr const char *SK_NVOF_LAST = "nvof_last";
 inline constexpr const char *SK_UNPACK_LAST = "unpack_last";
 inline constexpr const char *SK_INTERNAL_W = "internal_w";

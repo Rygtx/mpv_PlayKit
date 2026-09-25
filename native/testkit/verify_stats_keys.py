@@ -47,8 +47,9 @@ print("stats:", st[2] if st else "MAPPING MISSING")
 # fg_mult_max(运行库插值帧上限)、of_detail(光流失败原因);RTX 分段键
 # rtxvsr_last/rtxhdr_last(VSR/TrueHDR 专用队列 eval 拆账,关闭时恒 0);
 # v24(DSL5,管线全流程解耦)新增 conv_last(输出转换段,恒非 0);
-# v25(DSLN,账目诚实化)新增 queue_last(帧间排队)/of_engine_last(冲刷
-# 点引擎等待)—— GPU 时间戳括号 + 逐帧携带,段语义见 panel_ipc.h。
+# v25(DSLN,账目诚实化)新增 queue_last(帧间排队)—— GPU 时间戳括号,
+# 段语义见 panel_ipc.h;of_engine_last 曾短暂存在,随"光流段=全跨度"语义
+# 修正撤销(引擎计算并入 nvof_last,独立段=重复计账)。
 # 断言挂在 case 1 的存活 body 上 —— case 2/3 会因同进程第二个滤镜实例
 # 的 IAT hook 单例走 passthrough,边缘 body 不带 tick 键(环境特性,非回归)。
 # 真实部署机上 dlssnr_ui.ini(面板保存的设置优先于 VS 参数)可能开着
@@ -70,11 +71,11 @@ if st:
             and "gate_skips" in body and "gate_expired" in body and "gate_resets" in body
             and body.get("rtxvsr_last", -1) >= 0 and body.get("rtxhdr_last", -1) >= 0
             and body.get("conv_last", -1) >= 0
-            and body.get("queue_last", -1) >= 0 and body.get("of_engine_last", -1) >= 0
+            and body.get("queue_last", -1) >= 0
         )
     except json.JSONDecodeError:
         new_keys_present = False
-print("v19/v21/v24/v25 keys (fg_route_eff/fg_mult_create/fg_mult_max/of_detail/slot_wait/lock_wait/gate_*/conv_last/queue_last/of_engine_last):",
+print("v19/v21/v24/v25 keys (fg_route_eff/fg_mult_create/fg_mult_max/of_detail/slot_wait/lock_wait/gate_*/conv_last/queue_last):",
       "PASS" if new_keys_present else "FAIL")
 
 print("=== case 2: ofq=5(NVOF 会话建立,验证实际模式上报) ===")

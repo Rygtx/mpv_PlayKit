@@ -1481,7 +1481,8 @@ struct FrameFinish {
     int height = 0;
     int pipeW = 0;
     int pipeH = 0;
-    double nvofMs = 0.0;
+    double nvofMs = 0.0;    // OF 提交成本(eval_cpu 窗口内扣减用)
+    double nvofSpanMs = 0.0; // OF 全跨度(提交+引擎+暴露等待,nvof 段上报值)
     double ofEngineMs = 0.0; // 冲刷点引擎等待(逐帧携带 —— 共享探针会被
                              // 下一帧种子帧覆盖,污染前帧读数)
 };
@@ -2761,7 +2762,11 @@ bool DlssnrContext::ProcessFrame(
         ff->nvofInputIndex = nvofInputIndex;
         ff->width = width; ff->height = height;
         ff->pipeW = pipeW; ff->pipeH = pipeH;
-        ff->nvofMs = nvofMs;
+        // nvof 段上报值 = 光流阶段全跨度(2026-09-25 语义修正):门入口 →
+        // 冲刷完成 = 提交 + 引擎计算 + 暴露等待,即真实光流处理用时。此处
+        // 读取时冲刷已落位(点 A/B/C 均在 packFinish 前),fgMutex 下无跨帧
+        // 污染。ff->nvofMs 保持 StageFrame 提交成本(eval_cpu 窗口扣减用)。
+        ff->nvofSpanMs = (ofNeeded && _ofBackend) ? _ofBackend->LastStageTotalMs() : 0.0;
         ff->ofEngineMs = ofEngineMs;
         return ff;
     };
@@ -3219,7 +3224,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         // 锁内算,fmParallel 并发安全。
         double gpuLast = 0.0, gpuEma = 0.0, packEma = 0.0, nvofEma = 0.0,
                evalCpuEma = 0.0, unpackEma = 0.0;
-        const double packLast = packMs, nvofLast = ff->nvofMs,
+        const double packLast = packMs, nvofLast = ff->nvofSpanMs,
                      evalCpuLast = evalOnlyMs, unpackLast = unpackMs,
                      fgLast = fgMs, rtxVsrLast = rtxVsrMs, rtxHdrLast = rtxHdrMs,
                      convLast = convMs;
@@ -3227,7 +3232,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
             const double slotWaitMs = ms(ff->tSlot0, ff->tSlot1, ff->qpcFreq);
             const double lockWaitMs = ms(ff->tLock0, ff->tLock1, ff->qpcFreq);
-            g_timing.Push(gpuSegMs, packMs, ff->nvofMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
+            g_timing.Push(gpuSegMs, packMs, ff->nvofSpanMs, evalOnlyMs, unpackMs, slotWaitMs, lockWaitMs);
             const int lastIdx = g_timing.idx - 1 < 0 ? g_timing.count - 1 : g_timing.idx - 1;
             gpuLast = g_timing.gpu[lastIdx];
             // perf 行按时间门(≥1s 一行)而非帧数:诊断日志的样本密度不应
@@ -3311,7 +3316,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      "{\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
                      "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
-                     "\"%s\":%.1f,\"%s\":%.1f,"
+                     "\"%s\":%.1f,"
                      "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
                      "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
                      "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d,"
@@ -3325,7 +3330,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      SK_NVOF_LAST, nvofLast, SK_FG_LAST, fgLast,
                      SK_RTXVSR_LAST, rtxVsrLast, SK_RTXHDR_LAST, rtxHdrLast,
                      SK_CONV_LAST, convLast,
-                     SK_QUEUE_LAST, queueWaitMs, SK_OF_ENGINE_LAST, ff->ofEngineMs,
+                     SK_QUEUE_LAST, queueWaitMs,
                      SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
                      SK_WIDTH, _width, SK_HEIGHT, _height,
                      SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
@@ -3352,7 +3357,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
 
         if (vsTiming) {
             std::snprintf(timingOut, timingLen, "pack=%.1f,nvof=%.1f,eval_cpu=%.1f,gpu=%.1f,fg=%.1f,conv=%.1f,unpack=%.1f",
-                          packMs, ff->nvofMs, evalOnlyMs, gpuSegMs, fgMs, convMs, unpackMs);
+                          packMs, ff->nvofSpanMs, evalOnlyMs, gpuSegMs, fgMs, convMs, unpackMs);
         }
     }
     return rb;

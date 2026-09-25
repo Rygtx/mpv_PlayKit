@@ -91,6 +91,12 @@ public:
     }
     // 最近一次冲刷的引擎输出等待 ms(逐帧账目用;FFX 无引擎,恒 0)。
     virtual double LastExeWaitMs() const noexcept { return 0.0; }
+    // 光流阶段全跨度 ms(2026-09-25 语义修正:用户裁定"光流处理用时"=
+    // 真实光流处理时间,不是提交胶水):门入口 → 冲刷完成(densify 落位),
+    // 含提交 + 引擎计算 + 暴露等待 —— 与其他段的重叠如实计入本段(各记
+    // 各的)。FFX = StageFrame 跨度(其 GPU 计算在主队列,无独立冲刷点)。
+    // 供 nvof 段上报(逐帧:调用方在冲刷后/打包时读取)。
+    virtual double LastStageTotalMs() const noexcept { return 0.0; }
     // 诊断 dump 探针:本帧写入的输入纹理(index 0/1)。
     virtual ID3D12Resource *InputTexture(int index) const noexcept = 0;
     // SK_OF_MODE 能力串(backend 特有段;off/zero 前缀由 DlssnrContext 统一)。

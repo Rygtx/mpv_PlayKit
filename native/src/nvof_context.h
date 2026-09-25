@@ -163,6 +163,10 @@ public:
 
     // 最近一次 StageFrame 的 CPU 耗时(门等待 + 拷贝提交 + execute 调用),ms。
     double LastStageMs() const noexcept override { return _lastStageMs; }
+    // 光流阶段全跨度(2026-09-25 语义修正):门入口 → 冲刷完成 = 提交 +
+    // 引擎计算 + 暴露等待,即真实光流处理用时(nvof 段上报值)。延迟冲刷
+    // 帧在 FlushPendingDensify 落位;种子/迟到帧 = StageFrame 跨度。
+    double LastStageTotalMs() const noexcept override { return _lastOfWallMs; }
 
     // ---- 临时探针(定位 seek 后持续掉帧,验证后删除)----
     // StageFrame 内三段 CPU 等待细分 + 门异常事件累计。
@@ -244,6 +248,8 @@ private:
     std::atomic<bool> _ready{ false };
 
     double _lastStageMs = 0.0;
+    double _lastOfWallMs = 0.0;   // 光流阶段全跨度(门入口 → 冲刷完成,2026-09-25)
+    UINT64 _stageStartQpc = 0;    // 本帧门入口 QPC(冲刷完成时算全跨度)
     double _lastGateWaitMs = 0.0; // 临时探针(验证后删除)
     double _lastCpyWaitMs = 0.0;  // 临时探针(验证后删除)
     double _lastExeWaitMs = 0.0;  // 临时探针(验证后删除)
