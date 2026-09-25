@@ -437,40 +437,6 @@ static RtxVideoParams RtxFromParams(const DlssnrParams &p) noexcept {
     return rtx;
 }
 
-// 降级路径的缩放拷贝(OUT ≠ 源 或 位深不同:处理失败帧的兜底,画质次要,
-// 可用性第一)。近邻采样;8/10bit 同构(按样本粒度)。VS 平面 stride 对齐。
-static void CopyPlanesScaled(const VSFrame *src, VSFrame *dst, const VSAPI *vsapi,
-                             int srcW, int srcH, int dstW, int dstH) noexcept {
-    const VSVideoFormat *fi = vsapi->getVideoFrameFormat(dst);
-    const int bpp = fi->bytesPerSample;
-    // 色度平面尺寸按帧真实格式(420 半 / 422 半宽 / 444+RGB 全分辨率)。
-    const int srcCw = fi->subSamplingW ? (srcW + 1) >> 1 : srcW;
-    const int srcCh = fi->subSamplingH ? (srcH + 1) >> 1 : srcH;
-    const int dstCw = fi->subSamplingW ? (dstW + 1) >> 1 : dstW;
-    const int dstCh = fi->subSamplingH ? (dstH + 1) >> 1 : dstH;
-    for (int p = 0; p < 3; ++p) {
-        const int sw = p == 0 ? srcW : srcCw;
-        const int sh = p == 0 ? srcH : srcCh;
-        const int dw = p == 0 ? dstW : dstCw;
-        const int dh = p == 0 ? dstH : dstCh;
-        const uint8_t *sp = vsapi->getReadPtr(src, p);
-        const int64_t sstride = vsapi->getStride(src, p);
-        uint8_t *dp = vsapi->getWritePtr(dst, p);
-        const int64_t dstride = vsapi->getStride(dst, p);
-        const size_t sampleBytes = static_cast<size_t>(bpp);
-        for (int y = 0; y < dh; ++y) {
-            const int sy = (std::min)(sh - 1, static_cast<int>(static_cast<int64_t>(y) * sh / dh));
-            const uint8_t *srow = sp + sstride * sy;
-            uint8_t *drow = dp + dstride * y;
-            for (int x = 0; x < dw; ++x) {
-                const int sx = (std::min)(sw - 1, static_cast<int>(static_cast<int64_t>(x) * sw / dw));
-                memcpy(drow + static_cast<size_t>(x) * sampleBytes,
-                       srow + static_cast<size_t>(sx) * sampleBytes, sampleBytes);
-            }
-        }
-    }
-}
-
 // HDR 输出帧色彩签名(BT.2020 PQ limited;mpv 按 props 上屏/色调映射)。
 static void SetHdrFrameProps(VSFrame *frame, const VSAPI *vsapi) noexcept {
     VSMap *props = vsapi->getFramePropertiesRW(frame);
@@ -649,13 +615,10 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             // NR 关不在此列 —— ProcessFrame 内部门控跳过降噪评估,补帧以
             // 直通帧为 backbuffer 照常插值)。FG 输出计数仍是 M0(帧率已
             // ×M0):源帧单次复制入缓存,各槽回落该帧,时长按 1/M0 摊分。
-            // RTX 几何 ≠ 源时走缩放拷贝(输出帧尺寸契约不破)。
+            // rtxActive 只在 initOk 后置位(Create 侧),此处恒 false,
+            // 几何恒 = 源 → 恒同构行拷贝(缩放拷贝兜底已删,2026-09-26)。
             VSFrame *dup = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
-            if (d->rtxActive) {
-                CopyPlanesScaled(src, dup, vsapi, d->width, d->height, d->outW, d->outH);
-            } else {
-                CopyPlanes(src, dup, vsapi, d->width, d->height);
-            }
+            CopyPlanes(src, dup, vsapi, d->width, d->height);
             if (d->hdrOut) SetHdrFrameProps(dup, vsapi);
             ScaleOutputDuration(dup, vsapi, m0);
             d->fgCacheK = k;
@@ -740,14 +703,20 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 // 探针:首帧失败进 timing log(GUI mpv 完全看不到 logMessage)。
                 vsdlssnr::TimingStatusLine(msg);
             }
-            // Failed frames fall back to a plain copy of the source content so
-            // the output planes are never left uninitialized. YUV420:色度半尺寸;
-            // RTX 几何 ≠ 源时缩放拷贝兜底。
+            // RTX 会话失败不再兜底(2026-09-26 用户裁定):最近邻缩放拷贝
+            // 产出几何错误的伪内容,宁报错终止也不静默降级。失败帧不入
+            // 缓存、不推进世代 —— 等待者无从挂在本帧世代上。
             if (d->rtxActive) {
-                CopyPlanesScaled(src, out, vsapi, d->width, d->height, d->outW, d->outH);
-            } else {
-                CopyPlanes(src, out, vsapi, d->width, d->height);
+                char abortMsg[320];
+                std::snprintf(abortMsg, sizeof(abortMsg),
+                              "vs_dlssnr frame %d failed: %s", k, err);
+                vsapi->freeFrame(out);
+                vsapi->freeFrame(src);
+                vsapi->setFilterError(abortMsg, frameCtx);
+                return nullptr;
             }
+            // 非 RTX:同构行拷贝兜底,输出平面不留未初始化内容。
+            CopyPlanes(src, out, vsapi, d->width, d->height);
         } else {
             d->failureLogged.store(false);
             if (d->hdrOut) SetHdrFrameProps(out, vsapi);
@@ -813,8 +782,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             if (timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin post-finish");
             if (!finOk) {
                 // unpack 失败:帧已入缓存、引用可能已被消费方领走(尚未交付
-                // —— 世代门拦着)→ 内容兜底拷贝(fgGenOk 槽 + 真实帧),交付
-                // 的仍是可用内容。日志闩锁与 Submit 失败同惯例。
+                // —— 世代门拦着)。日志闩锁与 Submit 失败同惯例。
                 if (!d->failureLogged.exchange(true)) {
                     char msg[512];
                     std::snprintf(msg, sizeof(msg),
@@ -822,19 +790,33 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                     vsapi->logMessage(mtWarning, msg, core);
                     vsdlssnr::TimingStatusLine(msg);
                 }
+                // RTX 会话失败不再兜底(2026-09-26 用户裁定)。坏内容已入
+                // 缓存:作废 k 锚(缓存命中需 fgCacheK 精确匹配,置 -1 后
+                // 永不命中)+ 推进就绪世代(唤醒世代等待者,免 15s 超时
+                // 拖住报错),报错终止。评估中止后坏帧无人消费。
                 if (d->rtxActive) {
-                    CopyPlanesScaled(src, out, vsapi, d->width, d->height, d->outW, d->outH);
-                } else {
-                    CopyPlanes(src, out, vsapi, d->width, d->height);
+                    {
+                        std::lock_guard<std::mutex> cacheLock(d->fgMutex);
+                        d->fgCacheK = -1;
+                    }
+                    {
+                        std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
+                        d->fgReadyGen = myGen;
+                    }
+                    d->fgReadyCv.notify_all();
+                    char abortMsg[320];
+                    std::snprintf(abortMsg, sizeof(abortMsg),
+                                  "vs_dlssnr frame %d failed at finish: %s", k, err);
+                    vsapi->freeFrame(ret);
+                    vsapi->freeFrame(src);
+                    vsapi->setFilterError(abortMsg, frameCtx);
+                    return nullptr;
                 }
+                // 非 RTX:同构行拷贝兜底,交付的仍是可用内容。
+                CopyPlanes(src, out, vsapi, d->width, d->height);
                 for (int g = 0; g < effGens; ++g) {
                     if (genFrame[g]) {
-                        if (d->rtxActive) {
-                            CopyPlanesScaled(src, genFrame[g], vsapi,
-                                             d->width, d->height, d->outW, d->outH);
-                        } else {
-                            CopyPlanes(src, genFrame[g], vsapi, d->width, d->height);
-                        }
+                        CopyPlanes(src, genFrame[g], vsapi, d->width, d->height);
                     }
                 }
             }
@@ -888,11 +870,18 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             vsapi->logMessage(mtWarning, msg, core);
             vsdlssnr::TimingStatusLine(msg);
         }
+        // RTX 会话失败不再兜底(2026-09-26 用户裁定):报错终止。
         if (d->rtxActive) {
-            CopyPlanesScaled(src, out, vsapi, d->width, d->height, d->outW, d->outH);
-        } else {
-            CopyPlanes(src, out, vsapi, d->width, d->height);
+            char abortMsg[320];
+            std::snprintf(abortMsg, sizeof(abortMsg),
+                          "vs_dlssnr frame %d failed: %s", n, err);
+            vsapi->freeFrame(out);
+            vsapi->freeFrame(src);
+            vsapi->setFilterError(abortMsg, frameCtx);
+            return nullptr;
         }
+        // 非 RTX:同构行拷贝兜底,输出平面不留未初始化内容。
+        CopyPlanes(src, out, vsapi, d->width, d->height);
     } else {
         d->failureLogged.store(false);
         if (d->hdrOut) SetHdrFrameProps(out, vsapi);
