@@ -1308,18 +1308,29 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
         std::clamp(_shared->Snapshot().ofBackend, kOfBackendMin, kOfBackendMax);
     if (q == _curOfQuality && backendReq == _curOfBackend && !_nvofFailed && _ofBackend &&
         _ofBackend->Width() == dstW && _ofBackend->Height() == dstH) return true;
+    if (q == 0) {
+        // 保留会话仅停用:后端销毁不可靠(NVOF 引擎 destroy 实测崩溃,
+        // FFX 首期同策略走 _retiredOf);空闲会话无 GPU 开销,与热上下文
+        // 同哲学,进程退出统一回收。**不封池**:本分支不触碰任何 GPU 资源
+        // (此前在 PoolHold 内,配合下方 _curOfBackend 缺同步 bug,后端
+        // 切换 + quality=0 曾逐帧封池排空三槽 = 78-165ms 级停顿 ×149 帧,
+        // 2026-09-25 真机实锤)。
+        // _curOfBackend 语义 = "最近已处理的请求后端"(请求级),不是
+        // "现存会话的后端"(会话级,由 _ofBackend->Kind() 表达)。缺此
+        // 同步,后端切换后 SyncOfSession 每帧看见 backendReq !=
+        // _curOfBackend → 每帧重建风暴(同上)。将来 quality>0 回来时,
+        // 下方 else-if 由 Kind != backendReq 兜住真正重建。
+        _nvofFailed = false;
+        _curOfQuality = 0;
+        _curOfBackend = backendReq;
+        TimingStatusLine("DLSSNR STATUS: of disabled (quality=0; session kept)");
+        return _ofBackend && _ofBackend->Enabled();
+    }
     {
         D3D12Context::PoolHold pool(*_d3d12);
-        if (q == 0) {
-            // 保留会话仅停用:后端销毁不可靠(NVOF 引擎 destroy 实测崩溃,
-            // FFX 首期同策略走 _retiredOf);空闲会话无 GPU 开销,与热上下文
-            // 同哲学,进程退出统一回收。
-            _nvofFailed = false;
-            _curOfQuality = 0;
-            TimingStatusLine("DLSSNR STATUS: of disabled (quality=0; session kept)");
-        } else if (!_ofBackend || _nvofFailed ||
-                   _ofBackend->Quality() != q || _ofBackend->Width() != dstW ||
-                   _ofBackend->Height() != dstH || backendReq != _curOfBackend) {
+        if (!_ofBackend || _nvofFailed ||
+            _ofBackend->Quality() != q || _ofBackend->Width() != dstW ||
+            _ofBackend->Height() != dstH || _ofBackend->Kind() != backendReq) {
             // 先建新会话再弃旧(旧会话仅弃引用,不销毁 —— 见 _retiredOf 注释)。
             // 弃旧的 GPU 资源随 PoolHold 排空后不再被引用,纹理显存由驱动
             // 按引用回收(对象随进程生存)。
@@ -1355,10 +1366,12 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
         } else {
             // 复用保留的会话(q=0 期间停用):帧序门与历史都已在停用期冻结,
             // 重置让下一帧重新播种,避免旧参考帧产生一次错误流。停用期的
-            // 尺寸/档位/后端变化由上方的条件分支兜住。
+            // 尺寸/档位变化由上方的条件分支兜住;后端变化同样由
+            // Kind != backendReq 兜住(能落到本分支 = 会话后端与请求一致)。
             _ofBackend->ResetHistory();
             _nvofFailed = false;
             _curOfQuality = q;
+            _curOfBackend = backendReq;
         }
     }
     if (_ofBackend && _ofBackend->Enabled()) {
