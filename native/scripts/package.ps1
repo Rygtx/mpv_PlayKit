@@ -1,14 +1,19 @@
-﻿# 打包 mpv_PlayKit DLSSNR 完整发行包: dlssnr 分支 portable_config 全目录 + vs_dlssnr 插件三件套
+﻿# 打包 mpv_PlayKit DLSSNR 完整发行包: 发行分支 portable_config 全目录 + vs_dlssnr 插件三件套
 # 全部输入取自仓库树内, 无本机绝对路径
-# 用法: pwsh -File scripts\package.ps1 [-Version 2026.09.07]  (必须在 dlssnr 分支上运行)
+# 用法: pwsh -File scripts\package.ps1 [-Version 2026.09.07] [-Branch dlssnr]
 # 产物: dist\mpv_PlayKit-dlssnr-v<版本>-full.zip
-param([string]$Version)
+param(
+    [string]$Version,
+    # 分支门参数化(2026-09-25):此前硬编码 dlssnr 与当前 experimental 发行
+    # 流程冲突;基线分支可在 -Branch 指定(默认 dlssnr 兼容旧用法)。
+    [string]$Branch = "dlssnr"
+)
 
 $ErrorActionPreference = "Stop"
 $native = Split-Path -Parent $PSScriptRoot   # native/
 $repo   = Split-Path -Parent $native         # 仓库根
 $branch = git -C $repo rev-parse --abbrev-ref HEAD
-if ($branch -ne "dlssnr") { throw "请在 dlssnr 分支上运行 (当前: $branch, 该分支的 portable_config 才是发行基线+DLSSNR 定制)" }
+if ($branch -ne $Branch) { throw "请在 $Branch 分支上运行或用 -Branch 指定 (当前: $branch, 发行基线分支的 portable_config 才是发行内容)" }
 
 # 版本默认取打包当日日期 (vyyyy.MM.dd); 显式传入时兼容带/不带 v 前缀
 if (-not $PSBoundParameters.ContainsKey("Version")) {

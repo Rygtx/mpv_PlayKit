@@ -35,6 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402
+testenv.ini_restore_on_exit()  # 部署 ini 现场保护(2026-09-25 收敛)
 
 testenv.require_env()
 testenv.require_nvidia()
@@ -75,7 +76,13 @@ print(hsh.hexdigest()[:10])
 
 
 def capture(kw):
-    r = subprocess.run([sys.executable, "-c", WORKER, json.dumps(kw)],
+    # nr_enabled / scaling_enabled 显式钉 1(2026-09-25):插件出厂默认
+    # nr=0/scaling=0(1308b3f 起),空 kw 的"默认"case 此前靠部署 ini 恰好
+    # 开着而侥幸 live —— ini 一变全表 passthrough/残差失效假 FAIL。断言
+    # 要的是确定性,脱离部署现场。
+    base = {"nr_enabled": 1, "scaling_enabled": 1}
+    base.update(kw)
+    r = subprocess.run([sys.executable, "-c", WORKER, json.dumps(base)],
                        capture_output=True, text=True)
     out = r.stdout.strip().splitlines()
     return out[-1] if out else f"(worker failed: {r.stderr[-200:]})"
@@ -87,14 +94,19 @@ a2 = capture({})
 print(f"default res100 (again):    {a2}  {'DETERMINISTIC' if a2 == a else 'NONDETERMINISTIC!'}")
 b = capture({"input_resolution": 50})
 print(f"res50 (horizontal pass):   {b}  {'DIFF' if b != a else 'SAME!'}")
-d = capture({"residual_multiplier": 2.0})
-print(f"res100 multiplier=2:       {d}  {'DIFF' if d != a else 'SAME!'}")
-e = capture({"residual_saturation": 0.0, "residual_lightness": 0.5})
-print(f"saturation=0 light=0.5:    {e}  {'DIFF' if e != a else 'SAME!'}")
+# 残差控制类 case 归 res50(2026-09-25):res100+scaling=1 已被恒等折叠
+# 归一为直连(产出与直吃逐位相同,残差管线整体不存在 —— 对应审查修复
+# "scaling=1+res=100% 白付 4 个全分辨率 pass"),残差控制只在管线真实
+# 存在(res<100)时有效应,断言基线随之改为 res50。
+a50 = b
+d = capture({"input_resolution": 50, "residual_multiplier": 2.0})
+print(f"res50 multiplier=2:        {d}  {'DIFF' if d != a50 else 'SAME!'}")
+e = capture({"input_resolution": 50, "residual_saturation": 0.0, "residual_lightness": 0.5})
+print(f"res50 sat=0 light=0.5:     {e}  {'DIFF' if e != a50 else 'SAME!'}")
 g = capture({"intensity": 1.5})
 print(f"intensity=1.5 (clamp 1.0): {g}  {'CLAMPED-OK' if g == a else 'NOT CLAMPED!'}")
-s = capture({"shadow_structure": 0.0, "reflection_glow": 1.8})
-print(f"shadow=0 glow=1.8:         {s}  {'DIFF' if s != a else 'SAME!'}")
+s = capture({"input_resolution": 50, "shadow_structure": 0.0, "reflection_glow": 1.8})
+print(f"res50 shadow=0 glow=1.8:   {s}  {'DIFF' if s != a50 else 'SAME!'}")
 
 # -- 契约面(2026-09-14):Style / AutoMask / NR 总开关 / Preset 哨兵 --
 st1 = capture({"style": 1})
@@ -114,7 +126,7 @@ if not p_ok:
     print("  ^ SENTINEL TRIPPED: 新 DLL 消费 Hint.Render.Preset 了 —— "
           "恢复面板\"预设\"下拉(对照 2026-09-14 的移除提交)")
 
-ok = (a2 == a) and (b != a) and (d != a) and (e != a) and (g == a) and (s != a)
+ok = (a2 == a) and (b != a) and (d != a50) and (e != a50) and (g == a) and (s != a50)
 ok = ok and (st1 != a) and (st2 != a) and (am != a) and (nr0 != a) and p_ok
 print("VALIDATE-PARAMS:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

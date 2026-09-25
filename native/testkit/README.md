@@ -47,6 +47,9 @@ python testmedia.py --force    # 强制重生成(生成器确定性,重跑逐位
 |---|---|---|
 | `dlssnr_fmt_444.y4m` | 320x180@24 8s C444 | 444P8 直吃(test_format_coverage) |
 | `dlssnr_fmt_444p10.y4m` | 同上 C444p10 | 444P10 直吃(test_format_coverage) |
+| `dlssnr_fmt_420p10.y4m` | 同上 C420p10 | 420P10 直吃(test_format_coverage) |
+| `dlssnr_fmt_422.y4m` | 同上 C422 | 422P8 直吃(test_format_coverage) |
+| `dlssnr_fmt_444p16.y4m` | 同上 C444p16 | 444P16 直吃(>10bit FP16 管线色,test_format_coverage) |
 | `dlssnr_fmt_mono.y4m` | 同上 Cmono | GRAY8→444 兜底(test_format_coverage) |
 | `dlssnr_fmt_rgb.png` | 96x96 RGB24 单帧 | RGB→444 兜底(test_format_coverage;y4m 的 Crgb ffmpeg 不认) |
 | `hdr_hint_sync_test.y4m` | 640x360@24 15s 420jpeg 移动条纹 | HDR 打标/hint、全关态等通用 420P8 载体(test_hdr_hint_sync / test_alloff_state) |
@@ -100,7 +103,7 @@ python testmedia.py --force    # 强制重生成(生成器确定性,重跑逐位
 | `test_alloff_state.py` | 全关直通实例 state_detail = "NR+FG+RTX disabled","NR off (panel)" 误标永久不得再现(边沿体已随解耦删除);stats 映射 ctypes 直读 |
 
 `panel_ipc.py` 是 `native/src/panel_ipc.h` 的 python 字节级镜像
-(92 字节 packed struct + 自检 assert)。**改头文件必须同步这里**——
+(152 字节 packed struct + 自检 assert;stats 通道同镜像:STATS_MAGIC + SK 键名表)。**改头文件必须同步这里**——
 布局错位的教训:payload 字段错位时"存活断言"会空心通过。
 
 ### 数值验收(需 `VSDLSSNR_DUMP=1` 等环境开关 + numpy)

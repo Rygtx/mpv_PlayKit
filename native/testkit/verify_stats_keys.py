@@ -13,6 +13,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")  # 纯 stats 键位验证,勿拉真实面板污染后序测试
 import testenv  # noqa: E402
 import panel_ipc  # noqa: E402
 
@@ -33,7 +34,10 @@ def pull(clip, n):
 print("=== case 1: 默认(ofq=0,零 guidance 是用户选择,应为 ok/off) ===")
 # 显式传参脱离 ini:本机部署的 dlssnr_ui.ini 若开着 FG/FFX,route_eff 会是
 # official-hook 而非 off —— 键位断言要的是确定性,不是用户现役配置。
-ret = core.dlssnr.Enhance(base, ffx_quality=0, motion_vector_quality=0, fg_enabled=0)
+# nr_enabled=1 同理显式钉(2026-09-25):插件出厂默认 nr=0,空依赖 = 全关
+# passthrough,create 行都不出现,键位断言空心。
+ret = core.dlssnr.Enhance(base, nr_enabled=1, ffx_quality=0,
+                          motion_vector_quality=0, fg_enabled=0)
 pull(ret, 0)
 pull(ret, 1)
 st = panel_ipc.read_stats()
@@ -71,7 +75,8 @@ print("v19/v21/v24 keys (fg_route_eff/fg_mult_create/fg_mult_max/of_detail/slot_
       "PASS" if new_keys_present else "FAIL")
 
 print("=== case 2: ofq=5(NVOF 会话建立,验证实际模式上报) ===")
-ret2 = core.dlssnr.Enhance(base, motion_vector_quality=5)
+ret2 = core.dlssnr.Enhance(base, nr_enabled=1, motion_vector_quality=5,
+                           ffx_quality=0, fg_enabled=0)
 pull(ret2, 0)  # 播种帧
 pull(ret2, 1)  # execute + densify
 pull(ret2, 2)

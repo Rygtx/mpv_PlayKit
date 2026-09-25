@@ -249,10 +249,12 @@ public:
 
     // diagnostics: dump a texture's raw rows to a file (VSDLSSNR_DUMP);
     // format must match the resource (CopyTextureRegion has no cross-family
-    // conversion). Uses the control path; caller holds CtlMutex.
+    // conversion). Uses the control path; caller holds CtlMutex. err/errLen
+    // 可选失败原因出参(2026-09-25:此前四类失败点全部静默)。
     bool DumpTextureToFile(ID3D12Resource *tex, int width, int height,
                            const wchar_t *path,
-                           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM) noexcept;
+                           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
+                           char *err = nullptr, size_t errLen = 0) noexcept;
 
     // Residual scaling rebuilds. The caller must hold a PoolHold (all slots
     // idle, pool sealed) — the rebuild replaces every slot's scaling

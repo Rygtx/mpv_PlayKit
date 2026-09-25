@@ -17,6 +17,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402
+testenv.ini_restore_on_exit()  # 部署 ini 现场保护(2026-09-25 收敛)
 import panel_ipc  # noqa: E402
 
 testenv.require_env()

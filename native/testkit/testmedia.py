@@ -53,6 +53,31 @@ def _pack_mono8(n):
     return _row8(W, n * 5) * H
 
 
+def _plane10(w, h, base, step, n):
+    return b"".join(struct.pack(">H", ((x * 8 + base + n * step) & 0x3FF))
+                    for x in range(w)) * h
+
+
+def _plane16(w, h, base, step, n):
+    return b"".join(struct.pack(">H", ((x * 257 + base * 257 + n * step * 257) & 0xFFFF))
+                    for x in range(w)) * h
+
+
+def _pack420p10(n):
+    cw, ch = W // 2, H // 2
+    return (b"".join(struct.pack(">H", ((x * 4 + n * 5) & 0x3FF)) for x in range(W)) * H) + \
+           _plane10(cw, ch, 384, 3, n) + _plane10(cw, ch, 640, 3, n)
+
+
+def _pack422p8(n):
+    cw = W // 2
+    return (_row8(W, n * 5) * H) + (_row8(cw, 96 + n * 3) * H) + (_row8(cw, 160 + n * 3) * H)
+
+
+def _pack444p16(n):
+    return _plane16(W, H, 0, 5, n) + _plane16(W, H, 96, 3, n) + _plane16(W, H, 160, 3, n)
+
+
 def gen_png_rgb24(path):
     """单帧 PNG(mpv 按 image2 解码,--loop=inf 连续供帧)。"""
     pw = ph = 96
@@ -92,6 +117,12 @@ CLIPS = [
      W, H, 8, "YUV444P8 直吃"),
     ("dlssnr_fmt_444p10.y4m", lambda p: gen_y4m(p, "C444p10", _pack444p10),
      W, H, 10, "YUV444P10 直吃"),
+    ("dlssnr_fmt_420p10.y4m", lambda p: gen_y4m(p, "C420p10", _pack420p10),
+     W, H, 10, "YUV420P10 直吃(转换砍除矩阵扩容 2026-09-25)"),
+    ("dlssnr_fmt_422.y4m", lambda p: gen_y4m(p, "C422", _pack422p8),
+     W, H, 8, "YUV422P8 直吃(同上)"),
+    ("dlssnr_fmt_444p16.y4m", lambda p: gen_y4m(p, "C444p16", _pack444p16),
+     W, H, 16, "YUV444P16 直吃(同上;>10bit 管线色 FP16)"),
     ("dlssnr_fmt_mono.y4m", lambda p: gen_y4m(p, "Cmono", _pack_mono8),
      W, H, 8, "GRAY8 -> vpy 转 444P8"),
     ("dlssnr_fmt_rgb.png", gen_png_rgb24,

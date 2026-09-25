@@ -2676,7 +2676,8 @@ bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
 } // namespace
 
 bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
-                                     const wchar_t *path, DXGI_FORMAT format) noexcept {
+                                     const wchar_t *path, DXGI_FORMAT format,
+                                     char *err, size_t errLen) noexcept {
     // 4 B/px covers the BGRA color dumps; the horizontal residual is
     // R16G16B16A16_FLOAT (8 B/px, signed range); R8/R16_UNORM (1/2 B/px)
     // are the YUV planes (YUV 原生化 dump 验收用)。
@@ -2690,9 +2691,13 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
     if (!CreateRawBuffer(static_cast<UINT64>(height) * width * bpp, D3D12_HEAP_TYPE_READBACK,
                          D3D12_RESOURCE_STATE_COPY_DEST, buffer.GetAddressOf(),
                          pitch, width * bpp, ignore, sizeof(ignore))) {
+        SetErr(err, errLen, E_FAIL, "dump readback buffer create failed");
         return false;
     }
-    if (!BeginCtlRecording()) return false;
+    if (!BeginCtlRecording()) {
+        SetErr(err, errLen, E_FAIL, "dump begin ctl recording failed");
+        return false;
+    }
     D3D12_RESOURCE_BARRIER b[1]{
         Transition(tex, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
     };
@@ -2709,20 +2714,32 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
         Transition(tex, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
     };
     _ctlCommandList->ResourceBarrier(1, back);
-    if (!ExecuteCtlAndWait()) return false;
+    if (!ExecuteCtlAndWait()) {
+        SetErr(err, errLen, E_FAIL, "dump ctl execute/wait failed");
+        return false;
+    }
 
     void *mapped = nullptr;
-    if (FAILED(buffer->Map(0, nullptr, &mapped))) return false;
+    if (FAILED(buffer->Map(0, nullptr, &mapped))) {
+        SetErr(err, errLen, E_FAIL, "dump readback map failed");
+        return false;
+    }
     FILE *f = nullptr;
-    bool ok = _wfopen_s(&f, path, L"wb") == 0 && f;
+    errno_t fe = _wfopen_s(&f, path, L"wb");
+    bool ok = fe == 0 && f;
     if (ok) {
         for (int y = 0; y < height; ++y) {
             fwrite(static_cast<const uint8_t *>(mapped) + static_cast<size_t>(pitch) * y, 1,
                    static_cast<size_t>(width) * bpp, f);
         }
         fclose(f);
+    } else {
+        SetErr(err, errLen, E_FAIL, "dump fopen failed");
     }
     buffer->Unmap(0, nullptr);
+    // 失败原因带出(2026-09-25):此前四个失败点全部静默 return false,
+    // 调用方只有一行 "dump X FAILED" —— "为什么"无迹可查。
+    if (!ok) SetErr(err, errLen, E_FAIL, "dump write failed");
     return ok;
 }
 

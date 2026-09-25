@@ -107,7 +107,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `Nvof_Follow_Scaling` | True/False | False | 光流输入跟随内部降采样(需 Scaling_Enabled;大幅降低光流引擎占用,运动精度略降) |
 | `Of_Backend` | 0–1 | 0 | 光流后端(0 = FFX/AMD FidelityFX,跨厂商通用,默认;1 = NVOF/NVIDIA 专属引擎)。切换只影响下一次光流会话建立(下一帧/seek 生效) |
 | `Fg_Enabled` | True/False | False | DLSS 帧生成(挂降噪之后,输出帧率 ×2–×6;自动档依赖 `ngx\version.dll`(dlssg_for_sm86 ≥0.3.0),初始化失败自动回退 1:1) |
-| `Fg_Multiplier` | 2–6 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps)。运行库上限默认开到 6x(部署 ini `MaxGeneratedFrames=5`,上限只是钳位),改倍数原地重载即时生效;输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率) |
+| `Fg_Multiplier` | 2–6 | 2 | 插帧倍数(输出帧数/节奏随创建档位定格;面板改档位/开关自动触发 mpv 原地重载即时生效,需 mpv.conf 启用 `input-ipc-server`;未启用时关/降档退化为会话内复制真实帧,升档需手动 seek;24fps ×3 = 72fps)。运行库上限默认开到 6x(部署 ini `MaxGeneratedFrames=5`,上限只是钳位),改倍数原地重载即时生效;输出帧率 = 源 ×M,显示端刷新率建议 ≥ 输出帧率)。**与 mpv `interpolation` 的叠加**:FG 已把时间轴插满,输出帧率高于刷新率时 mpv 的 display-resample+tscale 又做一层时间混合,两层插帧可能互相引入抖动 —— FG 高档位下值得实测 `interpolation=no` 对比) |
 | `Fg_Route` | 0–1 | 0 | FG 路由(0 = 自动,按 GPU 族分流——RTX 30/20 系预载 dlssg_for_sm86 0.3.x hook 代理接管 DLSS-G,仍走官方签名链;RTX 40 系走官方运行库并自动做 mfg gate 解锁放行 3–6x(仅 Ada 触发,50 系原生多帧不解锁),未命中回落 2x;1 = 纯官方,不预载代理,直连官方运行时,40 系同样解锁,30/20 系被拒载不回落。进程级,重启 mpv 生效;v20 起不兼容旧值,存量 1–3 按越界归 1,升级后在面板选回自动) |
 | `VSR_Mode` | 0–2 | 1 | RTX Video 超分(0 = 关;1 = 自动,直读 mpv 显示矩形自适应;2 = 手动倍率)。创建参数,改动触发原地重载 |
 | `VSR_Scale` | 1.0–4.0 | 2.0 | VSR 手动放大倍率(仅 `VSR_Mode = 2` 消费;官方单 pass 上限 4x) |
@@ -118,6 +118,11 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `HDR_MiddleGray` | 10–100 | 50 | HDR 中间灰 |
 | `HDR_PeakNits` | 400–2000 | 1000 | HDR 峰值亮度(nits) |
 | `H_Max` | 整数 | 0 | 输出高度限制(源超过该值跳过处理;0 = 不限制) |
+
+### 与本包 mpv.conf 的两个叠加提示(2026-09-25)
+
+- **`hwdec = auto-copy`**:VS 滤镜链的固有成本链 = 解码 VRAM→RAM→插件上传 VRAM→处理→解包回 RAM→mpv 渲染再上传(VS 帧必须驻留 CPU,框架决定,无法零拷贝)。了解即可,不是配置问题。
+- **`QCOM_SGEDS_ms_RT.glsl` 全局常挂**:锐化与 RTX VSR 同时启用时锐化量叠加,画面调性可能过头 —— 建议在 mpv.conf 注释该行二选一,或自行调 `STR`。
 
 调参参考:100% 开缩放 ≈ 关闭缩放(multiplier = 1 时等价);降档位省不了多少帧耗(NGX 固定成本主导),主要影响高频细节,1080p 内容建议 50–75%,25% 仅极端省电场景;4K 源建议配合 `Input_Resolution = 50`。4K 全分辨率(res=100%)推理约 200ms/帧,物理性上限,非卡顿。
 

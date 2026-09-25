@@ -145,10 +145,12 @@ def _to_native(c) :
 	conv = c.resize.Bicubic(format=out_fmt, matrix_s="709") \
 		if f.color_family == vs.RGB else c.resize.Bicubic(format=out_fmt)
 	# resize 不透传帧 props,DLL 读 _ColorRange 判 limited/full:从首帧
-	# 搬关键字段回填(属性流内恒定,静态回填足够)。
+	# 搬关键字段回填(属性流内恒定,静态回填足够)。_Primaries/_Transfer
+	# 一并回填(2026-09-25:缺它们时 RTX TrueHDR/HDR 语义不完整)。
 	try :
 		props = c.get_frame(0).props
-		keep = {k : int(props[k]) for k in ("_ColorRange", "_Matrix") if k in props}
+		keep = {k : int(props[k]) for k in ("_ColorRange", "_Matrix",
+		                                    "_Primaries", "_Transfer") if k in props}
 		if keep :
 			conv = conv.std.SetFrameProps(**keep)
 	except Exception :
@@ -159,12 +161,14 @@ if H_Max and clip.height > H_Max :
 	ret = clip
 else :
 	f = clip.format
+	# native 收编面 = 插件原生支持面(YUV 计划族 × {420,422,444} × 8-16bit)。
+	# 2026-09-25 删恒假 RGB 分支:本部署 VS(R73)无计划 RGB(RGBP* 缺,RGB
+	# 恒 packed 单平面),num_planes==3 的 RGB 恒不出现;且插件收编面只有
+	# YUV —— 若该分支命中会直传 Enhance 而插件不收,反而破坏直通兜底。
 	native = (f.color_family == vs.YUV
 	          and f.sample_type == vs.INTEGER
 	          and 8 <= f.bits_per_sample <= 16
-	          and f.subsampling_w <= 1 and f.subsampling_h <= 1) or \
-	         (f.color_family == vs.RGB and f.sample_type == vs.INTEGER
-	          and f.subsampling_w == 0 and f.subsampling_h == 0 and f.num_planes == 3)
+	          and f.subsampling_w <= 1 and f.subsampling_h <= 1)
 	try :
 		proc = clip if native else _to_native(clip)
 	except Exception :

@@ -15,7 +15,9 @@
     由本脚本拉起 mpv 验证时宿主 = mpv.exe → MPV_TIMING_LOG。
   - dlssnr_ui.ini / dlssnr_panel.exe / ngx\\nvngx_dlssnr.dll:vs-plugins\\ 下。
 """
+import contextlib
 import os
+import shutil
 import subprocess
 import sys
 
@@ -51,8 +53,70 @@ def require_env():
 
 def require_nvidia():
     """NGX/DLSSNR 相关数值断言的前提:没有 N 卡时全链直通,哈希断言必然空转。"""
-    import shutil
     require(shutil.which("nvidia-smi") is not None, "未检测到 nvidia-smi(N 卡),NGX 数值断言无意义")
+
+
+def ini_restore_on_exit():
+    """进程退出时把 ini 恢复为调用时刻现场(2026-09-25 收敛)。
+
+    动 ini 的测试在 import testenv 后立即调用一行即可:
+
+        import testenv
+        testenv.ini_restore_on_exit()
+
+    测试脚本多为模块级流程(无统一 main/with 结构),atexit 恢复是侵入
+    最小的保护 —— 无论 PASS/FAIL/异常退出,部署 ini 都回到调用时刻现场
+    (硬崩溃跳过 atexit,属尽力而为)。返回恢复函数,需要中途显式固定
+    现场的场景可留存调用。
+    """
+    import atexit
+    backup = None
+    if os.path.isfile(INI):
+        with open(INI, "rb") as f:
+            backup = f.read()
+
+    def _restore():
+        if backup is not None:
+            with open(INI, "wb") as f:
+                f.write(backup)
+        elif os.path.isfile(INI):
+            os.remove(INI)
+
+    atexit.register(_restore)
+    return _restore
+
+
+@contextlib.contextmanager
+def ini_snapshot(clear=False):
+    """部署树真实 dlssnr_ui.ini 的备份/恢复上下文(2026-09-25 收敛)。
+
+    部署根即用户 mpv-lazy 目录,ini 是用户"保存设置"的真实面板配置。
+    此前约 10 个测试直接改写/删除该文件且不恢复 —— 跑一遍测试丢一次
+    "保存为默认值"。所有动 ini 的测试必须经本上下文:
+
+        with testenv.ini_snapshot():        # 现场原样备份,finally 恢复
+            os.remove(testenv.INI)          # 需要空场(无 ini)的测试
+            ...
+
+    clear=True = 进入即清空文件内容(语义等价"删除"但保留文件属性;
+    面板/插件的 WritePrivateProfileStringW 在空文件上照常建节)。
+    备份按原始字节整文件进行,任意编码(UTF-8/UTF-16)无损恢复。
+    """
+    backup = None
+    if os.path.isfile(INI):
+        with open(INI, "rb") as f:
+            backup = f.read()
+    if clear:
+        open(INI, "w").close()
+    try:
+        yield
+    finally:
+        if backup is not None:
+            with open(INI, "wb") as f:
+                f.write(backup)
+        elif os.path.isfile(INI):
+            # 进入时无 ini:恢复为"无 ini"(测试期间生成的清掉)。
+            os.remove(INI)
 
 
 def kill_panel():

@@ -2899,9 +2899,12 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     // "dump 文件缺失/尺寸不对"从这行直接定位)。
                     auto dumpOrLog = [&](ID3D12Resource *tex, int w, int h,
                                          const wchar_t *name, DXGI_FORMAT fmt) {
-                        if (!_d3d12->DumpTextureToFile(tex, w, h, (base / name).c_str(), fmt)) {
-                            char msg[160];
-                            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED", name);
+                        char why[128]{};
+                        if (!_d3d12->DumpTextureToFile(tex, w, h, (base / name).c_str(), fmt,
+                                                       why, sizeof(why))) {
+                            char msg[224];
+                            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED: %.120s",
+                                          name, why);
                             TimingStatusLine(msg);
                         }
                     };
@@ -2941,9 +2944,22 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     dumpOrLog(_d3d12->OutputColor(*ff->slot), ff->width, ff->height, L"dump_output.bin", kPipeDump);
                     // TrueHDR 输出本体(FP16 scRGB,PIPE 尺寸):黑屏排查的
                     // "没写 vs 写了零 vs 写了错值"判据(VSDLSSNR_DUMP=1)。
-                    if (ff->slot->hdrColor) {
-                        dumpOrLog(ff->slot->hdrColor.Get(), _pipeW, _pipeH,
-                                  L"dump_hdrcolor.bin", DXGI_FORMAT_R16G16B16A16_FLOAT);
+                    // 三态全留痕(2026-09-25):此前 OK/跳过都静默,
+                    // "为什么没有 hdrColor dump"无法定位。
+                    {
+                        if (ff->slot->hdrColor) {
+                            char why[128]{};
+                            const bool okHC = _d3d12->DumpTextureToFile(
+                                ff->slot->hdrColor.Get(), _pipeW, _pipeH,
+                                (base / L"dump_hdrcolor.bin").c_str(),
+                                DXGI_FORMAT_R16G16B16A16_FLOAT, why, sizeof(why));
+                            char msgHC[192];
+                            std::snprintf(msgHC, sizeof(msgHC), "DLSSNR STATUS: dump_hdrcolor %s%.150s",
+                                          okHC ? "OK" : "FAILED: ", okHC ? "" : why);
+                            TimingStatusLine(msgHC);
+                        } else {
+                            TimingStatusLine("DLSSNR STATUS: dump_hdrcolor SKIPPED (slot->hdrColor null)");
+                        }
                     }
                     // FG 插值输出(仅 eval 过的帧有内容;首帧必为播种,等
                     // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。

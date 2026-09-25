@@ -3,9 +3,11 @@
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")
-sys.path.insert(0, r"f:\Project\mpv_PlayKit\native\testkit")
 import testenv  # noqa: E402  (发现部署根 + 环境准备)
+testenv.ini_restore_on_exit()  # 部署 ini 现场保护(2026-09-25 收敛)
+testenv.require_env()  # 环境缺失打印 SKIP,而非 AttributeError 崩溃
 
 import vapoursynth as vs  # noqa: E402
 
@@ -14,8 +16,7 @@ src = core.std.BlankClip(width=320, height=240, format=vs.YUV420P8, length=10, f
 # 环境前提:proxy 未部署是本测试的触发条件。部署树带了 0.3.x hook 代理
 # (ngx/version.dll)时 FG 真激活(官方链经 hook 交付)→ 降级路径前提失效,
 # 交由部署无 proxy 的环境覆盖(对称于 fg_live 的官方链不可用 SKIP)。
-ngx_dir = os.path.join(os.path.dirname(testenv.INI), "ngx")
-if os.path.exists(os.path.join(ngx_dir, "version.dll")):
+if os.path.exists(os.path.join(os.path.dirname(testenv.NGX_DLL), "version.dll")):
     print("FG FALLBACK SKIP: 部署树带 hook 代理,FG 正常激活;降级路径需无 proxy 环境")
     sys.exit(0)
 ret = core.dlssnr.Enhance(src, fg_enabled=1, motion_vector_quality=0)

@@ -12,13 +12,23 @@ function Fetch([string]$url, [string]$dst) {
     if (Test-Path $dst) { return }
     # --fail: never persist an HTTP error body (a 404 page would pass the
     # non-empty check below and poison the dependency cache permanently)
-    & curl.exe -sSL --fail --retry 8 --retry-all-errors --retry-delay 2 -o $dst $url
-    if ($LASTEXITCODE -ne 0) { throw "download failed: $url (curl exit $LASTEXITCODE)" }
-    if (-not (Test-Path $dst) -or (Get-Item $dst).Length -eq 0) { throw "download failed: $url" }
+    # 断连防线(2026-09-25):先落临时名,成功后原子 Move —— curl 中途断连
+    # 留下的截断文件不会再让 Test-Path 短路而永久毒化依赖缓存。
+    $tmp = "$dst.download"
+    & curl.exe -sSL --fail --retry 8 --retry-all-errors --retry-delay 2 -o $tmp $url
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        throw "download failed: $url (curl exit $LASTEXITCODE)"
+    }
+    if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) { throw "download failed: $url" }
+    Move-Item $tmp $dst -Force
     Write-Host "fetched: $dst ($((Get-Item $dst).Length) bytes)"
 }
 
-# --- NGX SDK headers (github.com/NVIDIA/DLSS, main @ a291cc7d2cc6) ---
+# --- NGX SDK headers (github.com/NVIDIA/DLSS,commit 钉死 2026-09-25:
+#     此前走 /main 未钉 —— 上游 main 漂移会静默进构建;与同脚本 RTX SDK
+#     的 SHA-256 钉死、sm86 的 tag+尺寸双钉对齐)---
+$ngxCommit = "a291cc7d2cc6"
 $ngxHeaders = @(
     "nvsdk_ngx.h", "nvsdk_ngx_defs.h", "nvsdk_ngx_defs_dlssd.h", "nvsdk_ngx_defs_dlssg.h",
     "nvsdk_ngx_defs_vk.h", "nvsdk_ngx_helpers.h", "nvsdk_ngx_helpers_dlssd.h",
@@ -27,11 +37,17 @@ $ngxHeaders = @(
     "nvsdk_ngx_params_dlssd.h", "nvsdk_ngx_params_dlssg.h", "nvsdk_ngx_vk.h"
 )
 foreach ($h in $ngxHeaders) {
-    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/main/include/$h" (Join-Path $ngxInc $h)
+    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/include/$h" (Join-Path $ngxInc $h)
 }
 
 # --- NGX static core lib (layout mirrors Magpie BuildOptions.props DLSSSdkDir) ---
-Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" (Join-Path $ngxLib "nvsdk_ngx_s.lib")
+# COFF 归档魔数断言:HTML 错误页/LFS 指针文件拦下(同类防线见下文 dll)。
+$ngxLibPath = Join-Path $ngxLib "nvsdk_ngx_s.lib"
+Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" $ngxLibPath
+$libHead = [System.IO.File]::ReadAllBytes($ngxLibPath)[0..7]
+if (-not $libHead -or [System.Text.Encoding]::ASCII.GetString($libHead) -ne '!<arch>') {
+    throw "nvsdk_ngx_s.lib sanity failed (not a COFF archive; delete and refetch)"
+}
 
 # --- Official signed NGX FG runtime (PORTING #8 官方帧生成后端) ---
 # 落到 vendor\ngx\ 与模型 DLL 同目录,打包脚本按存在与否选装;官方链是 FG
@@ -41,7 +57,7 @@ $fgOfficial = Join-Path $root "vendor\ngx\nvngx_dlssg.dll"
 if (-not (Test-Path $fgOfficial)) {
     New-Item -ItemType Directory -Force (Split-Path -Parent $fgOfficial) | Out-Null
     $tmp = "$fgOfficial.download"
-    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/rel/nvngx_dlssg.dll" $tmp
+    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/rel/nvngx_dlssg.dll" $tmp
     $len = (Get-Item $tmp).Length
     if ($len -lt 1MB) { Remove-Item $tmp -Force; throw "nvngx_dlssg.dll size sanity failed ($len bytes)" }
     Move-Item $tmp $fgOfficial -Force
@@ -157,7 +173,10 @@ foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
 }
 
 # --- NVOF headers(清单 #6 光流;官方 OpticalFlowSDK 仓库已从 GitHub 撤下,
-#     mbucchia/Optical-Flow-SDK 是完整官方镜像,NvOFInterface 即 SDK 头目录)---
+#     mbucchia/Optical-Flow-SDK 是完整官方镜像,NvOFInterface 即 SDK 头目录)。
+#     头文件非空 + C 头魔数无法判别,钉 commit 需要上游确认的固定哈希;
+#     当前至少走 Fetch 的临时名原子落盘(截断不再毒化),换 commit 的动作
+#     留给下一次有据可依的升级(勿手造哈希)。---
 $nvofDir = Join-Path $root "vendor\nvof"
 New-Item -ItemType Directory -Force $nvofDir | Out-Null
 foreach ($h in @("nvOpticalFlowCommon.h", "nvOpticalFlowD3D12.h", "nvOpticalFlowD3D11.h", "nvOpticalFlowCuda.h")) {

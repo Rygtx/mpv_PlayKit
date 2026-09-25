@@ -15,10 +15,54 @@ import struct
 
 PAYLOAD_SIZE = 1024
 PAYLOAD_MAGIC = 0x4E4C5344  # "DSLN" (v23, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
+STATS_MAGIC = 0x354C5344  # "DSL5" (stats v24)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
 ALIVE_EVENT = "vs_dlssnr_bridge_alive"
+
+# Stats JSON schema 键名镜像(panel_ipc.h SK_* 单一权威的 python 侧;
+# 2026-09-25 收敛 —— 此前 verify_stats_keys/test_* 手抄键名字符串,头文件
+# 加键/改名时 python 侧无同步防线)。断言一律从本表取键,勿手抄字面量。
+SK = {
+    "gpu_last": "gpu_last",
+    "pack_last": "pack_last",
+    "eval_cpu_last": "eval_cpu_last",
+    "fg_last": "fg_last",
+    "rtxvsr_last": "rtxvsr_last",
+    "rtxhdr_last": "rtxhdr_last",
+    "conv_last": "conv_last",
+    "nvof_last": "nvof_last",
+    "unpack_last": "unpack_last",
+    "internal_w": "internal_w",
+    "internal_h": "internal_h",
+    "width": "width",
+    "height": "height",
+    "scaling": "scaling",
+    "fps": "fps",
+    "gpu_name": "gpu_name",
+    "gpu_hang": "gpu_hang",
+    "removed_reason": "removed_reason",
+    "filter_state": "filter_state",
+    "state_detail": "state_detail",
+    "of_mode": "of_mode",
+    "fg": "fg",
+    "fg_mult": "fg_mult",
+    "fg_route_eff": "fg_route_eff",
+    "fg_mult_create": "fg_mult_create",
+    "fg_mult_max": "fg_mult_max",
+    "fg_detail": "fg_detail",
+    "of_detail": "of_detail",
+    "rtx": "rtx",
+    "rtx_detail": "rtx_detail",
+    "slot_wait": "slot_wait",
+    "lock_wait": "lock_wait",
+    "gate_skips": "gate_skips",
+    "gate_expired": "gate_expired",
+    "gate_resets": "gate_resets",
+}
+assert len(set(SK.values())) == len(SK), "SK 键名表内有重复值"
+kStateNrSeekInit = "NR on; seek to initialize"
 
 # mirror of PanelPayload (#pragma pack push, 全 4 字节字段无对齐缝隙):
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
@@ -122,11 +166,23 @@ def open_params_mapping_readonly():
     return h, v
 
 
-def read_stats():
-    """读 stats 通道 JSON(插件 -> 面板),无映射时返回 None。"""
-    k32 = ctypes.WinDLL("kernel32")
+def read_stats(require_magic=True):
+    """读 stats 通道 JSON(插件 -> 面板),无映射时返回 None。
+
+    返回 (magic, seq, body)。require_magic=True(默认)时 magic 失配即
+    返回 None —— 面板/插件版本位不配对(成对部署被破坏)不该被当成
+    "stats 缺键"消音;旧行为(不校验)用 require_magic=False 取得。
+    2026-09-25 修:kernel32 函数补 restype/argtypes(此前 64 位下句柄
+    截断侥幸可用),magic 校验默认开启。
+    """
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
     k32.OpenFileMappingW.restype = ctypes.c_void_p
+    k32.OpenFileMappingW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
     k32.MapViewOfFile.restype = ctypes.c_void_p
+    k32.MapViewOfFile.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                  ctypes.c_uint32, ctypes.c_uint32, ctypes.c_size_t]
+    k32.UnmapViewOfFile.argtypes = [ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
     h = k32.OpenFileMappingW(FILE_MAP_READ, False, STATS_MAPPING)
     if not h:
         return None
@@ -138,5 +194,7 @@ def read_stats():
     k32.UnmapViewOfFile(ctypes.c_void_p(p))
     k32.CloseHandle(ctypes.c_void_p(h))
     magic, seq = struct.unpack_from("<II", raw, 0)
+    if require_magic and magic != STATS_MAGIC:
+        return None
     body = raw[8:].split(b"\0")[0].decode("utf-8", "replace")
     return magic, seq, body

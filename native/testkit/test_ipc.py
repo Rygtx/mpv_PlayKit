@@ -14,9 +14,17 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402
+testenv.ini_restore_on_exit()  # 部署 ini 现场保护(2026-09-25 收敛)
 import panel_ipc  # noqa: E402
 
 testenv.require_env()
+# 真实面板清场(2026-09-25 修连跑 flake):前序测试(未设 NO_PANEL 的
+# verify_stats_keys 等)经 BridgeStart 拉起过真实面板时,它会与本项目
+# ParamsChannel 互写同一映射的 generation(seq 基线反复重置),recreate
+# 计数断言随机失败。本测试的通道语义必须独占。
+testenv.kill_panel()
+os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")
+time.sleep(1)
 
 import vapoursynth as vs  # noqa: E402
 from vapoursynth import core  # noqa: E402
