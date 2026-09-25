@@ -446,7 +446,9 @@ bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_
 
 FrameSlot *D3D12Context::AcquireSlot() noexcept {
     std::unique_lock<std::mutex> lock(_poolMutex);
-    _poolCv.wait(lock, [this] { return _freeCount > 0; });
+    // !_drain:排他排空期间新帧一律阻塞(否则归还的槽会被后续请求偷走,
+    // PoolHold 等三槽全空被饿死 —— 2026-09-25 真机 1.5s 排空实锤)。
+    _poolCv.wait(lock, [this] { return _freeCount > 0 && !_drain; });
     FrameSlot *slot = &_slots[_freeStack[--_freeCount]];
     return slot;
 }
@@ -467,12 +469,17 @@ D3D12Context::PoolHold::PoolHold(D3D12Context &ctx) noexcept : _ctx(&ctx) {
     // the resources the holder is about to replace. Waiting for the drain
     // inside the same lock is safe — the frames still in flight never take
     // _poolMutex again (they already own their slot), they just release.
+    // 排他排空(2026-09-25):先置 _drain 阻塞新 AcquireSlot 再等三槽归还
+    // —— 否则 mpv 追赶期的连续请求会不断偷走刚归还的槽,排空被饿(真机
+    // 1.5s 实锤);置位后归还即满足,排空 ≈ 在飞帧自然完成。
     // 探针:排空等待 = recreate 的顿挫主体(#32 的"切档帧一次性顿挫")。
     // 每次切预设/滑块一行,量化换挡停顿;若在无用户操作时出现 = 有东西在
     // 反复触发重建。
     LARGE_INTEGER t0{}, t1{}, tf{};
     QueryPerformanceCounter(&t0);
     _lock = std::unique_lock<std::mutex>(_ctx->_poolMutex);
+    _ctx->_drain = true;
+    _ctx->_poolCv.notify_all(); // 唤醒已阻塞的 AcquireSlot 重新检查谓词(阻塞)
     _ctx->_poolCv.wait(_lock, [&ctx] { return ctx._freeCount == kSlotCount; });
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&tf);
@@ -487,6 +494,8 @@ D3D12Context::PoolHold::PoolHold(D3D12Context &ctx) noexcept : _ctx(&ctx) {
 
 D3D12Context::PoolHold::~PoolHold() noexcept {
     if (_lock.owns_lock()) {
+        _ctx->_drain = false;
+        _ctx->_poolCv.notify_all(); // 锁内清旗 + 唤醒,锁外再补一次通知
         _lock.unlock();
         _ctx->_poolCv.notify_all();
     }

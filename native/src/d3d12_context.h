@@ -751,6 +751,10 @@ private:
     FrameSlot _slots[kSlotCount];
     int _freeStack[kSlotCount];
     int _freeCount = 0;
+    bool _drain = false; // PoolHold 排他排空:置位后 AcquireSlot 阻塞,防
+                         // 归还的槽被后续帧请求偷走(否则 PoolHold 等三槽
+                         // 全空会被 mpv 追赶期的连续请求饿死,2026-09-25
+                         // 真机 1.5s 排空实锤)
     std::mutex _poolMutex;
     std::condition_variable _poolCv;
 
