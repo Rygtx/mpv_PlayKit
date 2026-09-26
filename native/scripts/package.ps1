@@ -1,4 +1,4 @@
-﻿# 打包 mpv_PlayKit DLSSNR 完整发行包: 发行分支 portable_config 全目录 + vs_dlssnr 插件三件套
+﻿# 打包 mpv_PlayKit DLSSNR 完整发行包: 发行分支 portable_config 全目录 + vs_dlssnr 插件三件套 + pdb 调试符号
 # 全部输入取自仓库树内, 无本机绝对路径
 # 用法: pwsh -File scripts\package.ps1 [-Version 2026.09.07] [-Branch dlssnr]
 # 产物: dist\mpv_PlayKit-dlssnr-v<版本>-full.zip
@@ -23,6 +23,8 @@ $Version = $Version.TrimStart("v")
 
 $binDll     = Join-Path $native "bin\vs_dlssnr.dll"
 $binPanel   = Join-Path $native "bin\dlssnr_panel.exe"
+$binDllPdb  = Join-Path $native "bin\vs_dlssnr.pdb"
+$binPanelPdb = Join-Path $native "bin\dlssnr_panel.pdb"
 $model      = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"
 $fgDll      = Join-Path $native "vendor\ngx\version.dll"
 $fgIni      = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
@@ -35,6 +37,10 @@ $rtxLicense = Join-Path $native "vendor\rtxvideo\NVIDIA_RTX_Video_SDK_License.pd
 # 缺任一件 = 打包失败,杜绝残缺发行包。
 if (-not (Test-Path $binDll))     { throw "缺少编译产物: $binDll (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $binPanel))   { throw "缺少编译产物: $binPanel (先运行 scripts\build.ps1)" }
+# PDB 必须与同包 DLL/EXE 出自同一次编译(符号对不上 = 用户 dump 无法还原调用栈)。
+# build.ps1 增量编译不会产生错位:每次链接都重写两个 pdb。
+if (-not (Test-Path $binDllPdb))   { throw "缺少符号文件: $binDllPdb (先运行 scripts\build.ps1)" }
+if (-not (Test-Path $binPanelPdb)) { throw "缺少符号文件: $binPanelPdb (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $model))      { throw "缺少模型文件: $model (把 nvngx_dlssnr.dll 复制到 native\vendor\ngx\)" }
 if (-not (Test-Path $fgDll))      { throw "缺少帧生成代理: $fgDll (先运行 scripts\fetch-deps.ps1 自动拉取)" }
 if (-not (Test-Path $fgIni))      { throw "缺少帧生成代理配置: $fgIni (先运行 scripts\fetch-deps.ps1 自动拉取)" }
@@ -63,6 +69,12 @@ Copy-Item $fgOfficial (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $rtxVsr     (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $rtxHdr     (Join-Path $stage "vs-plugins\ngx")
 
+# --- PDB 调试符号随包分发 (pdb\ 子目录;配 installer\mpv-诊断设置.bat 收到的
+#     崩溃 dump,用 WinDbg 载入同包 pdb 即可还原闪退调用栈,用户可整目录删除) ---
+New-Item -ItemType Directory -Force (Join-Path $stage "pdb") | Out-Null
+Copy-Item $binDllPdb   (Join-Path $stage "pdb")
+Copy-Item $binPanelPdb (Join-Path $stage "pdb")
+
 # --- 第三方许可:AMD FidelityFX SDK(MIT,静态编入 vs_dlssnr.dll 的 OF 后端)
 #     + NVIDIA RTX Video SDK(专有条款,VSR/TrueHDR 运行库随包分发)---
 $ffxNotice = Join-Path $native "vendor\fidelityfx\3rdpartynotice.md"
@@ -89,6 +101,8 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   vs-plugins\ngx\version.dll          DLSS 帧生成 hook 代理 0.3.x (dlssg_for_sm86, 自签名, RTX 30/20 系)
   vs-plugins\ngx\dlssg_sm86.ini       帧生成代理出厂配置 (上游原样分发, 插件不再写入)
   vs-plugins\ngx\nvngx_dlssg.dll      DLSS 官方帧生成运行时 (NVIDIA 签名, 官方链载体; 面板 "FG 路由" 可选)
+  pdb\vs_dlssnr.pdb                   调试符号 (闪退分析用, 平时可删除)
+  pdb\dlssnr_panel.pdb                调试符号 (闪退分析用, 平时可删除)
 
 安装 (已有 mpv-lazy, 建议与打包基线同版或更新)
   1. 备份你的 portable_config\ (若有个人修改)
