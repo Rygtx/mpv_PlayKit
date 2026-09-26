@@ -257,6 +257,10 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
 void D3D12Context::Finalize() noexcept {
     // 探针:D3D12 上下文销毁只发生在 parked 上下文排干/非热路径释放。
     if (_device) TimingStatusLine("DLSSNR STATUS: d3d12 context finalized");
+    // Finish 在途票据排空:停泊覆盖销毁(parked 上下文被下一次停泊顶替)时,
+    // 楔住的 Finish 若仍解引用本上下文的槽资源,先排空再拆(自防御;
+    // 正常宿主路径 plugin.cpp 1217-1231 在 g_lifecycleMutex 内、无在飞帧)。
+    WaitFinishTicketsDrained(30000);
     if (_queue && _fence) {
         // Best-effort drain so the GPU is idle before releasing command objects.
         const uint64_t v = _fenceValue.fetch_add(1) + 1;

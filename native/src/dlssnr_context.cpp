@@ -1342,6 +1342,17 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
     }
     {
         D3D12Context::PoolHold pool(*_d3d12);
+        // Finish 在途票据排空:与 RecreateFeature 对称(见其 PoolHold 后
+        // 注释)。现状安全依赖"ReleaseSlot 是 Finish 最后一次槽资源访问"
+        // 这一跨函数约定 —— 显式排空消除对约定的隐式依赖。
+        if (!_d3d12->WaitFinishTicketsDrained(30000)) {
+            if (err && errLen) {
+                std::snprintf(err, errLen,
+                              "RebuildOf: frame finish tickets not drained (pipeline wedged)");
+            }
+            TimingStatusLine("DLSSNR STATUS: of rebuild ABORTED (finish tickets not drained)");
+            return false;
+        }
         if (!_ofBackend || _nvofFailed ||
             _ofBackend->Quality() != q || _ofBackend->Width() != dstW ||
             _ofBackend->Height() != dstH || _ofBackend->Kind() != backendReq) {
