@@ -765,6 +765,29 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 ? vsapi->addFrameRef(d->fgCache[slot])
                 : vsapi->addFrameRef(d->fgCache[0]);
         // src 引用持到 Finish 兜底拷贝之后(unpack 失败的降级路径还要读它)。
+        // Finish 保活引用:fmParallel 下并发源帧在 fgMutex 外替换缓存并
+        // freeFrame 本帧 out/genFrame,而本帧 Finish 的 unpack 持裸平面
+        // 指针写它们 —— GPU 忙时(重建窗口)Finish 拖长,窗口必炸
+        // (2026-09-26 闪退族:memcpy INVALID_POINTER_WRITE 写已去提交的
+        // VS 帧页,复现 = VSR 切换)。引用计数保活,本帧所有出口(含
+        // RTX 报错终止)释放。sync 路径 ff 为 null,Finish 已在
+        // ProcessFrame 内完成,无需引用。
+        const VSFrame *dstKeep[kFgGenSlots + 1] = {};
+        int dstKeepN = 0;
+        struct DstKeepGuard {
+            const VSAPI *vsapi;
+            const VSFrame *const *keep;
+            int n;
+            ~DstKeepGuard() {
+                for (int i = 0; i < n; ++i) vsapi->freeFrame(keep[i]);
+            }
+        } dstGuard{vsapi, dstKeep, dstKeepN};
+        if (ff) {
+            dstKeep[dstKeepN++] = vsapi->addFrameRef(out);
+            for (int g = 0; g < effGens; ++g) {
+                if (genFrame[g]) dstKeep[dstKeepN++] = vsapi->addFrameRef(genFrame[g]);
+            }
+        }
         if (procOk) {
             // ---- 锁外 Finish:GPU 等待 + unpack(真实帧 + 逐 gen)----
             // 从这里到 Ready 通知之间不持 fgMutex:其它源帧的 CPU 链
