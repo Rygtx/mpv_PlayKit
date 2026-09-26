@@ -123,6 +123,15 @@ bool GetSelfIniPath(wchar_t *path, size_t pathLen) noexcept {
 bool BridgeLoadIni(DlssnrParams &p) noexcept {
     wchar_t iniPath[MAX_PATH];
     if (!GetSelfIniPath(iniPath, MAX_PATH)) return false;
+    // 启动自检:剪除表外键(跨版本回滚残留/手编历史键,见 PruneDlssnrIni)。
+    wchar_t pruned[256] = L"";
+    const int prunedN = PruneDlssnrIni(iniPath, pruned, sizeof(pruned) / sizeof(pruned[0]));
+    if (prunedN > 0) {
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: pruned %d stale ini key(s)", prunedN);
+        TimingStatusLine(msg);
+    }
     return LoadDlssnrIni(p, iniPath); // shared key list + clamps (dlssnr_ini.h)
 }
 

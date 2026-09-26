@@ -554,12 +554,19 @@ void LoadIni() noexcept {
     // 状态行提示,不再无声 —— 老用户"补帧怎么没了"的直接答案。
     {
         int legacyRoute = 0;
+        // 启动自检:剪除表外键(跨版本回滚残留,见 PruneDlssnrIni);
+        // 明细仅在无更重要提示时占用状态行。
+        wchar_t pruned[256] = L"";
+        const int prunedN = PruneDlssnrIni(path, pruned, 256);
         LoadDlssnrIni(g_app.params, path, &legacyRoute);
         if (legacyRoute > kFgRouteMax) {
             snprintf(g_app.status, sizeof(g_app.status),
                      "检测到旧版 fg_route=%d(档位语义已作废),已按新版解释为纯官方;"
                      "如需自动档请在面板选回 \"自动\"",
                      legacyRoute);
+        } else if (prunedN > 0) {
+            snprintf(g_app.status, sizeof(g_app.status),
+                     "清理了 %d 个已作废的保存配置键:%ls", prunedN, pruned);
         }
     }
     // Optimized 档位的存储单点 = 代理 ini(代理只在进程加载时读一次),

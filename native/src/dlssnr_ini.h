@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <windows.h>
 
 namespace vsdlssnr {
@@ -168,6 +169,83 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
     p.rtxHdrMiddleGray = std::clamp(readRtxInt(L"hdr_middle_gray", p.rtxHdrMiddleGray), kHdrMiddleGrayMin, kHdrMiddleGrayMax);
     p.rtxHdrMaxLuminance = std::clamp(readRtxInt(L"hdr_peak_nits", p.rtxHdrMaxLuminance), kHdrMaxLumMin, kHdrMaxLumMax);
     return true;
+}
+
+// 保存文件的自检键表:WriteDlssnrIni 逐键落盘(上方),本表驱动启动自检
+// —— 文件里的表外键(例:rtxvideo 的作废 vsr_height,语义已并入
+// vsr_scale_x100)一律剪除。与写侧同文件紧邻,漂移在 review 里可见;
+// 改键名/增删键时两处同步。
+inline constexpr const wchar_t *kDlssnrSectionKeys[] = {
+    L"nr_enabled", L"preset", L"style", L"intensity_x100",
+    L"local_tone_x100", L"local_structure_x100", L"skin_structure_x100",
+    L"use_auto_mask", L"input_resolution", L"scaling_enabled",
+    L"residual_multiplier_x100", L"residual_saturation_x100",
+    L"residual_lightness_x100", L"shadow_structure_x100",
+    L"reflection_glow_x100", L"motion_vector_quality", L"ffx_quality",
+    L"nvof_follow_scaling", L"fg_enabled", L"fg_multiplier", L"fg_route",
+    L"fg_hdr_interp", L"of_backend", L"saved",
+};
+inline constexpr const wchar_t *kRtxSectionKeys[] = {
+    L"vsr_mode", L"vsr_scale_x100", L"vsr_strength", L"hdr_enabled",
+    L"hdr_contrast", L"hdr_saturation", L"hdr_middle_gray", L"hdr_peak_nits",
+};
+
+// 启动自检:剪除 [dlssnr]/[rtxvideo] 两节里的表外键(跨版本回滚残留、
+// 手编历史键)。读取侧本就不认未知键,留着只会在回滚/手编时制造困惑;
+// 剪除只触表外键,不碰任何已知键与 [panel] 节(面板自有)。返回剪除键数;
+// prunedOut(可空)以 "节:键;" 追加剪除明细。
+inline int PruneDlssnrIni(const wchar_t *iniPath,
+                          wchar_t *prunedOut = nullptr, size_t prunedLen = 0) noexcept {
+    struct Section {
+        const wchar_t *name;
+        const wchar_t *const *keys;
+        size_t count;
+    };
+    constexpr Section sections[] = {
+        {L"dlssnr", kDlssnrSectionKeys,
+         sizeof(kDlssnrSectionKeys) / sizeof(kDlssnrSectionKeys[0])},
+        {L"rtxvideo", kRtxSectionKeys,
+         sizeof(kRtxSectionKeys) / sizeof(kRtxSectionKeys[0])},
+    };
+    const auto eqi = [](const wchar_t *a, const wchar_t *b) {
+        return _wcsicmp(a, b) == 0; // INI 键名不区分大小写
+    };
+    const auto appendLog = [&](const wchar_t *section, const wchar_t *key) {
+        if (!prunedOut || prunedLen == 0) return;
+        const size_t used = wcslen(prunedOut);
+        _snwprintf_s(prunedOut + used, prunedLen - used, _TRUNCATE,
+                     L"%ls:%ls;", section, key);
+    };
+    int pruned = 0;
+    for (const Section &sec : sections) {
+        size_t cap = 2048;
+        for (;;) {
+            const auto buf = std::unique_ptr<wchar_t[]>(new (std::nothrow) wchar_t[cap]());
+            if (!buf) return pruned;
+            // 键名枚举:key 传 nullptr 返回该节全部键名(双 \0 结尾)。
+            const DWORD got = GetPrivateProfileStringW(
+                sec.name, nullptr, L"", buf.get(), static_cast<DWORD>(cap), iniPath);
+            if (got >= cap - 2) {
+                cap *= 2; // 截断:翻倍重枚举(1MB 上限防失控)
+                if (cap > (1u << 20)) return pruned;
+                continue;
+            }
+            for (const wchar_t *k = buf.get(); *k; k += wcslen(k) + 1) {
+                bool known = false;
+                for (size_t i = 0; i < sec.count; ++i) {
+                    if (eqi(k, sec.keys[i])) { known = true; break; }
+                }
+                if (!known) {
+                    // 删键:key 赋 NULL。
+                    WritePrivateProfileStringW(sec.name, k, nullptr, iniPath);
+                    ++pruned;
+                    appendLog(sec.name, k);
+                }
+            }
+            break;
+        }
+    }
+    return pruned;
 }
 
 } // namespace vsdlssnr
