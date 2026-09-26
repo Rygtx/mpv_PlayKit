@@ -10,9 +10,9 @@ echo ==
 echo == 删除 mpv.exe / umpv.exe / dlssnr_panel.exe 的崩溃转储配置,
 echo == 之后闪退不再生成 dump（回到 Windows 默认行为）
 echo ==
-echo == 已生成的 dump 不受影响,位于:
-echo ==   %LOCALAPPDATA%\CrashDumps\
-echo == 确认反馈已发出后,可手动删除该目录释放空间
+echo == 本插件进程的诊断 dump 位于 %LOCALAPPDATA%\CrashDumps\,
+echo == 关闭后可选择一并删除（只删这三个进程的 dump,
+echo == 其他应用的转储不受影响）
 echo ==========================================================
 
 reg delete "HKCU\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\mpv.exe" /f >nul 2>&1
@@ -25,8 +25,19 @@ call :verify umpv.exe
 call :verify dlssnr_panel.exe
 
 echo.
-powershell -NoProfile -Command "$p=$env:LOCALAPPDATA+'\CrashDumps'; if (Test-Path $p) { $d=@(Get-ChildItem $p -Filter *.dmp -ErrorAction SilentlyContinue); if ($d.Count) { '现有 dump: {0} 个文件, 共 {1:N0} MB' -f $d.Count, (($d | Measure-Object Length -Sum).Sum/1MB) } else { '无 dump 文件' } } else { '无 dump 目录' }"
+echo [诊断 dump] 检索本插件进程的转储文件:
+powershell -NoProfile -Command "$p=$env:LOCALAPPDATA+'\CrashDumps'; if (Test-Path $p) { $d=@(Get-ChildItem $p -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(mpv|umpv|dlssnr_panel)\.exe\..*\.dmp$' }); if ($d.Count) { $d | ForEach-Object { '  {0}  ({1:N1} MB)' -f $_.Name, ($_.Length/1MB) }; '共 {0} 个文件, {1:N0} MB' -f $d.Count, (($d | Measure-Object Length -Sum).Sum/1MB) } else { '  无' } } else { '  无 dump 目录' }"
 
+choice /C YN /M "是否删除上述诊断 dump 文件"
+if errorlevel 2 goto :keep
+
+powershell -NoProfile -Command "$p=$env:LOCALAPPDATA+'\CrashDumps'; if (Test-Path $p) { $d=@(Get-ChildItem $p -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(mpv|umpv|dlssnr_panel)\.exe\..*\.dmp$' }); $n=$d.Count; $s=($d | Measure-Object Length -Sum).Sum; $d | Remove-Item -Force -ErrorAction SilentlyContinue; $left=@(Get-ChildItem $p -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(mpv|umpv|dlssnr_panel)\.exe\..*\.dmp$' }); if ($left.Count -eq 0) { '已删除 {0} 个文件, 释放 {1:N0} MB' -f $n, ($s/1MB) } else { '{0} 个文件被占用未删除, 已释放其余 {1:N0} MB' -f $left.Count, (($s-($left | Measure-Object Length -Sum).Sum)/1MB) } }"
+goto :done
+
+:keep
+echo   已保留 dump 文件（可稍后手动删除 %LOCALAPPDATA%\CrashDumps\）
+
+:done
 echo ==========================================================
 echo == 已恢复默认
 echo ==========================================================
