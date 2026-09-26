@@ -12,6 +12,57 @@
 #include <memory>
 #include <windows.h>
 
+// ---------------------------------------------------------------------------
+// 保存键单一权威表(编译期):写侧(WriteDlssnrIni)与剪除表
+// (kDlssnrSectionKeys / kRtxSectionKeys)由同一组宏展开 —— 键名/值式漂移
+// 在构造上不可能(此前靠"同文件紧邻 + review 可见")。改键名/增删键只动
+// DLSSNR_FIELDS / RTX_FIELDS 两组宏表;LoadDlssnrIni 读侧手动同步(漏加
+// 无害:缺键保留当前值),但宏表漏加 = 启动剪除把刚写的键当垃圾删掉,
+// 故新增键必经宏表。注意:宏体内禁用 // 注释(会吞掉续行反斜杠),行内
+// 说明用块注释;含逗号的表达式须整体加括号。
+// v20:fg_route 两档(0=自动/1=纯官方),保存即把存量 2/3 归一;
+// v23:fg_hdr_interp 实验性(HDR 域插帧,可能闪烁)。
+#define DLSSNR_STRW(name) L## #name
+
+// 行格式:X(键名, 写函数, 值表达式)。
+#define DLSSNR_FIELDS(X) \
+    X(nr_enabled, writeInt, p.nrEnabled ? 1 : 0) \
+    X(preset, writeInt, (std::clamp(p.preset, kPresetMin, kPresetMax))) \
+    X(style, writeInt, p.style) \
+    X(intensity_x100, writeX100, p.intensity) \
+    X(local_tone_x100, writeX100, p.localToneStrength) \
+    X(local_structure_x100, writeX100, p.localStructureStrength) \
+    X(skin_structure_x100, writeX100, p.skinStructureStrength) \
+    X(use_auto_mask, writeInt, p.useAutoMask ? 1 : 0) \
+    X(input_resolution, writeInt, (std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax))) \
+    X(scaling_enabled, writeInt, p.scalingEnabled ? 1 : 0) \
+    X(residual_multiplier_x100, writeX100, p.residualMultiplier) \
+    X(residual_saturation_x100, writeX100, p.residualSaturation) \
+    X(residual_lightness_x100, writeX100, p.residualLightness) \
+    X(shadow_structure_x100, writeX100, p.shadowStructureMultiplier) \
+    X(reflection_glow_x100, writeX100, p.reflectionGlowMultiplier) \
+    X(motion_vector_quality, writeInt, (std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax))) \
+    X(ffx_quality, writeInt, (std::clamp(p.ffxQuality, kFfxQualityMin, kFfxQualityMax))) \
+    X(nvof_follow_scaling, writeInt, p.nvofFollowScaling ? 1 : 0) \
+    X(fg_enabled, writeInt, p.fgEnabled ? 1 : 0) \
+    X(fg_multiplier, writeInt, (std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax))) \
+    X(fg_route, writeInt, (std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax))) \
+    X(fg_hdr_interp, writeInt, p.fgHdrInterp ? 1 : 0) \
+    X(of_backend, writeInt, (std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax))) \
+    X(saved, writeInt, 1)
+
+// RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管;
+// 面板"保存设置"与 bridge saveRequest 共用写侧)。
+#define RTX_FIELDS(X) \
+    X(vsr_mode, writeRtxInt, (std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax))) \
+    X(vsr_scale_x100, writeRtxInt, (static_cast<int>(std::lround(std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax) * 100.0f)))) \
+    X(vsr_strength, writeRtxInt, (std::clamp(p.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax))) \
+    X(hdr_enabled, writeRtxInt, p.rtxHdrEnabled ? 1 : 0) \
+    X(hdr_contrast, writeRtxInt, (std::clamp(p.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax))) \
+    X(hdr_saturation, writeRtxInt, (std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax))) \
+    X(hdr_middle_gray, writeRtxInt, (std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax))) \
+    X(hdr_peak_nits, writeRtxInt, (std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax)))
+
 namespace vsdlssnr {
 
 // Persist the parameter profile (the [panel] log toggle is panel-local and
@@ -29,44 +80,15 @@ inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexce
     auto writeX100 = [&](const wchar_t *key, float v) {
         writeInt(key, static_cast<int>(std::lround(v * 100.0f)));
     };
-    writeInt(L"nr_enabled", p.nrEnabled ? 1 : 0);
-    writeInt(L"preset", p.preset);
-    writeInt(L"style", p.style);
-    writeX100(L"intensity_x100", p.intensity);
-    writeX100(L"local_tone_x100", p.localToneStrength);
-    writeX100(L"local_structure_x100", p.localStructureStrength);
-    writeX100(L"skin_structure_x100", p.skinStructureStrength);
-    writeInt(L"use_auto_mask", p.useAutoMask ? 1 : 0);
-    writeInt(L"input_resolution", std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax));
-    writeInt(L"scaling_enabled", p.scalingEnabled ? 1 : 0);
-    writeX100(L"residual_multiplier_x100", p.residualMultiplier);
-    writeX100(L"residual_saturation_x100", p.residualSaturation);
-    writeX100(L"residual_lightness_x100", p.residualLightness);
-    writeX100(L"shadow_structure_x100", p.shadowStructureMultiplier);
-    writeX100(L"reflection_glow_x100", p.reflectionGlowMultiplier);
-    writeInt(L"motion_vector_quality", std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax));
-    writeInt(L"ffx_quality", std::clamp(p.ffxQuality, kFfxQualityMin, kFfxQualityMax));
-    writeInt(L"nvof_follow_scaling", p.nvofFollowScaling ? 1 : 0);
-    writeInt(L"fg_enabled", p.fgEnabled ? 1 : 0);
-    writeInt(L"fg_multiplier", std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax));
-    writeInt(L"fg_route", std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax)); // v20 两档:保存即把存量 2/3 归一
-    writeInt(L"fg_hdr_interp", p.fgHdrInterp ? 1 : 0); // v23 实验性:HDR 域插帧,可能闪烁
-    writeInt(L"of_backend", std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax));
-    // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管;
-    // 本函数是唯一写侧,面板"保存设置"与 bridge saveRequest 共用)。
     auto writeRtxInt = [&](const wchar_t *key, int v) {
         swprintf_s(buf, L"%d", v);
         ok = WritePrivateProfileStringW(L"rtxvideo", key, buf, iniPath) && ok;
     };
-    writeRtxInt(L"vsr_mode", std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax));
-    writeRtxInt(L"vsr_scale_x100", static_cast<int>(std::lround(std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax) * 100.0f)));
-    writeRtxInt(L"vsr_strength", std::clamp(p.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax));
-    writeRtxInt(L"hdr_enabled", p.rtxHdrEnabled ? 1 : 0);
-    writeRtxInt(L"hdr_contrast", std::clamp(p.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax));
-    writeRtxInt(L"hdr_saturation", std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax));
-    writeRtxInt(L"hdr_middle_gray", std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax));
-    writeRtxInt(L"hdr_peak_nits", std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax));
-    writeInt(L"saved", 1);
+    // 键名与值式全部来自上方权威宏(写侧与剪除表同源,漂移在构造上不可能)。
+#define DLSSNR_WRITE_ROW(name, fn, val) fn(DLSSNR_STRW(name), val);
+    DLSSNR_FIELDS(DLSSNR_WRITE_ROW)
+    RTX_FIELDS(DLSSNR_WRITE_ROW)
+#undef DLSSNR_WRITE_ROW
     return ok;
 }
 
@@ -171,24 +193,20 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
     return true;
 }
 
-// 保存文件的自检键表:WriteDlssnrIni 逐键落盘(上方),本表驱动启动自检
-// —— 文件里的表外键(例:rtxvideo 的作废 vsr_height,语义已并入
-// vsr_scale_x100)一律剪除。与写侧同文件紧邻,漂移在 review 里可见;
-// 改键名/增删键时两处同步。
+// 保存文件的自检键表:由上方权威宏直接生成 —— 写侧加键时本表自动跟上,
+// 构造上不可能漂移。读取侧本就不认未知键;文件里的表外键(例:rtxvideo
+// 的作废 vsr_height,语义已并入 vsr_scale_x100)由下方 PruneDlssnrIni 剪除。
+#define DLSSNR_NAME_ROW(name, fn, val) DLSSNR_STRW(name),
 inline constexpr const wchar_t *kDlssnrSectionKeys[] = {
-    L"nr_enabled", L"preset", L"style", L"intensity_x100",
-    L"local_tone_x100", L"local_structure_x100", L"skin_structure_x100",
-    L"use_auto_mask", L"input_resolution", L"scaling_enabled",
-    L"residual_multiplier_x100", L"residual_saturation_x100",
-    L"residual_lightness_x100", L"shadow_structure_x100",
-    L"reflection_glow_x100", L"motion_vector_quality", L"ffx_quality",
-    L"nvof_follow_scaling", L"fg_enabled", L"fg_multiplier", L"fg_route",
-    L"fg_hdr_interp", L"of_backend", L"saved",
+    DLSSNR_FIELDS(DLSSNR_NAME_ROW)
 };
 inline constexpr const wchar_t *kRtxSectionKeys[] = {
-    L"vsr_mode", L"vsr_scale_x100", L"vsr_strength", L"hdr_enabled",
-    L"hdr_contrast", L"hdr_saturation", L"hdr_middle_gray", L"hdr_peak_nits",
+    RTX_FIELDS(DLSSNR_NAME_ROW)
 };
+#undef DLSSNR_NAME_ROW
+#undef DLSSNR_FIELDS
+#undef RTX_FIELDS
+#undef DLSSNR_STRW
 
 // 启动自检:剪除 [dlssnr]/[rtxvideo] 两节里的表外键(跨版本回滚残留、
 // 手编历史键)。读取侧本就不认未知键,留着只会在回滚/手编时制造困惑;
