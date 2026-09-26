@@ -1085,6 +1085,20 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // lock is needed. ConsumeRebuild is consumed before any slot is acquired
     // on this thread, so this thread holds no slot and the drain completes.
     D3D12Context::PoolHold pool(*_d3d12);
+    // Finish 半段在 VS 线程池异步消费裸槽指针(读回映射/fenceEvent/时间戳)。
+    // PoolHold 的槽排空只保证"槽已归还",不覆盖归还前的消费窗口:票据未
+    // 清零前替换槽资源 = 迟到 Finish 持已释放的读回映射 memcpy =
+    // use-after-free(2026-09-26 闪退族:memcpy INVALID_POINTER_WRITE,
+    // 复现 = VSR 切换)。事件驱动排空,上限仅防卡死保险 —— 超时响亮
+    // 失败,不静默踩堆。
+    if (!_d3d12->WaitFinishTicketsDrained(30000)) {
+        if (err && errLen) {
+            std::snprintf(err, errLen,
+                          "RecreateFeature: frame finish tickets not drained (pipeline wedged)");
+        }
+        TimingStatusLine("DLSSNR STATUS: recreate ABORTED (finish tickets not drained)");
+        return false;
+    }
     // A video-size change replaces every slot's frame resources first —
     // outside CtlMutex because the guidance clear inside takes it itself.
     // All GPU work is complete (slots are only released after WaitFrame).
@@ -1485,6 +1499,16 @@ struct FrameFinish {
     double nvofSpanMs = 0.0; // OF 全跨度(提交+引擎+暴露等待,nvof 段上报值)
     double ofEngineMs = 0.0; // 冲刷点引擎等待(逐帧携带 —— 共享探针会被
                              // 下一帧种子帧覆盖,污染前帧读数)
+    // Finish 在途票据:打包时取号,本续体消费完(析构)销号。资源重建
+    // (RecreateFeature → CreateFrameResources)在票据未清零前必须等待 ——
+    // 本结构持裸槽指针(读回映射/fenceEvent/时间戳),重建窗口穿过 =
+    // use-after-free(2026-09-26 闪退族:memcpy INVALID_POINTER_WRITE)。
+    // RAII:ProcessFrameFinish 的 FinishSelfDelete 在所有出口 delete 本体,
+    // 析构销号覆盖全部路径(含失败提前 return)。
+    D3D12Context *ticketCtx = nullptr;
+    ~FrameFinish() {
+        if (ticketCtx) ticketCtx->EndFrameFinishTicket();
+    }
 };
 
 bool DlssnrContext::ProcessFrame(
@@ -2745,6 +2769,11 @@ bool DlssnrContext::ProcessFrame(
         auto *ff = new (std::nothrow) FrameFinish();
         if (!ff) return nullptr;
         ff->slot = slot;
+        // Finish 在途票据:本续体持裸槽指针直到消费完,资源重建必须等它
+        // (见 FrameFinish::ticketCtx 注释)。取号先于移交 —— 失败路径
+        // delete 本体时析构销号,票据不悬空。
+        ff->ticketCtx = _d3d12;
+        ff->ticketCtx->BeginFrameFinishTicket();
         guard.handoff = true; // 槽所有权移交(含失败路径:Finish 负责释放)
         ff->qpcFreq = qpcFreq;
         ff->t0 = t0; ff->t1 = t1;

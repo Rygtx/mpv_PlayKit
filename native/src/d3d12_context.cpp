@@ -462,6 +462,33 @@ void D3D12Context::ReleaseSlot(FrameSlot *slot) noexcept {
     _poolCv.notify_all();
 }
 
+// --- Finish 在途票据:见 WaitFinishTicketsDrained 注释 ----------------------
+
+void D3D12Context::BeginFrameFinishTicket() noexcept {
+    std::lock_guard<std::mutex> lock(_finishMutex);
+    ++_pendingFinishTickets;
+}
+
+void D3D12Context::EndFrameFinishTicket() noexcept {
+    {
+        std::lock_guard<std::mutex> lock(_finishMutex);
+        if (--_pendingFinishTickets < 0) _pendingFinishTickets = 0;
+    }
+    _finishCv.notify_all();
+}
+
+bool D3D12Context::WaitFinishTicketsDrained(int timeoutMs) noexcept {
+    // wait_for 可能抛 system_error(罕见系统失败):noexcept 下转为响亮
+    // 失败语义 —— 调用方放弃重建,不带着未排空的 Finish 踩堆。
+    try {
+        std::unique_lock<std::mutex> lock(_finishMutex);
+        return _finishCv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
+                                  [this] { return _pendingFinishTickets == 0; });
+    } catch (...) {
+        return false;
+    }
+}
+
 // --- PoolHold: drain + seal ------------------------------------------------
 
 D3D12Context::PoolHold::PoolHold(D3D12Context &ctx) noexcept : _ctx(&ctx) {

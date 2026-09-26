@@ -19,6 +19,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <cstdint>
@@ -322,6 +323,17 @@ public:
     // the caller must ReleaseSlot exactly once on every path.
     FrameSlot *AcquireSlot() noexcept;
     void ReleaseSlot(FrameSlot *slot) noexcept;
+
+    // Finish 在途票据:ProcessFrameSubmit 打包续体时取号,ProcessFrameFinish
+    // 消费完(FrameFinish 析构)销号。资源重建(CreateFrameResources)在
+    // 排号未清零前不得替换槽资源 —— Finish 半段在 VS 线程池异步持裸槽指针
+    // (读回映射/fenceEvent/时间戳),重建窗口穿过 = use-after-free
+    // (2026-09-26 闪退族:memcpy INVALID_POINTER_WRITE,复现 = VSR 切换)。
+    // 排空等待为事件驱动:最后一个销号即刻放行,无定时精度依赖;
+    // timeoutMs 仅防卡死保险(管线已死时响亮失败,不静默踩堆)。
+    void BeginFrameFinishTicket() noexcept;
+    void EndFrameFinishTicket() noexcept;
+    bool WaitFinishTicketsDrained(int timeoutMs) noexcept;
 
     // NVOF flow/cost 纹理的 SRV 写入每个槽的描述符堆(14-17),注册输入
     // 纹理的 UAV 写 23/24(GPU 光流输入降采样直写目标);资源为 null 时
@@ -757,6 +769,11 @@ private:
                          // 真机 1.5s 排空实锤)
     std::mutex _poolMutex;
     std::condition_variable _poolCv;
+
+    // Finish 在途票据(见 WaitFinishTicketsDrained 注释)。
+    std::mutex _finishMutex;
+    std::condition_variable _finishCv;
+    int _pendingFinishTickets = 0;
 
     int _internalWidth = 0;
     int _internalHeight = 0;
