@@ -22,3 +22,6 @@ Temp/
 # AI 模型文件体积巨大 (nvngx_dlssnr.dll ~165MB), 随 Release 附件分发不入库
 *.dll
 !portable_config/**/*.dll
+
+# 诊断收集脚本(误在仓库根运行时)的产物
+诊断收集/
