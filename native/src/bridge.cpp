@@ -26,7 +26,9 @@ constexpr wchar_t PANEL_EXE[] = L"dlssnr_panel.exe";
 constexpr int POLL_INTERVAL_MS = 40;
 
 struct BridgeState {
-    SharedParams *params = nullptr;
+    // shared_ptr:超时泄漏路径下楔住的线程仍解引用 params,与 FilterData
+    // 的所有权解耦(见 plugin.cpp FilterData::params 注释)。
+    std::shared_ptr<SharedParams> params;
     HANDLE thread = nullptr;
     volatile bool running = false;
 };
@@ -363,7 +365,7 @@ void LaunchPanelSilently() noexcept {
 
 } // namespace
 
-bool BridgeStart(SharedParams *params) noexcept {
+bool BridgeStart(const std::shared_ptr<SharedParams> &params) noexcept {
     std::lock_guard<std::mutex> lock(g_bridgeMutex);
     if (g_bridge) {
         if (g_bridge->params == params) return true;
@@ -414,7 +416,7 @@ bool BridgeStart(SharedParams *params) noexcept {
     return true;
 }
 
-void BridgeStop(SharedParams *params) noexcept {
+void BridgeStop(const std::shared_ptr<SharedParams> &params) noexcept {
     std::lock_guard<std::mutex> lock(g_bridgeMutex);
     BridgeState *state = g_bridge;
     if (!state || state->params != params) return; // newer instance owns the bridge

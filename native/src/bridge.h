@@ -10,10 +10,10 @@ namespace vsdlssnr {
 
 // Start the bridge (poll thread). Blocks briefly until the thread is up.
 // Returns false if startup failed (plugin keeps working).
-bool BridgeStart(SharedParams *params) noexcept;
+bool BridgeStart(const std::shared_ptr<SharedParams> &params) noexcept;
 // Stop the bridge iff it belongs to this SharedParams instance (a newer
 // filter instance may already own it; VS filter free order is not guaranteed).
-void BridgeStop(SharedParams *params) noexcept;
+void BridgeStop(const std::shared_ptr<SharedParams> &params) noexcept;
 
 // Load panel-saved defaults from dlssnr_ui.ini (plugin dir), if present.
 // Returns true when a saved profile was applied onto `p`.

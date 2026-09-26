@@ -67,7 +67,11 @@ struct FilterData {
     // come from the .vpy call). RTX Video 参数(v22 起)也住 DlssnrParams:
     // vpy args ← ini ← 面板 payload 合并,创建时经 RtxFromParams 折成
     // ctx 载荷。
-    std::unique_ptr<vsdlssnr::SharedParams> params;
+    std::shared_ptr<vsdlssnr::SharedParams> params;
+    // shared_ptr 而非 unique_ptr:bridge 线程超时泄漏路径(bridge.cpp
+    // BridgeStopLocked 5s 超时)下,楔住的线程仍持 state->params 裸用 ——
+    // unique_ptr 会随 FilterData 销毁 SharedParams = use-after-free;
+    // shared_ptr 由 BridgeState 同持,生命周期对齐最后的消费者。
 
     // Eagerly initialized in DlssnrCreate (before playback starts); VS may
     // call getFrame on several threads under fmParallel, but each frame runs
@@ -399,7 +403,10 @@ DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
     // 时 SetEvent —— 实例与线程生命周期对齐。
     for (;;) {
         const DWORD w = WaitForSingleObject(ctx->stop, 400);
-        if (w == WAIT_OBJECT_0) break; // 滤镜已释放(重建/热停泊/关停)
+        // 非 WAIT_TIMEOUT 一律停:SetEvent 是正常停旗;WAIT_FAILED = Free 的
+        // CloseHandle 撞上扫描窗口(不在 wait 中),句柄已关,继续循环会
+        // 全速空转(每圈全量 EnumWindows)。
+        if (w != WAIT_TIMEOUT) break; // 滤镜已释放(重建/热停泊/关停)
         const DisplayPick d = DetectTargetSize(ctx->srcW, ctx->srcH);
         if (d.height <= 0) { drift = 0; continue; } // 窗口暂不可见,不积累
         const int thresh = (std::max)(8, ctx->refH / 50);
@@ -774,6 +781,14 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         // ProcessFrame 内完成,无需引用。
         const VSFrame *dstKeep[kFgGenSlots + 1] = {};
         int dstKeepN = 0;
+        if (ff) {
+            dstKeep[dstKeepN++] = vsapi->addFrameRef(out);
+            for (int g = 0; g < effGens; ++g) {
+                if (genFrame[g]) dstKeep[dstKeepN++] = vsapi->addFrameRef(genFrame[g]);
+            }
+        }
+        // 守卫在填充后构造(按值捕获最终 n);填充与构造之间无出口。
+        // 首版把构造放在填充前,按值捕获的 n 恒 0 = 引用永不释放(泄漏)。
         struct DstKeepGuard {
             const VSAPI *vsapi;
             const VSFrame *const *keep;
@@ -782,12 +797,6 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 for (int i = 0; i < n; ++i) vsapi->freeFrame(keep[i]);
             }
         } dstGuard{vsapi, dstKeep, dstKeepN};
-        if (ff) {
-            dstKeep[dstKeepN++] = vsapi->addFrameRef(out);
-            for (int g = 0; g < effGens; ++g) {
-                if (genFrame[g]) dstKeep[dstKeepN++] = vsapi->addFrameRef(genFrame[g]);
-            }
-        }
         if (procOk) {
             // ---- 锁外 Finish:GPU 等待 + unpack(真实帧 + 逐 gen)----
             // 从这里到 Ready 通知之间不持 fgMutex:其它源帧的 CPU 链
@@ -941,7 +950,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         CloseHandle(d->resizeWatchStop);
         d->resizeWatchStop = nullptr;
     }
-    vsdlssnr::BridgeStop(d->params.get());
+    vsdlssnr::BridgeStop(d->params);
     // FG 缓存帧:最后一个引用(缓存自留),先于 filter 释放。
     for (int i = 0; i < kFgMultMax; ++i) {
         if (d->fgCache[i]) vsapi->freeFrame(d->fgCache[i]);
@@ -1091,7 +1100,7 @@ static void VS_CC DlssnrCreate(
                       initial.fgMultiplier, initial.fgRoute, initial.fgHdrInterp ? 1 : 0);
         vsdlssnr::TimingStatusLine(msg);
     }
-    d->params = std::make_unique<vsdlssnr::SharedParams>(initial);
+    d->params = std::make_shared<vsdlssnr::SharedParams>(initial);
 
     int dllErr = 0;
     const char *dllArg = vsapi->mapGetData(in, "ngx_dll", 0, &dllErr);
@@ -1198,7 +1207,7 @@ static void VS_CC DlssnrCreate(
         if (d->ngx->Rebind(d->params.get(), d->width, d->height, d->depth, rtx, err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
-            if (!vsdlssnr::BridgeStart(d->params.get())) {
+            if (!vsdlssnr::BridgeStart(d->params)) {
                 vsapi->logMessage(mtWarning,
                                   "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
                                   core);
@@ -1241,7 +1250,7 @@ static void VS_CC DlssnrCreate(
                                err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
-            if (!vsdlssnr::BridgeStart(d->params.get())) {
+            if (!vsdlssnr::BridgeStart(d->params)) {
                 vsapi->logMessage(mtWarning,
                                   "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
                                   core);
@@ -1280,7 +1289,7 @@ static void VS_CC DlssnrCreate(
         std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR+FG+RTX disabled (panel/vpy)\"}",
                       vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
         vsdlssnr::PublishStatsJson(body);
-        if (!vsdlssnr::BridgeStart(d->params.get())) {
+        if (!vsdlssnr::BridgeStart(d->params)) {
             vsapi->logMessage(mtWarning,
                               "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
                               core);
