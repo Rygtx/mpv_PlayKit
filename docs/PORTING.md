@@ -4,7 +4,7 @@
 
 参考仓库:[SAOG0721/Magpie](https://github.com/SAOG0721/Magpie)(experimental,HEAD 9824d758,2026-09-06 对齐)
 宿主仓库:本仓库 · 部署:mpv-lazy 发行包(任意安装位置,下称「部署根」)
-模型来源:`nvngx_dlssnr.dll`(DLSS SDK 310.9.0)取自 RenoDX 项目
+模型来源:`nvngx_dlssnr.dll`(DLSS SDK 310.9.0)取自 RenoDX 项目(获取:RenoDX Discord [频道①](https://discord.com/channels/1408098019194310818/1551422945203855370) / [频道②](https://discord.com/channels/1408098019194310818/1543976771920330884),需登录并加入该服务器)
 
 ---
 

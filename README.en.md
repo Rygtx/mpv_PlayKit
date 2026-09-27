@@ -54,7 +54,7 @@ Beyond the denoise/frame-gen chain, two NGX snippets from the NVIDIA RTX Video S
 | `portable_config\` | Complete configuration directory (official release config, with DLSSNR keybinds and menus integrated) |
 | `vs-plugins\vs_dlssnr.dll` | VapourSynth API4 plugin (loaded automatically by mpv-lazy) |
 | `vs-plugins\dlssnr_panel.exe` | Standalone ImGui tuning panel (optional, launched automatically when the filter loads) |
-| `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR model (must reside in the `ngx\` subdirectory; the plugin resolves it by this relative path; taken from the RenoDX project) |
+| `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR model (must reside in the `ngx\` subdirectory; the plugin resolves it by this relative path; taken from the RenoDX project — grab it from the RenoDX Discord, [channel 1](https://discord.com/channels/1408098019194310818/1551422945203855370) / [channel 2](https://discord.com/channels/1408098019194310818/1543976771920330884); Discord login + server membership required) |
 | `vs-plugins\ngx\nvngx_dlssg.dll` | Official DLSS frame-generation runtime (NVIDIA-signed, official-chain carrier; selectable via "FG route") |
 | `vs-plugins\ngx\nvngx_vsr.dll` | RTX Video SDK 1.1 VSR snippet (auto-fetched by fetch-deps.ps1; optional via the panel's "RTX upscale/HDR" tab) |
 | `vs-plugins\ngx\nvngx_truehdr.dll` | RTX Video SDK 1.1 TrueHDR snippet (auto-fetched by fetch-deps.ps1; SDR→PQ HDR10 display) |

@@ -54,7 +54,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | `portable_config\` | 完整配置目录(官方发行配置,已接入 DLSSNR 键位与菜单) |
 | `vs-plugins\vs_dlssnr.dll` | VapourSynth API4 插件(mpv-lazy 会自动加载) |
 | `vs-plugins\dlssnr_panel.exe` | ImGui 独立调参面板(可选,滤镜加载时自动拉起) |
-| `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR 模型(必须位于 `ngx\` 子目录,插件按此相对路径寻找;取自 RenoDX 项目) |
+| `vs-plugins\ngx\nvngx_dlssnr.dll` | DLSSNR 模型(必须位于 `ngx\` 子目录,插件按此相对路径寻找;取自 RenoDX 项目,获取:RenoDX Discord [频道①](https://discord.com/channels/1408098019194310818/1551422945203855370) / [频道②](https://discord.com/channels/1408098019194310818/1543976771920330884),需登录并加入该服务器) |
 | `vs-plugins\ngx\nvngx_dlssg.dll` | DLSS 官方帧生成运行时(NVIDIA 签名,官方链载体;面板"FG 路由"可选) |
 | `vs-plugins\ngx\nvngx_vsr.dll` | RTX Video SDK 1.1 VSR 超分片段(fetch-deps.ps1 自动拉取;面板"RTX 超分/HDR"页可选) |
 | `vs-plugins\ngx\nvngx_truehdr.dll` | RTX Video SDK 1.1 TrueHDR 片段(fetch-deps.ps1 自动拉取;SDR→PQ HDR10 上屏) |
