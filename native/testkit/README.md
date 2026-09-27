@@ -93,6 +93,7 @@ python testmedia.py --force    # 强制重生成(生成器确定性,重跑逐位
 | `test_ipc.py` | F2 契约:payload 推参 -> 恰好一次 recreate;saveRequest -> ini 落盘;logEnabled=0 -> timing log 停增 |
 | `test_e2e_panel.py` | F3:真实面板自动拉起,stats 通道 JSON + params 通道 magic/seq/gen |
 | `test_seek_adopt.py` | seek 回归:新实例 create 时 adopt 面板 payload(不回退 ini),热交接零 recreate |
+| `test_shape_hotswap.py` | RTX/FG 形态热重建:切 HDR/VSR/FG 档走 `hot rebind shape`(Rebind 形态段),全程无冷回落;FG 请求感知 1:1 语义 |
 | `test_nvof_switch.py` | NVOF 质量热切换只重建 OF 会话,NGX feature 不动 |
 | `verify_stats_keys.py` | stats JSON 键位:filter_state / of_mode / 必败路径上报 |
 | `test_lifecycle.py` | 滤镜加载自动拉起面板;杀 mpv 后面板 watchdog 自退 |

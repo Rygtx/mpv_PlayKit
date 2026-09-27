@@ -172,17 +172,12 @@ struct HotContext {
     int subW = 1;
     int subH = 1;
     bool isRgb = false;
-    // FG 状态参与 hotMatch:开关/代理路径变化 = 槽资源形态变化(FG 纹理
-    // 有无),必须冷重建。fgHdrInterp(实验性 HDR 域插帧)同样参与:FG
-    // 插值纹理格式与 post 分支随之变化。路由(route)进程级,重启生效,
-    // 不参与。
-    bool fgEnabled = false;
-    bool fgHdrInterp = false;
+    // FG/RTX 档位(开关/模式/倍率/hdr/fmt)不参与 hotMatch(2026-09-27
+    // 解耦收尾):变化由 DlssnrContext::Rebind → RecreateFeature 形态段
+    // 热重建(槽资源 + VSR/HDR/FG 会话),切档不再付冷启动。代理路径仍
+    // 参与(hotMatch 保证形态段 _fgProxyPath 恒等);路由(route)进程级,
+    // 重启生效。
     std::wstring fgDllPath;
-    // RTX Video 参与 hotMatch:mode/scale/autoHeight/hdrEnabled 变化 = 管
-    // 线几何或输出格式变化,冷重建。RtxVideoParams 的 == 只覆盖这些
-    // (strength/HDR 四参是 live per-eval,不参与,拖滑块不付冷重建)。
-    RtxVideoParams rtx{};
     bool valid = false;
 };
 HotContext &Hot() {
@@ -965,10 +960,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
         Hot().subW = d->subW;
         Hot().subH = d->subH;
         Hot().isRgb = d->isRgb;
-        Hot().fgEnabled = d->fgActive;
-        Hot().fgHdrInterp = d->fgHdrInterp;
         Hot().fgDllPath = std::move(d->fgDllPath);
-        Hot().rtx = RtxFromParams(d->params->Snapshot());
         Hot().valid = true;
         // 探针:停放行 —— 与下一次 create 的 "hot rebind kept"/"re-init"
         // 行配对,seek 生命周期序列(bridge stopped → freed → started →
@@ -1172,15 +1164,13 @@ static void VS_CC DlssnrCreate(
     char err[256]{};
     // depth 参与 hotMatch:同尺寸换深度(P8↔P10)走冷重建 —— 热上下文的
     // 槽纹理按旧位深建,R8 纹理遇 P10 打包 = 数据撕裂(#40-① 同族)。
-    // FG 状态(开关 + 代理路径)同样参与:槽资源形态(FG 纹理有无)随之
-    // 变化,必须冷重建。路由(route)进程级,重启生效,不参与。
-    // fgHdrInterp(实验性 HDR 域插帧)参与:FG 插值纹理格式(BGRA8/FP16)
-    // 与 post 分支随之变化,必须冷重建。
-    // NR+FG 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开秒回);
-    // 仅 NR 关而 FG 开仍需热复用(设备与上下文都在用)。
-    // RTX 请求开 = vsr_mode>0 或 hdr 开(初始化守卫参与;皆关 + NR/FG 皆关
-    // = 纯直通零 GPU)。ctx 载荷从合并后的 DlssnrParams 折出(probe 已在
-    // ResolveRtxParams 填入)。
+    // RTX/FG 档位(vsr_mode/scale/hdr/fg_enabled/fg_hdr_interp)不参与
+    // (2026-09-27):Rebind 形态段热重建槽资源 + VSR/HDR/FG 会话,切档
+    // 不再付冷启动;代理路径仍参与(形态段预载按同路径补)。
+    // NR+FG+RTX 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开
+    // 秒回);仅 NR 关而 FG/RTX 开仍需热复用(设备与上下文都在用)。
+    // ctx 载荷从合并后的 DlssnrParams 折出(probe 已在 ResolveRtxParams
+    // 填入)。
     const RtxVideoParams rtx = RtxFromParams(initial);
     // 生命周期锁:覆盖热匹配判定 → 冷初始化结束(见 g_lifecycleMutex 定义
     // 处注释)。冷初始化 ~1s 在锁内 —— 并发的 Free 最多等一个冷启动周期。
@@ -1195,10 +1185,7 @@ static void VS_CC DlssnrCreate(
                           // 色度面几何/核形态变化,必须冷重建。
                           Hot().subW == d->subW && Hot().subH == d->subH &&
                           Hot().isRgb == d->isRgb &&
-                          Hot().fgEnabled == (initial.fgEnabled != 0) &&
-                          Hot().fgHdrInterp == (initial.fgHdrInterp != 0) &&
-                          Hot().fgDllPath == d->fgDllPath &&
-                          Hot().rtx == rtx;
+                          Hot().fgDllPath == d->fgDllPath;
     if (hotMatch) {
         d->d3d12 = std::move(Hot().d3d12);
         d->ngx = std::move(Hot().ngx);
@@ -1228,12 +1215,13 @@ static void VS_CC DlssnrCreate(
         }
     }
     if ((initial.nrEnabled || initial.fgEnabled || rtxRequested) && !d->initOk && !d->d3d12) {
-        // Any parked context left over (different snippet DLL) must be torn
-        // down BEFORE a cold init: the IAT hook and the NGX core are
-        // process-global singletons. A second full Initialize could never
-        // install the hook (its owner CAS is held by the parked context) and
-        // its eventual Shutdown1 would tear down the shared core under the
-        // parked feature — silently degrading every later resolution.
+        // Any parked context left over (snippet DLL / size / depth / layout /
+        // proxy path mismatch) must be torn down BEFORE a cold init: the IAT
+        // hook and the NGX core are process-global singletons. A second full
+        // Initialize could never install the hook (its owner CAS is held by
+        // the parked context) and its eventual Shutdown1 would tear down the
+        // shared core under the parked feature — silently degrading every
+        // later resolution. RTX/FG 档位变化不进此路径(Rebind 形态段热重建)。
         if (Hot().valid) {
             Hot().ngx->Shutdown();
             Hot().ngx.reset();

@@ -470,6 +470,103 @@ bool DlssnrContext::SetEvaluateParametersSafely(FrameSlot &slot, bool resetHisto
 
 // ---- Lifecycle ----
 
+// RTX feature 降级收口:与 2b capability 失败分支同语义(清旗标 + 几何回落
+// + _rtxDetail 记因),CreateFeature 失败共用。解耦关键:RTX 段建不起来只
+// 停 RTX,资源尚未建时调用,后续 CreateFrameResources 按降级形态自洽 ——
+// NR/FG/OF 不连坐(此前 VSR/HDR CreateFeature 失败 = 整体初始化失败,
+// 插件纯直通,是最后一个"建不起就全停"的段)。
+void DlssnrContext::DegradeRtxFeature(bool vsr, const char *why) noexcept {
+    SanitizeJsonDetail(why, _rtxDetail, sizeof(_rtxDetail));
+    if (vsr) {
+        _vsrRequested = false;
+        _vsr.reset(); // 析构 no-op(不重入 NGX),feature handle 随进程回收
+        // 几何回落源尺寸(与 2b capability 失败同款;HDR 不缩放不受影响,
+        // 若 HDR 存活则回落到 hdr-only 会话的合法形态 pipe=out=源)。
+        _pipeW = _width & ~1;
+        _pipeH = _height & ~1;
+        _outW = _pipeW;
+        _outH = _pipeH;
+        TimingStatusLine("DLSSNR STATUS: rtx vsr CreateFeature failed; passthrough size");
+    } else {
+        _hdrActive = false;
+        _hdr.reset();
+        TimingStatusLine("DLSSNR STATUS: rtx hdr CreateFeature failed; SDR output");
+    }
+    _rtxActive = _vsrRequested || _hdrActive;
+}
+
+// RTX 几何单一裁决(Initialize 与 RecreateFeature 形态段共用):
+//   ratio = 目标高 / 源高;≤ 1.001 → VSR 旁路(只支持放大,对齐浏览器
+//   端官方语义;1:1 与缩小场景本就不该付 VSR 的 GPU 价)。
+//   pipe  = min(目标, 源×4) —— 官方单 pass 放大上限,超出部分由
+//   convert-out 双线性从 4x 中间位补完。
+//   hdr   = TrueHDR 在管线(输出几何切换 P10,与 VSR 无关,pipe=src)。
+void DlssnrContext::DecideRtxGeometry(const RtxVideoParams &rtx, int srcW, int srcH) noexcept {
+    int dstW = srcW, dstH = srcH;
+    if (rtx.vsrMode == 1 || rtx.vsrMode == 2) {
+        if (rtx.vsrMode == 2) {
+            // 手动倍率:输出 = 源 × scale(宽度按源宽高比推)。
+            const double sc = std::clamp(rtx.vsrScale, kVsrScaleMin, kVsrScaleMax);
+            dstH = static_cast<int>(std::lround(static_cast<double>(srcH) * sc));
+            dstW = static_cast<int>(std::lround(static_cast<double>(srcW) * sc));
+        } else {
+            // vsrAutoHeight <= 0 = 探测失败(无可见窗口):目标=源,
+            // ratio=1 走旁路 —— 窗口出现后的链重建重新探测并启用。
+            dstH = rtx.vsrAutoHeight > 0
+                       ? std::clamp(rtx.vsrAutoHeight, 144, 8192)
+                       : srcH;
+            const double scale = static_cast<double>(dstH) / static_cast<double>(srcH);
+            dstW = static_cast<int>(std::lround(static_cast<double>(srcW) * scale));
+        }
+        dstH = (std::max)(1, dstH);
+        dstW = (std::max)(1, dstW);
+        // 420 输出契约:目标尺寸必须取偶。VS 按算术右移分配色度面
+        // (奇高 → floor 行数),拷贝侧按 ceil 行数写会越界一格 ——
+        // 静默堆腐蚀,落进未映射页时 c0000005(2026-09-22 真机实锤:
+        // 窗口客户区 2290x959 奇高,15 帧后崩)。偏差 ≤1px。
+        dstH &= ~1;
+        dstW &= ~1;
+    }
+    const double ratio = static_cast<double>(dstH) / static_cast<double>(srcH);
+    _vsrRequested = rtx.vsrMode > 0 && ratio > 1.001;
+    _hdrActive = rtx.hdrEnabled != 0;
+    if (_vsrRequested) {
+        const double cap = static_cast<double>(kVsrMaxScale);
+        _pipeH = static_cast<int>(std::lround(static_cast<double>(srcH) *
+                                              (std::min)(ratio, cap)));
+        _pipeW = static_cast<int>(std::lround(static_cast<double>(srcW) *
+                                              (std::min)(ratio, cap)));
+        _pipeH = (std::max)(1, _pipeH);
+        _pipeW = (std::max)(1, _pipeW);
+        _outW = dstW;
+        _outH = dstH;
+    } else {
+        _pipeW = srcW;
+        _pipeH = srcH;
+        _outW = srcW;
+        _outH = srcH;
+    }
+    // 同上:直通/HDR-only 路径的输出也强制偶尺寸(源本身奇尺寸时
+    // newVideoFrame 的色度面行数是 floor,拷贝侧必须与其一致)。
+    _outW &= ~1;
+    _outH &= ~1;
+    _pipeW &= ~1;
+    _pipeH &= ~1;
+    _rtxActive = _vsrRequested || _hdrActive;
+}
+
+void DlssnrContext::RefreshRtxStateString() noexcept {
+    if (_vsrRequested && _hdrActive) {
+        std::snprintf(_rtxStateStr, sizeof(_rtxStateStr), "vsr+hdr %dx%d", _outW, _outH);
+    } else if (_vsrRequested) {
+        std::snprintf(_rtxStateStr, sizeof(_rtxStateStr), "vsr %dx%d", _outW, _outH);
+    } else if (_hdrActive) {
+        std::snprintf(_rtxStateStr, sizeof(_rtxStateStr), "hdr %dx%d", _outW, _outH);
+    } else {
+        std::snprintf(_rtxStateStr, sizeof(_rtxStateStr), "off");
+    }
+}
+
 bool DlssnrContext::Initialize(
     D3D12Context &d3d12, const wchar_t *ngxDllPath, const wchar_t *fgDllPath,
     int width, int height, int depth, SharedParams *shared,
@@ -501,66 +598,10 @@ bool DlssnrContext::Initialize(
     _shared = shared;
     _rtx = rtx;
 
-    // RTX Video 几何换算(创建时定格;capability 预检在资源创建之前 ——
-    // 不过 = 资源就不按 RTX 形态建,直通尺寸零浪费):
-    //   ratio = 目标高 / 源高;≤ 1.001 → VSR 旁路(只支持放大,对齐浏览器
-    //   端官方语义;1:1 与缩小场景本就不该付 VSR 的 GPU 价)。
-    //   pipe  = min(目标, 源×4) —— 官方单 pass 放大上限,超出部分由
-    //   convert-out 双线性从 4x 中间位补完。
-    //   hdr   = TrueHDR 在管线(输出几何切换 P10,与 VSR 无关,pipe=src)。
-    {
-        int dstW = width, dstH = height;
-        if (_rtx.vsrMode == 1 || _rtx.vsrMode == 2) {
-            if (_rtx.vsrMode == 2) {
-                // 手动倍率:输出 = 源 × scale(宽度按源宽高比推)。
-                const double sc = std::clamp(_rtx.vsrScale, kVsrScaleMin, kVsrScaleMax);
-                dstH = static_cast<int>(std::lround(static_cast<double>(height) * sc));
-                dstW = static_cast<int>(std::lround(static_cast<double>(width) * sc));
-            } else {
-                // vsrAutoHeight <= 0 = 探测失败(无可见窗口):目标=源,
-                // ratio=1 走旁路 —— 窗口出现后的链重建重新探测并启用。
-                dstH = _rtx.vsrAutoHeight > 0
-                           ? std::clamp(_rtx.vsrAutoHeight, 144, 8192)
-                           : height;
-                const double scale = static_cast<double>(dstH) / static_cast<double>(height);
-                dstW = static_cast<int>(std::lround(static_cast<double>(width) * scale));
-            }
-            dstH = (std::max)(1, dstH);
-            dstW = (std::max)(1, dstW);
-            // 420 输出契约:目标尺寸必须取偶。VS 按算术右移分配色度面
-            // (奇高 → floor 行数),拷贝侧按 ceil 行数写会越界一格 ——
-            // 静默堆腐蚀,落进未映射页时 c0000005(2026-09-22 真机实锤:
-            // 窗口客户区 2290x959 奇高,15 帧后崩)。偏差 ≤1px。
-            dstH &= ~1;
-            dstW &= ~1;
-        }
-        const double ratio = static_cast<double>(dstH) / static_cast<double>(height);
-        _vsrRequested = _rtx.vsrMode > 0 && ratio > 1.001;
-        _hdrActive = _rtx.hdrEnabled != 0;
-        if (_vsrRequested) {
-            const double cap = static_cast<double>(kVsrMaxScale);
-            _pipeH = static_cast<int>(std::lround(static_cast<double>(height) *
-                                                  (std::min)(ratio, cap)));
-            _pipeW = static_cast<int>(std::lround(static_cast<double>(width) *
-                                                  (std::min)(ratio, cap)));
-            _pipeH = (std::max)(1, _pipeH);
-            _pipeW = (std::max)(1, _pipeW);
-            _outW = dstW;
-            _outH = dstH;
-        } else {
-            _pipeW = width;
-            _pipeH = height;
-            _outW = width;
-            _outH = height;
-        }
-        // 同上:直通/HDR-only 路径的输出也强制偶尺寸(源本身奇尺寸时
-        // newVideoFrame 的色度面行数是 floor,拷贝侧必须与其一致)。
-        _outW &= ~1;
-        _outH &= ~1;
-        _pipeW &= ~1;
-        _pipeH &= ~1;
-        _rtxActive = _vsrRequested || _hdrActive;
-    }
+    // RTX Video 几何换算(单一裁决 helper;capability 预检在资源创建之前 ——
+    // 不过/建不起 = 由 DegradeRtxFeature 收口,资源按降级形态建,直通尺寸
+    // 零浪费)。
+    DecideRtxGeometry(_rtx, width, height);
 
     // Application data path = snippet directory (mirrors Magpie using its exe dir;
     // the directory must be writable for NGX caches).
@@ -579,6 +620,13 @@ bool DlssnrContext::Initialize(
     // 的非设计路径下钩子生效极慢(2026-09-22 实测:预载当拍查询 + 250ms×20
     // 轮询全败 0xBAD0000B,+17s seek 后同进程重查才过)。挪到核心初始化前
     // 即走设计路径。纯官方档/FG 未请求不预载。
+    // 代理路径留档:Rebind 形态段 FG off→on 时按此补预载(hotMatch 保证
+    // 代理路径跨 seek 恒等;进程缓存命中即秒回)。
+    if (fgDllPath && fgDllPath[0]) {
+        wcsncpy_s(_fgProxyPath, fgDllPath, _TRUNCATE);
+    } else {
+        _fgProxyPath[0] = L'\0';
+    }
     // GPU 族分流:SM86 代理只适用 Turing/Ampere;Ada 及更新走官方链,由
     // dlssfg_context 的 mfg gate 解锁拿多帧(RTX 40 6x)。探测失败 fail-open
     // 维持预载(30 系无损)。
@@ -761,6 +809,31 @@ bool DlssnrContext::Initialize(
         _snippetInitialized = true;
     }
 
+    // 3b) RTX Video features(VSR → TrueHDR;capability 已在 2b 预检,这里
+    //     只做 CreateFeature)。**先于槽资源创建定案会话形态**:失败走
+    //     DegradeRtxFeature 降级(清旗标 + 几何回落),资源按降级形态建,
+    //     NR/FG 不连坐 —— 此前排在 FG 之后、失败 = 整体初始化失败,是最后
+    //     一个"建不起就全停"的段(2026-09-27 解耦收尾)。Rebind 形态重建
+    //     复用同一"先建 feature、后建资源"顺序不变量。上下文与尺寸无关,
+    //     跨 seek 热复用。
+    //     _rtxDetail 只由降级路径写入(2b capability / 本段 Create),
+    //     成功路径不触碰 —— 冷初始化成员全新恒空;热重建由形态段按结果
+    //     清/写。
+    if (_vsrRequested) {
+        _vsr = std::make_unique<RtxVsrContext>();
+        char rtxErr[192]{};
+        if (!_vsr->Initialize(*_d3d12, _vsrParams, _width, _height, rtxErr, sizeof(rtxErr))) {
+            DegradeRtxFeature(/*vsr=*/true, rtxErr);
+        }
+    }
+    if (_hdrActive) {
+        _hdr = std::make_unique<RtxHdrContext>();
+        char rtxErr[192]{};
+        if (!_hdr->Initialize(*_d3d12, _hdrParams, _pipeW, _pipeH, rtxErr, sizeof(rtxErr))) {
+            DegradeRtxFeature(/*vsr=*/false, rtxErr);
+        }
+    }
+
     // 4) Frame resources incl. zero-guidance textures + residual scaling
     //    textures/compute at the internal resolution (skipped entirely when
     //    internal-resolution scaling is disabled)
@@ -770,9 +843,10 @@ bool DlssnrContext::Initialize(
     // 改变只影响逐帧 eval 门,不重建槽资源。
     _fgRequested = _shared->Snapshot().fgEnabled != 0;
     // 实验性补帧 HDR 域插帧(创建时定格;仅 HDR 会话有意义 —— HDR 关时
-    // 强制 0,FG create 格式与槽资源恒 SDR 形态,管线等价)。
-    _fgHdrInterp = (_shared->Snapshot().fgHdrInterp != 0) &&
-                   (_shared->Snapshot().rtxHdrEnabled != 0);
+    // 强制 0,FG create 格式与槽资源恒 SDR 形态,管线等价)。判据用
+    // _hdrActive 实际态而非 rtxHdrEnabled 请求:TrueHDR 在 2b/3b 降级后
+    // (capability 不过 / CreateFeature 失败)FG 不再携带 PQ 域形态。
+    _fgHdrInterp = (_shared->Snapshot().fgHdrInterp != 0) && _hdrActive;
     // FG 会话级事实初值:请求了 = 暂记 copy(初始化成功会被下文改写成
     // 实际路由);没请求 = off。失败原因串在此段内逐路径覆写。
     _fgCreateMult = _fgRequested
@@ -780,14 +854,8 @@ bool DlssnrContext::Initialize(
                         : 0;
     std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s", _fgRequested ? "copy" : "off");
     _fgDetail[0] = '\0';
-    // 预载失败归因并入:官方链失败时 _fgDetail 只描述官方链自身,真因
-    // (proxy 没进托)在 _fgProxyNote —— 拼接后面板一行直读完整因果,
-    // 不必再翻 timing log 反推。
-    auto appendProxyNote = [&]() noexcept {
-        if (!_fgProxyNote[0] || !_fgDetail[0]) return;
-        const size_t len = std::strlen(_fgDetail);
-        std::snprintf(_fgDetail + len, sizeof(_fgDetail) - len, "; %s", _fgProxyNote);
-    };
+    // 预载失败归因并入(appendProxyNote)与 FG 会话建立一起迁入
+    // SetupFgSession —— 冷初始化与 Rebind 形态重建共用同一条链。
     if (!_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested,
                                       _pipeW, _pipeH, _outW, _outH,
                                       _vsrRequested, _hdrActive, _fgHdrInterp,
@@ -813,122 +881,11 @@ bool DlssnrContext::Initialize(
     // 4a) DLSS FG 会话(挂 NR 之后;先于 NVOF 建立,使光流 follow 的会话
     // 输入尺寸决策能感知 FG)。失败优雅降级:滤镜回退 1:1 输出(不翻倍
     // 帧率),NR 不受影响 —— FG 的 SEH 走本地闩锁,不进全局 NgxRuntimeGuard。
+    // 建立流程 = SetupFgSession(冷初始化与 Rebind 形态重建共用同一条链,
+    // 路由/能力块/失败记因不漂移)。
     if (_fgRequested) {
-        // FG 路由选择(0=自动:预载 0.3.x hook 代理后走官方链;1=纯官方:
-        // 不预载代理直连官方运行时)。钉档失败不回落(选错档 = FG 关,
-        // 输出 1:1)。
-        const int fgRoute =
-            std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax);
-        // 官方 NGX 链(PORTING #8):官方签名 nvngx_dlssg.dll 与模型 DLL
-        // 同目录(ngx\)部署,经共享 NGX core 走官方签名链 —— 免自签
-        // proxy 与杀软误报面。参数块 = GetCapability(官方 DLSSG 的 Magpie
-        // 同款 create/eval 块)。RTX 30/20 的 DLSS-G 由 dlssg_for_sm86
-        // 0.3.x hook 代理接管交付(见下方预载段),链路形态不变。
-        wchar_t officialDll[MAX_PATH]{};
-        {
-            const std::filesystem::path p =
-                std::filesystem::path(ngxDllPath).parent_path() / L"nvngx_dlssg.dll";
-            const std::wstring ws = p.wstring();
-            if (ws.size() < MAX_PATH) {
-                const DWORD attr = GetFileAttributesW(ws.c_str());
-                if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-                    std::memcpy(officialDll, ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
-                }
-            }
-        }
-        // (自动档预载已前移至 NGX 核心初始化之前 —— 见 Initialize 第 0 步:
-        // 0.3.x 钩子的设计路径是代理先在、监视核心加载后再装;0.3.x 代理
-        // 拦截 nvngx_dlssg.dll 加载替换为内嵌运行库 + fg_gate 钩子接答核心
-        // 能力查询/CreateFeature。)
-        bool fgUp = false;
-        if (officialDll[0]) {
-            DWORD sehCode = 0;
-            const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
-            if (sehCode || !NVSDK_NGX_SUCCEED(pr) || !_fgParams) {
-                TimingStatusLine(fgRoute == kFgRouteOfficial
-                                     ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
-                                     : "DLSSNR STATUS: dlssfg official capability block FAILED; FG off");
-                std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
-                appendProxyNote();
-            } else {
-                _fg = std::make_unique<DlssfgContext>();
-                char fgErr[256]{};
-                // FG backbuffer = 管线色:**默认恒 BGRA8 SDR 域**(TrueHDR
-                // 后置:DLSSG 的 HDR 路径对 >1.0 线性值不保真,2026-09-23
-                // 实验定案;插值在 SDR 域,逐输出帧 TrueHDR 提升)。实验开关
-                // fg_hdr_interp=1 = FP16 backbuffer 载 **PQ 码域**(TrueHDR
-                // 产物经 HdrToPq 编码,ColorBuffersHDR=0;DLSSG 在感知域插帧
-                // —— 直吃 scRGB 线性 >1.0 会被钳 ~0.875,值域定案 2026-09-24),
-                // 尺寸 = PIPE。
-                if (_fg->Initialize(*_d3d12, officialDll, _fgParams,
-                                    _pipeW, _pipeH,
-                                    _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                                 : DXGI_FORMAT_B8G8R8A8_UNORM,
-                                    fgErr, sizeof(fgErr))) {
-                    fgUp = true;
-                    // 钩子进程级、装上不可拆:只要缓存模块是 hook 型就标
-                    // official-hook(与本次是否预载解耦 —— 上会话自动档
-                    // 预载后,本会话纯官方在 30/20 系实际仍是 hook 在托)。
-                    std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
-                                  DlssfgContext::CachedProxyIsHookStyle() ? "official-hook" : "official");
-                } else {
-                    char msg[352];
-                    std::snprintf(msg, sizeof(msg),
-                                  "DLSSNR STATUS: dlssfg official init failed (%s); %s",
-                                  fgErr,
-                                  fgRoute == kFgRouteOfficial
-                                      ? "FG off (route pinned)"
-                                      : "FG off (dlssg_for_sm86 >= 0.3.0 required for RTX 30/20)");
-                    DbgLine(msg);
-                    TimingStatusLine(msg);
-                    SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
-                    appendProxyNote();
-                    _fg.reset();
-                    // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
-                    // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
-                    _fgParams = nullptr;
-                }
-            }
-        }
-        if (!fgUp) {
-            // 部署缺失时尝试路径没跑,失败原因没有其它出口,这里补一行;
-            // 尝试路径自身失败已有带因状态行。
-            if (!officialDll[0]) {
-                TimingStatusLine(
-                    "DLSSNR STATUS: dlssfg nvngx_dlssg.dll missing; 1:1 output");
-                std::snprintf(_fgDetail, sizeof(_fgDetail), "nvngx_dlssg.dll missing");
-                appendProxyNote();
-            }
-            _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
-            _fgCreateMult = 0;    // 未激活:面板倍数 mismatch 判定归零
-        }
+        SetupFgSession();
     }
-
-    // 4a-bis) RTX Video features(VSR → TrueHDR;capability 已在 2b 预检,
-    // 这里只做 CreateFeature。失败 = capability 过后仍建不起来(驱动/核心
-    // 版本错配等异常)→ 整体初始化失败:管线几何已按 RTX 形态建,半套
-    // 降级会写出未定义内容 —— 插件层回落纯直通比静默花屏诚实)。
-    if (_vsrRequested) {
-        _vsr = std::make_unique<RtxVsrContext>();
-        char rtxErr[192]{};
-        if (!_vsr->Initialize(*_d3d12, _vsrParams, _width, _height, rtxErr, sizeof(rtxErr))) {
-            SanitizeJsonDetail(rtxErr, _rtxDetail, sizeof(_rtxDetail));
-            char msg[256];
-            std::snprintf(msg, sizeof(msg), "rtx vsr CreateFeature failed: %.180s", rtxErr);
-            return fail(msg);
-        }
-    }
-    if (_hdrActive) {
-        _hdr = std::make_unique<RtxHdrContext>();
-        char rtxErr[192]{};
-        if (!_hdr->Initialize(*_d3d12, _hdrParams, _pipeW, _pipeH, rtxErr, sizeof(rtxErr))) {
-            SanitizeJsonDetail(rtxErr, _rtxDetail, sizeof(_rtxDetail));
-            char msg[256];
-            std::snprintf(msg, sizeof(msg), "rtx hdr CreateFeature failed: %.180s", rtxErr);
-            return fail(msg);
-        }
-    }
-    _rtxDetail[0] = '\0'; // VSR/HDR 全部成功:清空失败原因(diagnostic 红显解除)
 
     // 4b) 光流会话(of_backend 单一后端,默认 FFX):quality > 0 时建立;
     // 失败优雅回退零 guidance(记 _nvofFailed,不拖垮整个滤镜)。冷初始化
@@ -988,19 +945,10 @@ bool DlssnrContext::Initialize(
         // 960:gpu_name(≤128)+ fg_detail(≤128)+ of_detail(≤96)全满时
         // 512 会截断(PublishStatsJson 超长静默截断 = 尾键丢失,面板读不到
         // 还不报错 —— v19 扩容 tick body 的同一教训)。
-        char rtxState[96];
-        if (_vsrRequested && _hdrActive) {
-            std::snprintf(rtxState, sizeof(rtxState), "vsr+hdr %dx%d", _outW, _outH);
-        } else if (_vsrRequested) {
-            std::snprintf(rtxState, sizeof(rtxState), "vsr %dx%d", _outW, _outH);
-        } else if (_hdrActive) {
-            std::snprintf(rtxState, sizeof(rtxState), "hdr %dx%d", _outW, _outH);
-        } else {
-            std::snprintf(rtxState, sizeof(rtxState), "off");
-        }
-        // 缓存进成员:每帧 stats 体(_rtx 键)复用 —— 每帧体覆盖 init 体后
-        // 若缺 rtx 键,面板诊断恒 "(未加载)"(2026-09-22 实锤)。
-        std::snprintf(_rtxStateStr, sizeof(_rtxStateStr), "%s", rtxState);
+        // RTX 实态串(缓存进成员:每帧 stats 体(_rtx 键)复用 —— 每帧体
+        // 覆盖 init 体后若缺 rtx 键,面板诊断恒 "(未加载)"(2026-09-22
+        // 实锤)。刷新点 = init 与 Rebind 形态重建(RefreshRtxStateString)。
+        RefreshRtxStateString();
         char body[1024];
         std::snprintf(body, sizeof(body),
                       "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d,"
@@ -1009,7 +957,7 @@ bool DlssnrContext::Initialize(
                       "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
                       "\"%s\":%d,\"%s\":\"%s\"}",
                       _gpuNameUtf8, _width, _height,
-                      rtxState, _rtxDetail,
+                      _rtxStateStr, _rtxDetail,
                       SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
                       SK_OF_MODE, OfModeString(),
                       SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
@@ -1067,7 +1015,8 @@ bool DlssnrContext::Initialize(
 }
 
 bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
-                                    int newWidth, int newHeight, int newDepth) noexcept {
+                                    int newWidth, int newHeight, int newDepth,
+                                    const RtxVideoParams *newRtx, int fgReq, int fgHdrReq) noexcept {
     if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
         return false;
@@ -1099,18 +1048,34 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         TimingStatusLine("DLSSNR STATUS: recreate ABORTED (finish tickets not drained)");
         return false;
     }
-    // A video-size change replaces every slot's frame resources first —
+    // A video-size/shape change replaces every slot's frame resources first —
     // outside CtlMutex because the guidance clear inside takes it itself.
     // All GPU work is complete (slots are only released after WaitFrame).
-    const bool resize = newWidth > 0 &&
-                        (newWidth != _width || newHeight != _height || newDepth != _depth);
-    if (resize) {
-        // RTX 几何随源尺寸换算(必须先于 CreateFrameResources —— 资源按
-        // 新几何建)。vsr 开:输出目标 _outH 绝对(显示器适配/手动高度),
-        // 宽按新源宽高比重推,pipe = min(目标, 新源×4);否则 pipe/out
-        // 跟随新源(TrueHDR 不缩放;plain-NR 同样跟随 —— 此前只在 _hdrActive
-        // 时更新,plain-NR 会话换尺寸后 UnpackOutput 按旧 _outW/_outH 回读,
-        // 潜伏写穿/裁切)。
+    // 尺寸变化:bridge preset 路径(传 -1)不触发;Rebind 跨分辨率触发。
+    // 形态变化(newRtx/fgReq 提供):Rebind 形态热化(2026-09-27)——
+    // hotMatch 放宽后 RTX/FG 档位变化落到这里,不再付冷启动。
+    const bool dimsChange = newWidth > 0 &&
+                            (newWidth != _width || newHeight != _height || newDepth != _depth);
+    const bool shapeChange = newRtx != nullptr || fgReq >= 0;
+    const bool resize = dimsChange || shapeChange;
+    if (dimsChange) {
+        // 先行更新成员尺寸:形态段的几何换算/降级回落、OF 会话内部尺寸
+        // 推导都要按新源尺寸。
+        _width = newWidth;
+        _height = newHeight;
+        _depth = newDepth;
+    }
+    if (newRtx) {
+        // RTX 几何随新参数 + (可能变化的)源尺寸一次换算(单一裁决
+        // helper,必须先于 CreateFrameResources —— 资源按新几何建)。
+        _rtx = *newRtx;
+        DecideRtxGeometry(*newRtx, _width, _height);
+    } else if (dimsChange) {
+        // RTX 几何随源尺寸换算(rtx 未变)。vsr 开:输出目标 _outH 绝对
+        // (显示器适配/手动高度),宽按新源宽高比重推,pipe = min(目标,
+        // 新源×4);否则 pipe/out 跟随新源(TrueHDR 不缩放;plain-NR 同样
+        // 跟随 —— plain-NR 会话换尺寸后 UnpackOutput 按旧 _outW/_outH
+        // 回读,潜伏写穿/裁切)。
         if (_vsrRequested) {
             const double ratio = static_cast<double>(_outH) / static_cast<double>(newHeight);
             const double cap = static_cast<double>(kVsrMaxScale);
@@ -1128,16 +1093,87 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             _outW = newWidth;
             _outH = newHeight;
         }
-        // 420 输出契约:全形态输出/管线尺寸强制偶(同 Initialize 的注释:
-        // 奇高色度面 floor/ceil 错位 = 静默堆腐蚀,2026-09-22 真机实锤)。
-        // 原 resize 分支缺此步,是三处潜伏缺陷之一(2026-09-25 修复;分支
-        // 当前不可达 —— hotMatch 尺寸恒等,修复为将来放开铺路)。
+        // 420 输出契约:全形态输出/管线尺寸强制偶(奇高色度面 floor/ceil
+        // 错位 = 静默堆腐蚀,2026-09-22 真机实锤)。
         _outW &= ~1;
         _outH &= ~1;
         _pipeW &= ~1;
         _pipeH &= ~1;
     }
-    if (resize && !_d3d12->CreateFrameResources(newWidth, newHeight, newDepth, _fgRequested,
+    // ---- 形态段(RTX/FG 会话形态热重建)----
+    // 顺序不变量与冷初始化一致(2b/3b/4a):几何定案 → capability 补查 →
+    // VSR/HDR 上下文建/退(降级不整体失败)→ FG 旗标定格 → 资源 → FG 会话。
+    // 全程在 PoolHold + 票据排空之后:fmParallel 下无并发帧触碰这些成员,
+    // NGX create 的 ctl 互斥自取。
+    if (shapeChange) {
+        // capability 补查:2b 只在请求时查询,关→开场景参数块可能从未取过
+        // (不可用时也留块,与 2b 同语义)。失败 = 降级收口。
+        if (_vsrRequested && !_vsrParams) {
+            DWORD sehCode = 0;
+            NVSDK_NGX_Parameter *cap = nullptr;
+            const NVSDK_NGX_Result r = CoreGetCapabilityParametersSafely(&cap, &sehCode);
+            if (sehCode || !NVSDK_NGX_SUCCEED(r) || !cap) {
+                DegradeRtxFeature(/*vsr=*/true, "vsr capability block unavailable");
+            } else {
+                _vsrParams = cap;
+            }
+        }
+        if (_hdrActive && !_hdrParams) {
+            DWORD sehCode = 0;
+            NVSDK_NGX_Parameter *cap = nullptr;
+            const NVSDK_NGX_Result r = CoreGetCapabilityParametersSafely(&cap, &sehCode);
+            if (sehCode || !NVSDK_NGX_SUCCEED(r) || !cap) {
+                DegradeRtxFeature(/*vsr=*/false, "hdr capability block unavailable");
+            } else {
+                _hdrParams = cap;
+            }
+        }
+        // VSR/HDR 上下文建/退:feature 与尺寸无关(热复用键 = 请求态)。
+        // SEH 本地闩锁;CreateFeature 失败走 DegradeRtxFeature(清旗标 +
+        // 几何回落),NR/FG 不连坐。撤销请求 = 退役(reset 即弃引用:析构
+        // no-op 不重入 NGX,feature handle 随进程回收)。
+        char rtxErr[192]{};
+        if (_vsrRequested && !_vsr) {
+            _vsr = std::make_unique<RtxVsrContext>();
+            if (!_vsr->Initialize(*_d3d12, _vsrParams, _width, _height, rtxErr, sizeof(rtxErr))) {
+                DegradeRtxFeature(/*vsr=*/true, rtxErr);
+            }
+        } else if (!_vsrRequested && _vsr) {
+            _vsr.reset();
+        }
+        if (_hdrActive && !_hdr) {
+            _hdr = std::make_unique<RtxHdrContext>();
+            if (!_hdr->Initialize(*_d3d12, _hdrParams, _pipeW, _pipeH, rtxErr, sizeof(rtxErr))) {
+                DegradeRtxFeature(/*vsr=*/false, rtxErr);
+            }
+        } else if (!_hdrActive && _hdr) {
+            _hdr.reset();
+        }
+        // FG 旗标定格(折叠用 RTX 降级后的实际态)。
+        if (fgReq >= 0) {
+            _fgRequested = fgReq != 0;
+        }
+        if (fgHdrReq >= 0) {
+            _fgHdrInterp = (fgHdrReq != 0) && _hdrActive;
+        }
+        // FG 会话级事实重算(路由/倍数;stats tick 复用成员即面板可见)。
+        std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
+                      !_fgRequested ? "off"
+                      : (_fg && _fg->Enabled())
+                          ? (DlssfgContext::CachedProxyIsHookStyle() ? "official-hook" : "official")
+                          : "copy");
+        _fgCreateMult = (_fgRequested && _fg && _fg->Enabled())
+                            ? std::clamp(_shared->Snapshot().fgMultiplier, kFgMultMin, kFgMultMax)
+                            : 0;
+        RefreshRtxStateString();
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: hot rebind shape (vsr=%d hdr=%d fg=%d pipe=%dx%d out=%dx%d)",
+                      _vsrRequested ? 1 : 0, _hdrActive ? 1 : 0, FgActive() ? 1 : 0,
+                      _pipeW, _pipeH, _outW, _outH);
+        TimingLog(msg);
+    }
+    if (resize && !_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested,
                                                 _pipeW, _pipeH, _outW, _outH,
                                                 _vsrRequested, _hdrActive, _fgHdrInterp,
                                                 _subW, _subH, _isRgb,
@@ -1145,14 +1181,12 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         _ready.store(false, std::memory_order_release);
         return false;
     }
-    if (resize) {
-        _width = newWidth;
-        _height = newHeight;
-        _depth = newDepth;
-        // FG feature 随尺寸重建(proxy Release + CreateFeature;失败 = FG
-        // 闩停,降级复制帧,NR 不受影响)。历史在重建时作废。backbuffer
-        // 尺寸/格式 = PIPE/RTX 形态(与冷初始化同判据)。
+    if (resize && _fgRequested) {
         if (_fg && _fg->Enabled()) {
+            // FG feature 随尺寸/格式重建(proxy Release + CreateFeature;
+            // Rebuild 内部键 = 尺寸 + 格式,相同即免)。失败 = FG 闩停,
+            // 降级复制帧,NR 不受影响。历史在重建时作废。backbuffer
+            // 尺寸/格式 = PIPE/RTX 形态(与冷初始化同判据)。
             char fgErr[192]{};
             if (!_fg->Rebuild(_pipeW, _pipeH,
                               _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
@@ -1165,38 +1199,64 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
                 DbgLine(msg);
                 TimingStatusLine(msg);
             }
-        }
-        // 光流会话随尺寸重建(已在 PoolHold 内,内联处理,勿调 RebuildOf
-        // —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见 _retiredOf
-        // 注释),失败降级零 guidance,不致命。会话输入尺寸遵循 follow 语义
-        // (scalingEnabled/resPercent 是本次重建的目标态,内部尺寸由参数
-        // 直推,不依赖尚未执行的 RebuildScaling)。
-        if (_ofBackend && _curOfQuality > 0 && !_nvofFailed) {
-            const DlssnrParams sp = _shared->Snapshot();
-            // FG 激活时 MVecs 契约要求源尺寸稠密运动 —— follow 被忽略。
-            const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled && !(_fg && _fg->Enabled());
-            int iw = _width, ih = _height;
-            if (foll) InternalSize(_width, _height, resPercent, iw, ih);
-            char ofErr[160]{};
-            auto next = CreateOfBackend(_curOfQuality, iw, ih, ofErr, sizeof(ofErr));
-            if (next) {
-                _retiredOf.push_back(std::move(_ofBackend));
-                _ofBackend = std::move(next);
-                _curOfBackend = std::clamp(sp.ofBackend, kOfBackendMin, kOfBackendMax);
-            } else {
-                _nvofFailed = true;
-                // 尺寸重建失败:旧会话尺寸必然已失配(触发本次重建的原因),
-                // 退役它 —— 否则旧会话尺寸项在 ProcessFrame 触发条件里每帧
-                // 为真 → RebuildOf 每帧封池风暴(2026-09-25)。降级零 guidance,
-                // 重试通道由 _nvofFailed 保留。
-                _retiredOf.push_back(std::move(_ofBackend));
-                _ofBackend = nullptr;
-                char msg[288];
-                std::snprintf(msg, sizeof(msg),
-                              "DLSSNR STATUS: of resize failed (%s); zero guidance", ofErr);
-                DbgLine(msg);
-                TimingLog(msg);
+        } else {
+            // off→on / 旧会话闩停:重建会话(SetupFgSession 与冷初始化同
+            // 一条链)。auto 档先补预载:hotMatch 保证代理路径未变,进程
+            // 缓存命中即秒回;首次进托走非设计慢路径有案可查,失败由
+            // SetupFgSession 降级 FG off(_fgProxyNote 归因并入),无重试
+            // 风暴(seek 边界一次性)。
+            if (!DlssfgContext::CachedProxyIsHookStyle()) {
+                const DlssnrParams sp = _shared->Snapshot();
+                if (std::clamp(sp.fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
+                    _fgProxyPath[0] &&
+                    dlssfg_gate::GpuFamilyPrefersProxy()) {
+                    char proxyErr[96]{};
+                    if (DlssfgContext::PreloadProxyModule(_fgProxyPath, proxyErr, sizeof(proxyErr))) {
+                        TimingStatusLine(
+                            "DLSSNR STATUS: dlssfg proxy preloaded before capability (shape rebind)");
+                    } else {
+                        std::snprintf(_fgProxyNote, sizeof(_fgProxyNote), "%s", proxyErr);
+                    }
+                }
             }
+            SetupFgSession();
+        }
+    } else if (resize && !_fgRequested && _fg) {
+        // on→off:会话保留(热复用免费,重开无缝;FgActive() 请求感知 →
+        // 插件 1:1 输出)。倍数已在形态段归零(纯 FG 关即 shapeChange)。
+    }
+    // 光流会话随尺寸重建(dims-only;已在 PoolHold 内,内联处理,勿调
+    // RebuildOf —— 那会二次取 PoolHold 死锁)。退役旧会话不销毁(见
+    // _retiredOf 注释),失败降级零 guidance,不致命。会话输入尺寸遵循
+    // follow 语义(scalingEnabled/resPercent 是本次重建的目标态,内部尺寸
+    // 由参数直推,不依赖尚未执行的 RebuildScaling)。纯形态变化不在此重建:
+    // FG 激活变化改写 follow 语义,由 Rebind 尾部 SyncOfSession 的 stale
+    // 检查收口(档位/尺寸失配才重建,无风暴)。
+    if (dimsChange && _ofBackend && _curOfQuality > 0 && !_nvofFailed) {
+        const DlssnrParams sp = _shared->Snapshot();
+        // FG 激活时 MVecs 契约要求源尺寸稠密运动 —— follow 被忽略。
+        const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled && !(_fg && _fg->Enabled());
+        int iw = _width, ih = _height;
+        if (foll) InternalSize(_width, _height, resPercent, iw, ih);
+        char ofErr[160]{};
+        auto next = CreateOfBackend(_curOfQuality, iw, ih, ofErr, sizeof(ofErr));
+        if (next) {
+            _retiredOf.push_back(std::move(_ofBackend));
+            _ofBackend = std::move(next);
+            _curOfBackend = std::clamp(sp.ofBackend, kOfBackendMin, kOfBackendMax);
+        } else {
+            _nvofFailed = true;
+            // 尺寸重建失败:旧会话尺寸必然已失配(触发本次重建的原因),
+            // 退役它 —— 否则旧会话尺寸项在 ProcessFrame 触发条件里每帧
+            // 为真 → RebuildOf 每帧封池风暴(2026-09-25)。降级零 guidance,
+            // 重试通道由 _nvofFailed 保留。
+            _retiredOf.push_back(std::move(_ofBackend));
+            _ofBackend = nullptr;
+            char msg[288];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: of resize failed (%s); zero guidance", ofErr);
+            DbgLine(msg);
+            TimingLog(msg);
         }
     }
     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
@@ -1282,6 +1342,103 @@ std::unique_ptr<IOpticalFlowBackend> DlssnrContext::CreateOfBackend(
     auto b = std::make_unique<FxofContext>();
     if (!b->Initialize(*_d3d12, dstW, dstH, q, err, errLen)) return nullptr;
     return b;
+}
+
+bool DlssnrContext::SetupFgSession() noexcept {
+    // FG 路由选择(0=自动:预载 0.3.x hook 代理后走官方链;1=纯官方:
+    // 不预载代理直连官方运行时)。钉档失败不回落(选错档 = FG 关,
+    // 输出 1:1)。
+    const int fgRoute =
+        std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax);
+    // 官方 NGX 链(PORTING #8):官方签名 nvngx_dlssg.dll 与模型 DLL
+    // 同目录(ngx\)部署,经共享 NGX core 走官方签名链 —— 免自签
+    // proxy 与杀软误报面。参数块 = GetCapability(官方 DLSSG 的 Magpie
+    // 同款 create/eval 块)。RTX 30/20 的 DLSS-G 由 dlssg_for_sm86
+    // 0.3.x hook 代理接管交付(自动档在冷初始化 stage 0 / 形态段预载),
+    // 链路形态不变。
+    wchar_t officialDll[MAX_PATH]{};
+    {
+        const std::filesystem::path p =
+            std::filesystem::path(_appDataPath) / L"nvngx_dlssg.dll";
+        const std::wstring ws = p.wstring();
+        if (ws.size() < MAX_PATH) {
+            const DWORD attr = GetFileAttributesW(ws.c_str());
+            if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                std::memcpy(officialDll, ws.c_str(), (ws.size() + 1) * sizeof(wchar_t));
+            }
+        }
+    }
+    // 预载失败归因并入:官方链失败时 _fgDetail 只描述官方链自身,真因
+    // (proxy 没进托)在 _fgProxyNote —— 拼接后面板一行直读完整因果,
+    // 不必再翻 timing log 反推。
+    const auto appendProxyNote = [&]() noexcept {
+        if (!_fgProxyNote[0] || !_fgDetail[0]) return;
+        const size_t len = std::strlen(_fgDetail);
+        std::snprintf(_fgDetail + len, sizeof(_fgDetail) - len, "; %s", _fgProxyNote);
+    };
+    bool fgUp = false;
+    if (officialDll[0]) {
+        DWORD sehCode = 0;
+        const NVSDK_NGX_Result pr = CoreGetCapabilityParametersSafely(&_fgParams, &sehCode);
+        if (sehCode || !NVSDK_NGX_SUCCEED(pr) || !_fgParams) {
+            TimingStatusLine(fgRoute == kFgRouteOfficial
+                                 ? "DLSSNR STATUS: dlssfg official capability block FAILED; FG off (route pinned)"
+                                 : "DLSSNR STATUS: dlssfg official capability block FAILED; FG off");
+            std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
+            appendProxyNote();
+        } else {
+            _fg = std::make_unique<DlssfgContext>();
+            char fgErr[256]{};
+            // FG backbuffer = 管线色:**默认恒 BGRA8 SDR 域**(TrueHDR
+            // 后置:DLSSG 的 HDR 路径对 >1.0 线性值不保真,2026-09-23
+            // 实验定案;插值在 SDR 域,逐输出帧 TrueHDR 提升)。实验开关
+            // fg_hdr_interp=1 = FP16 backbuffer 载 **PQ 码域**(TrueHDR
+            // 产物经 HdrToPq 编码,ColorBuffersHDR=0;DLSSG 在感知域插帧
+            // —— 直吃 scRGB 线性 >1.0 会被钳 ~0.875,值域定案 2026-09-24),
+            // 尺寸 = PIPE。
+            if (_fg->Initialize(*_d3d12, officialDll, _fgParams,
+                                _pipeW, _pipeH,
+                                _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                             : DXGI_FORMAT_B8G8R8A8_UNORM,
+                                fgErr, sizeof(fgErr))) {
+                fgUp = true;
+                // 钩子进程级、装上不可拆:只要缓存模块是 hook 型就标
+                // official-hook(与本次是否预载解耦 —— 上会话自动档
+                // 预载后,本会话纯官方在 30/20 系实际仍是 hook 在托)。
+                std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
+                              DlssfgContext::CachedProxyIsHookStyle() ? "official-hook" : "official");
+            } else {
+                char msg[352];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: dlssfg official init failed (%s); %s",
+                              fgErr,
+                              fgRoute == kFgRouteOfficial
+                                  ? "FG off (route pinned)"
+                                  : "FG off (dlssg_for_sm86 >= 0.3.0 required for RTX 30/20)");
+                DbgLine(msg);
+                TimingStatusLine(msg);
+                SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
+                appendProxyNote();
+                _fg.reset();
+                // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
+                // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
+                _fgParams = nullptr;
+            }
+        }
+    }
+    if (!fgUp) {
+        // 部署缺失时尝试路径没跑,失败原因没有其它出口,这里补一行;
+        // 尝试路径自身失败已有带因状态行。
+        if (!officialDll[0]) {
+            TimingStatusLine(
+                "DLSSNR STATUS: dlssfg nvngx_dlssg.dll missing; 1:1 output");
+            std::snprintf(_fgDetail, sizeof(_fgDetail), "nvngx_dlssg.dll missing");
+            appendProxyNote();
+        }
+        _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
+        _fgCreateMult = 0;    // 未激活:面板倍数 mismatch 判定归零
+    }
+    return fgUp;
 }
 
 bool DlssnrContext::SyncOfSession(const DlssnrParams &p, int srcW, int srcH,
@@ -1446,7 +1603,16 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     cur.inputResolutionPercent = _curRes;
     cur.scalingEnabled = _curScaling;
     const bool dimsChanged = width != _width || height != _height || depth != _depth;
-    if (!dimsChanged && !CreateParamsChanged(p, cur)) {
+    // 形态变化(RTX 参数 / FG 请求 / FG HDR 折叠态):热复用 + 会话形态
+    // 重建(RecreateFeature 形态段),NR NGX feature 不额外重建 —— 冷启动
+    // (设备/核心/snippet 重载)不再发生(2026-09-27 解耦收尾)。fg_hdr_interp
+    // 按折叠态比较(请求 && rtxHdrEnabled):与 _fgHdrInterp 的折叠语义一致,
+    // 纯 HDR 域内翻转由 rtx != _rtx 兜住。
+    const bool fgHdrDesired = (p.fgHdrInterp != 0) && (p.rtxHdrEnabled != 0);
+    const bool shapeChanged = rtx != _rtx ||
+                              (p.fgEnabled != 0) != (_fgRequested != 0) ||
+                              fgHdrDesired != (_fgHdrInterp != 0);
+    if (!dimsChanged && !shapeChanged && !CreateParamsChanged(p, cur)) {
         // 热复用:NGX feature 保持,但 seek 是新时间线 —— 光流历史必须
         // 作废(下一帧播种),光流档位同步到新实例的参数快照;此前建立
         // 失败的会话在热复用时重试一次。FG 同理(下一帧 eval 带 Reset,
@@ -1467,7 +1633,10 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     }
     const bool nvofOk = RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen,
                                         dimsChanged ? width : -1, dimsChanged ? height : -1,
-                                        dimsChanged ? depth : -1);
+                                        dimsChanged ? depth : -1,
+                                        shapeChanged ? &rtx : nullptr,
+                                        shapeChanged ? (p.fgEnabled ? 1 : 0) : -1,
+                                        shapeChanged ? (fgHdrDesired ? 1 : 0) : -1);
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
     // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。会话输
     // 入尺寸同样在此对齐(follow 开关/res% 变化)。单一裁决点见 SyncOfSession。

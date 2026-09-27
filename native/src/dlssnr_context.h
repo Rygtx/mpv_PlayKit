@@ -51,17 +51,14 @@ public:
     void Shutdown() noexcept;
 
     // Hot-context rebind: attach this kept-warm context (device, NGX feature,
-    // slot pool all alive) to a new filter instance's SharedParams. The
-    // frame-resources/feature rebuild branch for a CHANGED video size/depth
-    // (newWidth > 0) is currently unreachable: the caller's hotMatch requires
-    // size/depth/layout equality (a different size always takes the cold
-    // path). The branch is kept correct (2026-09-25: even-aligned geometry,
-    // plain-NR out-size update) for future enablement — do not rely on it.
-    // The feature is rebuilt only when a create-time
-    // parameter (preset / input_resolution / scaling_enabled) or the
-    // size/depth actually differs; otherwise it is free. Returns false (and
-    // leaves _ready false) when the rebuild fails; the caller then falls back
-    // to a full Initialize.
+    // slot pool all alive) to a new filter instance's SharedParams. A changed
+    // video size/depth rebuilds frame resources + feature inside one
+    // pool-sealed RecreateFeature pass; a changed RTX/FG session shape
+    // (vsr_mode/scale/hdr_enabled/fg_enabled/fg_hdr_interp) likewise hot-
+    // rebuilds via RecreateFeature's shape segment (2026-09-27 解耦收尾:
+    // hotMatch 只锁 snippet 路径/尺寸/深度/布局/代理路径,形态变化不再付
+    // 冷启动). Returns false (and leaves _ready false) when the rebuild
+    // fails; the caller then falls back to a full Initialize.
     bool Rebind(SharedParams *shared, int width, int height, int depth,
                 const RtxVideoParams &rtx, char *err, size_t errLen) noexcept;
 
@@ -70,8 +67,13 @@ public:
     // textures for resolution changes; disabled = residual pipeline dropped).
     // newWidth/newHeight/depth >= 0 additionally rebuild the per-slot frame
     // resources for that geometry (used by Rebind across resolutions/depth).
+    // newRtx/fgReq/fgHdrReq(>=0 = 提供)驱动形态段:RTX/FG 会话形态热重建
+    // (capability 补查 + VSR/HDR 上下文建退 + FG 会话建/重建,降级不整体
+    // 失败)。bridge 的 preset 重建路径传默认值,形态段整体跳过。
     bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
-                         int newWidth = -1, int newHeight = -1, int newDepth = -1) noexcept;
+                         int newWidth = -1, int newHeight = -1, int newDepth = -1,
+                         const RtxVideoParams *newRtx = nullptr,
+                         int fgReq = -1, int fgHdrReq = -1) noexcept;
 
     // 光流会话重建(quality / of_backend / 会话输入尺寸变化)。只重建光流
     // 会话(PoolHold 内,毫秒级),NGX feature 不动。quality == 0 时停用会话
@@ -138,10 +140,13 @@ public:
     // RTX 段是否在管线中(vsr 或 hdr 任一存活;FG backbuffer 形态随之)。
     bool RtxActive() const noexcept { return _rtxActive; }
 
-    // FG 会话是否激活(创建时 fgEnabled 且官方链初始化成功且槽资源在)。
-    // 决定滤镜输出帧率是否 ×2(插件 create 侧)。
+    // FG 会话是否激活(请求态 fgEnabled 且官方链初始化成功且槽资源在)。
+    // 决定滤镜输出帧率是否 ×2(插件 create 侧)。请求感知:live 关(会话内
+    // 面板切 0)不动 _fgRequested → 输出保持 ×M0 契约、槽位回落真实帧;
+    // seek 携带 fg=0 → Rebind 形态段清 _fgRequested → 1:1 输出(= 昔日
+    // 冷重建行为)。
     bool FgActive() const noexcept {
-        return _fg && _fg->Enabled();
+        return _fgRequested && _fg && _fg->Enabled();
     }
 
 private:
@@ -184,6 +189,27 @@ private:
     // 串,内部消毒)。发布即替换共享内存里的旧统计 body —— 帧已不再成功,
     // tick 停摆,不替换面板就会一直显示冻结的"NGX 延迟"。
     void PublishDeadState(const char *state, const char *detail) noexcept;
+    // RTX feature 降级收口(capability 不过 / CreateFeature 失败共用):清对应
+    // 旗标 + VSR 失败时几何回落源尺寸 + _rtxActive 重算 + _rtxDetail 记因。
+    // 必须在 CreateFrameResources 之前调用 —— 资源随后按降级形态建,管线
+    // 自洽,NR/FG 不连坐。上下文对象直接 reset(析构 no-op 不重入 NGX,
+    // 已建的 feature handle 留在 core 内随进程回收)。
+    void DegradeRtxFeature(bool vsr, const char *why) noexcept;
+    // RTX 几何单一裁决(Initialize 与 RecreateFeature 形态段共用):dstW/dstH
+    // 换算(mode=1 autoHeight / mode=2 scale)、ratio 旁路、pipe=min(目标,
+    // 源×4)、偶尺寸收口。写 _vsrRequested/_hdrActive/_rtxActive 与
+    // _pipeW/_pipeH/_outW/_outH。第二份几何换算在构造上不可能。
+    void DecideRtxGeometry(const RtxVideoParams &rtx, int srcW, int srcH) noexcept;
+    // RTX 会话实态串刷新(_rtxStateStr:SK_RTX 键数据源;init 与形态重建
+    // 共用)。逐帧 tick 复用成员,刷新即面板可见。
+    void RefreshRtxStateString() noexcept;
+    // FG 会话建立(冷初始化 4a 与 Rebind 形态重建共用;_fgRequested 已由
+    // 调用方定格):路由日志/官方 dll 解析(_appDataPath 同目录
+    // nvngx_dlssg.dll)/capability 块/DlssfgContext::Initialize/失败记因
+    // (_fgDetail + 预载归因并入)一条龙。成功置 _fgRouteEff=
+    // official-hook|official;失败清 _fgRequested(槽资源已带 FG 纹理时
+    // 无害留用)。返回会话是否可用。
+    bool SetupFgSession() noexcept;
     // 光流后端构造(of_backend 单一后端,默认 FFX;失败不跨后端回落 ——
     // 对齐 fg_route 先例:行为可预测)。
     // q > 0;err 带最后一个失败原因(冷初始化 4b 与 RebuildOf 共用)。
@@ -294,6 +320,11 @@ private:
     std::unique_ptr<DlssfgContext> _fg;
     NVSDK_NGX_Parameter *_fgParams = nullptr; // FG 专用核心参数块(core 拥有)
     bool _fgRequested = false;
+    // sticky 语义仅限会话内 live 变化(面板开关只动逐帧 eval 门);seek 边界
+    // 由 Rebind 按新请求重定格(形态段),FgActive() 请求感知随之。
+    // FG hook 代理 dll 路径(hotMatch 保证代理路径跨 seek 恒等;形态段
+    // off→on 时按此补预载 —— 冷初始化 stage 0 已预载过则进程缓存秒回)。
+    wchar_t _fgProxyPath[MAX_PATH]{};
     // 实验性补帧 HDR 域插帧(创建时定格):TrueHDR 前置 + DLSSG 吃其 FP16
     // **PQ 码域** backbuffer(HdrToPq 编码 pass,ColorBuffersHDR=0 —— 直吃
     // scRGB 线性 >1.0 会被 DLSSG HDR 路径钳在 ~0.875 = 插值帧高光塌陷,

@@ -24,7 +24,7 @@ import testenv
 import testmedia
 
 STATS_MAPPING = "vs_dlssnr_stats"
-STATS_MAGIC = 0x354C5344  # "DSL5" (v24) — panel_ipc.h STATS_MAGIC
+STATS_MAGIC = 0x364C5344  # "DSL6" (v25:PAYLOAD 2048 + queue/of 改名)— panel_ipc.h STATS_MAGIC
 PAYLOAD_SIZE = 2048
 
 
