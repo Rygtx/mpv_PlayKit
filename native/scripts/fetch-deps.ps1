@@ -8,73 +8,82 @@ $ngxLib = Join-Path $root "dependencies\ngx\lib\Windows_x86_64\x64"
 $vsInc  = Join-Path $root "dependencies\vapoursynth\include"
 New-Item -ItemType Directory -Force $ngxInc, $ngxLib, $vsInc | Out-Null
 
-function Fetch([string]$url, [string]$dst) {
-    if (Test-Path $dst) { return }
+function Fetch([string]$url, [string]$dst, [string]$sha256) {
+    if (Test-Path $dst) {
+        if (-not $sha256) { return }
+        # 哈希钉值在位才短路;缓存内容与钉值不符(旧时代毒化缓存/钉值刚升级)
+        # 删了重取,自愈而非等人来删。
+        if ((Get-FileHash -LiteralPath $dst -Algorithm SHA256).Hash -eq $sha256) { return }
+        Remove-Item $dst -Force
+    }
     # --fail: never persist an HTTP error body (a 404 page would pass the
     # non-empty check below and poison the dependency cache permanently)
     # 断连防线(2026-09-25):先落临时名,成功后原子 Move —— curl 中途断连
     # 留下的截断文件不会再让 Test-Path 短路而永久毒化依赖缓存。
+    # 重试只走 curl 默认暂态集(超时/5xx/429):404 等硬失败秒报,不做 8 次徒劳重试。
     $tmp = "$dst.download"
-    & curl.exe -sSL --fail --retry 8 --retry-all-errors --retry-delay 2 -o $tmp $url
+    & curl.exe -sSL --fail --retry 8 --retry-delay 2 -o $tmp $url
     if ($LASTEXITCODE -ne 0) {
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         throw "download failed: $url (curl exit $LASTEXITCODE)"
     }
     if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) { throw "download failed: $url" }
+    # 哈希钉值:落盘前验临时文件,错字节进不了缓存。
+    # 报错带上实际哈希:刻意升级时,改 ref → 跑 → 从这里复制新哈希 → 粘贴钉值。
+    if ($sha256) {
+        $got = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash
+        if ($got -ne $sha256) {
+            Remove-Item $tmp -Force
+            throw "SHA-256 mismatch: $url`ngot  $got`nwant $sha256`n(deliberate upgrade? paste the got hash into the pin)"
+        }
+    }
     Move-Item $tmp $dst -Force
     Write-Host "fetched: $dst ($((Get-Item $dst).Length) bytes)"
 }
 
 # --- NGX SDK headers (github.com/NVIDIA/DLSS,commit 钉死 2026-09-25:
 #     此前走 /main 未钉 —— 上游 main 漂移会静默进构建;与同脚本 RTX SDK
-#     的 SHA-256 钉死、sm86 的 tag+尺寸双钉对齐)---
+#     的 SHA-256 钉死、sm86 的 tag+SHA-256 双钉对齐)---
 $ngxCommit = "a291cc7d2cc6"
+# 2026-10-02 裁剪(docs/CLEANUP-DECISIONS #8):只拉 include 传递闭包 5 个。
+# 闭包:src 直接消费 nvsdk_ngx.h / nvsdk_ngx_defs_dlssg.h,vendor\rtxvideo
+# 4 头 → {defs,helpers};ngx.h→defs+params,helpers.h→ngx+defs,其余
+# (VK/dlssd 族 + helpers_dlssg/params_dlssg)零 include 不拉。
 $ngxHeaders = @(
-    "nvsdk_ngx.h", "nvsdk_ngx_defs.h", "nvsdk_ngx_defs_dlssd.h", "nvsdk_ngx_defs_dlssg.h",
-    "nvsdk_ngx_defs_vk.h", "nvsdk_ngx_helpers.h", "nvsdk_ngx_helpers_dlssd.h",
-    "nvsdk_ngx_helpers_dlssd_cuda.h", "nvsdk_ngx_helpers_dlssd_vk.h", "nvsdk_ngx_helpers_dlssg.h",
-    "nvsdk_ngx_helpers_dlssg_vk.h", "nvsdk_ngx_helpers_vk.h", "nvsdk_ngx_params.h",
-    "nvsdk_ngx_params_dlssd.h", "nvsdk_ngx_params_dlssg.h", "nvsdk_ngx_vk.h"
+    "nvsdk_ngx.h", "nvsdk_ngx_defs.h", "nvsdk_ngx_defs_dlssg.h",
+    "nvsdk_ngx_helpers.h", "nvsdk_ngx_params.h"
 )
 foreach ($h in $ngxHeaders) {
     Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/include/$h" (Join-Path $ngxInc $h)
 }
 
 # --- NGX static core lib (layout mirrors Magpie BuildOptions.props DLSSSdkDir) ---
-# COFF 归档魔数断言:HTML 错误页/LFS 指针文件拦下(同类防线见下文 dll)。
+# SHA-256 钉死:HTML 错误页/LFS 指针/截断/内容漂移全拦,缓存不符自愈重取。
+$ngxLibSha256 = '36EAB29264C2A06456BA8415F20086AEA36F0CBB314D020085CB288CC06BB9AE'
 $ngxLibPath = Join-Path $ngxLib "nvsdk_ngx_s.lib"
-Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" $ngxLibPath
-# ar 魔数 8 字节 = '!<arch>' + 换行;只比前 7 字节可见字符,避开换行符。
-$libHead = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($ngxLibPath)[0..6])
-if ($libHead -ne '!<arch>') {
-    throw "nvsdk_ngx_s.lib sanity failed (not a COFF archive; delete and refetch)"
-}
+Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" $ngxLibPath $ngxLibSha256
 
 # --- Official signed NGX FG runtime (PORTING #8 官方帧生成后端) ---
 # 落到 vendor\ngx\ 与模型 DLL 同目录,打包脚本按存在与否选装;官方链是 FG
 # 唯一路径,RTX 30/20 由 dlssg_for_sm86 0.3.x hook 代理接管交付(自动档
-# 预载)。尺寸门槛:HTML 错误页 / LFS 指针文件能通过非空检查,必须拦下。
+# 预载)。SHA-256 钉死(commit 已钉,raw 文件 immutable):HTML 错误页/
+# LFS 指针/截断/漂移全拦,与 RTX SDK 的 zip 哈希钉同一机制。
 $fgOfficial = Join-Path $root "vendor\ngx\nvngx_dlssg.dll"
-if (-not (Test-Path $fgOfficial)) {
-    New-Item -ItemType Directory -Force (Split-Path -Parent $fgOfficial) | Out-Null
-    $tmp = "$fgOfficial.download"
-    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/rel/nvngx_dlssg.dll" $tmp
-    $len = (Get-Item $tmp).Length
-    if ($len -lt 1MB) { Remove-Item $tmp -Force; throw "nvngx_dlssg.dll size sanity failed ($len bytes)" }
-    Move-Item $tmp $fgOfficial -Force
-    Write-Host "official DLSSG runtime: $fgOfficial ($len bytes)"
-}
+$dlssgDllSha256 = '135EAF0733C1E37381A8C28ABCF7A862404A54132B81787C04E35D09EFC5E36F'
+New-Item -ItemType Directory -Force (Split-Path -Parent $fgOfficial) | Out-Null
+Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/rel/nvngx_dlssg.dll" $fgOfficial $dlssgDllSha256
 
 # --- dlssg_for_sm86 FG hook proxy(RTX 30/20 DLSS-G 接管层;上游仓库直取)---
 # version.dll 与出厂 dlssg_sm86.ini 都在上游仓库根(普通 git blob,非 LFS),
-# codeload tag 归档直下解出。tag 与 dll 尺寸双钉:升级上游时同步改两处;
-# 既有文件尺寸不符(含手工放置的旧版)一律重取覆盖,vendor 是可重建暂存区,
-# 不承载手工修改(出厂 ini 同理,部署侧要改请改部署副本)。
+# codeload tag 归档直下解出。tag 与 dll SHA-256 双钉:codeload zip 字节会漂移,
+# 钉解出物(zip 内容 immutable);升级上游时同步改两处。既有文件哈希不符
+# (含手工放置的旧版)一律重取覆盖,vendor 是可重建暂存区,不承载手工修改
+# (出厂 ini 同理,部署侧要改请改部署副本)。
 $fgProxyDll = Join-Path $root "vendor\ngx\version.dll"
 $fgProxyIni = Join-Path $root "vendor\ngx\dlssg_sm86.ini"
 $sm86Tag = "0.3.5"
-$sm86DllBytes = 30021920
-if (-not (Test-Path $fgProxyDll) -or (Get-Item $fgProxyDll).Length -ne $sm86DllBytes) {
+$sm86DllSha256 = 'C3934A09399F022504227C72DF0BF8C0DE55F9A08880DDDDE898C5262CEFA838'
+if (-not (Test-Path $fgProxyDll) -or (Get-FileHash -LiteralPath $fgProxyDll -Algorithm SHA256).Hash -ne $sm86DllSha256) {
     New-Item -ItemType Directory -Force (Split-Path -Parent $fgProxyDll) | Out-Null
     $zip = Join-Path $env:TEMP "dlssg_for_sm86-$sm86Tag.zip"
     Fetch "https://codeload.github.com/sdli1995/dlssg_for_sm86/zip/refs/tags/$sm86Tag" $zip
@@ -87,7 +96,8 @@ if (-not (Test-Path $fgProxyDll) -or (Get-Item $fgProxyDll).Length -ne $sm86DllB
     $dllSrc = Join-Path $repoRootDir.FullName "version.dll"
     $iniSrc = Join-Path $repoRootDir.FullName "dlssg_sm86.ini"
     if (-not (Test-Path $dllSrc)) { throw "dlssg_for_sm86 zip: version.dll missing" }
-    if ((Get-Item $dllSrc).Length -ne $sm86DllBytes) { throw "dlssg_for_sm86 zip: version.dll size mismatch (tag/binary drift; update sm86Tag/sm86DllBytes)" }
+    $gotDllSha = (Get-FileHash -LiteralPath $dllSrc -Algorithm SHA256).Hash
+    if ($gotDllSha -ne $sm86DllSha256) { throw "dlssg_for_sm86 zip: version.dll SHA-256 mismatch`ngot  $gotDllSha`nwant $sm86DllSha256`n(deliberate upgrade? paste the got hash into sm86DllSha256)" }
     if (-not (Test-Path $iniSrc)) { throw "dlssg_for_sm86 zip: dlssg_sm86.ini missing" }
     Copy-Item $dllSrc $fgProxyDll -Force
     Copy-Item $iniSrc $fgProxyIni -Force
@@ -103,6 +113,10 @@ if (Test-Path $fgProxyIni) {
     $iniText = Get-Content $fgProxyIni -Raw
     if ($iniText -notmatch '(?m)^MaxGeneratedFrames=5\s*$') {
         $iniText = $iniText -replace '(?m)^MaxGeneratedFrames=\d+\s*$', "MaxGeneratedFrames=5"
+        # 替换必须命中:上游删键/改名的话静默丢 6X 上限,不如当场炸。
+        if ($iniText -notmatch '(?m)^MaxGeneratedFrames=5\s*$') {
+            throw "dlssg_sm86.ini: MaxGeneratedFrames key not found (upstream layout changed)"
+        }
         # PS 5.1 无 utf8NoBOM 枚举值,用 .NET 无 BOM UTF8 写回(两代 PowerShell 通用)。
         [System.IO.File]::WriteAllText($fgProxyIni, $iniText, [System.Text.UTF8Encoding]::new($false))
         Write-Host "fg proxy ini: MaxGeneratedFrames -> 5 (6X cap)"
@@ -129,7 +143,8 @@ if (-not (Test-Path $rtxZipMarker)) {
     }
     if ($needDownload) {
         # NGC 下载 API 返回 302 → xfiles.ngc.nvidia.com 签名 CDN 地址,curl -L 跟随。
-        & curl.exe -sSL --fail --retry 8 --retry-all-errors --retry-delay 2 `
+        # 重试只走 curl 默认暂态集,404 等硬失败秒报(与 Fetch 同款)。
+        & curl.exe -sSL --fail --retry 8 --retry-delay 2 `
             -o $rtxArchive "https://api.ngc.nvidia.com/v2/models/nvidia/multimedia/dlpp/versions/1.5/files/RTX_Video_SDK_v1.1.0.zip"
         if ($LASTEXITCODE -ne 0) { throw "RTX Video SDK download failed (curl exit $LASTEXITCODE)" }
     }
@@ -176,13 +191,15 @@ foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
 
 # --- NVOF headers(清单 #6 光流;官方 OpticalFlowSDK 仓库已从 GitHub 撤下,
 #     mbucchia/Optical-Flow-SDK 是完整官方镜像,NvOFInterface 即 SDK 头目录)。
-#     头文件非空 + C 头魔数无法判别,钉 commit 需要上游确认的固定哈希;
-#     当前至少走 Fetch 的临时名原子落盘(截断不再毒化),换 commit 的动作
-#     留给下一次有据可依的升级(勿手造哈希)。---
+#     commit 钉死 2026-10-02(git ls-remote 实测 HEAD,与 NGX 同款操作;
+#     此前走 /main 漂移。升级时重新 ls-remote 取新 commit,勿凭记忆改)---
+$nvofCommit = "54e68293b4898a530bc07e4d7df71efbc5d30f9b"
 $nvofDir = Join-Path $root "vendor\nvof"
 New-Item -ItemType Directory -Force $nvofDir | Out-Null
-foreach ($h in @("nvOpticalFlowCommon.h", "nvOpticalFlowD3D12.h", "nvOpticalFlowD3D11.h", "nvOpticalFlowCuda.h")) {
-    Fetch "https://raw.githubusercontent.com/mbucchia/Optical-Flow-SDK/main/NvOFInterface/$h" (Join-Path $nvofDir $h)
+# D3D12-only:Common 被 D3D12 头直接包含必留;D3D11/Cuda 是平级喂入接口
+# (D3D11 纹理/CUDA 缓冲),不在本工程路径上。
+foreach ($h in @("nvOpticalFlowCommon.h", "nvOpticalFlowD3D12.h")) {
+    Fetch "https://raw.githubusercontent.com/mbucchia/Optical-Flow-SDK/$nvofCommit/NvOFInterface/$h" (Join-Path $nvofDir $h)
 }
 
 # --- FidelityFX SDK v2.3.0(AMD 光流后端 FxofContext;裁剪子集,vendor 不入库
@@ -191,7 +208,11 @@ foreach ($h in @("nvOpticalFlowCommon.h", "nvOpticalFlowD3D12.h", "nvOpticalFlow
 #     断言(头文件 API 符号 + 7 个 pass shader 齐全),任何一步失败即 throw,
 #     防止半成品 vendor 毒化构建。---
 $ffxDir = Join-Path $root "vendor\fidelityfx"
-if (-not (Test-Path (Join-Path $ffxDir "api\include\ffx_api.h"))) {
+$ffxMarker = Join-Path $ffxDir ".sdk-2.3.0-ok"
+# 门卫用 marker(RTX 段同款)而非探测 ffx_api.h:api\include 是复制顺序第一项,
+# 若某次挂在中途,ffx_api.h 已在位 → 整段被跳过,半成品 vendor 绕过全部断言
+# 直进构建。marker 最后落盘,复制不完整则下次整段重跑(裁剪复制可 -Force 重入)。
+if (-not (Test-Path $ffxMarker)) {
     $zip = Join-Path $env:TEMP "FidelityFX-SDK-v2.3.0.zip"
     Fetch "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/zip/refs/tags/v2.3.0" $zip
     $extract = Join-Path $env:TEMP "ffx-sdk-extract"
@@ -253,6 +274,7 @@ if (-not (Test-Path (Join-Path $ffxDir "api\include\ffx_api.h"))) {
     foreach ($p in $passes) {
         if (-not (Test-Path (Join-Path $shaderDst "$p.hlsl"))) { throw "FidelityFX SDK assert: shader $p.hlsl missing" }
     }
+    New-Item -ItemType File -Path $ffxMarker -Force | Out-Null
     Write-Host "FidelityFX SDK v2.3.0 trimmed to $ffxDir"
 }
 
@@ -278,14 +300,16 @@ if (-not (Test-Path (Join-Path $pixDir "pix3.h"))) {
 }
 
 # --- Dear ImGui (independent panel UI), unpacked to dependencies\imgui ---
+$imguiVer = "1.91.9b"
 $imguiDir = Join-Path $root "dependencies\imgui"
 if (-not (Test-Path (Join-Path $imguiDir "imgui.h"))) {
-    $zip = Join-Path $env:TEMP "imgui.zip"
-    Fetch "https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9b.zip" $zip
+    # 临时 zip 带版本后缀:TEMP 残留旧包不会在升版本后被 Test-Path 短路复用。
+    $zip = Join-Path $env:TEMP "imgui-$imguiVer.zip"
+    Fetch "https://github.com/ocornut/imgui/archive/refs/tags/v$imguiVer.zip" $zip
     $extract = Join-Path $root "dependencies"
     Expand-Archive $zip $extract -Force
     if (Test-Path $imguiDir) { Remove-Item $imguiDir -Recurse -Force -Confirm:$false }
-    Rename-Item (Join-Path $extract "imgui-1.91.9b") "imgui"
+    Rename-Item (Join-Path $extract "imgui-$imguiVer") "imgui"
     Remove-Item $zip -Force -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host "imgui: unpacked to $imguiDir"
 }
