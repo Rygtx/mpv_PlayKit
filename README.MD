@@ -208,7 +208,7 @@ powershell -File native\scripts\build.ps1          # 产物: native\bin\{vs_dlss
 pwsh -File native\scripts\package.ps1 [-Version 2026.09.08]   # 产物: native\dist\mpv_PlayKit-dlssnr-v<版本>-full.zip(默认版本号取当日日期)
 ```
 
-移植清单、架构说明与踩坑记录见 [docs/PORTING.md](docs/PORTING.md)。
+移植清单、架构说明与踩坑记录见 [docs/PORTING.md](docs/PORTING.md);过度构建审查的"刻意保留/不做"裁定清单见 [docs/CLEANUP-DECISIONS.md](docs/CLEANUP-DECISIONS.md)(复审前必读,勿把已裁定项当发现重报)。
 
 `native/testkit/` 为可复用测试工具箱(真实 mpv 播放路径端到端断言,用法见目录内 README);合成测试媒体统一由 `native/testkit/testmedia.py` 确定性生成到 `native/testkit/media/`(二进制不入库,删除后重跑 `python testmedia.py` 即可),亦可用作手动验证素材。
 
