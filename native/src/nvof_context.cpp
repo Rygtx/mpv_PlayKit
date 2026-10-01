@@ -490,6 +490,9 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
     _stageStartQpc = t0.QuadPart; // 全跨度锚(门入口 → 冲刷完成,LastStageTotalMs)
 
     {
+        // 取锁前声明在途:门据此区分"前驱堵在 mutex 外(等它插队)"与
+        // "真丢帧(零等待立即播种)"(of_frame_gate.h)。
+        _gate.MarkIncoming(frameIndex);
         std::unique_lock<std::mutex> lock(_gate.Mutex);
         // 入门即清:上一帧失败路径(ProcessFrame 提前返回且守卫冲刷未跑,
         // 理论上守卫恒跑,此为双保险)残留的待冲刷作废 —— 其帧已失败,
@@ -497,7 +500,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         _pendingDensifyValue = 0;
 
         // ---- 帧序门:迟到/缺口一律播种,连续才 execute(OfFrameGate::Arrive;
-        // 15ms 让路语义与"不做长等待"的教训记录见 of_frame_gate.h)----
+        // 在途判据与事件驱动等待语义见 of_frame_gate.h)----
         const OfGateDecision gate = _gate.Arrive(frameIndex, lock);
         if (gate == OfGateDecision::Expired) {
             // 迟到帧(乱序/回退,其序号已被越过):清零发布,不推进门。
@@ -509,10 +512,12 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         }
         const bool gapSkip = gate == OfGateDecision::Seed; // 缺口未等到前驱 → 播种
         // 设备丢失:栅栏永不满足,直接降级(下帧 ProcessFrame 顶部会因
-        // _ready 闩锁早退)。
+        // _ready 闩锁早退)。仍须推进门:活性不变量要求过 Arrive 的帧所有
+        // 路径必达 Advance,否则缺口=1 的等待方永久悬等(of_frame_gate.h)。
         if (_d3d12->IsDeviceLost()) {
             result.historyReset = true;
             _gate.InvalidateHistory();
+            _gate.Advance(frameIndex);
             _lastStageMs = 0.0;
             _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
             return result;

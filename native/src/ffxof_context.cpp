@@ -293,6 +293,9 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
     QueryPerformanceCounter(&t0);
 
     {
+        // 取锁前声明在途:门据此区分"前驱堵在 mutex 外(等它插队)"与
+        // "真丢帧(零等待立即播种)"(of_frame_gate.h)。
+        _gate.MarkIncoming(frameIndex);
         std::unique_lock<std::mutex> lock(_gate.Mutex);
         const OfGateDecision decision = _gate.Arrive(frameIndex, lock);
         if (decision == OfGateDecision::Expired) {
@@ -300,9 +303,12 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             _lastGpuSpanMs = 0.0; // 过期帧无光流计算,nvof 段读 0
             return result;
         }
+        // 推进门:活性不变量要求过 Arrive 的帧所有路径必达 Advance,否则
+        // 缺口=1 的等待方永久悬等(of_frame_gate.h)。
         if (_d3d12->IsDeviceLost()) {
             result.historyReset = true;
             _gate.InvalidateHistory();
+            _gate.Advance(frameIndex);
             _lastStageMs = 0.0;
             _lastGpuSpanMs = 0.0;
             return result;

@@ -29,9 +29,10 @@
 // 帧序门(OfFrameGate,_gate.Mutex):_nextSeq = 上一完成帧 + 1。到达帧 ==
 // _nextSeq 才 execute;不匹配一律播种(零 guidance)—— 到得早的(乱序/
 // 回退)与缺了前驱的(host 丢帧/大跳)都走播种,链在下一帧立即恢复,不做
-// 簿记。唯一等待:缺口恰为 1 时 cv 让路 15ms(fmParallel 相邻竞争下前驱大
-// 概率正卡在门 mutex 上,cv 释放锁的语义让它插队完成,两帧都保住 guidance);
-// 真丢帧则 15ms 后播种,代价钉死。门内工作 = 拷贝提交 + execute + CPU 等
+// 簿记。唯一等待:缺口恰为 1 且前驱"在途"(取锁前 MarkIncoming 声明,即
+// 堵在门 mutex 外)时 cv 事件驱动等待,前驱 Advance 即醒、不限时 —— 两帧
+// 都保住 guidance;前驱不在途 = 真丢帧,零等待立即播种。语义细节与活性
+// 不变量见 of_frame_gate.h。门内工作 = 拷贝提交 + execute + CPU 等
 // + densify 提交,天然按帧序串行。
 
 #include <d3d12.h>
@@ -231,7 +232,7 @@ private:
     int _pendingDensifyInput = 0;
 
     // 帧序门(与 FxofContext 共用 OfFrameGate;mutex/决策/历史状态在门内,
-    // 语义与原内联版本逐条一致 —— 15ms 让路/迟到播种/seek 复位)。
+    // 语义 —— 在途判据等待/迟到播种/seek 复位 —— 见 of_frame_gate.h)。
     OfFrameGate _gate;
     int _curInput = 0;            // ping-pong 当前写槽位
     uint32_t _consecutiveFailures = 0;
