@@ -428,19 +428,17 @@ DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
 
 } // namespace
 
-// ctx 载荷(创建时定格):DlssnrParams 合并值 → RtxVideoParams(几何/形态
-// + per-eval 初值;per-eval 项运行中改由 Snapshot 逐帧取)。
+// ctx 载荷(创建时定格):DlssnrParams 合并值 → RtxVideoParams(纯创建时
+// 几何/形态;per-eval live 值运行中由 Snapshot 逐帧取,不进卡片)。
 static RtxVideoParams RtxFromParams(const DlssnrParams &p) noexcept {
     RtxVideoParams rtx;
     rtx.vsrMode = std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax);
     rtx.vsrScale = std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax);
-    rtx.vsrStrength = std::clamp(p.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax);
     rtx.hdrEnabled = p.rtxHdrEnabled != 0;
-    rtx.hdrContrast = std::clamp(p.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax);
-    rtx.hdrSaturation = std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax);
-    rtx.hdrMiddleGray = std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
-    rtx.hdrMaxLuminance = std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
-    rtx.vsrAutoHeight = std::clamp(p.rtxVsrAutoHeight, 144, 8192);
+    // 探测失败哨兵 0 原样直达:消费侧(vsrAutoHeight > 0 ? clamp : srcH)
+    // 以 0 = "目标=源,VSR 旁路"分支消费;此处若钳 0→144 会令该分支不可达
+    // (旁路语义全靠 ratio<=1.001 巧合兜住)。
+    rtx.vsrAutoHeight = p.rtxVsrAutoHeight;
     return rtx;
 }
 

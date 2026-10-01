@@ -65,6 +65,26 @@
 
 namespace vsdlssnr {
 
+// 键读取原语(节名参数化;dlssnr / rtxvideo 两节共用,读取侧单点)。
+inline int ReadIniInt(const wchar_t *section, const wchar_t *key, int def,
+                      const wchar_t *iniPath) noexcept {
+    return static_cast<int>(GetPrivateProfileIntW(section, key, def, iniPath));
+}
+
+// 宽容布尔键解析:机器写入恒为 0/1,但手编 "true"/"false" 曾经
+// (GetPrivateProfileInt 对非数字返回 0)静默关掉功能。接受常见拼写,
+// 其余落回整数语义。
+inline bool ReadIniBool(const wchar_t *section, const wchar_t *key, bool def,
+                        const wchar_t *iniPath) noexcept {
+    wchar_t raw[16]{};
+    if (GetPrivateProfileStringW(section, key, L"", raw, 16, iniPath) && raw[0]) {
+        const auto eqi = [&](const wchar_t *lit) { return _wcsicmp(raw, lit) == 0; };
+        if (eqi(L"true") || eqi(L"yes") || eqi(L"on")) return true;
+        if (eqi(L"false") || eqi(L"no") || eqi(L"off")) return false;
+    }
+    return ReadIniInt(section, key, def ? 1 : 0, iniPath) != 0;
+}
+
 // Persist the parameter profile (the [panel] log toggle is panel-local and
 // stays with the panel). Returns false when any key write failed (file
 // locked / permission) — callers log it; a silent false-save reads back as
@@ -108,21 +128,10 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
     }
     if (legacyFgRouteRaw) *legacyFgRouteRaw = 0;
     const auto readInt = [&](const wchar_t *key, int def) -> int {
-        return static_cast<int>(GetPrivateProfileIntW(L"dlssnr", key, def, iniPath));
+        return ReadIniInt(L"dlssnr", key, def, iniPath);
     };
-    // 布尔键宽容解析:机器写入恒为 0/1,但手编 "true"/"false" 曾经
-    // (GetPrivateProfileInt 对非数字返回 0)静默关掉功能。接受常见拼写,
-    // 其余落回整数语义。
     const auto readBool = [&](const wchar_t *key, bool def) -> bool {
-        wchar_t raw[16]{};
-        if (GetPrivateProfileStringW(L"dlssnr", key, L"", raw, 16, iniPath) && raw[0]) {
-            const auto eqi = [&](const wchar_t *lit) {
-                return _wcsicmp(raw, lit) == 0;
-            };
-            if (eqi(L"true") || eqi(L"yes") || eqi(L"on")) return true;
-            if (eqi(L"false") || eqi(L"no") || eqi(L"off")) return false;
-        }
-        return readInt(key, def ? 1 : 0) != 0;
+        return ReadIniBool(L"dlssnr", key, def, iniPath);
     };
     // *_x100 values are hand-editable on disk: clamp to the documented ranges
     // (the panel and vpy paths clamp; without this an edited ini would push
@@ -140,11 +149,9 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
     p.skinStructureStrength = readX100(L"skin_structure_x100", p.skinStructureStrength, kSkinMin, kSkinMax);
     p.useAutoMask = readBool(L"use_auto_mask", p.useAutoMask != 0);
     p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), kResPctMin, kResPctMax);
-    // 与其它布尔位同款 != 0 归一:GetPrivateProfileInt 对非数字("true")
-    // 返回 0 会静默关掉缩放;>1 的值又会让 CreateParamsChanged 每次热复用
-    // 误判为变更而多付一次 feature 重建。
-    // >1 的数值仍走整数语义(0/1):手编 2 会让 CreateParamsChanged 每次热
-    // 复用误判为变更而多付一次 feature 重建 —— readInt != 0 归一保留。
+    // != 0 归一:GetPrivateProfileInt 对非数字("true")返回 0 会静默关掉
+    // 缩放;>1 的值走整数语义(0/1),否则 CreateParamsChanged 每次热复用
+    // 会误判为变更而多付一次 feature 重建。
     p.scalingEnabled = readBool(L"scaling_enabled", p.scalingEnabled != 0);
     p.residualMultiplier = readX100(L"residual_multiplier_x100", p.residualMultiplier, kResidualMultMin, kResidualMultMax);
     p.residualSaturation = readX100(L"residual_saturation_x100", p.residualSaturation, kResidualFineMin, kResidualFineMax);
@@ -169,23 +176,14 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
     // 与 WriteDlssnrIni 同键表)。旧部署样例的 vsr_height 键已作废(语义
     // 换成倍率 vsr_scale_x100),不读取 —— 旧值静默失效,面板重存即归位。
     const auto readRtxInt = [&](const wchar_t *key, int def) -> int {
-        return static_cast<int>(GetPrivateProfileIntW(L"rtxvideo", key, def, iniPath));
-    };
-    const auto readRtxBool = [&](const wchar_t *key, bool def) -> bool {
-        wchar_t raw[16]{};
-        if (GetPrivateProfileStringW(L"rtxvideo", key, L"", raw, 16, iniPath) && raw[0]) {
-            const auto eqi = [&](const wchar_t *lit) { return _wcsicmp(raw, lit) == 0; };
-            if (eqi(L"true") || eqi(L"yes") || eqi(L"on")) return true;
-            if (eqi(L"false") || eqi(L"no") || eqi(L"off")) return false;
-        }
-        return readRtxInt(key, def ? 1 : 0) != 0;
+        return ReadIniInt(L"rtxvideo", key, def, iniPath);
     };
     p.rtxVsrMode = std::clamp(readRtxInt(L"vsr_mode", p.rtxVsrMode), kVsrModeMin, kVsrModeMax);
     p.rtxVsrScale = std::clamp(
         static_cast<float>(readRtxInt(L"vsr_scale_x100", static_cast<int>(p.rtxVsrScale * 100.0f))) / 100.0f,
         kVsrScaleMin, kVsrScaleMax);
     p.rtxVsrStrength = std::clamp(readRtxInt(L"vsr_strength", p.rtxVsrStrength), kVsrStrengthMin, kVsrStrengthMax);
-    p.rtxHdrEnabled = readRtxBool(L"hdr_enabled", p.rtxHdrEnabled != 0);
+    p.rtxHdrEnabled = ReadIniBool(L"rtxvideo", L"hdr_enabled", p.rtxHdrEnabled != 0, iniPath);
     p.rtxHdrContrast = std::clamp(readRtxInt(L"hdr_contrast", p.rtxHdrContrast), kHdrContrastMin, kHdrContrastMax);
     p.rtxHdrSaturation = std::clamp(readRtxInt(L"hdr_saturation", p.rtxHdrSaturation), kHdrSaturationMin, kHdrSaturationMax);
     p.rtxHdrMiddleGray = std::clamp(readRtxInt(L"hdr_middle_gray", p.rtxHdrMiddleGray), kHdrMiddleGrayMin, kHdrMiddleGrayMax);

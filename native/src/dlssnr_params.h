@@ -84,19 +84,15 @@ struct RtxVideoParams {
     // 内 GetClientRect 零桥接,clamp 到所在显示器)填入;链创建粒度,非
     // 持久化字段,ini 不读写。窗口换屏/改尺寸后的生效点 = 下一次链重建。
     int vsrAutoHeight = 2160;
-    int vsrStrength = 2;     // VSR QualityLevel(1-4=AI;per-eval,live)
     // TrueHDR(0/1):输出域切换为 HDR10 —— 滤镜输出 YUV420P10(BT.2020
     // PQ limited),上屏由面板自动同步(vf 打标 + target-colorspace-hint)。
-    // 创建时。
+    // 创建时。vsrStrength 与 HDR 四参(对比度/饱和度/中间灰/峰值)是
+    // per-eval live 值,唯一权威在 DlssnrParams(逐帧 Snapshot),不进卡片。
     int hdrEnabled = 0;
-    int hdrContrast = 100;       // 0-200(官方默认 100;per-eval,live)
-    int hdrSaturation = 100;     // 0-200
-    int hdrMiddleGray = 50;      // 10-100
-    int hdrMaxLuminance = 1000;  // 400-2000 nits
 
-    // 相等性只覆盖**创建时几何/形态**:mode/scale/autoHeight/hdrEnabled。
-    // strength 与 HDR 四参是 per-eval live 值 —— 变化不换槽资源几何,
-    // 参与 == 会让 hotMatch 拒掉本可秒回的热复用(每次拖质量滑块 = 冷重建)。
+    // 相等性覆盖**全部字段**=创建时几何/形态:mode/scale/autoHeight/hdrEnabled。
+    // live 值变化不换槽资源几何,参与 == 会让 hotMatch 拒掉本可秒回的热
+    // 复用(每次拖质量滑块 = 冷重建)—— 故 live 值不在本结构体里。
     friend bool operator==(const RtxVideoParams &a, const RtxVideoParams &b) noexcept {
         return a.vsrMode == b.vsrMode && a.vsrScale == b.vsrScale &&
                a.vsrAutoHeight == b.vsrAutoHeight && a.hdrEnabled == b.hdrEnabled;
