@@ -22,9 +22,8 @@ os.environ["VSDLSSNR_DUMP"] = "1"
 os.environ["VSDLSSNR_DUMP_SKIP"] = "5"  # dump 与对比帧同帧号
 
 k32 = ctypes.windll.kernel32
-for k, v in {"vsr_mode": "2", "vsr_scale_x100": "200", "vsr_strength": "2",
-             "hdr_enabled": "1"}.items():
-    assert k32.WritePrivateProfileStringW("rtxvideo", k, v, testenv.INI), k
+testenv.set_rtxvideo_ini(vsr_mode="2", vsr_scale_x100="200",
+                    vsr_strength="2", hdr_enabled="1")
 
 import time  # noqa: E402
 import numpy as np  # noqa: E402

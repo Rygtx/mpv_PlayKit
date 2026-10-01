@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """verify_pq_roundtrip:PQ 常量修复的数值闭环。
 
-同一次运行里:插件 dump hdrColor(VSDLSSNR_DUMP=1,帧0)+ 脚本读回输出
+同一次运行里:插件 dump hdrColor(VSDLSSNR_DUMP=1,第一真运动帧)+ 脚本读回输出
 YUV420P10 平面 → numpy 前向复算 shader 数学(scRGB→2020→PQ→limited 10bit)
 → 与实测平面逐位对照。max|Δcode| ≤ 1 = PQ 链路端到端正确。
 
@@ -47,9 +47,10 @@ dump = os.path.join(testenv.HOST_DIR, "dump_hdrcolor.bin")
 if os.path.exists(dump):
     os.remove(dump)
 
-ret = core.dlssnr.Enhance(clip, vsr_mode=2, vsr_scale=2.0, hdr_enabled=1)
+ret = core.dlssnr.Enhance(clip, vsr_mode=2, vsr_scale=2.0, hdr_enabled=1,
+                          ffx_quality=2)  # 真运动帧才触发 dump(播种帧锁存不落)
 print("out:", ret.format.name, ret.width, ret.height)
-f = ret.get_frame(0)
+f = ret.get_frame(1)  # dump-site 对齐:与 dump 同帧(帧0 播种不触发 dump)
 yuv = [np.asarray(f[p]).copy() for p in range(3)]
 
 # dump 在首帧 Finish 内同步落盘;轮询仅兜异步边界,正常首轮即命中。

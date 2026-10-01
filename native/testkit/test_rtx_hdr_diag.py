@@ -46,7 +46,7 @@ scenes = {
     "vsr":    {"vsr_mode": "2", "vsr_scale_x100": "200", "vsr_strength": "2", "hdr_enabled": "0"},
 }
 for k, v in scenes[scenario].items():
-    wr(k, v)
+    testenv.set_ini("rtxvideo", k, v)
 
 # 2nd arg "min" = 最小管线(nr/fg 全关):排除 feature 共存因素。
 # 写回 [dlssnr] 节(插件落盘回写在 teardown,脚本每次启动重写,以脚本为准)。
