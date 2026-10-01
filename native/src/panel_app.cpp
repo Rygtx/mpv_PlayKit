@@ -1129,7 +1129,19 @@ void DrawUi() noexcept {
     // 首行必须手动定位到 marginX:后续行自动回流到 WindowPadding.x,历史
     // 上这里写死 16*s,而 WindowPadding 不缩放,高 DPI 下首行比后续行更靠右。
     ImGui::Text("GPU: %s", g_app.gpuName[0] ? g_app.gpuName : "(等待滤镜加载)");
-    ImGui::Text("帧率: %.1f FPS", g_app.fps);
+    // fps 打点在源帧入口(不含插帧):fg 状态非 off 即按 ×M 节奏出帧
+    // (on=真插值;dup/unavailable=复制帧,节拍不变),输出 = 源 × fg_mult。
+    // 计数本身就是整数,按整数显示(%.1f 是假精度)。
+    {
+        const bool fgCadence = g_app.fgState[0] && std::strcmp(g_app.fgState, "off") != 0 && g_app.fgMult > 0;
+        const int mult = fgCadence ? g_app.fgMult : 1;
+        const int src = static_cast<int>(g_app.fps + 0.5);
+        if (mult > 1) {
+            ImGui::Text("帧率: %d 源 / %d 输出 FPS", src, src * mult);
+        } else {
+            ImGui::Text("帧率: %d FPS", src);
+        }
+    }
     // 连接指示:此前"滤镜未加载 / 插件没在跑 / stats magic 不配对"三种
     // 故障的用户可见表象完全相同(滑块能调、能保存、画面永远不变),
     // 区别只在日志文件。这里一行给出最短诊断路径。
