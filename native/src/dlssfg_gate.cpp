@@ -17,7 +17,10 @@ namespace {
 // 为系统组件"从简,仅查导出存在)----
 constexpr uint32_t kNvapiIdInitialize = 0x0150e828;
 constexpr uint32_t kNvapiIdEnumPhysicalGPUs = 0xe5ac921f;
-constexpr uint32_t kNvapiIdGetArchitecture = 0xd8265d24;
+// 0xd8265d24:同 ID 换过签名 —— R590 SDK 前是 GetArchitecture(handle,
+// uint32*),R590 起(实测 617.14 驱动)旧标量形态恒返 -9,由 GetArchInfo
+// versioned struct 接管(官方 nvapi64.lib nvlib_gen.obj 反汇编实证同 ID)。
+constexpr uint32_t kNvapiIdGetArchInfo = 0xd8265d24;
 
 // NVAPI_GPU_ARCHITECTURE(NV_GPU_ARCHITECTURE_ID,官方 nvapi.h 枚举;
 // 0x170 另为 RTX40MFG-Unlock 实证值):TU100=0x160 Turing、GA100=0x170
@@ -108,6 +111,17 @@ bool PageOfModuleIsExecuteRead(HMODULE provider, uintptr_t address, size_t size)
            owner == provider;
 }
 
+// NV_GPU_ARCH_INFO_V2(官方 nvapi.h;version = sizeof|2<<16 是 NVAPI
+// versioned struct 惯例)。更旧的驱动(<R590)同 ID 还是标量实现,会把
+// arch 直接写进首字段(version 槽,只写 4 字节不越界)—— 两形态统一按
+// "非零 architecture 槽,兜底 version 槽"取值。
+struct ArchInfoV2 {
+    uint32_t version;
+    uint32_t architecture;
+    uint32_t implementation;
+    uint32_t revision;
+};
+
 // 枚举物理 GPU 架构值(官方 NVAPI NV_GPU_ARCHITECTURE_ID)。返回是否有
 // 任一块 GPU 查到架构;false(含 NVAPI 缺失/初始化失败/全部失败)时
 // *archCount 可能为 0。成功初始化后 nvapi64.dll 进程常驻(内部工作线程
@@ -122,13 +136,13 @@ bool GetGpuArchs(uint32_t *archs, size_t cap, size_t *archCount) noexcept {
         reinterpret_cast<void *>(GetProcAddress(nvapi, "nvapi_QueryInterface")));
     using InitFn = int __cdecl();
     using EnumFn = int __cdecl(void **, uint32_t *);
-    using ArchFn = int __cdecl(void *, uint32_t *);
+    using ArchFn = int __cdecl(void *, ArchInfoV2 *);
     auto init = reinterpret_cast<InitFn *>(
         query ? reinterpret_cast<void *>(query(kNvapiIdInitialize)) : nullptr);
     auto enumGpus = reinterpret_cast<EnumFn *>(
         query ? reinterpret_cast<void *>(query(kNvapiIdEnumPhysicalGPUs)) : nullptr);
     auto getArch = reinterpret_cast<ArchFn *>(
-        query ? reinterpret_cast<void *>(query(kNvapiIdGetArchitecture)) : nullptr);
+        query ? reinterpret_cast<void *>(query(kNvapiIdGetArchInfo)) : nullptr);
     if (!init || !enumGpus || !getArch || init() != 0) {
         FreeLibrary(nvapi); // 未成功初始化,无内部线程,可安全卸载
         return false;
@@ -139,8 +153,11 @@ bool GetGpuArchs(uint32_t *archs, size_t cap, size_t *archCount) noexcept {
     bool any = false;
     for (uint32_t i = 0; i < count && i < 64; ++i) {
         if (!gpus[i]) continue;
-        uint32_t arch = 0;
-        if (getArch(gpus[i], &arch) != 0) continue;
+        ArchInfoV2 info{};
+        info.version = uint32_t(sizeof(ArchInfoV2) | (2u << 16));
+        if (getArch(gpus[i], &info) != 0) continue;
+        const uint32_t arch = info.architecture ? info.architecture : info.version;
+        if (!arch) continue;
         if (*archCount < cap) archs[*archCount] = arch;
         ++*archCount;
         any = true;
@@ -161,9 +178,25 @@ bool GpuFamilyPrefersProxy() noexcept {
             "DLSSNR STATUS: dlssfg GPU family probe failed; proxy preload fail-open");
         return true;
     }
-    for (size_t i = 0; i < count; ++i)
-        if (archs[i] == kArchTuring || archs[i] == kArchAmpere) return true;
-    return false;
+    // 成功也留痕(走对更要留痕 —— 2026-10-02 probe 恒失败事故的排查成本
+    // 就卡在成功路径零日志,分不清"真 Ampere"还是"fail-open 撞对了")。
+    char list[80]{}; // 列前 4 块:" 0x1B0," ≤8 字节/块
+    for (size_t i = 0; i < count && i < 4; ++i) {
+        char one[16];
+        std::snprintf(one, sizeof(one), "%s0x%X", i ? " " : "", archs[i]);
+        std::strncat(list, one, sizeof(list) - strlen(list) - 1);
+    }
+    const bool prefersProxy = [&] {
+        for (size_t i = 0; i < count; ++i)
+            if (archs[i] == kArchTuring || archs[i] == kArchAmpere) return true;
+        return false;
+    }();
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "DLSSNR STATUS: dlssfg gpu family probe: %zu gpu(s) arch=[%s] -> %s",
+                  count, list, prefersProxy ? "proxy preload" : "official chain");
+    TimingStatusLine(msg);
+    return prefersProxy;
 }
 
 unsigned UnlockMfgCountGate(HMODULE provider, unsigned currentMax) noexcept {
@@ -171,14 +204,18 @@ unsigned UnlockMfgCountGate(HMODULE provider, unsigned currentMax) noexcept {
     uint32_t archs[64]{};
     size_t archCount = 0;
     bool ada = false;
-    if (GetGpuArchs(archs, 64, &archCount)) {
+    const bool probed = GetGpuArchs(archs, 64, &archCount);
+    if (probed) {
         for (size_t i = 0; i < archCount; ++i)
             if (archs[i] == kArchAda) { ada = true; break; }
     }
     if (!ada) {
-        TimingStatusLine(
-            "DLSSNR STATUS: dlssfg mfg gate unlock skipped (not Ada; "
-            "Blackwell ships native MFG)");
+        // "不是 Ada"与"探测失败"分文案:混同会让"40 系为何没解锁"无从查起。
+        TimingStatusLine(probed
+            ? "DLSSNR STATUS: dlssfg mfg gate unlock skipped (not Ada; "
+              "Blackwell ships native MFG)"
+            : "DLSSNR STATUS: dlssfg mfg gate unlock skipped (GPU arch probe "
+              "failed; conservative skip)");
         return currentMax;
     }
     uint8_t *site = FindGateSite(provider);
