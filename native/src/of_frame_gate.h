@@ -1,7 +1,7 @@
 #pragma once
 // 光流帧序门(纯时序决策,无 D3D12 依赖)。从 nvof_context.cpp StageFrame
-// 的内联门提取,FxofContext 复用;NvofContext 本期保留内联门不动(NVOF 是
-// 唯一在役链路,原位重构风险/收益不成比例)。
+// 的内联门提取,FxofContext 复用;NvofContext 亦已迁移至本门(FFX 转正
+// 默认后端后"内联门=唯一在役链路"的理由失效,双份门逻辑不再各自维护)。
 //
 // 语义与 NvofContext 门逐条一致(_nextSeq = 上一完成帧 + 1):
 //   - 迟到帧(乱序/回退,序号已被越过):播种,不推进门;

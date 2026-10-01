@@ -12,7 +12,6 @@
 #include "d3d12_context.h"
 #include "dlssnr_context.h" // TimingStatusLine(时序失败必须进 timing log)
 
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 
@@ -193,13 +192,11 @@ void NvofContext::DestroySession() noexcept {
     _gridSize = 0;
     _d3d12 = nullptr;
     {
-        std::lock_guard<std::mutex> lock(_gateMutex);
-        _historyValid = false;
+        std::lock_guard<std::mutex> lock(_gate.Mutex);
+        _gate.ResetTimeline(); // 历史作废 + 门自定起点(of_frame_gate.h 同款)
         _curInput = 0;
         _consecutiveFailures = 0;
-        _nextSeq = -1;
         _pendingDensifyValue = 0;
-        _gateCv.notify_all();
     }
     _ready.store(false, std::memory_order_release);
 }
@@ -446,12 +443,10 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
     }
 
     {
-        std::lock_guard<std::mutex> lock(_gateMutex);
-        _historyValid = false; // 新会话:首帧播种(清零发布)
+        std::lock_guard<std::mutex> lock(_gate.Mutex);
+        _gate.ResetTimeline(); // 新会话:首帧播种(清零发布)+ 门自定起点
         _curInput = 0;
         _consecutiveFailures = 0;
-        _nextSeq = -1;         // 下一帧自定起点
-        _gateCv.notify_all();
     }
     // 实际能力记录:bidir/cost 的逐级回退(BOTH+cost → BOTH → FORWARD →
     // FORWARD 无 cost)成功时原先无任何日志 —— 观测只认 timing log,这里
@@ -495,15 +490,16 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
     _stageStartQpc = t0.QuadPart; // 全跨度锚(门入口 → 冲刷完成,LastStageTotalMs)
 
     {
-        std::unique_lock<std::mutex> lock(_gateMutex);
+        std::unique_lock<std::mutex> lock(_gate.Mutex);
         // 入门即清:上一帧失败路径(ProcessFrame 提前返回且守卫冲刷未跑,
         // 理论上守卫恒跑,此为双保险)残留的待冲刷作废 —— 其帧已失败,
         // densify 不再有意义。
         _pendingDensifyValue = 0;
 
-        // ---- 帧序门:_nextSeq = 上一完成帧 + 1,匹配才 execute ----
-        if (_nextSeq < 0) _nextSeq = frameIndex;
-        if (frameIndex < _nextSeq) {
+        // ---- 帧序门:迟到/缺口一律播种,连续才 execute(OfFrameGate::Arrive;
+        // 15ms 让路语义与"不做长等待"的教训记录见 of_frame_gate.h)----
+        const OfGateDecision gate = _gate.Arrive(frameIndex, lock);
+        if (gate == OfGateDecision::Expired) {
             // 迟到帧(乱序/回退,其序号已被越过):清零发布,不推进门。
             // 零等待门下无需簿记,链不受影响。
             _lastStageMs = 0.0;
@@ -511,37 +507,12 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
             return result;
         }
-        bool gapSkip = false; // 缺口且未等到前驱:参考非紧邻前驱 → 播种
-        if (frameIndex > _nextSeq) {
-            // 缺口 = 参考槽位不是本帧的紧邻前驱。恰缺 1 帧时前驱大概率在飞
-            // (fmParallel 相邻竞争卡在门 mutex 上、或正在 pack):cv 让路
-            // 15ms,前驱插队完成后两帧都保住 guidance;真丢帧(宿主不再
-            // 请求)或更大缺口立即播种。**不做长等待**——等待叠加进序列化
-            // 延迟链,让帧错过呈现 deadline,宿主丢帧 → 更多突发 → 更多缺
-            // 口,自持成"过载恢复后持续卡顿"(实测 4K of=3:60/235ms 等待
-            // 期 s 以 4 次/秒爬升、切档自愈失效)。播种一次即恢复链,迟到
-            // 的前驱走上方迟到分支。
-            if (frameIndex == _nextSeq + 1) {
-                _gateCv.wait_for(lock, std::chrono::milliseconds(15),
-                                 [&] { return _nextSeq >= frameIndex; });
-            }
-            if (_nextSeq > frameIndex) {
-                // 等待期间另一帧已越过本帧:按迟到帧处理。
-                _lastStageMs = 0.0;
-                ++_gateExpired;
-                _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
-                return result;
-            }
-            if (_nextSeq < frameIndex) {
-                ++_gateSkips;
-                gapSkip = true; // 参考非紧邻前驱 → 播种(不碰 _nextSeq,结尾统一推进)
-            }
-        }
+        const bool gapSkip = gate == OfGateDecision::Seed; // 缺口未等到前驱 → 播种
         // 设备丢失:栅栏永不满足,直接降级(下帧 ProcessFrame 顶部会因
         // _ready 闩锁早退)。
         if (_d3d12->IsDeviceLost()) {
             result.historyReset = true;
-            _historyValid = false;
+            _gate.InvalidateHistory();
             _lastStageMs = 0.0;
             _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
             return result;
@@ -553,9 +524,9 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                           static_cast<double>(freq.QuadPart);
 
         const int cur = _curInput;
-        // execute 的前提:参考槽位恰好是紧邻前驱的输入。首帧(_historyValid
-        // false)或缺口未等到前驱(gapSkip)一律播种。
-        const bool seed = !_historyValid || gapSkip;
+        // execute 的前提:参考槽位恰好是紧邻前驱的输入。首帧(历史无效)
+        // 或缺口未等到前驱(gapSkip)一律播种。
+        const bool seed = !_gate.HistoryValid() || gapSkip;
         bool execute = !seed;
         // densify/清零在本帧 nvof CL 上录制;execute 帧拆成两次提交
         // (copy → execute 提交 → [延迟] CPU 等 → densify),播种帧合并为
@@ -643,7 +614,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             OutputDebugStringA("vs_dlssnr: nvof copy submit failed\n");
             TimingStatusLine(msg);
             result.historyReset = true;
-            _historyValid = false; // 参考帧未更新,历史链断
+            _gate.InvalidateHistory(); // 参考帧未更新,历史链断
             execute = false;
         }
 
@@ -722,7 +693,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 OutputDebugStringA("\n");
                 TimingStatusLine(msg);
                 result.historyReset = true;
-                _historyValid = false;
+                _gate.InvalidateHistory();
                 if (++_consecutiveFailures >= 3) {
                     _ready.store(false, std::memory_order_release);
                     char msg2[96];
@@ -753,9 +724,8 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         //   播种帧(拷贝成功)→ 历史已建立,下一帧可 execute。
         if (copyOk) result.inputIndex = cur;
         _curInput = 1 - cur;
-        if (seed && copyOk) _historyValid = true;
-        _nextSeq = static_cast<int64_t>(frameIndex) + 1;
-        _gateCv.notify_all();
+        if (seed && copyOk) _gate.MarkSeeded();
+        _gate.Advance(frameIndex); // 下一帧放行 + notify(同款)
         if (result.pendingDensify) {
             // 门锁移交:调用方持锁至 FlushPendingDensify —— 提交互斥/轮转
             // 簿记/ densify-先于-copy(n+1) 的串行化与旧"门内全程"形态等价,
@@ -804,7 +774,7 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
                     static_cast<double>(freq.QuadPart);
     if (!reached) {
         TimingStatusLine("DLSSNR STATUS: nvof output fence timeout at flush; session retired");
-        _historyValid = false; // 门锁由调用方持有,门状态可安全触碰
+        _gate.InvalidateHistory(); // 门锁由调用方持有,门状态可安全触碰
         _ready.store(false, std::memory_order_release);
         return;
     }
