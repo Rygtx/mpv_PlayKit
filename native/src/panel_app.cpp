@@ -1462,7 +1462,7 @@ void DrawUi() noexcept {
     // mpv 重载,路由进程级重启生效。倍数选择 关/2x/3x/4x/5x/6x,同步
     // fgEnabled + fgMultiplier 两键。
     pairLabel(0, "帧生成", "DLSS 补帧,输出帧率 ×2–×6,插值帧落在相邻真实帧之间。\n"
-              "需光流质量 > 0(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
+              "需光流质量非\"无\"(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
               "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。\n"
               "运行库上限默认开到 6x(部署 ini MaxGeneratedFrames=5);\n"
               "输出帧率 = 源 ×M,显示端刷新率建议不低于输出帧率。");
@@ -1521,9 +1521,17 @@ void DrawUi() noexcept {
     }
     y += rowH;
 
-            // 跨页依赖提示:光流质量在降噪增强页
+            // 跨页依赖提示:光流是 NR(主消费者)与 FG 的共享资源,设置留在
+            // 降噪增强页不复制控件;此处按钮跳转,复用启动页签恢复机制
+            //(SetSelected 需逐帧重喂 + 强制重绘,见 pageRestore 注释)。
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-            ImGui::TextDisabled("提示: 帧生成需光流质量 > 0(降噪增强页),否则只复制帧。");
+            ImGui::TextDisabled("帧生成需光流质量非\"无\",否则只复制帧。");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("前往光流设置")) {
+                g_app.page = 0;
+                g_app.pageRestore = true;
+                g_app.restoreFrames = 8;
+            }
             y += rowH;
 
             ImGui::EndTabItem();

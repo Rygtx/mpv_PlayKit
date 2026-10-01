@@ -133,7 +133,7 @@ _管他什么逻辑、什么架构、什么边界条件、什么代码规范，v
 | 光流引导 1–5 档 | FFX:D3D12 SM6.2 + WaveOps + R16G16_SINT UAV(跨厂商);NVOF:RTX Turing+ | 会话建立失败自动回退零 guidance,不挡其他功能 |
 | 光流降采样 | `Scaling_Enabled = True`;**帧生成激活时被强制忽略**(帧生成要求源尺寸运动场) | 开关无效,光流按源尺寸计算 |
 | `Input_Resolution` / `Residual_Multiplier` | `Scaling_Enabled = True` | 无意义(关闭缩放按源尺寸直接处理) |
-| 帧生成 `Fg_Enabled` | ① **光流质量 ≥ 1**(零 guidance 无真运动场)② `ngx\` 内对应运行时(官方 `nvngx_dlssg.dll` 或代理 `version.dll`) | 零 guidance 下插值帧全部退化为复制真实帧(等于白开);运行时缺失/拒载自动回退 1:1,降噪不受影响 |
+| 帧生成 `Fg_Enabled` | ① **光流质量非"无"**(零 guidance 无真运动场)② `ngx\` 内对应运行时(官方 `nvngx_dlssg.dll` 或代理 `version.dll`) | 零 guidance 下插值帧全部退化为复制真实帧(等于白开);运行时缺失/拒载自动回退 1:1,降噪不受影响 |
 | 帧生成改档/开关自动重载 | mpv.conf `input-ipc-server`(本包发行配置已默认开启) | 关/降档退化为会话内复制真实帧;升档需手动 seek |
 | `Fg_Route` 纯官方档 | `nvngx_dlssg.dll` 存在且硬件在官方支持范围(RTX 40/50) | 30/20 系被架构门禁拒载(0xBAD0000B)**不回落**,补帧直接关(诊断页 `fg_detail` 留因) |
 | RTX 40 系 3–6x 插帧 | 本机 GPU 为 Ada(SM89,NVAPI AD100=0x190;仅 Ada 触发,50 系原生 MFG 不碰官方运行库)+ 官方运行库 count gate 字节特征命中(进程内解锁,RTX40MFG-Unlock 同源手法;仅进程内存,不落盘) | 非 Ada 一律跳过;特征未命中(驱动升级改版)自动回落 2x,timing log 留因 |
