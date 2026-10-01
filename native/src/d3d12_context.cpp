@@ -532,12 +532,12 @@ D3D12Context::PoolHold::~PoolHold() noexcept {
     }
 }
 
-DXGI_FORMAT D3D12Context::NrColorFormat(bool allowFp16) const noexcept {
+DXGI_FORMAT D3D12Context::NrColorFormat(bool allowFp16, bool vsrOnly) const noexcept {
     // Phase C 管线色策略(2026-09-24):>8bit 源默认 RGBA16F(NR 全程 10bit,
     // 消 P10→BGRA8 的 2bit 量化)。**否决制实证(320x180d10 探针)**:TrueHDR
     // 对 FP16 输入 EvaluateFeature 失败(BGRA 对照通过)→ rtx 请求时回落
-    // BGRA8 并由调用方日志显形。VSDLSSNR_NR_FORMAT=fp16/bgra8 强制覆盖
-    // (全矩阵后续验证用)。FFX OF / FG / NVOF-downsample 均 SRV 消费,
+    // BGRA8 并由调用方日志显形。VSDLSSNR_NR_FORMAT=fp16/bgra8/rgb10a2 强制
+    // 覆盖(全矩阵验证用)。FFX OF / FG / NVOF-downsample 均 SRV 消费,
     // 格式无关,已随默认档实测。
     static const int envOverride = [] {
         char v[16]{};
@@ -545,12 +545,24 @@ DXGI_FORMAT D3D12Context::NrColorFormat(bool allowFp16) const noexcept {
         if (n > 0 && n < sizeof(v)) {
             if (_stricmp(v, "fp16") == 0) return 1;
             if (_stricmp(v, "bgra8") == 0) return -1;
+            if (_stricmp(v, "rgb10a2") == 0) return 2;
         }
         return 0;
     }();
     if (envOverride == 1) return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    if (envOverride == -1 || !allowFp16) return DXGI_FORMAT_B8G8R8A8_UNORM;
-    return _bitDepth > 8 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (envOverride == 2) return DXGI_FORMAT_R10G10B10A2_UNORM;
+    if (envOverride == -1) return DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (allowFp16) {
+        return _bitDepth > 8 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+    // VSR-only 10bit:R10G10B10A2(2026-10-02 定案)。TrueHDR 不在链上,FP16
+    // 否决不适用;VSR 官方输入/输出格式面含 R10G10B10A2(rtx_video_context.h),
+    // 10bit 源免 BGRA8 的 2bit 量化,经 vsrColor 同格式直达 C2。**真机实证
+    // (2026-10-02,RTX 3080,1920x800d10 vsr+nr+fg×4 官方 DLSSG 路由)**:
+    // NR snippet 输入/输出、DLSSG backbuffer、VSR 出入三腿全通过,零 eval
+    // 失败,perf 与 BGRA8 基线逐项持平。回退:VSDLSSNR_NR_FORMAT=bgra8。
+    if (vsrOnly && _bitDepth > 8) return DXGI_FORMAT_R10G10B10A2_UNORM;
+    return DXGI_FORMAT_B8G8R8A8_UNORM;
 }
 
 bool D3D12Context::CreateColorTexture(
@@ -624,9 +636,12 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     _outPlaneBytes = (_hdrPipe || _bitDepth > 8) ? 2u : 1u;
     _outFmt = _outPlaneBytes > 1 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
     // 管线色格式(NR input/output 缓冲):>8bit 且无 RTX = RGBA16F(NR 全程
-    // 10bit,消 P10→BGRA8 的 2bit 量化);RTX 会话回落 BGRA8(TrueHDR 拒
-    // FP16,否决制实证 2026-09-24)。CreateSlotResources 按此建缓冲。
-    _inColorFmt = NrColorFormat(!hdr && !vsr);
+    // 10bit,消 P10→BGRA8 的 2bit 量化);VSR-only 10bit = R10G10B10A2(见
+    // NrColorFormat 注释);其余 RTX 会话回落 BGRA8(TrueHDR 拒 FP16,否决制
+    // 实证 2026-09-24)。CreateSlotResources 按此建缓冲(vsrColor 同格式)。
+    _inColorFmt = NrColorFormat(!hdr && !vsr, vsr && !hdr);
+    // 新组合的留痕由 dlssnr_context 的 "color buffer" 观察行承担(格式名
+    // 三态 + 回退提示),此处不再重复发行。
 
     // 零 guidance 纹理:R16G16_FLOAT motion + R32_FLOAT depth,内容清 0。
     // RTV clear 要求 ALLOW_RENDER_TARGET 标志。clear 后常驻
@@ -928,14 +943,16 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         return false;
     }
     // RTX Video 管线纹理(PIPE 尺寸;请求了才建,描述符侧占位视图)。
-    // vsrColor: VSR 输出(BGRA8 —— 官方 VSR 支持的输入/输出格式族
-    // R8G8B8A8/B8G8R8A8/R10G10B10A2,输出需 UAV 标志,SDK D3D12 样例同款)。
+    // vsrColor: VSR 输出,跟随管线色(_inColorFmt;官方 VSR 输入/输出格式族
+    // R8G8B8A8/B8G8R8A8/R10G10B10A2 全覆盖 BGRA8/R10G10B10A2 两档 —— 落
+    // BGRA8 会让 R10G10B10A2 管线的量化在 VSR 输出侧卷土重来。HDR 会话管线
+    // 色恒 BGRA8 = TrueHDR 输入契约。输出需 UAV 标志,SDK D3D12 样例同款)。
     // hdrColor: TrueHDR 输出 FP16 scRGB(FG backbuffer / PQ 转换源)。
     // motionDense: FG MVecs 的 PIPE 尺寸版本(PIPE==src 时无纹理,eval
     // 直用 motion)。创建顺序在描述符块之前 —— NULL 描述符 TDR 铁律。
     if (_vsrSlots &&
         !CreateColorTexture(slot.vsrColor.GetAddressOf(), _pipeW, _pipeH,
-                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            _inColorFmt, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }

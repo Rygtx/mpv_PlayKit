@@ -548,9 +548,10 @@ public:
     // YUV 原生化 dump/调试:输出/输入平面([0]=Y [1]=U [2]=V)。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
-    // 管线色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit);RTX 会话
-    // BGRA8(TrueHDR 拒 FP16,否决制);VSDLSSNR_NR_FORMAT=fp16/bgra8 强制
-    // 覆盖。dump 侧必须与资源一致(CopyTextureRegion 跨格式 E_INVALIDARG)。
+    // 管线色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit);VSR-only
+    // 10bit = R10G10B10A2(消 2bit 量化);其余 RTX 会话 BGRA8(TrueHDR 拒
+    // FP16,否决制);VSDLSSNR_NR_FORMAT=fp16/bgra8/rgb10a2 强制覆盖。
+    // dump 侧必须与资源一致(CopyTextureRegion 跨格式 E_INVALIDARG)。
     DXGI_FORMAT ColorFormat() const noexcept { return _inColorFmt; }
     ID3D12Resource *ReducedColor(FrameSlot &s) const noexcept { return s.reducedColor.Get(); }
     ID3D12Resource *ReducedDenoised(FrameSlot &s) const noexcept { return s.reducedDenoised.Get(); }
@@ -614,8 +615,9 @@ private:
                             DXGI_FORMAT format, D3D12_RESOURCE_STATES initialState,
                             D3D12_RESOURCE_FLAGS flags,
                             char *err, size_t errLen) noexcept;
-    // 管线色格式策略(实例:依赖 _bitDepth;allowFp16 = !hdr && !vsr)。
-    DXGI_FORMAT NrColorFormat(bool allowFp16) const noexcept;
+    // 管线色格式策略(实例:依赖 _bitDepth;allowFp16 = !hdr && !vsr,
+    // vsrOnly = vsr && !hdr)。
+    DXGI_FORMAT NrColorFormat(bool allowFp16, bool vsrOnly) const noexcept;
     bool CreateComputeObjects(char *err, size_t errLen) noexcept;
     void SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept;
 

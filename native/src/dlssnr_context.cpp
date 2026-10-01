@@ -830,14 +830,21 @@ bool DlssnrContext::Initialize(
                                       _vsrRequested, _hdrActive, _fgHdrInterp,
                                       _subW, _subH, _isRgb,
                                       err, errLen)) return failWithExistingErr();
-    // 显形记账:管线色格式(">8bit 无 RTX = FP16")及其回落原因,防
-    // "10bit 源怎么不是 FP16"无头案(排查成本一次一行)。
+    // 显形记账:管线色格式(">8bit 无 RTX = FP16;VSR-only 10bit =
+    // R10G10B10A2")及其回落原因,防"10bit 源怎么不是 FP16"无头案
+    // (排查成本一次一行)。R10G10B10A2 附回退开关提示(NR snippet 侧
+    // 探针未过前的可观察锚点)。
     {
-        const bool fp16 = _d3d12->ColorFormat() == DXGI_FORMAT_R16G16B16A16_FLOAT;
-        char msg[160];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: color buffer %s (depth=%d rtx=%d)",
-                      fp16 ? "RGBA16F" : "BGRA8", _depth,
-                      (_vsrRequested || _hdrActive) ? 1 : 0);
+        const DXGI_FORMAT fmt = _d3d12->ColorFormat();
+        const char *name = fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? "RGBA16F"
+                         : fmt == DXGI_FORMAT_R10G10B10A2_UNORM ? "R10G10B10A2"
+                                                                : "BGRA8";
+        char msg[200];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: color buffer %s (depth=%d rtx=%d)%s",
+                      name, _depth,
+                      (_vsrRequested || _hdrActive) ? 1 : 0,
+                      fmt == DXGI_FORMAT_R10G10B10A2_UNORM
+                          ? " [revert: VSDLSSNR_NR_FORMAT=bgra8]" : "");
         TimingStatusLine(msg);
     }
     if (_shared->Snapshot().scalingEnabled) {
