@@ -4,7 +4,7 @@
 验证点:
   - 滤镜加载后面板经 LaunchPanelSilently 自动启动(仅托盘)
   - stats 通道(插件 -> 面板)出现合法 JSON
-  - 参数通道(面板 -> 插件)magic=0x364C5344、seq>=1、generation!=0
+  - 参数通道(面板 -> 插件)magic=PAYLOAD_MAGIC、seq>=1、generation!=0
 
 运行: <部署根>\\python.exe testkit\\test_e2e_panel.py
 """

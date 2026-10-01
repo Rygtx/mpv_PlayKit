@@ -6,7 +6,6 @@
 #include "bridge.h"
 #include "d3d12_context.h"
 #include "dlssnr_context.h"
-#include "dlssnr_ini.h" // LoadRtxVideoIni([rtxvideo] 节)
 #include "dlssnr_params.h"
 #include "panel_ipc.h"
 #include "shared_params.h"
@@ -19,10 +18,8 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <string>
 #include <windows.h>
 
@@ -130,7 +127,6 @@ struct FilterData {
     bool fgActive = false;
     std::wstring fgDllPath;
     int fgCreateMult = 2;                     // 创建时倍数(vi.fps/帧数元数据 + 组槽位结构)
-    bool fgHdrInterp = false;                 // 创建时实验开关(HDR 域插帧,hotMatch 键)
     int srcFrames = 0;                        // 源帧数(vi.numFrames;0 = 未知,尾部钳制禁用)
     int fgCacheK = -1;                        // 缓存命中 = 同源帧的后继槽位请求
     int fgCacheM = 0;                         // 有效缓存条目上界(1 + 插值槽数;空位判 null)
@@ -219,6 +215,15 @@ static void ScaleOutputDuration(VSFrame *frame, const VSAPI *vsapi, int m) noexc
     if (!err) {
         vsapi->mapSetFloat(props, "_Duration", dur / m, maReplace);
     }
+}
+
+// 面板参数桥启动失败提示(三条初始化路径共用;失败 = 播放照常,仅面板
+// 改动不生效)。
+static void WarnBridgeFailed(VSCore *core, const VSAPI *vsapi) noexcept {
+    vsapi->logMessage(mtWarning,
+                      "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
+                      core);
+    vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
 }
 
 // 从源帧复制三平面(YUV420)到 dst —— 帧失败的降级路径。
@@ -1194,12 +1199,7 @@ static void VS_CC DlssnrCreate(
         if (d->ngx->Rebind(d->params.get(), d->width, d->height, d->depth, rtx, err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
-            if (!vsdlssnr::BridgeStart(d->params)) {
-                vsapi->logMessage(mtWarning,
-                                  "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
-                                  core);
-                vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
-            }
+            if (!vsdlssnr::BridgeStart(d->params)) WarnBridgeFailed(core, vsapi);
             char msg[128];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr ready from hot context (%dx%d)", d->width, d->height);
             vsapi->logMessage(mtInformation, msg, core);
@@ -1238,12 +1238,7 @@ static void VS_CC DlssnrCreate(
                                err, sizeof(err))) {
             d->initOk = true;
             // Filter is live: start the mpv-side parameter bridge
-            if (!vsdlssnr::BridgeStart(d->params)) {
-                vsapi->logMessage(mtWarning,
-                                  "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
-                                  core);
-                vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
-            }
+            if (!vsdlssnr::BridgeStart(d->params)) WarnBridgeFailed(core, vsapi);
             char msg[128];
             std::snprintf(msg, sizeof(msg), "vs_dlssnr ready (%dx%d)", d->width, d->height);
             vsapi->logMessage(mtInformation, msg, core);
@@ -1253,9 +1248,6 @@ static void VS_CC DlssnrCreate(
                           "vs_dlssnr init failed, falling back to passthrough: %s", err);
             vsapi->logMessage(mtWarning, msg, core);
             vsdlssnr::TimingStatusLine(msg); // GUI mpv 不透传 logMessage,失败必须进 timing log
-            OutputDebugStringA("vs_dlssnr: init failed: ");
-            OutputDebugStringA(err);
-            OutputDebugStringA("\n");
             // 面板可见状态:D3D12/NGX 初始化失败 = 本实例整体直通。原因串
             // 可能含 D3D12 debug-layer 文本(引号),消毒后再进 stats。
             char safe[288];
@@ -1277,12 +1269,7 @@ static void VS_CC DlssnrCreate(
         std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR+FG+RTX disabled (panel/vpy)\"}",
                       vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
         vsdlssnr::PublishStatsJson(body);
-        if (!vsdlssnr::BridgeStart(d->params)) {
-            vsapi->logMessage(mtWarning,
-                              "vs_dlssnr: parameter bridge failed to start; panel edits will not apply",
-                              core);
-            vsdlssnr::TimingStatusLine("DLSSNR STATUS: bridge start FAILED; panel edits will not apply");
-        }
+        if (!vsdlssnr::BridgeStart(d->params)) WarnBridgeFailed(core, vsapi);
         vsdlssnr::TimingStatusLine("DLSSNR STATUS: NR+FG+RTX disabled; passthrough (zero GPU)");
     }
 
@@ -1291,7 +1278,6 @@ static void VS_CC DlssnrCreate(
     // 否则 1:1(FG 失败的降级语义)。vi 副本按创建值倍增 fps —— 纯元数据
     // (mpv 不据此节拍,但下游工具/时长估算消费它)。
     d->fgActive = d->initOk && d->ngx && d->ngx->FgActive();
-    d->fgHdrInterp = initial.fgHdrInterp != 0;
     // RTX 输出几何(init 后从 context 读回 —— pipe/out 的最终裁决在
     // Initialize 内含 capability/倍率旁路)。未初始化实例 = 源几何直通。
     d->outW = d->width;

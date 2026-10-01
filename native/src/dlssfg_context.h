@@ -92,7 +92,6 @@ public:
 private:
     bool CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbufferFormat,
                             char *err, size_t errLen) noexcept;
-    void Disable(const char *why) noexcept;
 
     // FG 本地 SEH:__try/__except 捕获后只置 _faulted(本类闩锁),
     // 不进全局 NgxRuntimeGuard。实现见 .cpp(与 NgxRuntimeGuard 同构)。

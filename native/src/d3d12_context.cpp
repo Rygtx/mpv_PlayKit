@@ -1,5 +1,5 @@
 #include "d3d12_context.h"
-#include "dlssnr_context.h" // TimingStatusLine(临时探针)
+#include "dlssnr_context.h" // TimingStatusLine
 #include "panel_ipc.h"
 
 #include <cstdio>
@@ -154,7 +154,6 @@ bool D3D12Context::Initialize(char *err, size_t errLen) noexcept {
             debugController->EnableDebugLayer();
             OutputDebugStringA("vs_dlssnr: D3D12 debug layer enabled\n");
         }
-        _device = nullptr; // mark pre-device stage
     }
 
     // Prefer the NVIDIA adapter; fall back to the default one so error reporting
@@ -1083,17 +1082,12 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
             _device->CreateUnorderedAccessView(slot.yuvOut[i].Get(), nullptr, nullptr, slotHandle(28 + i));
         }
         _device->CreateUnorderedAccessView(slot.inputColor.Get(), nullptr, nullptr, slotHandle(31));
-        // 32/33:fgInterp[0] 的 SRV/UAV 占位(历史槽位;逐 gen 转换视图在
-        // 39-43。fgInterp 已在上面创建 —— 顺序是硬约束,见描述符块前的
-        // NULL 描述符 TDR 注释)。非 FG 槽 = outputColor 占位视图(占位永
-        // 不被有效读取:FG 第二遍转换仅在 _fg && realMotion 帧被记录)。
-        if (_fgSlots) {
-            _device->CreateShaderResourceView(slot.fgInterp[0].Get(), nullptr, slotHandle(32));
-            _device->CreateUnorderedAccessView(slot.fgInterp[0].Get(), nullptr, nullptr, slotHandle(33));
-        } else {
-            _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(32));
-            _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(33));
-        }
+        // 32/33:占位视图(shader 已改用逐 gen 转换视图 39-43,本座不再被
+        // 任何 pass 绑定)—— 但堆里绝不留 NULL 描述符(见描述符块前的 TDR
+        // 注释),恒绑 outputColor 占位。fgInterp 已在上面创建 —— 顺序是
+        // 硬约束。
+        _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(32));
+        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(33));
         // 34:共享差异调试纹理的 UAV(资源 = context 级 _debugDiff,已在
         // CreateFrameResources 槽池循环前创建;每槽堆各持一份指向同一
         // 资源的视图,dispatch 只被本槽 CL 引用)。

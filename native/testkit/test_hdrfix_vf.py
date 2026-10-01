@@ -36,7 +36,7 @@ testenv.require(MEDIA and os.path.isfile(MEDIA),
 shot = os.path.join(testenv.ROOT, "hdrfix_panel.png")
 if os.path.exists(shot):
     os.remove(shot)
-errf = open(os.path.join(testenv.ROOT, "mpv_stderr.txt"), "w", encoding="utf-8")
+errf = open(testenv.MPV_STDERR, "w", encoding="utf-8")
 
 mpv = subprocess.Popen([
     testenv.MPV_EXE,

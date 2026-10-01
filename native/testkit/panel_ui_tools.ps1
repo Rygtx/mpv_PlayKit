@@ -105,16 +105,6 @@ switch ($Action) {
     $dpi = [PanelUI]::GetDpiForWindow($script:hwnd)
     "window: $($r.R - $r.L) x $($r.B - $r.T), GetDpiForWindow: $dpi (per-monitor-v2 set in code)"
   }
-  "hittest" {
-    # WM_NCHITTEST 探针:区分客户区(1=CLIENT)与标题栏(2=CAPTION)
-    $r = New-Object PanelUI+RECT
-    [PanelUI]::GetWindowRect($script:hwnd, [ref]$r) | Out-Null
-    foreach ($pt in @(@(50, 20), @(230, 20), @(415, 19), @(370, 19), @(230, 200), @(230, 330))) {
-      $lp = [IntPtr]((($pt[1]) -shl 16) -bor (($pt[0]) -band 0xFFFF))
-      $ht = [PanelUI]::SendMessageW($script:hwnd, 0x0084, [IntPtr]::Zero, $lp)
-      "client($($pt[0]),$($pt[1])) -> HT=$ht (1=CLIENT 2=CAPTION)"
-    }
-  }
   "capture" {
     # PrintWindow + PW_RENDERFULLCONTENT:ImGui D3D11 自绘内容必须用此标志
     [PanelUI]::ShowWindow($script:hwnd, 5) | Out-Null

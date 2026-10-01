@@ -110,7 +110,7 @@ def main():
 
     ok = True
     mpv = None
-    errf = open(os.path.join(testenv.ROOT, "mpv_stderr.txt"), "a", encoding="utf-8")
+    errf = open(testenv.MPV_STDERR, "a", encoding="utf-8")
     try:
         env = dict(os.environ, VSDLSSNR_NO_PANEL="1")
         vf = '--vf=vapoursynth="~~/vs/DLSSNR_NV.vpy"'

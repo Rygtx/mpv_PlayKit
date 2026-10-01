@@ -485,12 +485,4 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
     return ok;
 }
 
-void DlssfgContext::Disable(const char *why) noexcept {
-    std::lock_guard<std::mutex> lock(_mutex);
-    _ready.store(false, std::memory_order_release);
-    char msg[160];
-    std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dlssfg disabled (%s)", why ? why : "?");
-    TimingStatusLine(msg);
-}
-
 } // namespace vsdlssnr

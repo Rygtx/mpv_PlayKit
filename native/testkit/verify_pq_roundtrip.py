@@ -42,7 +42,7 @@ clip = core.std.StackHorizontal([dark, bright])
 # 就是刚写好的文件,锁存已置位永不重写 → 轮询必空(上一版把 os.remove 放
 # 在 get_frame 后,dump_hdrcolor"永远缺失"的真凶)。此前用 >= 尺寸门槛,
 # 上一会话更大尺寸的残留 dump 直接通过 → reshape 崩溃,同根同源。
-dump = os.path.join(testenv.ROOT, "dump_hdrcolor.bin")
+dump = os.path.join(testenv.HOST_DIR, "dump_hdrcolor.bin")
 if os.path.exists(dump):
     os.remove(dump)
 
@@ -50,8 +50,6 @@ ret = core.dlssnr.Enhance(clip, vsr_mode=2, vsr_scale=2.0, hdr_enabled=1)
 print("out:", ret.format.name, ret.width, ret.height)
 f = ret.get_frame(0)
 yuv = [np.asarray(f[p]).copy() for p in range(3)]
-np.save(os.path.join(testenv.ROOT, "verify_y.npy"), yuv[0])
-np.save(os.path.join(testenv.ROOT, "verify_u.npy"), yuv[1])
 
 # dump 在首帧 Finish 内同步落盘;轮询仅兜异步边界,正常首轮即命中。
 import time  # noqa: E402

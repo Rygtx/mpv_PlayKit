@@ -48,7 +48,7 @@ else:
 def launch(hdr):
     set_ini(vsr_mode="2", vsr_scale_x100="200", vsr_strength="2",
             hdr_enabled="1" if hdr else "0")
-    errf = open(os.path.join(testenv.ROOT, "mpv_stderr.txt"), "a", encoding="utf-8")
+    errf = open(testenv.MPV_STDERR, "a", encoding="utf-8")
     mpv = subprocess.Popen([
         testenv.MPV_EXE,
         "--input-ipc-server=mpvpipe",

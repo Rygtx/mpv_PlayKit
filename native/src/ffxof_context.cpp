@@ -296,7 +296,6 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
     (void)srcTex; // 输入取材经 postCopy(RecordConvertInput → inputColor)
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue() ||
         !postExecute || !postCopy) {
-        result.publishZero = true;
         result.historyReset = true;
         return result;
     }
@@ -308,13 +307,11 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         std::unique_lock<std::mutex> lock(_gate.Mutex);
         const OfGateDecision decision = _gate.Arrive(frameIndex, lock);
         if (decision == OfGateDecision::Expired) {
-            result.publishZero = true;
             _lastStageMs = 0.0;
             _lastGpuSpanMs = 0.0; // 过期帧无光流计算,nvof 段读 0
             return result;
         }
         if (_d3d12->IsDeviceLost()) {
-            result.publishZero = true;
             result.historyReset = true;
             _gate.InvalidateHistory();
             _lastStageMs = 0.0;
@@ -391,7 +388,6 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             result.inputIndex = 0;
         } else {
             TimingStatusLine("DLSSNR STATUS: fxof copy submit failed");
-            result.publishZero = true;
             result.historyReset = true;
             _gate.InvalidateHistory();
             if (++_consecutiveFailures >= 3) {
@@ -417,7 +413,6 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             std::snprintf(msg, sizeof(msg),
                           "DLSSNR STATUS: fxof main cl acquire failed (rotator)");
             TimingStatusLine(msg);
-            result.publishZero = true;
             result.historyReset = true;
             _gate.InvalidateHistory();
             if (++_consecutiveFailures >= 3) {
@@ -468,7 +463,6 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             OutputDebugStringA(msg);
             OutputDebugStringA("\n");
             TimingStatusLine(msg);
-            result.publishZero = true;
             result.historyReset = true;
             _gate.InvalidateHistory();
             if (++_consecutiveFailures >= 3) {
@@ -526,7 +520,6 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             result.waitFenceValue = _lastDone; // 非 0 = realMotion
         } else {
             TimingStatusLine("DLSSNR STATUS: fxof densify submit failed");
-            result.publishZero = true;
             result.historyReset = true;
             result.waitFenceValue = 0;
             _gate.InvalidateHistory();
@@ -538,7 +531,6 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         // 跨时间线泄漏(2026-09-25 修复)。本帧 densify 已照录,输出仅下帧
         // 起被消费,不影响。
         if (seed) {
-            result.publishZero = true;
             result.historyReset = true;
             result.waitFenceValue = 0;
         }

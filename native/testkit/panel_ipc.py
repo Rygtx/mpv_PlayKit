@@ -63,7 +63,6 @@ SK = {
     "gate_resets": "gate_resets",
 }
 assert len(set(SK.values())) == len(SK), "SK 键名表内有重复值"
-kStateNrSeekInit = "NR on; seek to initialize"
 
 # mirror of PanelPayload (#pragma pack push, 全 4 字节字段无对齐缝隙):
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
@@ -145,14 +144,6 @@ class ParamsChannel:
             vals["hdrMiddleGray"], vals["hdrMaxLuminance"], vals["fgHdrInterp"])
         assert len(data) == _STRUCT.size, "PanelPayload pack 布局与 panel_ipc.h 不一致"
         ctypes.memmove(ctypes.c_void_p(self._view), data, len(data))
-
-    def read(self):
-        buf = ctypes.string_at(ctypes.c_void_p(self._view), PAYLOAD_SIZE)
-        magic, seq = struct.unpack_from("<II", buf, 0)
-        if magic != PAYLOAD_MAGIC:
-            return None
-        vals = dict(zip(_FIELDS, _STRUCT.unpack(buf[:_STRUCT.size])))
-        return vals
 
 
 def open_params_mapping_readonly():

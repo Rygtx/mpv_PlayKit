@@ -3,9 +3,9 @@
 // 两实现:NvofContext(NVIDIA NVOF 引擎,在役链路,时序模型见其头注释)与
 // FxofContext(AMD FidelityFX OF,跨厂商)。接口面 = NvofContext 原公开面;
 // 语义契约一致:
-//   - StageFrame 帧序门:迟到/缺口帧一律播种(publishZero),会话内部
+//   - StageFrame 帧序门:迟到/缺口帧一律播种(清零发布),会话内部
 //     历史只接受按帧序的连续输入;
-//   - 播种帧(Seed/历史无效)必须 publishZero = historyReset = true 且
+//   - 播种帧(Seed/历史无效)必须 historyReset = true 且
 //     waitFenceValue = 0(2026-09-25 钉死契约;NGX PARAM_RESET 只由播种帧
 //     携带,后端漏带 = seek 后 NR 时域历史跨时间线泄漏);
 //   - waitFenceValue != 0 = 本帧真运动已产出(realMotion 判据);
@@ -40,8 +40,7 @@ using OfPostCopyFn = std::function<void(ID3D12GraphicsCommandList *, int inputIn
 
 struct OfStageResult {
     uint64_t waitFenceValue = 0; // 非 0 = 本帧真运动已产出(densify 待录/已录)
-    bool publishZero = false;    // 本帧清零发布 per-slot motion/confidence
-    bool historyReset = false;   // 本帧对 NGX 置 PARAM_RESET
+    bool historyReset = false;   // 本帧播种:对 NGX 置 PARAM_RESET + 清零发布
     int inputIndex = -1;         // 本帧写入的输入槽位(dump 用)
     // NVOF 专属:execute 已提交、densify 录制延迟到 FlushPendingDensify。
     // 调用方在首个 motion 消费者 CL 提交前(或帧失败路径的守卫析构里)必须

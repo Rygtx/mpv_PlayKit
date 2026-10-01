@@ -30,7 +30,7 @@ namespace vsdlssnr {
 
 using Microsoft::WRL::ComPtr;
 
-// 每源帧的最大插值帧数(倍数 M-1,M 封顶 4)—— FG 回读缓冲按此建组。
+// 每源帧的最大插值帧数(倍数 M-1,M 封顶 6)—— FG 回读缓冲按此建组。
 inline constexpr int kFgGenSlots = kFgMultMax - 1;
 
 // Full-subresource transition barrier — the one barrier builder for the whole
@@ -204,8 +204,8 @@ struct FrameSlot {
     // 25=srvYuvIn0 26=srvYuvIn1 27=srvYuvIn2(YUV→RGB 转换采样)
     // 28=uavYuvOut0 29=uavYuvOut1 30=uavYuvOut2(RGB→YUV 写出)
     // 31=uavInput(inputColor 的 UAV,YUV→RGB 转换直写)
-    // 32/33=fgInterp[0] 的 SRV/UAV 占位(历史槽位;逐 gen 视图在 39-43。
-    // 非 FG 槽 = outputColor 占位视图 —— 绝不写 NULL 描述符,见 14-17 注释)
+    // 32/33=占位视图(shader 改用逐 gen 视图 39-43 后不再绑定;恒绑
+    // outputColor 占位 —— 绝不写 NULL 描述符,见 14-17 注释)
     // 39-43=srvFgInterp[0..4](FG 插值输出逐 gen SRV,转换读/HDR 输入读)
     // 34=uavDebugDiff(共享差异调试纹理的 UAV,"差异调试 ×20" 视图写入目标;
     // 资源为 context 级单例,每槽堆各持一份视图)
@@ -292,7 +292,6 @@ public:
         return _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
                             : DXGI_FORMAT_B8G8R8A8_UNORM;
     }
-    bool VsrPipe() const noexcept { return _vsrSlots; }
 
     // 诊断探针:把 InfoQueue 已存消息格式化进 buf(debug layer 开启时)。
     // 非 SetErr 失败点(如命令列表 Close 失败)定位用。
@@ -545,8 +544,6 @@ public:
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
     ID3D12Resource *FgInterp(FrameSlot &s, int gen) const noexcept { return s.fgInterp[gen].Get(); }
-    // TrueHDR 逐插值帧输出(仅 _fgSlots && _hdrPipe 有纹理)。
-    ID3D12Resource *HdrFg(FrameSlot &s, int gen) const noexcept { return s.hdrFg[gen].Get(); }
     // 描述符堆槽位(RecordYuvOutput / FG 转换共用)。
     static constexpr UINT kSrvOutputColor = 22;  // outputColor 的 SRV
     static constexpr UINT kSrvFgInterpBase = 39; // fgInterp[0..4] 的 SRV(FG 槽)
@@ -566,7 +563,6 @@ public:
     // 输出色度平面几何(OUT 尺寸;RTX VSR 会话 yuvOut 在目标尺寸,与源不同)。
     int OutChromaWidth() const noexcept { return _outChromaW; }
     int OutChromaHeight() const noexcept { return _outChromaH; }
-    bool IsRgb() const noexcept { return _isRgb; }
     // 管线色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit);RTX 会话
     // BGRA8(TrueHDR 拒 FP16,否决制);VSDLSSNR_NR_FORMAT=fp16/bgra8 强制
     // 覆盖。dump 侧必须与资源一致(CopyTextureRegion 跨格式 E_INVALIDARG)。
@@ -589,7 +585,6 @@ public:
     void NotifyFrameTick(double qpcSeconds) noexcept; // 帧入口计数打点
     // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
     // motion R16G16_FLOAT、depth R32_FLOAT,内容全 0,常驻 NSR 只读
-    ID3D12Resource *Motion() const noexcept { return _motion.Get(); }
     ID3D12Resource *Depth() const noexcept { return _depth.Get(); }
     // PIPE 尺寸零深度(FG + VSR 放大;仅在需要时创建,否则空 —— 调用方
     // 以 motionDense 的有无判别同一条件,勿单独判空)。

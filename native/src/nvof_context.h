@@ -91,7 +91,6 @@ public:
     uint32_t GridSize() const noexcept { return _gridSize; }
     bool Bidirectional() const noexcept { return _bidirectional; }
     bool CostEnabled() const noexcept { return _costEnabled; }
-    ID3D12Fence *DoneFence() const noexcept { return _doneFence.Get(); }
     // SK_OF_MODE 能力段(实际模式,逐级回退的可见反馈)。
     const char *ModeString(char *buf, size_t len) noexcept override {
         std::snprintf(buf, len, "%s q%d grid%u",
@@ -110,7 +109,7 @@ public:
         std::lock_guard<std::mutex> lock(_gateMutex);
         _historyValid = false;
         _nextSeq = -1;
-        ++_resetCount; // 临时探针
+        ++_resetCount;
         _gateCv.notify_all();
     }
 
@@ -168,7 +167,7 @@ public:
     // 帧在 FlushPendingDensify 落位;种子/迟到帧 = StageFrame 跨度。
     double LastStageTotalMs() const noexcept override { return _lastOfWallMs; }
 
-    // ---- 临时探针(定位 seek 后持续掉帧,验证后删除)----
+    // ---- 门/等待诊断(常驻:面板诊断页与 testkit 断言消费)----
     // StageFrame 内三段 CPU 等待细分 + 门异常事件累计。
     double LastGateWaitMs() const noexcept { return _lastGateWaitMs; } // 门互斥+cv 等待
     double LastCpyWaitMs() const noexcept { return _lastCpyWaitMs; }   // 前帧拷贝完成 CPU 等待
@@ -250,12 +249,12 @@ private:
     double _lastStageMs = 0.0;
     double _lastOfWallMs = 0.0;   // 光流阶段全跨度(门入口 → 冲刷完成,2026-09-25)
     UINT64 _stageStartQpc = 0;    // 本帧门入口 QPC(冲刷完成时算全跨度)
-    double _lastGateWaitMs = 0.0; // 临时探针(验证后删除)
-    double _lastCpyWaitMs = 0.0;  // 临时探针(验证后删除)
-    double _lastExeWaitMs = 0.0;  // 临时探针(验证后删除)
-    uint32_t _gateSkips = 0;      // 临时探针(验证后删除)
-    uint32_t _gateExpired = 0;    // 临时探针(验证后删除)
-    uint32_t _resetCount = 0;     // 临时探针(验证后删除)
+    double _lastGateWaitMs = 0.0; // 常驻诊断(面板/testkit 消费)
+    double _lastCpyWaitMs = 0.0;  // 常驻诊断(面板/testkit 消费)
+    double _lastExeWaitMs = 0.0;  // 常驻诊断(面板/testkit 消费)
+    uint32_t _gateSkips = 0;      // 常驻诊断(面板/testkit 消费)
+    uint32_t _gateExpired = 0;    // 常驻诊断(面板/testkit 消费)
+    uint32_t _resetCount = 0;     // 常驻诊断(面板/testkit 消费)
 };
 
 } // namespace vsdlssnr

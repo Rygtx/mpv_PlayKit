@@ -65,10 +65,10 @@ public:
                  uint64_t *signalValueOut) noexcept;
     // CPU 等待某次 Execute 的完成点(节点依赖链的 CPU 侧锚;GPU 侧顺序由
     // 消费者队列 Wait 保证,CPU 等待只为统一 Unpack 的完成时序)。
-    // timeoutMs:分段计时用有界等待(超时 = 队列 wedge/设备丢失,交由
-    // WaitFrame 的既有失败路径收尾);同 allocator 复用的背压等待保持
-    // INFINITE。
-    bool Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs = INFINITE) noexcept;
+    // timeoutMs:有界等待(调用点恒 10000;超时 = 专用队列 wedge/设备丢失,
+    // 交由 WaitFrame 的既有失败路径收尾 —— 含 allocator 复用的背压等待,
+    // 此前"背压保持 INFINITE"的语义已随 5e239eb 修复废弃)。
+    bool Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs) noexcept;
     ID3D12Fence *Fence() const noexcept { return _fence.Get(); }
 
 private:

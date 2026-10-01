@@ -41,7 +41,7 @@ y_meas = np.asarray(f[0]).astype(np.float64) / 1023.0
 u_meas = np.asarray(f[1]).astype(np.float64) / 1023.0
 v_meas = np.asarray(f[2]).astype(np.float64) / 1023.0
 
-dump = os.path.join(testenv.ROOT, "dump_hdrcolor.bin")
+dump = os.path.join(testenv.HOST_DIR, "dump_hdrcolor.bin")
 for _ in range(80):
     if os.path.exists(dump) and os.path.getsize(dump) > 1000000:
         break

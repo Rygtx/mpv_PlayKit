@@ -32,6 +32,8 @@ PANEL_EXE = os.path.join(PLUGIN_DIR, "dlssnr_panel.exe")
 NGX_DLL = os.path.join(PLUGIN_DIR, "ngx", "nvngx_dlssnr.dll")
 MPV_EXE = os.path.join(ROOT, "mpv.exe")
 MPV_COM = os.path.join(ROOT, "mpv.com")
+# mpv 拉起脚本的 stderr 汇总(测试产物,落 testkit 目录,不脏部署根)。
+MPV_STDERR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv_stderr.txt")
 
 PANEL_PROCESS = "dlssnr_panel.exe"
 MPV_PROCESS = "mpv.exe"

@@ -24,17 +24,16 @@ namespace {
 struct NvofProfile {
     uint32_t gridSize;
     NV_OF_PERF_LEVEL perfLevel;
-    const char *label;
 };
 
 constexpr NvofProfile ResolveProfile(int quality) noexcept {
     switch (quality) {
-    case 1: return { 4, NV_OF_PERF_LEVEL_FAST, "4F" };
-    case 3: return { 4, NV_OF_PERF_LEVEL_SLOW, "4S" };
-    case 4: return { 2, NV_OF_PERF_LEVEL_MEDIUM, "2M" };
-    case 5: return { 2, NV_OF_PERF_LEVEL_SLOW, "2S" };
+    case 1: return { 4, NV_OF_PERF_LEVEL_FAST };
+    case 3: return { 4, NV_OF_PERF_LEVEL_SLOW };
+    case 4: return { 2, NV_OF_PERF_LEVEL_MEDIUM };
+    case 5: return { 2, NV_OF_PERF_LEVEL_SLOW };
     case 2:
-    default: return { 4, NV_OF_PERF_LEVEL_MEDIUM, "4M" };
+    default: return { 4, NV_OF_PERF_LEVEL_MEDIUM };
     }
 }
 
@@ -135,7 +134,7 @@ bool NvofContext::AcquireCl(ID3D12CommandAllocator **allocator,
     const int idx = static_cast<int>(_submitSeq % kClDepth);
     if (_lastUseFence[idx] && _lastUseValue[idx] &&
         !_d3d12->IsDeviceLost()) {
-        // 临时探针:轮转位等待(>0 = GPU 落后背压)。
+        // 常驻诊断:轮转位等待(>0 = GPU 落后背压)。
         LARGE_INTEGER tc0{}, tc1{};
         QueryPerformanceCounter(&tc0);
         const bool reached = WaitFenceReached(_lastUseFence[idx], _lastUseValue[idx],
@@ -184,7 +183,6 @@ void NvofContext::DestroySession() noexcept {
             WaitFenceReached(_doneFence.Get(), _lastDone, _doneFenceEvent, 10000);
         }
     }
-    TimingStatusLine("PROBE: destroy begin"); // 临时探针
     // 注意:不调用 nvOFUnregisterResourceD3D12 / nvOFDestroy(见上)。
     _session = nullptr;
     for (NvOFGPUBufferHandle &h : _registered) h = nullptr;
@@ -509,7 +507,6 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                                                  std::unique_lock<std::mutex> &gateOut) noexcept {
     StageResult result{};
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) {
-        result.publishZero = true;
         result.historyReset = true;
         return result;
     }
@@ -530,10 +527,9 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         if (frameIndex < _nextSeq) {
             // 迟到帧(乱序/回退,其序号已被越过):清零发布,不推进门。
             // 零等待门下无需簿记,链不受影响。
-            result.publishZero = true;
             _lastStageMs = 0.0;
-            ++_gateExpired; // 临时探针
-            _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
+            ++_gateExpired;
+            _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
             return result;
         }
         bool gapSkip = false; // 缺口且未等到前驱:参考非紧邻前驱 → 播种
@@ -552,28 +548,26 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             }
             if (_nextSeq > frameIndex) {
                 // 等待期间另一帧已越过本帧:按迟到帧处理。
-                result.publishZero = true;
                 _lastStageMs = 0.0;
-                ++_gateExpired; // 临时探针
-                _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
+                ++_gateExpired;
+                _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
                 return result;
             }
             if (_nextSeq < frameIndex) {
-                ++_gateSkips; // 临时探针
+                ++_gateSkips;
                 gapSkip = true; // 参考非紧邻前驱 → 播种(不碰 _nextSeq,结尾统一推进)
             }
         }
         // 设备丢失:栅栏永不满足,直接降级(下帧 ProcessFrame 顶部会因
         // _ready 闩锁早退)。
         if (_d3d12->IsDeviceLost()) {
-            result.publishZero = true;
             result.historyReset = true;
             _historyValid = false;
             _lastStageMs = 0.0;
-            _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0; // 临时探针
+            _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
             return result;
         }
-        // 临时探针:门等待终点(互斥竞争 + cv 等待合计)。
+        // 常驻诊断:门等待终点(互斥竞争 + cv 等待合计)。
         LARGE_INTEGER tG{};
         QueryPerformanceCounter(&tG);
         _lastGateWaitMs = static_cast<double>(tG.QuadPart - t0.QuadPart) * 1000.0 /
@@ -669,13 +663,12 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                           "DLSSNR STATUS: nvof copy submit failed frame=%d", frameIndex);
             OutputDebugStringA("vs_dlssnr: nvof copy submit failed\n");
             TimingStatusLine(msg);
-            result.publishZero = true;
             result.historyReset = true;
             _historyValid = false; // 参考帧未更新,历史链断
             execute = false;
         }
 
-        _lastExeWaitMs = 0.0; // 临时探针:非 execute 帧(播种/拷贝失败)无引擎等待
+        _lastExeWaitMs = 0.0; // 常驻诊断:非 execute 帧(播种/拷贝失败)无引擎等待
         if (execute) {
             // execute(n):输入栅栏点 = {copyFence, k_n}(输入内容就绪)
             // + {doneFence, doneByParity[cur]}(纵深防御);输出栅栏点 =
@@ -733,7 +726,6 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                     result.pendingDensify = true;
                 } else {
                     result.waitFenceValue = 0;
-                    result.publishZero = true;
                 }
             } else {
                 char last[96]{};
@@ -750,7 +742,6 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 OutputDebugStringA(msg);
                 OutputDebugStringA("\n");
                 TimingStatusLine(msg);
-                result.publishZero = true;
                 result.historyReset = true;
                 _historyValid = false;
                 if (++_consecutiveFailures >= 3) {
@@ -774,7 +765,6 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         } else if (copyOk) {
             // 播种帧:发布零运动 + NGX 重置(首帧/重置后的第一帧)。
             // 清零已随拷贝合并为同一次提交(见上方 postExecute 调用)。
-            result.publishZero = true;
             result.historyReset = true;
         }
 

@@ -19,7 +19,6 @@ using namespace vsdlssnr;
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <algorithm>
-#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -31,7 +30,6 @@ using namespace vsdlssnr;
 #include <string>
 
 #pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
@@ -79,6 +77,8 @@ constexpr struct { const char *key; const char *label; const char *tip;
 constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
 // 光流后端(0=ffx 1=nvof)
 constexpr const char *kOfBackendNames[] = { "FFX (AMD 光流,默认)", "NVOF (NVIDIA 引擎)" };
+// FG 路由(0=自动 1=纯官方)
+constexpr const char *kFgRouteNames[] = { "自动 (预载 0.3.x 代理)", "纯官方 (不预载)" };
 // 光流质量(上游 motionVectorQuality 0-5,文案对齐上游 resw)
 constexpr const char *kOfQualityNames[] = {
     "无", "性能", "均衡(推荐)", "质量", "高质量(高开销)", "最高质量(极高开销)"
@@ -146,14 +146,9 @@ struct AppState {
     int gateExpired = 0;     // SK_GATE_EXPIRED: 过期帧累计(诊断页)
     int gateResets = 0;      // SK_GATE_RESETS: 历史重置累计(诊断页)
     double fps = 0.0;
-    float segPack = 0.0f, segEval = 0.0f, segGpu = 0.0f, segUnpack = 0.0f, segNvof = 0.0f;
-    float segFg = 0.0f;
-    float segRtxVsr = 0.0f, segRtxHdr = 0.0f; // SK_RTXVSR_LAST / SK_RTXHDR_LAST
-    float segConv = 0.0f;                     // SK_CONV_LAST(输出转换段,v24)
-    float segQueue = 0.0f;                    // SK_QUEUE_LAST(帧间排队,v25 账目诚实化)
-    // 分段显示值(EMA 平滑,用户裁定"显示平滑、真实数据不平滑"):上面
-    // 各段恒为插件上报的裸 last 值;时间线/列表/tooltip 用这里的平滑值,
-    // 避免 CPU 唤醒竞争造成的瞬时 0 让段忽隐忽现。
+    // 分段显示值(EMA 平滑,用户裁定"显示平滑、真实数据不平滑"):每拍从
+    // 插件上报的裸 last 值就地喂 EMA;时间线/列表/tooltip 用平滑值,避免
+    // CPU 唤醒竞争造成的瞬时 0 让段忽隐忽现。
     float segDispPack = 0.0f, segDispEval = 0.0f, segDispGpu = 0.0f, segDispUnpack = 0.0f,
           segDispNvof = 0.0f, segDispFg = 0.0f, segDispRtxVsr = 0.0f, segDispRtxHdr = 0.0f,
           segDispConv = 0.0f, segDispQueue = 0.0f;
@@ -843,6 +838,26 @@ DWORD WINAPI HdrTagProc(LPVOID) noexcept {
     return 0;
 }
 
+// 会话状态统一清零(断连 / GPU 挂起 / 死亡 body 三条路径共用):残留旧值
+// 会让状态行说谎。标题行(statsBig/statsRes)、分段显示值与帧率语义随路径
+// 不同,由各调用点自行处理。
+void ClearSessionState() noexcept {
+    g_app.filterState[0] = 0;
+    g_app.stateDetail[0] = 0;
+    g_app.ofMode[0] = 0;
+    g_app.fgState[0] = 0;
+    g_app.fgRouteEff[0] = 0;
+    g_app.fgDetail[0] = 0;
+    g_app.ofDetail[0] = 0;
+    g_app.rtxState[0] = 0;
+    g_app.rtxDetail[0] = 0;
+    g_app.fgMult = 0;
+    g_app.fgMultCreate = 0;
+    g_app.fgMultMax = 0;
+    g_app.slotWait = g_app.lockWait = 0.0f;
+    g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
+}
+
 // Read the plugin's per-frame stats from named shared memory (zero disk IO).
 // Mapping absent = no live filter: clear the stats line. The mapping object
 // dies with the plugin process, so re-open each refresh (no stale handles)
@@ -862,20 +877,7 @@ void LoadStats() noexcept {
                            g_app.rtxState[0] != 0 || g_app.rtxDetail[0] != 0;
         g_app.statsBig[0] = 0;
         g_app.statsRes[0] = 0;
-        g_app.filterState[0] = 0;
-        g_app.stateDetail[0] = 0;
-        g_app.ofMode[0] = 0;
-        g_app.fgState[0] = 0;
-        g_app.fgRouteEff[0] = 0;
-        g_app.fgDetail[0] = 0;
-        g_app.ofDetail[0] = 0;
-        g_app.rtxState[0] = 0;
-        g_app.rtxDetail[0] = 0;
-        g_app.fgMult = 0;
-        g_app.fgMultCreate = 0;
-        g_app.fgMultMax = 0;
-        g_app.slotWait = g_app.lockWait = 0.0f;
-        g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
+        ClearSessionState();
         g_app.connState = 0; // 连接指示随之变化(statsDirty 已置)
         return;
     }
@@ -936,20 +938,7 @@ void LoadStats() noexcept {
             snprintf(g_app.statsRes, sizeof(g_app.statsRes), "移除原因 %s", reason);
         }
         // hang 有自己的展示行,清掉状态字段防上一 body 的残留
-        g_app.filterState[0] = 0;
-        g_app.stateDetail[0] = 0;
-        g_app.ofMode[0] = 0;
-        g_app.fgState[0] = 0;
-        g_app.fgRouteEff[0] = 0;
-        g_app.fgDetail[0] = 0;
-        g_app.ofDetail[0] = 0;
-        g_app.rtxState[0] = 0;
-        g_app.rtxDetail[0] = 0;
-        g_app.fgMult = 0;
-        g_app.fgMultCreate = 0;
-        g_app.fgMultMax = 0;
-        g_app.slotWait = g_app.lockWait = 0.0f;
-        g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
+        ClearSessionState();
     } else {
         const double gpuLast = JsonGetFloat(body, SK_GPU_LAST, -1);
         if (gpuLast >= 0) {
@@ -978,26 +967,26 @@ void LoadStats() noexcept {
             auto segSmooth = [kSegAlpha](float prev, float v) {
                 return prev + (v - prev) * kSegAlpha;
             };
-            g_app.segPack = static_cast<float>(JsonGetFloat(body, SK_PACK_LAST, 0));
-            g_app.segEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
-            g_app.segGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_LAST, 0));
-            g_app.segUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_LAST, 0));
-            g_app.segNvof = static_cast<float>(JsonGetFloat(body, SK_OF_LAST, 0));
-            g_app.segFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
-            g_app.segRtxVsr = static_cast<float>(JsonGetFloat(body, SK_RTXVSR_LAST, 0));
-            g_app.segRtxHdr = static_cast<float>(JsonGetFloat(body, SK_RTXHDR_LAST, 0));
-            g_app.segConv = static_cast<float>(JsonGetFloat(body, SK_CONV_LAST, 0));
-            g_app.segQueue = static_cast<float>(JsonGetFloat(body, SK_QUEUE_LAST, 0));
-            g_app.segDispPack = segSmooth(g_app.segDispPack, g_app.segPack);
-            g_app.segDispEval = segSmooth(g_app.segDispEval, g_app.segEval);
-            g_app.segDispGpu = segSmooth(g_app.segDispGpu, g_app.segGpu);
-            g_app.segDispUnpack = segSmooth(g_app.segDispUnpack, g_app.segUnpack);
-            g_app.segDispNvof = segSmooth(g_app.segDispNvof, g_app.segNvof);
-            g_app.segDispFg = segSmooth(g_app.segDispFg, g_app.segFg);
-            g_app.segDispRtxVsr = segSmooth(g_app.segDispRtxVsr, g_app.segRtxVsr);
-            g_app.segDispRtxHdr = segSmooth(g_app.segDispRtxHdr, g_app.segRtxHdr);
-            g_app.segDispConv = segSmooth(g_app.segDispConv, g_app.segConv);
-            g_app.segDispQueue = segSmooth(g_app.segDispQueue, g_app.segQueue);
+            const float rawPack = static_cast<float>(JsonGetFloat(body, SK_PACK_LAST, 0));
+            const float rawEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
+            const float rawGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_LAST, 0));
+            const float rawUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_LAST, 0));
+            const float rawNvof = static_cast<float>(JsonGetFloat(body, SK_OF_LAST, 0));
+            const float rawFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
+            const float rawRtxVsr = static_cast<float>(JsonGetFloat(body, SK_RTXVSR_LAST, 0));
+            const float rawRtxHdr = static_cast<float>(JsonGetFloat(body, SK_RTXHDR_LAST, 0));
+            const float rawConv = static_cast<float>(JsonGetFloat(body, SK_CONV_LAST, 0));
+            const float rawQueue = static_cast<float>(JsonGetFloat(body, SK_QUEUE_LAST, 0));
+            g_app.segDispPack = segSmooth(g_app.segDispPack, rawPack);
+            g_app.segDispEval = segSmooth(g_app.segDispEval, rawEval);
+            g_app.segDispGpu = segSmooth(g_app.segDispGpu, rawGpu);
+            g_app.segDispUnpack = segSmooth(g_app.segDispUnpack, rawUnpack);
+            g_app.segDispNvof = segSmooth(g_app.segDispNvof, rawNvof);
+            g_app.segDispFg = segSmooth(g_app.segDispFg, rawFg);
+            g_app.segDispRtxVsr = segSmooth(g_app.segDispRtxVsr, rawRtxVsr);
+            g_app.segDispRtxHdr = segSmooth(g_app.segDispRtxHdr, rawRtxHdr);
+            g_app.segDispConv = segSmooth(g_app.segDispConv, rawConv);
+            g_app.segDispQueue = segSmooth(g_app.segDispQueue, rawQueue);
             // 时间线可见性 = 任一段有处理时间(平滑值合计 > 0):EMA 衰减
             // 期内仍算"插件在运作",过渡平滑;全关直通/死亡 body 走下方
             // 清零分支归 false。原判据 segGpu>0 与 9729c84 冲突 —— NR 关
@@ -1009,68 +998,25 @@ void LoadStats() noexcept {
                                  g_app.segDispRtxVsr + g_app.segDispRtxHdr + g_app.segDispConv +
                                  g_app.segDispQueue) > 0.0f;
             g_app.fps = JsonGetFloat(body, SK_FPS, 0);
-            char gnPat[32];
-            snprintf(gnPat, sizeof(gnPat), "\"%s\":\"", SK_GPU_NAME);
-            const char *gn = strstr(body, gnPat);
-            if (gn) {
-                gn += strlen(gnPat);
-                const char *end = strchr(gn, '"');
-                const size_t len = end ? std::min<size_t>(end - gn, 127) : 0;
-                if (len) {
-                    memcpy(g_app.gpuName, gn, len);
-                    g_app.gpuName[len] = 0;
-                }
-            }
+            // 缺键即清(与状态字段同款规则;旧手写版缺键保留旧值,换卡残留)。
+            if (!JsonGetString(body, SK_GPU_NAME, g_app.gpuName, sizeof(g_app.gpuName)))
+                g_app.gpuName[0] = 0;
         } else {
             // 死亡 body(passthrough / ngx_faulted):清掉冻结的旧统计与
             // 分段,让状态行成为唯一内容。
             g_app.statsBig[0] = 0;
             g_app.statsRes[0] = 0;
-            g_app.segPack = g_app.segEval = g_app.segGpu = g_app.segUnpack = g_app.segNvof = 0.0f;
-            g_app.segFg = g_app.segRtxVsr = g_app.segRtxHdr = g_app.segConv = 0.0f;
-            g_app.segQueue = 0.0f;
+            ClearSessionState();
             g_app.segDispPack = g_app.segDispEval = g_app.segDispGpu = g_app.segDispUnpack =
             g_app.segDispNvof = g_app.segDispFg = g_app.segDispRtxVsr = g_app.segDispRtxHdr =
             g_app.segDispConv = g_app.segDispQueue = 0.0f;
             g_app.hasSegments = false;
             g_app.fps = 0.0;
-            g_app.fgRouteEff[0] = 0;
-            g_app.fgDetail[0] = 0;
-            g_app.ofDetail[0] = 0;
-            g_app.rtxState[0] = 0;
-            g_app.rtxDetail[0] = 0;
-            g_app.fgMult = 0;
-            g_app.fgMultCreate = 0;
-            g_app.fgMultMax = 0;
-            g_app.slotWait = g_app.lockWait = 0.0f;
-            g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
         }
     }
-    g_app.statsDirty = memcmp(before.statsBig, g_app.statsBig, sizeof(g_app.statsBig)) != 0 ||
-                       memcmp(before.statsRes, g_app.statsRes, sizeof(g_app.statsRes)) != 0 ||
-                       memcmp(before.gpuName, g_app.gpuName, sizeof(g_app.gpuName)) != 0 ||
-                       memcmp(before.filterState, g_app.filterState, sizeof(g_app.filterState)) != 0 ||
-                       memcmp(before.stateDetail, g_app.stateDetail, sizeof(g_app.stateDetail)) != 0 ||
-                       memcmp(before.ofMode, g_app.ofMode, sizeof(g_app.ofMode)) != 0 ||
-                       memcmp(before.fgState, g_app.fgState, sizeof(g_app.fgState)) != 0 ||
-                       memcmp(before.fgRouteEff, g_app.fgRouteEff, sizeof(g_app.fgRouteEff)) != 0 ||
-                       memcmp(before.fgDetail, g_app.fgDetail, sizeof(g_app.fgDetail)) != 0 ||
-                       memcmp(before.ofDetail, g_app.ofDetail, sizeof(g_app.ofDetail)) != 0 ||
-                       memcmp(before.rtxState, g_app.rtxState, sizeof(g_app.rtxState)) != 0 ||
-                       memcmp(before.rtxDetail, g_app.rtxDetail, sizeof(g_app.rtxDetail)) != 0 ||
-                       before.fgMult != g_app.fgMult || before.fgMultCreate != g_app.fgMultCreate ||
-                       before.fgMultMax != g_app.fgMultMax || before.connState != g_app.connState ||
-                       before.slotWait != g_app.slotWait || before.lockWait != g_app.lockWait ||
-                       before.gateSkips != g_app.gateSkips ||
-                       before.gateExpired != g_app.gateExpired ||
-                       before.gateResets != g_app.gateResets ||
-                       before.fps != g_app.fps || before.hasSegments != g_app.hasSegments ||
-                       before.segPack != g_app.segPack || before.segEval != g_app.segEval ||
-                       before.segGpu != g_app.segGpu || before.segUnpack != g_app.segUnpack ||
-                       before.segNvof != g_app.segNvof || before.segFg != g_app.segFg ||
-                       before.segRtxVsr != g_app.segRtxVsr || before.segRtxHdr != g_app.segRtxHdr ||
-                       before.segConv != g_app.segConv ||
-                       before.segQueue != g_app.segQueue;
+    // 重画门:before 是 LoadStats 入口的全结构快照,期间只写展示字段 ——
+    // 整体比较一次即可(AppState 平凡可拷贝,快照含 padding 逐位一致)。
+    g_app.statsDirty = memcmp(&before, &g_app, sizeof(AppState)) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1546,17 +1492,7 @@ void DrawUi() noexcept {
               "仍走官方签名链;需 ngx\\version.dll)。\n"
               "纯官方 = 不预载代理,直连官方运行时(RTX 40/50)。\n"
               "进程级,重启 mpv 生效。实际生效档在\"诊断\"页显示。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
-    ImGui::SetNextItemWidth(trackW);
-    {
-        const int items = 2;
-        const char *labels[items] = { "自动 (预载 0.3.x 代理)", "纯官方 (不预载)" };
-        int sel = std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax);
-        if (ImGui::Combo("##fg_route", &sel, labels, items)) {
-            g_app.params.fgRoute = sel;
-            g_app.liveDirty = true;
-        }
-    }
+    pairCombo("fg_route", &DlssnrParams::fgRoute, 2, kFgRouteNames, 1);
     y += rowH;
 
     // Optimized 内核档(整行;dlssg_for_sm86 一致性档位。代理只在进程加载
@@ -1701,68 +1637,47 @@ void DrawUi() noexcept {
         }
         if (!manual) ImGui::EndDisabled();
     }
-    pairLabel(1, "HDR 对比度", "TrueHDR Contrast(0-200,默认 100):明暗差强度。per-eval,拖动下一帧生效。");
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
-    {
+    // HDR 四参滑杆共用体(HDR 关时置灰;per-eval)。
+    auto hdrSlider = [&](int DlssnrParams::*f, int lo, int hi,
+                         const char *id, const char *fmt, bool intMode) {
         const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
         if (!hdrOn) ImGui::BeginDisabled(true);
-        float v = static_cast<float>(std::clamp(g_app.params.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax));
         ImGui::SetNextItemWidth(trackW);
-        if (ImGui::SliderFloat("##hdr_contrast", &v,
-                               static_cast<float>(kHdrContrastMin), static_cast<float>(kHdrContrastMax), "%.0f")) {
-            g_app.params.rtxHdrContrast = static_cast<int>(v + 0.5f);
-            g_app.liveDirty = true;
+        if (intMode) {
+            int v = std::clamp(g_app.params.*f, lo, hi);
+            if (ImGui::SliderInt(id, &v, lo, hi, fmt)) {
+                g_app.params.*f = v;
+                g_app.liveDirty = true;
+            }
+        } else {
+            float v = static_cast<float>(std::clamp(g_app.params.*f, lo, hi));
+            if (ImGui::SliderFloat(id, &v, static_cast<float>(lo),
+                                   static_cast<float>(hi), fmt)) {
+                g_app.params.*f = static_cast<int>(v + 0.5f);
+                g_app.liveDirty = true;
+            }
         }
         if (!hdrOn) ImGui::EndDisabled();
-    }
+    };
+    pairLabel(1, "HDR 对比度", "TrueHDR Contrast(0-200,默认 100):明暗差强度。per-eval,拖动下一帧生效。");
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
+    hdrSlider(&DlssnrParams::rtxHdrContrast, kHdrContrastMin, kHdrContrastMax, "##hdr_contrast", "%.0f", false);
     y += rowH;
 
     // (HDR 饱和度 | HDR 中间灰)
     pairLabel(0, "HDR 饱和度", "TrueHDR Saturation(0-200,默认 100):色彩强度。per-eval。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
-    {
-        const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
-        if (!hdrOn) ImGui::BeginDisabled(true);
-        float v = static_cast<float>(std::clamp(g_app.params.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax));
-        ImGui::SetNextItemWidth(trackW);
-        if (ImGui::SliderFloat("##hdr_saturation", &v,
-                               static_cast<float>(kHdrSaturationMin), static_cast<float>(kHdrSaturationMax), "%.0f")) {
-            g_app.params.rtxHdrSaturation = static_cast<int>(v + 0.5f);
-            g_app.liveDirty = true;
-        }
-        if (!hdrOn) ImGui::EndDisabled();
-    }
+    hdrSlider(&DlssnrParams::rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax, "##hdr_saturation", "%.0f", false);
     pairLabel(1, "HDR 中间灰", "TrueHDR MiddleGray(10-100,默认 50):平均亮度。per-eval。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
-    {
-        const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
-        if (!hdrOn) ImGui::BeginDisabled(true);
-        float v = static_cast<float>(std::clamp(g_app.params.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax));
-        ImGui::SetNextItemWidth(trackW);
-        if (ImGui::SliderFloat("##hdr_middle_gray", &v,
-                               static_cast<float>(kHdrMiddleGrayMin), static_cast<float>(kHdrMiddleGrayMax), "%.0f")) {
-            g_app.params.rtxHdrMiddleGray = static_cast<int>(v + 0.5f);
-            g_app.liveDirty = true;
-        }
-        if (!hdrOn) ImGui::EndDisabled();
-    }
+    hdrSlider(&DlssnrParams::rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax, "##hdr_middle_gray", "%.0f", false);
     y += rowH;
 
     // HDR 峰值亮度(整行;HDR 关时置灰)+ 跨页提示
     pairLabel(0, "HDR 峰值亮度", "TrueHDR MaxLuminance(400-2000 nits,默认 1000):显示器峰值亮度,\n"
               "与显示器的实际峰值一致时色调映射最准。per-eval。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
-    {
-        const bool hdrOn = g_app.params.rtxHdrEnabled != 0;
-        if (!hdrOn) ImGui::BeginDisabled(true);
-        int v = std::clamp(g_app.params.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
-        ImGui::SetNextItemWidth(trackW);
-        if (ImGui::SliderInt("##hdr_peak_nits", &v, kHdrMaxLumMin, kHdrMaxLumMax, "%d nits")) {
-            g_app.params.rtxHdrMaxLuminance = v;
-            g_app.liveDirty = true;
-        }
-        if (!hdrOn) ImGui::EndDisabled();
-    }
+    hdrSlider(&DlssnrParams::rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax, "##hdr_peak_nits", "%d nits", true);
     y += rowH;
 
     // 补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 代价提示。
@@ -2091,7 +2006,7 @@ void DrawUi() noexcept {
         //         hdr(TrueHDR 链)→ conv(post:全部输出转换 + 回读)
         //   HDR 域插帧(fg_hdr_interp):gpu → vsr →
         //         hdr(TrueHDR 前置,真实帧一次)→ fg(HDR 域插帧)→ conv
-        // 显示值 = segDisp*(EMA 平滑);真实裸值在 seg*(诊断可用)。
+        // 显示值 = segDisp*(EMA 平滑)。
         // 关闭段恒 0(OF 无消费者的 nvof、NR 关的 eval_cpu、RTX 关的
         // vsr/hdr),零值段由下方 <1e-3f 跳过,时间线自动收缩。conv 恒非 0
         // (格式契约必需)。

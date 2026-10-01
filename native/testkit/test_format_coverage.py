@@ -67,12 +67,12 @@ def main():
                 continue  # hdr_hint_sync_test.y4m = 420 基线载体,归各自的测试
             use_start = not fname.endswith(".png")  # 单帧 PNG 用 --loop=inf 供帧即可
             wm = testenv.log_size(testenv.MPV_TIMING_LOG)
-            args = [testenv.MPV_EXE, "--input-ipc-server=mpvpipe", "--really-quiet",
+            args = [testenv.MPV_EXE, "--really-quiet",
                     "--volume=0", "--loop=inf", "--geometry=640x360"]
             if use_start:
                 args.append("--start=2")
             args += [VF, media[fname]]
-            errf = open(os.path.join(testenv.ROOT, "mpv_stderr.txt"), "a", encoding="utf-8")
+            errf = open(testenv.MPV_STDERR, "a", encoding="utf-8")
             mpv = subprocess.Popen(args, cwd=testenv.ROOT, stderr=errf, stdout=subprocess.DEVNULL)
             time.sleep(10)
             alive = mpv.poll() is None

@@ -42,11 +42,6 @@ constexpr char PARAM_INDICATOR_INVERT_Y[] = "DLSS.Indicator.Invert.Y.Axis";
 constexpr char PARAM_COLOR[] = "DLSSNR.Color";
 constexpr char PARAM_OUTPUT[] = "DLSSNR.Output";
 constexpr char PARAM_MVEC[] = "DLSSNR.MVec";
-constexpr char PARAM_DEPTH[] = "DLSSNR.Depth";
-constexpr char PARAM_MVEC_SCALE_X[] = "DLSSNR.MVecScaleX";
-constexpr char PARAM_MVEC_SCALE_Y[] = "DLSSNR.MVecScaleY";
-constexpr char PARAM_DEPTH_INVERTED[] = "DLSSNR.DepthInverted";
-constexpr char PARAM_ENABLED[] = "DLSSNR.Enabled";
 constexpr char PARAM_RESET[] = "DLSSNR.Reset";
 constexpr char PARAM_STYLE[] = "DLSSNR.Style";
 constexpr char PARAM_INTENSITY[] = "DLSSNR.Intensity";
@@ -56,36 +51,10 @@ constexpr char PARAM_SKIN_STRUCTURE[] = "DLSSNR.SkinStructureStrength";
 constexpr char PARAM_AUTO_MASK[] = "DLSSNR.UseAutoMask";
 constexpr char PARAM_UI_CORRECTION[] = "DLSSNR.UICorrection";
 
-struct ResourceParameters {
-    const char *baseX;
-    const char *baseY;
-    const char *width;
-    const char *height;
-};
-
-// Color / Output / MVec / Depth subrect key groups (Magpie DLSSNRFilter.cpp:76-85)
-constexpr ResourceParameters RESOURCE_PARAMETERS[]{
-    { "DLSSNR.ColorSubrectBaseX", "DLSSNR.ColorSubrectBaseY",
-        "DLSSNR.ColorSubrectWidth", "DLSSNR.ColorSubrectHeight" },
-    { "DLSSNR.OutputSubrectBaseX", "DLSSNR.OutputSubrectBaseY",
-        "DLSSNR.OutputSubrectWidth", "DLSSNR.OutputSubrectHeight" },
-    { "DLSSNR.MVecSubrectBaseX", "DLSSNR.MVecSubrectBaseY",
-        "DLSSNR.MVecSubrectWidth", "DLSSNR.MVecSubrectHeight" },
-    { "DLSSNR.DepthSubrectBaseX", "DLSSNR.DepthSubrectBaseY",
-        "DLSSNR.DepthSubrectWidth", "DLSSNR.DepthSubrectHeight" }
-};
-
 void DbgLine(const char *msg) noexcept {
     OutputDebugStringA("vs_dlssnr: ");
     OutputDebugStringA(msg);
     OutputDebugStringA("\n");
-}
-
-void SetSubrect(NVSDK_NGX_Parameter *parameters, const ResourceParameters &resource, int width, int height) noexcept {
-    parameters->Set(resource.baseX, 0);
-    parameters->Set(resource.baseY, 0);
-    parameters->Set(resource.width, width);
-    parameters->Set(resource.height, height);
 }
 
 // Magpie DLSSNRFilter.cpp:1092-1102; the snippet calls back into this during
@@ -2047,7 +2016,7 @@ bool DlssnrContext::ProcessFrame(
     // 路径排空在 Finish 尾,失败 early-return 在 SlotGuard 析构点排空。
     guard.drain = ofNeeded && deferMode;
 
-    if (ProbeEnabled()) TimingStatusLine("PROBE: post-stage"); // 临时探针(VSDLSSNR_PROBE=1)
+    if (ProbeEnabled()) TimingStatusLine("PROBE: post-stage"); // 探针(VSDLSSNR_PROBE=1)
     if (!_d3d12->BeginFrameRecording(*slot)) {
         if (err && errLen) std::snprintf(err, errLen, "BeginFrameRecording(frame) failed");
         return false;
@@ -2180,13 +2149,13 @@ bool DlssnrContext::ProcessFrame(
         // The feature + parameter block are singletons: serialize the CPU-side
         // evaluate across concurrent frame threads. GPU dispatches recorded on
         // this slot's list still run overlapped with other slots' work.
-        if (ProbeEnabled()) TimingStatusLine("PROBE: pre-eval-lock"); // 临时探针(VSDLSSNR_PROBE=1)
+        if (ProbeEnabled()) TimingStatusLine("PROBE: pre-eval-lock"); // 探针(VSDLSSNR_PROBE=1)
         // 探针:evaluate 互斥等待。eval_cpu 段包含它(无法从分段里拆出),
         // 这里单独测量:"NGX CPU 变慢"与"被别的槽的 evaluate 排队"由此分家。
         QueryPerformanceCounter(&tLock0);
         std::lock_guard<std::mutex> evalLock(_evaluateMutex);
         QueryPerformanceCounter(&tLock1);
-        if (ProbeEnabled()) TimingStatusLine("PROBE: eval-locked"); // 临时探针(VSDLSSNR_PROBE=1)
+        if (ProbeEnabled()) TimingStatusLine("PROBE: eval-locked"); // 探针(VSDLSSNR_PROBE=1)
         DWORD sehCode = 0;
         // NGX PARAM_RESET 只由帧序门的播种帧携带(大跳/回退/缺口的恢复路径)。
         if (!SetEvaluateParametersSafely(*slot, nvofHistoryReset, realMotion, frameParams, &sehCode)) {
@@ -2198,7 +2167,7 @@ bool DlssnrContext::ProcessFrame(
                 } else {
                     std::snprintf(err, errLen, "Evaluate parameter setup raised SEH");
                 }
-                TimingStatusLine(err); // 临时探针
+                TimingStatusLine(err);
             }
             return false;
         }
@@ -2209,11 +2178,11 @@ bool DlssnrContext::ProcessFrame(
             snprintf(buf, sizeof(buf), "EvaluateFeature raised SEH 0x%x (scaling=%d); NGX latched, no further SDK entry",
                      sehCode, scaling ? 1 : 0);
             DbgLine(buf);
-            TimingStatusLine(buf); // 临时探针
+            TimingStatusLine(buf);
             if (err && errLen) snprintf(err, errLen, "EvaluateFeature raised SEH 0x%x; NGX disabled until host restart", sehCode);
             return false;
         }
-        if (ProbeEnabled()) TimingStatusLine("PROBE: eval-ok"); // 临时探针(VSDLSSNR_PROBE=1)
+        if (ProbeEnabled()) TimingStatusLine("PROBE: eval-ok"); // 探针(VSDLSSNR_PROBE=1)
         if (!NVSDK_NGX_SUCCEED(r)) {
             if (err && errLen) {
                 if (NgxRuntimeGuard::IsFaulted()) {
@@ -2223,7 +2192,7 @@ bool DlssnrContext::ProcessFrame(
                 } else {
                     snprintf(err, errLen, "EvaluateFeature failed (0x%x)", static_cast<unsigned>(r));
                 }
-                TimingStatusLine(err); // 临时探针
+                TimingStatusLine(err);
             }
             return false;
         }
@@ -2450,12 +2419,12 @@ bool DlssnrContext::ProcessFrame(
     if (!nrOff) flushOfDensify();
     if (!_d3d12->SubmitBaseFrame(*slot, nullptr, 0, err, errLen)) {
         if (err && errLen) {
-            TimingStatusLine(err); // 临时探针
+            TimingStatusLine(err);
             std::snprintf(err, errLen, "Submit(base) failed");
         }
         return false;
     }
-    if (ProbeEnabled()) TimingStatusLine("PROBE: base submitted"); // 临时探针(VSDLSSNR_PROBE=1)
+    if (ProbeEnabled()) TimingStatusLine("PROBE: base submitted"); // 探针(VSDLSSNR_PROBE=1)
     // base 完成观测(t3a,2026-09-25 时间戳化):默认路径不再 CPU 阻塞 ——
     // base GPU 执行与后续 RTX 提交链 + fg/post 录制重叠(此前阻塞把这段
     // CPU 时间串在 base 之后,FG 模式下还撑大 fgMutex 持锁窗口)。t3a 由
@@ -2466,12 +2435,12 @@ bool DlssnrContext::ProcessFrame(
         if (!_d3d12->WaitBaseFrame(*slot, err, errLen)) {
             if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
             if (err && errLen) {
-                TimingStatusLine(err); // 临时探针
+                TimingStatusLine(err);
                 std::snprintf(err, errLen, "Wait(base) failed");
             }
             return false;
         }
-        if (ProbeEnabled()) TimingStatusLine("PROBE: base waited"); // 临时探针(VSDLSSNR_PROBE=1)
+        if (ProbeEnabled()) TimingStatusLine("PROBE: base waited"); // 探针(VSDLSSNR_PROBE=1)
         QueryPerformanceCounter(&t3a);
     }
 
@@ -2706,7 +2675,7 @@ bool DlssnrContext::ProcessFrame(
                                              : (vsrRun ? vsrDoneVal : slot->baseFenceValue),
                                    err, errLen)) {
             if (err && errLen) {
-                TimingStatusLine(err); // 临时探针
+                TimingStatusLine(err);
                 std::snprintf(err, errLen, "Submit(fg) failed");
             }
             return false;
@@ -2934,7 +2903,7 @@ bool DlssnrContext::ProcessFrame(
     if (!_d3d12->SubmitPostFrame(*slot, postWaitA, postWaitAVal, postWaitB, postWaitBVal,
                                  err, errLen)) {
         if (err && errLen) {
-            TimingStatusLine(err); // 临时探针
+            TimingStatusLine(err);
             std::snprintf(err, errLen, "Submit(post) failed");
         }
         // 槽释放加固(同 gen eval 失败路径):post CL Close 失败时 fg CL 已
@@ -3056,12 +3025,12 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
     if (!_d3d12->WaitFrame(*ff->slot, err, errLen)) {
         if (_d3d12->IsDeviceLost()) _ready.store(false, std::memory_order_release);
         if (err && errLen) {
-            TimingStatusLine(err); // 临时探针
+            TimingStatusLine(err);
             std::snprintf(err, errLen, "Wait(fg) failed");
         }
         return false;
     }
-    if (ProbeEnabled()) TimingStatusLine("PROBE: waited"); // 临时探针(VSDLSSNR_PROBE=1)
+    if (ProbeEnabled()) TimingStatusLine("PROBE: waited"); // 探针(VSDLSSNR_PROBE=1)
     QueryPerformanceCounter(&t3b);
     // t3a 观测点(2026-09-25 时间戳化):base 完成的 GPU 时间戳已在 ts CL
     // 执行时写入 READBACK(post FIFO 在 ts 后,WaitFrame 蕴含数据就绪)。
@@ -3127,10 +3096,10 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         // the mutex is only taken when a dump is actually pending (the old
         // code locked it every frame even with dumping disabled).
         // 颜色 dump 与 NVOF motion/flow dump 分开锁存:首帧必然是播种帧
-        // (publishZero,无真流),motion dump 要等到第一个 densify 帧。
+        // (播种清零,无真流),motion dump 要等到第一个 densify 帧。
         static std::atomic<bool> dumped{ false };
         static std::atomic<bool> dumpedMotion{ false };
-        if (ProbeEnabled()) { // 临时探针
+        if (ProbeEnabled()) {
             char probe[96];
             std::snprintf(probe, sizeof(probe), "PROBE: dump-site realMotion=%d ofQ=%d",
                           ff->realMotion ? 1 : 0, _curOfQuality);
@@ -3150,7 +3119,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             static std::mutex dumpMotionMutex;
             std::lock_guard<std::mutex> dumpLock(dumpMotionMutex);
             if (!dumpedMotion.exchange(true)) {
-                TimingStatusLine("DLSSNR STATUS: motion latch fired"); // 临时探针
+                TimingStatusLine("DLSSNR STATUS: motion latch fired");
                 wchar_t dir[MAX_PATH];
                 if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
                     std::filesystem::path base = std::filesystem::path(dir).parent_path();
@@ -3171,7 +3140,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                             DXGI_FORMAT_R16G16_FLOAT);
                     }
                     if (!motionDumped) TimingStatusLine("DLSSNR STATUS: motion dump FAILED");
-                    else TimingStatusLine("DLSSNR STATUS: motion dump OK"); // 临时探针
+                    else TimingStatusLine("DLSSNR STATUS: motion dump OK");
                     if (_ofBackend && _ofBackend->Kind() == kOfBackendNvof &&
                         static_cast<NvofContext *>(_ofBackend.get())->FlowForward()) {
                         NvofContext *nv = static_cast<NvofContext *>(_ofBackend.get());

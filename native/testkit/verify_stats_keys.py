@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """stats 通道键位验证:filter_state / of_mode 等面板数据源字段。
 
-stats 通道是 1024 字节映射:magic+seq 头 + JSON body。键位定义在
+stats 通道是 2048 字节映射:magic+seq 头 + JSON body。键位定义在
 native/src/panel_ipc.h(SK_* 常量)。本脚本覆盖三类场景:
   case 1: 默认(ofq=0,零 guidance 是用户选择)→ filter_state=ok, of_mode=off
   case 2: ofq=5(NVOF 会话建立)→ of_mode 上报实际档位

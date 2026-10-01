@@ -86,7 +86,7 @@ def main():
     ok = True
     try:
         vf = '--vf=vapoursynth="~~/vs/DLSSNR_NV.vpy"'
-        errf = open(os.path.join(testenv.ROOT, "mpv_stderr.txt"), "a", encoding="utf-8")
+        errf = open(testenv.MPV_STDERR, "a", encoding="utf-8")
         mpv = subprocess.Popen([
             testenv.MPV_EXE, "--input-ipc-server=mpvpipe", "--really-quiet",
             "--volume=0", "--start=2", "--loop=inf", "--geometry=640x360",
