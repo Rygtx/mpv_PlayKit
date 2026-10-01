@@ -1879,7 +1879,7 @@ bool DlssnrContext::ProcessFrame(
             const uint32_t flowH = (nvH + gs - 1) / gs;
             const bool hasBwd = nv->Bidirectional();
             const bool hasCost = nv->CostEnabled();
-            post = [this, &slot, flowW, flowH, gs, hasCost, hasBwd, msX, msY, densifyInternal,
+            post = [this, &slot, flowW, flowH, hasCost, hasBwd, msX, msY, densifyInternal,
                     nvW, nvH, width, height](ID3D12GraphicsCommandList *cl, int inputIndex) {
                 (void)inputIndex;
                 ID3D12Resource *dstMotion = densifyInternal ? slot->reducedMotion.Get()
@@ -1894,7 +1894,7 @@ bool DlssnrContext::ProcessFrame(
                 _d3d12->RecordDensify(*cl, *slot,
                                       densifyInternal ? nvW : static_cast<uint32_t>(width),
                                       densifyInternal ? nvH : static_cast<uint32_t>(height),
-                                      flowW, flowH, gs,
+                                      flowW, flowH,
                                       hasCost, hasBwd, hasBwd && hasCost,
                                       densifyInternal ? 1.0f : msX,
                                       densifyInternal ? 1.0f : msY,
@@ -2417,7 +2417,7 @@ bool DlssnrContext::ProcessFrame(
     // 录制期间已被消耗大半,此处常态所剩无几。NR 关帧跳过(base CL 无运动
     // 消费),把重叠窗口让给 fg CL 录制(冲刷点 C)。
     if (!nrOff) flushOfDensify();
-    if (!_d3d12->SubmitBaseFrame(*slot, nullptr, 0, err, errLen)) {
+    if (!_d3d12->SubmitBaseFrame(*slot, err, errLen)) {
         if (err && errLen) {
             TimingStatusLine(err);
             std::snprintf(err, errLen, "Submit(base) failed");

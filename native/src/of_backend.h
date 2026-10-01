@@ -18,6 +18,7 @@
 // (原第三实现 HalfResContext 兜底已于 2026-09-21 随 FFX 的 AMD 卡验证
 //  通过而移除 —— 无存活场景;of_frame_gate.h 仍由 FxofContext 使用。)
 
+#include <windows.h>
 #include <d3d12.h>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,32 @@
 #include "dlssnr_params.h" // kOfBackend* 常量(Kind() 返回值;params 为唯一权威)
 
 namespace vsdlssnr {
+
+// 栅栏值到达等待(两光流后端共用):共享 auto-reset 事件的唤醒可能被同
+// 事件的其它等待者窃取(单次 Wait 返回不代表本等待的目标值已达成),循环
+// 复查完成值;栅栏值单调 ⇒ 有界退出。
+inline bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
+                             HANDLE event, DWORD timeoutMs) noexcept {
+    for (;;) {
+        if (fence->GetCompletedValue() >= value) return true;
+        if (FAILED(fence->SetEventOnCompletion(value, event))) return false;
+        if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
+    }
+}
+
+// CL 轮转池的 allocator Reset + force-close 自愈(两光流后端共用):上次
+// 录制中途失败遗留 open CL 会让 allocator Reset 永久 E_FAIL —— 先 Close
+// 一次再 Reset(d3d12 BeginCtlRecording 同款恢复模式)。含 CL->Reset。
+inline bool ResetAllocatorHealed(ID3D12CommandAllocator *alloc,
+                                 ID3D12GraphicsCommandList *cl) noexcept {
+    HRESULT hr = alloc->Reset();
+    if (FAILED(hr)) {
+        cl->Close();
+        hr = alloc->Reset();
+        if (FAILED(hr)) return false;
+    }
+    return SUCCEEDED(cl->Reset(alloc, nullptr));
+}
 
 class D3D12Context;
 

@@ -4,6 +4,7 @@
 
 #include "rtx_video_context.h"
 #include "dlssnr_context.h" // TimingStatusLine(失败必须进 timing log)
+#include "ngx_seh_gate.h"
 
 #include <cstdio>
 #include <functional>
@@ -12,26 +13,6 @@
 #include <nvsdk_ngx_helpers_vsr.h>
 
 namespace vsdlssnr {
-
-namespace {
-
-// ---- RTX Video 本地 SEH(与 DlssfgContext 同构;绝不上抛全局闩锁)----
-LONG RtxCaptureException(EXCEPTION_POINTERS *exception, DWORD *sehCode) noexcept {
-    *sehCode = exception->ExceptionRecord->ExceptionCode;
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-template <typename Fn>
-bool RtxSehCall(Fn &&fn, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
-        return fn() == NVSDK_NGX_Result_Success;
-    } __except (RtxCaptureException(GetExceptionInformation(), sehCode)) {
-        return false;
-    }
-}
-
-} // namespace
 
 // ---- 专用队列执行体(SDK CDx12NGXVSR 同款)----
 bool RtxQueue::Initialize(ID3D12Device *device, const char *label, char *err, size_t errLen) noexcept {
@@ -141,28 +122,8 @@ RtxVsrContext::~RtxVsrContext() {
 
 template <typename Fn>
 bool RtxVsrContext::SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept {
-    if (_faulted.load(std::memory_order_acquire)) {
-        if (err && errLen) {
-            std::snprintf(err, errLen, "rtx vsr: faulted latch active (%s not called)", what);
-        }
-        return false;
-    }
-    DWORD sehCode = 0;
-    const bool ok = RtxSehCall(fn, &sehCode);
-    if (!ok && sehCode) {
-        _faulted.store(true, std::memory_order_release);
-        char msg[160];
-        std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: rtx vsr %s raised SEH 0x%lX; VSR disabled until host restart",
-                      what, static_cast<unsigned long>(sehCode));
-        TimingStatusLine(msg);
-        if (err && errLen) {
-            std::snprintf(err, errLen, "rtx vsr: %s raised SEH 0x%lX",
-                          what, static_cast<unsigned long>(sehCode));
-        }
-        return false;
-    }
-    return ok;
+    return NgxSehGate(_faulted, std::forward<Fn>(fn), "rtx vsr", what,
+                      "VSR disabled until host restart", err, errLen, TimingStatusLine);
 }
 
 bool RtxVsrContext::Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
@@ -313,28 +274,8 @@ RtxHdrContext::~RtxHdrContext() {
 
 template <typename Fn>
 bool RtxHdrContext::SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept {
-    if (_faulted.load(std::memory_order_acquire)) {
-        if (err && errLen) {
-            std::snprintf(err, errLen, "rtx hdr: faulted latch active (%s not called)", what);
-        }
-        return false;
-    }
-    DWORD sehCode = 0;
-    const bool ok = RtxSehCall(fn, &sehCode);
-    if (!ok && sehCode) {
-        _faulted.store(true, std::memory_order_release);
-        char msg[160];
-        std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: rtx hdr %s raised SEH 0x%lX; HDR disabled until host restart",
-                      what, static_cast<unsigned long>(sehCode));
-        TimingStatusLine(msg);
-        if (err && errLen) {
-            std::snprintf(err, errLen, "rtx hdr: %s raised SEH 0x%lX",
-                          what, static_cast<unsigned long>(sehCode));
-        }
-        return false;
-    }
-    return ok;
+    return NgxSehGate(_faulted, std::forward<Fn>(fn), "rtx hdr", what,
+                      "HDR disabled until host restart", err, errLen, TimingStatusLine);
 }
 
 bool RtxHdrContext::Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,

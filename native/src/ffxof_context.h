@@ -102,11 +102,9 @@ private:
     void DestroySession() noexcept;
     bool CreateSession(D3D12Context &d3d12, int width, int height, int quality,
                        char *err, size_t errLen) noexcept;
-    static bool WaitForFenceReached(ID3D12Fence *fence, uint64_t value,
-                                    HANDLE event, DWORD timeoutMs) noexcept;
     // CL 池轮转:idx = _submitSeq % depth,CPU 等同 idx 上次使用的栅栏
     // (4 段之前,常态即刻返回),Reset allocator + CL(含 force-close 自愈,
-    // 与 BeginCtlRecording 同款)。提交后由调用方记 _lastUse。
+    // of_backend.h ResetAllocatorHealed)。提交后由调用方记 _lastUse。
     bool AcquireCl(ID3D12CommandAllocator **allocator,
                    ID3D12GraphicsCommandList **cl) noexcept;
 

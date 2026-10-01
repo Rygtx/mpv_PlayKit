@@ -5,6 +5,7 @@
 #include "dlssfg_context.h"
 #include "dlssfg_gate.h"
 #include "dlssnr_context.h" // TimingStatusLine(失败必须进 timing log)
+#include "ngx_seh_gate.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -37,25 +38,9 @@ FgModuleCache &FgModule() noexcept {
     return cache;
 }
 
-// ---- FG 本地 SEH(与 NgxRuntimeGuard::_InvokeSafely 同构,但闩锁本类)----
+// ---- FG 本地 SEH:经 ngx_seh_gate.h 的 NgxSehGate(闩锁本类)----
 // FG 的 SEH 绝不上抛全局闩锁:NR 的 NGX core/snippet 是独立模块,
 // FG 崩溃不应连带杀 NR(降级边界:本类 _faulted = FG 永久停用)。
-LONG DlssfgCaptureException(EXCEPTION_POINTERS *exception, DWORD *sehCode) noexcept {
-    *sehCode = exception->ExceptionRecord->ExceptionCode;
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-// 返回值:true = fn() 返回 Success 且无 SEH;false = 失败(sehCode 非零
-// = SEH,零 = 普通 NGX 失败)。
-template <typename Fn>
-bool DlssfgSehCall(Fn &&fn, DWORD *sehCode) noexcept {
-    *sehCode = 0;
-    __try {
-        return fn() == NVSDK_NGX_Result_Success;
-    } __except (DlssfgCaptureException(GetExceptionInformation(), sehCode)) {
-        return false;
-    }
-}
 
 } // namespace
 
@@ -106,28 +91,8 @@ DlssfgContext::~DlssfgContext() {
 
 template <typename Fn>
 bool DlssfgContext::SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept {
-    if (_faulted.load(std::memory_order_acquire)) {
-        if (err && errLen) {
-            std::snprintf(err, errLen, "dlssfg: faulted latch active (%s not called)", what);
-        }
-        return false;
-    }
-    DWORD sehCode = 0;
-    const bool ok = DlssfgSehCall(fn, &sehCode);
-    if (!ok && sehCode) {
-        _faulted.store(true, std::memory_order_release);
-        char msg[160];
-        std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: dlssfg %s raised SEH 0x%lX; FG disabled until host restart",
-                      what, static_cast<unsigned long>(sehCode));
-        TimingStatusLine(msg);
-        if (err && errLen) {
-            std::snprintf(err, errLen, "dlssfg: %s raised SEH 0x%lX",
-                          what, static_cast<unsigned long>(sehCode));
-        }
-        return false;
-    }
-    return ok;
+    return NgxSehGate(_faulted, std::forward<Fn>(fn), "dlssfg", what,
+                      "FG disabled until host restart", err, errLen, TimingStatusLine);
 }
 
 bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,

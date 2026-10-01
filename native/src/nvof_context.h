@@ -148,13 +148,9 @@ public:
     void WaitCopyIdle() noexcept override;
 
 private:
-    // 栅栏值到达等待:循环检查完成值(共享 auto-reset 事件的唤醒可能被
-    // 其它等待者窃取,单次 Wait 结果不可信),单调值保证有界退出。
-    static bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
-                                 HANDLE event, DWORD timeoutMs) noexcept;
     // 轮转池取 CL(门内调用):Reset 前等本位上一段提交完成(4 段之前常态
     // 即刻返回;超 4 段 = 背压,10s 上限,超时会话退役)。含 force-close
-    // 自愈(FfxofContext::AcquireCl 同款)。freq 仅服务 c% 探针计时。
+    // 自愈(of_backend.h ResetAllocatorHealed)。freq 仅服务 c% 探针计时。
     bool AcquireCl(ID3D12CommandAllocator **allocator,
                    ID3D12GraphicsCommandList **cl, LARGE_INTEGER freq) noexcept;
 

@@ -109,19 +109,6 @@ static NvofFences &GetNvofFences(ID3D12Device *device) noexcept {
     return fences;
 }
 
-// 栅栏值到达等待:共享 auto-reset 事件的唤醒可能被同事件的其它等待者窃取
-// (单次 Wait 返回不代表本等待的目标值已达成),循环复查完成值;栅栏值
-// 单调 ⇒ 有界退出。
-bool NvofContext::WaitFenceReached(ID3D12Fence *fence, uint64_t value,
-                                   HANDLE event, DWORD timeoutMs) noexcept {
-    for (;;) {
-        if (fence->GetCompletedValue() >= value) return true;
-        if (FAILED(fence->SetEventOnCompletion(value, event))) return false;
-        if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
-        // 唤醒被窃取时回到顶部复查;值单调,最终到达或超时。
-    }
-}
-
 bool NvofContext::AcquireCl(ID3D12CommandAllocator **allocator,
                             ID3D12GraphicsCommandList **cl, LARGE_INTEGER freq) noexcept {
     // 轮转池取 CL(RtxQueue/FfxofContext 同款纪律):idx = _submitSeq % 深度,
@@ -150,15 +137,7 @@ bool NvofContext::AcquireCl(ID3D12CommandAllocator **allocator,
     } else {
         _lastCpyWaitMs = 0.0;
     }
-    HRESULT hr = _alloc[idx]->Reset();
-    if (FAILED(hr)) {
-        // force-close 自愈:上次录制中途失败遗留 open CL 会让 allocator
-        // Reset 永久 E_FAIL(BeginCtlRecording/FfxofContext 同款恢复模式)。
-        _cl[idx]->Close();
-        hr = _alloc[idx]->Reset();
-        if (FAILED(hr)) return false;
-    }
-    if (FAILED(_cl[idx]->Reset(_alloc[idx].Get(), nullptr))) return false;
+    if (!ResetAllocatorHealed(_alloc[idx].Get(), _cl[idx].Get())) return false;
     *allocator = _alloc[idx].Get();
     *cl = _cl[idx].Get();
     return true;

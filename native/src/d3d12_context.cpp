@@ -1497,8 +1497,7 @@ bool D3D12Context::BeginFgRecording(FrameSlot &slot) noexcept {
 
 // 分段提交共用体:Close 目标 CL → 队列执行 → signal 全局栅栏新值。提交互斥
 // 保证栅栏值顺序与队列 ExecuteCommandLists 顺序一致(值永不回退)。
-bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence,
-                                   uint64_t waitValue, char *err, size_t errLen) noexcept {
+bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept {
     HRESULT hr = slot.commandList->Close();
     if (FAILED(hr)) {
         SetErr(err, errLen, hr, "Close(slot base) failed");
@@ -1519,13 +1518,6 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence,
             snprintf(buf, sizeof(buf), "DLSSNR STATUS: submit mutex wait=%.0fms (slots contending)", waitMs);
             TimingStatusLine(buf);
         }
-    }
-    // NVOF guidance:本槽 densify 依赖 NVOF execute 的 flow 输出 —— 队列级
-    // 栅栏等待(顺序无关:常规顺序下该值已满足,零开销;乱序提交时它把本
-    // 槽命令排到 NVOF 输出之后,防 GPU 端读-写竞争)。现状恒空:StageFrame
-    // 已 CPU 等待 NVOF execute 完成。
-    if (waitFence && waitValue) {
-        _queue->Wait(waitFence, waitValue);
     }
     // 排队段锚(2026-09-25 账目诚实化):base 纯执行的起点由 preBase 括号
     // 给出;preBase 时刻 − 本入口 QPC = 帧间排队(burst 等前帧尾部),单独
@@ -2038,8 +2030,7 @@ RWTexture2D<float> DenseConfidence : register(u1);
 
 cbuffer Params : register(b0) {
     uint2 SourceExtent;   // 稠密目标尺寸(源)
-    uint2 FlowExtent;     // 流场网格尺寸(= 会话输入/GridSize)
-    uint GridSize;
+    uint2 FlowExtent;     // 流场网格尺寸(= 会话输入)
     uint HasForwardCost;
     uint HasBackward;
     uint HasBackwardCost;
@@ -2054,7 +2045,7 @@ float2 LoadFlow(Texture2D<int2> field, int2 p) {
 float2 SampleFlow(Texture2D<int2> field, float2 sourcePixel) {
     // 源像素 → 流场网格坐标:流场均匀覆盖会话输入范围,会话输入被线性
     // 映射到源范围(MotionScale 同比),故按 FlowExtent/SourceExtent 比例
-    // 采样;未降采样时该比例 = 1/GridSize(与旧 GridSize 公式一致)。
+    // 采样(FlowExtent = ceil(会话输入/GridSize),公式只依赖两尺寸)。
     float2 gridPos = sourcePixel * (float2(FlowExtent) / float2(SourceExtent)) - 0.5;
     int2 p0 = int2(floor(gridPos));
     float2 f = frac(gridPos);
@@ -3884,7 +3875,7 @@ bool D3D12Context::BindNvofResources(ID3D12Resource *flowFwd, ID3D12Resource *fl
 
 void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &slot,
                                  uint32_t denseW, uint32_t denseH,
-                                 uint32_t flowW, uint32_t flowH, uint32_t gridSize,
+                                 uint32_t flowW, uint32_t flowH,
                                  bool hasForwardCost, bool hasBackward,
                                  bool hasBackwardCost,
                                  float motionScaleX, float motionScaleY,
@@ -3909,11 +3900,11 @@ void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
     const UINT flowWH[2]{ flowW, flowH };
     cl->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
     cl->SetComputeRoot32BitConstants(0, 2, flowWH, 2);
-    const UINT flags[4]{ gridSize, hasForwardCost ? 1u : 0u,
+    const UINT flags[3]{ hasForwardCost ? 1u : 0u,
                          hasBackward ? 1u : 0u, hasBackwardCost ? 1u : 0u };
-    cl->SetComputeRoot32BitConstants(0, 4, flags, 4);
+    cl->SetComputeRoot32BitConstants(0, 3, flags, 4);
     const float motionScale[2]{ motionScaleX, motionScaleY };
-    cl->SetComputeRoot32BitConstants(0, 2, motionScale, 8);
+    cl->SetComputeRoot32BitConstants(0, 2, motionScale, 7);
 
     cl->SetComputeRootDescriptorTable(1, gpu(14)); // t0 ForwardFlow
     cl->SetComputeRootDescriptorTable(2, gpu(15)); // t1 BackwardFlow

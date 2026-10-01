@@ -343,7 +343,7 @@ public:
                            ID3D12Resource *inputFwd, ID3D12Resource *inputBwd) noexcept;
     // densify(Magpie NVOF_Densify HLSL 原样):S10.5 网格 → 稠密运动 +
     // 置信度。在 NVOF 会话的 nvof CL 上执行(门内、execute 完成后),
-    // 调用方负责 motion/confidence 的 UAV 态转移。gridSize/旗标来自
+    // 调用方负责 motion/confidence 的 UAV 态转移。cost/反向旗标来自
     // NvofContext 会话。motionScale = 流向量单位换算(会话输入像素 →
     // 源像素;输入未降采样时为 1,1)。
     // densify:网格流 → 稠密运动场。denseW/H = 稠密目标尺寸(= dispatch 范围,
@@ -352,7 +352,7 @@ public:
     // 20/21(slot.reducedMotion/reducedConfidence,NGX 缩放消费纹理)。
     void RecordDensify(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                        uint32_t denseW, uint32_t denseH,
-                       uint32_t flowW, uint32_t flowH, uint32_t gridSize,
+                       uint32_t flowW, uint32_t flowH,
                        bool hasForwardCost, bool hasBackward, bool hasBackwardCost,
                        float motionScaleX, float motionScaleY,
                        UINT uavMotion, UINT uavConfidence) noexcept;
@@ -468,11 +468,10 @@ public:
     // fg = 插帧链(FG 推理 + 插值输出)。base 先提交(栅栏值 baseFenceValue),
     // fg CL 录完后提交(栅栏值 fenceValue)。CPU 侧先后等两个栅栏,完成点
     // 差 = 各段 GPU 耗时(等 fg 前先等 base:fg 排 base 后,醒来时 base 必
-    // 已完成,等待开销 = 一次事件唤醒)。waitFence/waitValue = NVOF copy
-    // 栅栏(可选,base 段 GPU 消费 flow 前排队;现状恒空 —— StageFrame 已
-    // CPU 等待 NVOF execute 完成)。
-    bool SubmitBaseFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
-                         char *err, size_t errLen) noexcept;
+    // 已完成,等待开销 = 一次事件唤醒)。NVOF 的 flow 就绪等待在 StageFrame
+    // CPU 侧完成(队列级 Wait 语义下可能永不满足,见 NvofContext::StageFrame
+    // 注释),故本提交不带前置栅栏;RTX 跨队列顺序见 SubmitFgFrame。
+    bool SubmitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
     // post/fg 段提交:waitFence/waitValue = RTX 专用队列的完成栅栏(可选;
     // 排在本次 Execute 之前 —— post CL 消费 VSR/TrueHDR 的输出,跨队列
     // 生产者-消费者顺序由此保证)。提交后 slot->fgFenceValue = 本次栅栏值

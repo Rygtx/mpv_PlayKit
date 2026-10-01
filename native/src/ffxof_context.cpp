@@ -45,27 +45,16 @@ bool CreateFfxTexture(ID3D12Device *device, DXGI_FORMAT format,
 
 FxofContext::~FxofContext() { Finalize(); }
 
-bool FxofContext::WaitForFenceReached(ID3D12Fence *fence, uint64_t value,
-                                      HANDLE event, DWORD timeoutMs) noexcept {
-    // 与 NvofContext::WaitFenceReached 同款:循环复查完成值(共享事件的
-    // 唤醒可能被窃取),栅栏值单调 ⇒ 有界退出。
-    for (;;) {
-        if (fence->GetCompletedValue() >= value) return true;
-        if (FAILED(fence->SetEventOnCompletion(value, event))) return false;
-        if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
-    }
-}
-
 void FxofContext::Finalize() noexcept { DestroySession(); }
 
 void FxofContext::DestroySession() noexcept {
     // 设备已挂时跳过栅栏等待(永不满值)。
     const bool gpuOk = _d3d12 && _d3d12->Queue() && !_d3d12->IsDeviceLost();
     if (gpuOk && _copyFenceEvent && _copyFence && _lastCopyFence) {
-        WaitForFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000);
+        WaitFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000);
     }
     if (gpuOk && _doneFenceEvent && _doneFence && _lastDone) {
-        WaitForFenceReached(_doneFence.Get(), _lastDone, _doneFenceEvent, 10000);
+        WaitFenceReached(_doneFence.Get(), _lastDone, _doneFenceEvent, 10000);
     }
     // 不调 ffxOpticalflowContextDestroy(见 ffxof_context.h destroy 注释):
     // context 与 scratch 随本对象进入 _retiredOf 名单存活到进程退出。
@@ -556,21 +545,13 @@ bool FxofContext::AcquireCl(ID3D12CommandAllocator **allocator,
         !_d3d12->IsDeviceLost()) {
         HANDLE ev = _lastUseFence[idx] == _doneFence.Get() ? _doneFenceEvent
                                                            : _copyFenceEvent;
-        if (!WaitForFenceReached(_lastUseFence[idx], _lastUseValue[idx], ev, 10000)) {
+        if (!WaitFenceReached(_lastUseFence[idx], _lastUseValue[idx], ev, 10000)) {
             TimingStatusLine("DLSSNR STATUS: fxof cl rotator wait timeout; session retired");
             _ready.store(false, std::memory_order_release);
             return false;
         }
     }
-    HRESULT hr = _alloc[idx]->Reset();
-    if (FAILED(hr)) {
-        // force-close 自愈:上次录制中途失败遗留 open CL 会让 allocator
-        // Reset 永久 E_FAIL(BeginCtlRecording 同款恢复模式)。
-        _cl[idx]->Close();
-        hr = _alloc[idx]->Reset();
-        if (FAILED(hr)) return false;
-    }
-    if (FAILED(_cl[idx]->Reset(_alloc[idx].Get(), nullptr))) return false;
+    if (!ResetAllocatorHealed(_alloc[idx].Get(), _cl[idx].Get())) return false;
     *allocator = _alloc[idx].Get();
     *cl = _cl[idx].Get();
     return true;
@@ -586,7 +567,7 @@ void FxofContext::WaitCopyIdle() noexcept {
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || _d3d12->IsDeviceLost()) return;
     bool ok = true;
     if (_lastDone && _doneFence->GetCompletedValue() < _lastDone) {
-        ok = WaitForFenceReached(_doneFence.Get(), _lastDone, _doneFenceEvent, 10000);
+        ok = WaitFenceReached(_doneFence.Get(), _lastDone, _doneFenceEvent, 10000);
         if (!ok) {
             TimingStatusLine("DLSSNR STATUS: fxof dispatch fence timeout at slot release; session retired");
             _ready.store(false, std::memory_order_release);
@@ -594,7 +575,7 @@ void FxofContext::WaitCopyIdle() noexcept {
         }
     }
     if (_lastCopyFence && _copyFence->GetCompletedValue() < _lastCopyFence) {
-        ok = WaitForFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000);
+        ok = WaitFenceReached(_copyFence.Get(), _lastCopyFence, _copyFenceEvent, 10000);
         if (!ok) {
             TimingStatusLine("DLSSNR STATUS: fxof copy fence timeout at slot release; session retired");
             _ready.store(false, std::memory_order_release);
