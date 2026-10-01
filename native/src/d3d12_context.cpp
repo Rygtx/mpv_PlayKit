@@ -2963,13 +2963,14 @@ bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
 
 } // namespace
 
-bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, int width, int height,
-                                     const wchar_t *path, DXGI_FORMAT format,
+bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, const wchar_t *path,
                                      char *err, size_t errLen) noexcept {
-    // 4 B/px covers the BGRA color dumps; the horizontal residual is
-    // R16G16B16A16_FLOAT (8 B/px, signed range); R8/R16_UNORM (1/2 B/px)
-    // are the YUV planes (YUV 原生化 dump 验收用)。
-    UINT bpp = 4u;
+    // 几何/格式取资源自身 desc(头注释:传参版三次踩坑的根修)。
+    const D3D12_RESOURCE_DESC desc = tex->GetDesc();
+    const UINT width = static_cast<UINT>(desc.Width);
+    const UINT height = desc.Height;
+    const DXGI_FORMAT format = desc.Format;
+    UINT bpp = 4u; // R8G8B8A8/BGRA8/R16G16 系
     if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) bpp = 8u;
     else if (format == DXGI_FORMAT_R16_UNORM) bpp = 2u;
     else if (format == DXGI_FORMAT_R8_UNORM) bpp = 1u;

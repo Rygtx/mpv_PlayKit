@@ -74,6 +74,6 @@ print("V: meas mean=%.1f exp mean=%.1f max|Δ|=%.1f" % (
     v_m.mean(), v_exp.mean(), np.abs(v_m - v_exp).max()))
 print("V<500 占比: meas=%.1f%% exp=%.1f%%" % (
     (v_m < 500).mean() * 100, (v_exp < 500).mean() * 100))
-print("pq.r vs y(编码域): mean(pq.r − y) = %.4f" % (pq_avg[:, :, 0] - y_exp).mean())
-print("pq.b vs y: mean(pq.b − y) = %.4f" % (pq_avg[:, :, 2] - y_exp).mean())
+print("pq.r vs y(编码域): mean(pq.r - y) = %.4f" % (pq_avg[:, :, 0] - y_exp).mean())
+print("pq.b vs y: mean(pq.b - y) = %.4f" % (pq_avg[:, :, 2] - y_exp).mean())
 sys.exit(0)

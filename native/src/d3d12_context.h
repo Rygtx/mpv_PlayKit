@@ -286,24 +286,17 @@ public:
     // footprint 必须用这个 —— 按源 BitDepth 推格式在"8bit 源 + P10 出"的
     // 混合会话(RTX VSR+HDR)恒错,R8 footprint 拷 R16 资源 = Close 报
     // E_INVALIDARG(2026-09-25 dump 三连失败真因)。
-    DXGI_FORMAT OutFormat() const noexcept { return _outFmt; }
-    // fgInterp 槽纹理格式(SDR 域 BGRA8 / fgHdrInterp 会话 FP16)。
-    DXGI_FORMAT FgInterpFormat() const noexcept {
-        return _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                            : DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
-
     // 诊断探针:把 InfoQueue 已存消息格式化进 buf(debug layer 开启时)。
     // 非 SetErr 失败点(如命令列表 Close 失败)定位用。
     void DebugDumpInfoQueue(char *buf, size_t len) const noexcept;
 
-    // diagnostics: dump a texture's raw rows to a file (VSDLSSNR_DUMP);
-    // format must match the resource (CopyTextureRegion has no cross-family
-    // conversion). Uses the control path; caller holds CtlMutex. err/errLen
-    // 可选失败原因出参(2026-09-25:此前四类失败点全部静默)。
-    bool DumpTextureToFile(ID3D12Resource *tex, int width, int height,
-                           const wchar_t *path,
-                           DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM,
+    // diagnostics: dump a texture's raw rows to a file (VSDLSSNR_DUMP)。
+    // 格式/尺寸一律取资源自身 desc —— footprint 族必须与资源一致
+    // (CopyTextureRegion 无跨族转换),调用方传参版三次踩坑(yuvOut 尺寸、
+    // R8 footprint 打 R16 资源、FFX 输入 R8G8B8A8 vs BGRA8 footprint),
+    // 2026-10-02 根修后此类失配构造上不可能。Uses the control path; caller
+    // holds CtlMutex. err/errLen 可选失败原因出参。
+    bool DumpTextureToFile(ID3D12Resource *tex, const wchar_t *path,
                            char *err = nullptr, size_t errLen = 0) noexcept;
 
     // Residual scaling rebuilds. The caller must hold a PoolHold (all slots
@@ -552,16 +545,9 @@ public:
     static constexpr UINT kUavMotionDense = 38;  // motionDense 的 UAV(mvec 放大写)
     static constexpr UINT kSrvHdrFgBase = 44;    // hdrFg[0..4] 的 SRV(PQ 转换读)
     static constexpr UINT kUavFgBack = 51;       // fgBack 的 UAV(PQ 域插帧编码 pass 写)
-    // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V)与位深。
+    // YUV 原生化 dump/调试:输出/输入平面([0]=Y [1]=U [2]=V)。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
-    int BitDepth() const noexcept { return _bitDepth; }
-    // 输入色度平面尺寸(subW/H 派生;dump/校验侧按真实布局读,勿再自推)。
-    int ChromaWidth() const noexcept { return _chromaW; }
-    int ChromaHeight() const noexcept { return _chromaH; }
-    // 输出色度平面几何(OUT 尺寸;RTX VSR 会话 yuvOut 在目标尺寸,与源不同)。
-    int OutChromaWidth() const noexcept { return _outChromaW; }
-    int OutChromaHeight() const noexcept { return _outChromaH; }
     // 管线色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit);RTX 会话
     // BGRA8(TrueHDR 拒 FP16,否决制);VSDLSSNR_NR_FORMAT=fp16/bgra8 强制
     // 覆盖。dump 侧必须与资源一致(CopyTextureRegion 跨格式 E_INVALIDARG)。

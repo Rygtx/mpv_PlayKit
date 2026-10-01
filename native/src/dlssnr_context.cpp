@@ -3127,52 +3127,27 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
                     // NGX 实际消费的运动场(缩放时为降采样版,R16G16_FLOAT)+
                     // 原始网格流(S10.5,R16G16_SINT)。
-                    bool motionDumped = false;
-                    if (scaling) {
-                        motionDumped = _d3d12->DumpTextureToFile(
-                            ff->slot->reducedMotion.Get(), _d3d12->InternalWidth(),
-                            _d3d12->InternalHeight(), (base / L"dump_motion.bin").c_str(),
-                            DXGI_FORMAT_R16G16_FLOAT);
-                    } else {
-                        motionDumped = _d3d12->DumpTextureToFile(
-                            ff->slot->motion.Get(), ff->width, ff->height,
-                            (base / L"dump_motion.bin").c_str(),
-                            DXGI_FORMAT_R16G16_FLOAT);
-                    }
+                    bool motionDumped = _d3d12->DumpTextureToFile(
+                        scaling ? ff->slot->reducedMotion.Get() : ff->slot->motion.Get(),
+                        (base / L"dump_motion.bin").c_str());
                     if (!motionDumped) TimingStatusLine("DLSSNR STATUS: motion dump FAILED");
                     else TimingStatusLine("DLSSNR STATUS: motion dump OK");
                     if (_ofBackend && _ofBackend->Kind() == kOfBackendNvof &&
                         static_cast<NvofContext *>(_ofBackend.get())->FlowForward()) {
-                        NvofContext *nv = static_cast<NvofContext *>(_ofBackend.get());
-                        const uint32_t gs = nv->GridSize();
-                        // flow 网格按会话输入尺寸(follow 模式 = 内部尺寸,
-                        // 与 StageFrame 调用点的 flowW/H 同款公式),不是源
-                        // 尺寸 —— 曾按源宽算 dump 维度,与纹理不符。
-                        const uint32_t nw = static_cast<uint32_t>(nv->Width());
-                        const uint32_t nh = static_cast<uint32_t>(nv->Height());
-                        const uint32_t fw = (nw + gs - 1) / gs;
-                        const uint32_t fh = (nh + gs - 1) / gs;
                         const bool flowOk = _d3d12->DumpTextureToFile(
-                            nv->FlowForward(), static_cast<int>(fw),
-                            static_cast<int>(fh), (base / L"dump_flow.bin").c_str(),
-                            DXGI_FORMAT_R16G16_SINT);
+                            static_cast<NvofContext *>(_ofBackend.get())->FlowForward(),
+                            (base / L"dump_flow.bin").c_str());
                         if (!flowOk) TimingStatusLine("DLSSNR STATUS: flow dump FAILED");
                     } else if (_ofBackend && _ofBackend->Kind() == kOfBackendFfx) {
                         // FFX 中间场:_ffxInput(R8G8B8A8 逻辑 RGBA 直写) +
                         // 稀疏流(R16G16_SINT,1/8 OF extent)。
                         auto *fx = static_cast<FxofContext *>(_ofBackend.get());
-                        if (!_d3d12->DumpTextureToFile(
-                                fx->FfxInput(), static_cast<int>(fx->OfWidth()),
-                                static_cast<int>(fx->OfHeight()),
-                                (base / L"dump_fxof_input.bin").c_str(),
-                                DXGI_FORMAT_R8G8B8A8_UNORM)) {
+                        if (!_d3d12->DumpTextureToFile(fx->FfxInput(),
+                                                       (base / L"dump_fxof_input.bin").c_str())) {
                             TimingStatusLine("DLSSNR STATUS: fxof input dump FAILED");
                         }
-                        if (!_d3d12->DumpTextureToFile(
-                                fx->SparseFlow(), static_cast<int>(fx->SparseWidth()),
-                                static_cast<int>(fx->SparseHeight()),
-                                (base / L"dump_fxof_sparse.bin").c_str(),
-                                DXGI_FORMAT_R16G16_SINT)) {
+                        if (!_d3d12->DumpTextureToFile(fx->SparseFlow(),
+                                                       (base / L"dump_fxof_sparse.bin").c_str())) {
                             TimingStatusLine("DLSSNR STATUS: fxof sparse dump FAILED");
                         }
                     }
@@ -3188,19 +3163,13 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     std::filesystem::path base = std::filesystem::path(dir).parent_path();
                     const bool scaling = _d3d12->HasScaling();
                     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
-                    // 管线色格式:BGRA8 默认 / RGBA16F fp16 探针 —— dump 的
-                    // footprint 格式必须与源一致,跨格式会 E_INVALIDARG
-                    // (memory #30 同族坑)。input/output 用 ColorFormat(),
-                    // reduced 系恒 BGRA8 保留 kColorDump。
-                    const DXGI_FORMAT kColorDump = DXGI_FORMAT_B8G8R8A8_UNORM;
-                    const DXGI_FORMAT kPipeDump = _d3d12->ColorFormat();
-                    // 探针:dump 失败逐个留痕(footprint/格式不匹配时
-                    // CopyTextureRegion 静默 E_INVALIDARG,#41-④ 同族坑;
-                    // "dump 文件缺失/尺寸不对"从这行直接定位)。
-                    auto dumpOrLog = [&](ID3D12Resource *tex, int w, int h,
-                                         const wchar_t *name, DXGI_FORMAT fmt) {
+                    // footprint 格式/尺寸由 DumpTextureToFile 自取资源 desc
+                    //(调用方传参版三次踩坑,见 d3d12_context.h 头注释);
+                    // 探针:dump 失败逐个留痕,"dump 文件缺失/尺寸不对"从
+                    // 这行直接定位。
+                    auto dumpOrLog = [&](ID3D12Resource *tex, const wchar_t *name) {
                         char why[128]{};
-                        if (!_d3d12->DumpTextureToFile(tex, w, h, (base / name).c_str(), fmt,
+                        if (!_d3d12->DumpTextureToFile(tex, (base / name).c_str(),
                                                        why, sizeof(why))) {
                             char msg[224];
                             std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED: %.120s",
@@ -3208,50 +3177,31 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                             TimingStatusLine(msg);
                         }
                     };
-                    dumpOrLog(_d3d12->InputColor(*ff->slot), ff->width, ff->height, L"dump_input.bin", kPipeDump);
+                    dumpOrLog(_d3d12->InputColor(*ff->slot), L"dump_input.bin");
                     // YUV 输入平面(YUV→RGB 转换验收:python 参考按矩阵/范围
                     // 重算 BGRA8 与 dump_input 对比 ≤1-2 LSB)。色度尺寸按
                     // 真实布局(444 全分辨率等),勿自推半分辨率。
                     {
-                        const DXGI_FORMAT yuvDumpIn = _d3d12->BitDepth() > 8
-                                                          ? DXGI_FORMAT_R16_UNORM
-                                                          : DXGI_FORMAT_R8_UNORM;
-                        const int cw = _d3d12->ChromaWidth(), ch = _d3d12->ChromaHeight();
-                        const int pw[3]{ ff->width, cw, cw };
-                        const int ph[3]{ ff->height, ch, ch };
                         const wchar_t *names[3]{ L"dump_yuvin_y.bin", L"dump_yuvin_u.bin", L"dump_yuvin_v.bin" };
                         for (int i = 0; i < 3; ++i) {
-                            dumpOrLog(_d3d12->YuvInPlane(*ff->slot, i), pw[i], ph[i], names[i], yuvDumpIn);
+                            dumpOrLog(_d3d12->YuvInPlane(*ff->slot, i), names[i]);
                         }
                     }
                     // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):
                     // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
                     // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
                     if (_ofBackend && ff->nvofInputIndex >= 0) {
-                        // 维度按纹理自身描述:FFX 的 _ffxInput 是 OF extent
-                        // (Performance 档 = 会话/2),后端 Width/Height 是会话
-                        // 尺寸 —— footprint 与资源不符 = CopyTextureRegion 静默
-                        // E_INVALIDARG(2026-09-25 审查;FFX inputIndex 回填后
-                        // 本 dump 首次对 FFX 生效)。
                         if (ID3D12Resource *ofIn =
                                 _ofBackend->InputTexture(ff->nvofInputIndex)) {
-                            const D3D12_RESOURCE_DESC ofInDesc = ofIn->GetDesc();
-                            dumpOrLog(ofIn,
-                                      static_cast<int>(ofInDesc.Width),
-                                      static_cast<int>(ofInDesc.Height),
-                                      L"dump_nvof_input.bin", kColorDump);
+                            dumpOrLog(ofIn, L"dump_nvof_input.bin");
                         }
                     }
                     if (scaling) {
-                        dumpOrLog(_d3d12->ReducedColor(*ff->slot), _d3d12->InternalWidth(),
-                                  _d3d12->InternalHeight(), L"dump_reduced_color.bin", kColorDump);
-                        dumpOrLog(_d3d12->ReducedDenoised(*ff->slot), _d3d12->InternalWidth(),
-                                  _d3d12->InternalHeight(), L"dump_reduced_denoised.bin", kColorDump);
-                        dumpOrLog(_d3d12->HorizontalRes(*ff->slot), ff->width,
-                                  _d3d12->InternalHeight(), L"dump_horizontal.bin",
-                                  DXGI_FORMAT_R16G16B16A16_FLOAT);
+                        dumpOrLog(_d3d12->ReducedColor(*ff->slot), L"dump_reduced_color.bin");
+                        dumpOrLog(_d3d12->ReducedDenoised(*ff->slot), L"dump_reduced_denoised.bin");
+                        dumpOrLog(_d3d12->HorizontalRes(*ff->slot), L"dump_horizontal.bin");
                     }
-                    dumpOrLog(_d3d12->OutputColor(*ff->slot), ff->width, ff->height, L"dump_output.bin", kPipeDump);
+                    dumpOrLog(_d3d12->OutputColor(*ff->slot), L"dump_output.bin");
                     // TrueHDR 输出本体(FP16 scRGB,PIPE 尺寸):黑屏排查的
                     // "没写 vs 写了零 vs 写了错值"判据(VSDLSSNR_DUMP=1)。
                     // 三态全留痕(2026-09-25):此前 OK/跳过都静默,
@@ -3260,9 +3210,8 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                         if (ff->slot->hdrColor) {
                             char why[128]{};
                             const bool okHC = _d3d12->DumpTextureToFile(
-                                ff->slot->hdrColor.Get(), _pipeW, _pipeH,
-                                (base / L"dump_hdrcolor.bin").c_str(),
-                                DXGI_FORMAT_R16G16B16A16_FLOAT, why, sizeof(why));
+                                ff->slot->hdrColor.Get(),
+                                (base / L"dump_hdrcolor.bin").c_str(), why, sizeof(why));
                             char msgHC[192];
                             std::snprintf(msgHC, sizeof(msgHC), "DLSSNR STATUS: dump_hdrcolor %s%.150s",
                                           okHC ? "OK" : "FAILED: ", okHC ? "" : why);
@@ -3275,35 +3224,17 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。
                     // 恒 SDR 域 BGRA8 @PIPE(VSR 时 = _pipeW/H,else 源尺寸)。
                     if (ff->fgRan) {
-                        dumpOrLog(_d3d12->FgInterp(*ff->slot, 0), ff->pipeW, ff->pipeH,
-                                  L"dump_fg_interp.bin", _d3d12->FgInterpFormat());
+                        dumpOrLog(_d3d12->FgInterp(*ff->slot, 0), L"dump_fg_interp.bin");
                     }
                     // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
                     // Y/U/V 与 dump 对比,≤1-2 LSB;P10 = 右对齐 word)。
-                    // 尺寸 = OUT 平面几何(2026-09-25 修:此前用源尺寸 ff->width/
-                    // height,RTX VSR 会话 yuvOut 在 OUT 尺寸 → footprint 与
-                    // 资源不符,dump 必败 —— RTX 会话的 P8 转换验收假阴)。
+                    // 尺寸/格式随资源 desc 自取 —— RTX VSR 会话 yuvOut 在 OUT
+                    // 尺寸、HDR 会话 P10,历史上手传参数两次踩坑(2026-09-25
+                    // "dump 三连失败真因"),desc 自取后整类失配消失。
                     {
-                        // yuvOut 资源格式 = OutFormat()(OUT 位深;HDR 会话
-                        // P10 = R16)。按源 BitDepth 推在"8bit 源 + P10 出"
-                        // 混合会话(RTX VSR+HDR)恒错 —— R8 footprint 拷
-                        // R16 资源,Close 报 E_INVALIDARG 并楔死 allocator
-                        // (2026-09-25 RTX 会话 dump 三连失败真因)。
-                        const DXGI_FORMAT yuvDump = _d3d12->OutFormat();
-                        const int cw = (ff->width + 1) >> 1, ch = (ff->height + 1) >> 1;
-                        const int pw[3]{ ff->width, cw, cw };
-                        const int ph[3]{ ff->height, ch, ch };
-                        const int ow[3]{ _outW, _d3d12->OutChromaWidth(),
-                                         _d3d12->OutChromaWidth() };
-                        const int oh[3]{ _outH, _d3d12->OutChromaHeight(),
-                                         _d3d12->OutChromaHeight() };
-                        const bool outSized = _rtxActive &&
-                                              (_outW != ff->width || _outH != ff->height);
-                        const int *dw = outSized ? ow : pw;
-                        const int *dh = outSized ? oh : ph;
                         const wchar_t *names[3]{ L"dump_y_plane.bin", L"dump_u_plane.bin", L"dump_v_plane.bin" };
                         for (int i = 0; i < 3; ++i) {
-                            dumpOrLog(_d3d12->YuvOutPlane(*ff->slot, i), dw[i], dh[i], names[i], yuvDump);
+                            dumpOrLog(_d3d12->YuvOutPlane(*ff->slot, i), names[i]);
                         }
                     }
                 }
