@@ -39,9 +39,6 @@ testenv.kill_mpv()
 k32 = ctypes.windll.kernel32
 
 
-def wr(key, val):
-    assert k32.WritePrivateProfileStringW("rtxvideo", key, val, testenv.INI), key
-
 
 scenes = {
     "hdr":    {"vsr_mode": "0", "vsr_scale_x100": "200", "vsr_strength": "2", "hdr_enabled": "1"},
@@ -55,7 +52,7 @@ for k, v in scenes[scenario].items():
 # 写回 [dlssnr] 节(插件落盘回写在 teardown,脚本每次启动重写,以脚本为准)。
 if len(sys.argv) > 2 and sys.argv[2] == "min":
     for k, v in {"nr_enabled": "0", "fg_enabled": "0"}.items():
-        assert k32.WritePrivateProfileStringW("dlssnr", k, v, testenv.INI), k
+        testenv.set_ini("dlssnr", k, v)
     print("[min] nr_enabled=0 fg_enabled=0")
 
 W, H = 640, 480

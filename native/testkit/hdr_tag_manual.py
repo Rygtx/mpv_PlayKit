@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""hdr_tag_manual:对实机 mpv 手动打/摘 PQ 元数据标签(面板自动同步的备用手段)。
+r"""hdr_tag_manual:对实机 mpv 手动打/摘 PQ 元数据标签(面板自动同步的备用手段)。
 
-用法: <部署根>\\python.exe hdr_tag_manual.py [add|remove|status]
+用法: <部署根>\python.exe hdr_tag_manual.py [add|remove|status]
   add     追加 @dlssnr-hdr-tag(lavfi setparams 打 BT.2020 PQ)
   remove  摘除该标签
   status  只打印当前 video-out-params 色彩标签
@@ -12,9 +12,11 @@ import re
 import sys
 import time
 
-# 管道名默认 mpvpipe(面板 mpv.conf 解析的常用名),可用 VSDLSSNR_MPV_PIPE 覆盖。
-PIPE = os.environ.get("VSDLSSNR_MPV_PIPE") or r"\\.\pipe\mpvpipe"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv
 
+# 管道名单一来源(testenv:VSDLSSNR_MPV_PIPE 可覆盖)。
+PIPE = testenv.MPV_PIPE
 
 def ipc(cmd):
     with open(PIPE, "r+b", buffering=0) as p:

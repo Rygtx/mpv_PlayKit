@@ -29,7 +29,10 @@ for k, v in {"vsr_mode": "2", "vsr_scale_x100": "200", "vsr_strength": "2",
 import time  # noqa: E402
 import numpy as np  # noqa: E402
 import vapoursynth as vs  # noqa: E402
-from vapoursynth import core  # noqa: E402
+from vapoursynth import core
+
+import pq2020  # noqa: E402
+from pq2020 import KR, KB, to_pq2020  # noqa: E402  # 前向数学单一权威(共享)  # noqa: E402
 
 dark = core.std.BlankClip(width=640, height=480, format=vs.YUV420P8, color=[40,128,128])
 bright = core.std.BlankClip(width=640, height=480, format=vs.YUV420P8, color=[200,128,128])
@@ -50,19 +53,6 @@ for _ in range(80):
 hdr = (np.fromfile(dump, dtype=np.uint16)
        .view(np.float16).astype(np.float64).reshape(ret.height, ret.width, 4))
 
-M = np.array([[0.6274, 0.3293, 0.0433], [0.0690, 0.9195, 0.0112], [0.0164, 0.0880, 0.8955]])
-KR, KB = 0.2627, 0.0593
-M1, M2 = 2610 / 16384, 2523 / 4096 * 128
-C1, C2, C3 = 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
-
-
-def pq(nits):
-    p = np.power(np.clip(nits / 10000.0, 0, 1), M1)
-    return np.power((C1 + C2 * p) / (1 + C3 * p), M2)
-
-
-def to_pq2020(lin709):
-    return pq(np.clip(lin709, 0, None) @ M.T * 80.0)
 
 
 # shader 2x2 box:色度输出 tid → 4 个 luma 域采样点(同尺寸 = tid*2 + 0.5/1.5)

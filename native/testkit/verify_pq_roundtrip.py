@@ -23,14 +23,15 @@ testenv.kill_mpv()
 
 os.environ["VSDLSSNR_DUMP"] = "1"
 
-k32 = ctypes.windll.kernel32
-for k, v in {"vsr_mode": "2", "vsr_scale_x100": "200", "vsr_strength": "2",
-             "hdr_enabled": "1"}.items():
-    assert k32.WritePrivateProfileStringW("rtxvideo", k, v, testenv.INI), k
+testenv.set_rtxvideo_ini(vsr_mode="2", vsr_scale_x100="200",
+                    vsr_strength="2", hdr_enabled="1")
 
 import numpy as np  # noqa: E402
 import vapoursynth as vs  # noqa: E402
-from vapoursynth import core  # noqa: E402
+from vapoursynth import core
+
+import pq2020  # noqa: E402
+from pq2020 import M, KR, KB, pq  # noqa: E402  # 前向数学单一权威(共享)  # noqa: E402
 
 W, H = 640, 480
 dark = core.std.BlankClip(width=W // 2, height=H, format=vs.YUV420P8, color=[40, 128, 128])
@@ -67,17 +68,6 @@ print("hdrColor: min|rgb|=%.4f max|rgb|=%.4f alpha_uniq=%s" % (
     np.abs(hdr[:, :, :3]).min(), np.abs(hdr[:, :, :3]).max(), np.unique(hdr[:, :, 3])))
 
 # ---- 前向复算(= PqToYuv shader 的数学)----
-M = np.array([[0.6274, 0.3293, 0.0433],
-              [0.0690, 0.9195, 0.0112],
-              [0.0164, 0.0880, 0.8955]], dtype=np.float64)
-KR, KB = 0.2627, 0.0593
-M1, M2 = 2610 / 16384, 2523 / 4096 * 128
-C1, C2, C3 = 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
-
-
-def pq(nits):
-    p = np.power(np.clip(nits / 10000.0, 0.0, 1.0), M1)
-    return np.power((C1 + C2 * p) / (1.0 + C3 * p), M2)
 
 
 lin = np.clip(hdr[:, :, :3].astype(np.float64), 0.0, None)  # max(lin709,0)

@@ -17,6 +17,8 @@ os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")  # 纯 stats 键位验证,勿拉
 import testenv  # noqa: E402
 import panel_ipc  # noqa: E402
 
+SK = panel_ipc.SK  # stats 键名单一镜像(勿手抄字面量 —— 改名时 python 侧同步防线)
+
 testenv.require_env()
 
 import vapoursynth as vs  # noqa: E402
@@ -59,19 +61,19 @@ if st:
     import json
     try:
         body = json.loads(st[2])
-        mc, mm = body.get("fg_mult_create", -1), body.get("fg_mult_max", -1)
+        mc, mm = body.get(SK["fg_mult_create"], -1), body.get(SK["fg_mult_max"], -1)
         new_keys_present = (
-            body.get("filter_state") == "ok"
-            and body.get("fg_route_eff") in ("off", "official-hook", "official", "copy")
+            body.get(SK["filter_state"]) == "ok"
+            and body.get(SK["fg_route_eff"]) in ("off", "official-hook", "official", "copy")
             and 0 <= mc <= 6 and 0 <= mm <= 5
             and (mc == 0 or mm >= 1)  # FG 会话存在时运行库上限必 >= 1
             and (mc <= mm + 1)        # 创建倍数不超上限+1(gate 正常钳制)
             and "fg_detail" in body and "of_detail" in body
             and "slot_wait" in body and "lock_wait" in body
             and "gate_skips" in body and "gate_expired" in body and "gate_resets" in body
-            and body.get("rtxvsr_last", -1) >= 0 and body.get("rtxhdr_last", -1) >= 0
-            and body.get("conv_last", -1) >= 0
-            and body.get("queue_last", -1) >= 0 and body.get("of_last", -1) >= 0
+            and body.get(SK["rtxvsr_last"], -1) >= 0 and body.get(SK["rtxhdr_last"], -1) >= 0
+            and body.get(SK["conv_last"], -1) >= 0
+            and body.get(SK["queue_last"], -1) >= 0 and body.get(SK["of_last"], -1) >= 0
         )
     except json.JSONDecodeError:
         new_keys_present = False
@@ -101,7 +103,7 @@ else:
     import json
     try:
         body = json.loads(st[2])
-        ok = ok and body.get("filter_state") == "passthrough" and bool(body.get("state_detail"))
+        ok = ok and body.get(SK["filter_state"]) == "passthrough" and bool(body.get(SK["state_detail"]))
     except json.JSONDecodeError:
         ok = False
 print("STATS-KEYS:", "PASS" if ok else "FAIL")

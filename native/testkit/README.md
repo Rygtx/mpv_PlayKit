@@ -129,6 +129,7 @@ dump 文件写在**宿主 exe 旁**(插件 `GetModuleFileNameW(nullptr)` 逻辑)
 | `test_hdrfix_vf.py` | 面板驱动 HDR 打标端到端:SK_RTX 含 hdr → 面板 IPC `vf add @dlssnr-hdr-tag` → mpv 按 PQ 解读 → 截图(需 `VSDLSSNR_TEST_MEDIA`;IPC 管道生命周期有竞态,失败先重跑) |
 | `test_hdr_hint_sync.py` | 打标 + target-colorspace-hint 同步:hdr=1 → 标签在链 + get hint==true;hdr=0 → 摘标 + hint 还原 mpv 连接时实值(媒体缺失自带合成 y4m,`VSDLSSNR_TEST_MEDIA` 可覆盖) |
 | `hdr_tag_manual.py` | 手动打/摘 PQ 标签工具(面板自动同步的备用手段;独立 python 可跑,`VSDLSSNR_MPV_PIPE` 覆盖管道名) |
+| `hint_status.py` | 一行命令读 mpv HDR 上屏四层实态(target-colorspace-hint / 滤镜输出 / 渲染目标 / vf 链打标;`VSDLSSNR_MPV_PIPE` 覆盖管道名) |
 
 ### 面板 UI 工具(PowerShell,交互排查非断言)
 
@@ -136,7 +137,7 @@ dump 文件写在**宿主 exe 旁**(插件 `GetModuleFileNameW(nullptr)` 逻辑)
 
 ```
 powershell -File panel_ui_tools.ps1 -Action capture   # PrintWindow 截图
-powershell -File panel_ui_tools.ps1 -Action size|poll|dpi|hittest|windows
+powershell -File panel_ui_tools.ps1 -Action size|poll|dpi|windows
 ```
 
 按窗口类 `vs_dlssnr_panel_app` 定位,不依赖安装路径。

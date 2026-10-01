@@ -25,9 +25,8 @@ time.sleep(2)
 import ctypes  # noqa: E402
 
 k32 = ctypes.windll.kernel32
-for k, v in {"vsr_mode": "2", "vsr_scale_x100": "200", "vsr_strength": "2",
-             "hdr_enabled": "1"}.items():
-    assert k32.WritePrivateProfileStringW("rtxvideo", k, v, testenv.INI), k
+testenv.set_rtxvideo_ini(vsr_mode="2", vsr_scale_x100="200",
+                         vsr_strength="2", hdr_enabled="1")
 
 MEDIA = os.environ.get("VSDLSSNR_TEST_MEDIA")
 testenv.require(MEDIA and os.path.isfile(MEDIA),
@@ -40,7 +39,7 @@ errf = open(testenv.MPV_STDERR, "w", encoding="utf-8")
 
 mpv = subprocess.Popen([
     testenv.MPV_EXE,
-    "--input-ipc-server=mpvpipe",
+    f"--input-ipc-server={testenv.MPV_IPC_SERVER}",
     "--screenshot-format=png",
     "--screenshot-png-compression=0",
     "--volume=0",
@@ -59,7 +58,7 @@ def ipc(cmd, retries=20):
         if mpv.poll() is not None:
             return "(mpv dead)"
         try:
-            with open(r"\\.\pipe\mpvpipe", "r+b", buffering=0) as p:
+            with open(testenv.MPV_PIPE, "r+b", buffering=0) as p:
                 p.write((json.dumps({"command": cmd}) + "\n").encode("utf-8"))
                 time.sleep(0.4)
                 try:

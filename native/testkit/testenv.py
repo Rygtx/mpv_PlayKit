@@ -34,6 +34,26 @@ MPV_EXE = os.path.join(ROOT, "mpv.exe")
 MPV_COM = os.path.join(ROOT, "mpv.com")
 # mpv 拉起脚本的 stderr 汇总(测试产物,落 testkit 目录,不脏部署根)。
 MPV_STDERR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mpv_stderr.txt")
+# mpv JSON IPC 管道(README 约定:VSDLSSNR_MPV_PIPE 可覆盖)—— 此前仅
+# hdr_tag_manual 遵守,其余脚本硬编码 \\.\pipe\mpvpipe,改管道名即静默失灵。
+MPV_PIPE = os.environ.get("VSDLSSNR_MPV_PIPE") or r"\\.\pipe\mpvpipe"
+MPV_IPC_SERVER = os.path.splitext(os.path.basename(MPV_PIPE))[0]
+
+
+def set_ini(section, key, value):
+    """dlssnr_ui.ini 单键写入(脚本公共帮手;现场保护见 ini_snapshot)。"""
+    import ctypes
+    k32 = ctypes.WinDLL("kernel32")
+    k32.WritePrivateProfileStringW.restype = ctypes.c_int
+    k32.WritePrivateProfileStringW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                               ctypes.c_wchar_p, ctypes.c_wchar_p]
+    assert k32.WritePrivateProfileStringW(section, key, str(value), INI), f"{section}.{key}"
+
+
+def set_rtxvideo_ini(**kv):
+    """[rtxvideo] 节批量写(vsr_mode/vsr_scale_x100/vsr_strength/hdr_enabled…)。"""
+    for k, v in kv.items():
+        set_ini("rtxvideo", k, v)
 
 PANEL_PROCESS = "dlssnr_panel.exe"
 MPV_PROCESS = "mpv.exe"

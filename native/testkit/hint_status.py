@@ -7,10 +7,15 @@
       会变)、vf 链(打标在不在)。
 """
 import json
+import os
 import sys
 import time
 
-PIPE = r"\\.\pipe\mpvpipe"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import testenv
+
+# 管道名单一来源(testenv:VSDLSSNR_MPV_PIPE 可覆盖)。
+PIPE = testenv.MPV_PIPE
 
 
 def main():

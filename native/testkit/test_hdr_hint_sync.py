@@ -32,11 +32,6 @@ import ctypes  # noqa: E402
 k32 = ctypes.windll.kernel32
 
 
-def set_ini(**kv):
-    for k, v in kv.items():
-        assert k32.WritePrivateProfileStringW("rtxvideo", k, v, testenv.INI), k
-
-
 MEDIA = os.environ.get("VSDLSSNR_TEST_MEDIA")
 if MEDIA and os.path.isfile(MEDIA):
     print("MEDIA:", MEDIA)
@@ -46,12 +41,12 @@ else:
 
 
 def launch(hdr):
-    set_ini(vsr_mode="2", vsr_scale_x100="200", vsr_strength="2",
+    testenv.set_rtxvideo_ini(vsr_mode="2", vsr_scale_x100="200", vsr_strength="2",
             hdr_enabled="1" if hdr else "0")
     errf = open(testenv.MPV_STDERR, "a", encoding="utf-8")
     mpv = subprocess.Popen([
         testenv.MPV_EXE,
-        "--input-ipc-server=mpvpipe",
+        f"--input-ipc-server={testenv.MPV_IPC_SERVER}",
         "--really-quiet",
         "--volume=0",
         "--start=5",
@@ -68,7 +63,7 @@ def ipc(cmd, retries=20):
     """管道连接重试(mpv 启动/前次残名释放均有竞态)。"""
     for _ in range(retries):
         try:
-            with open(r"\\.\pipe\mpvpipe", "r+b", buffering=0) as p:
+            with open(testenv.MPV_PIPE, "r+b", buffering=0) as p:
                 p.write((json.dumps({"command": cmd}) + "\n").encode("utf-8"))
                 time.sleep(0.3)
                 try:

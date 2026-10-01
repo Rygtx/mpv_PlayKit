@@ -190,3 +190,18 @@ def read_stats(require_magic=True):
         return None
     body = raw[8:].split(b"\0")[0].decode("utf-8", "replace")
     return magic, seq, body
+
+
+def read_stats_json():
+    """read_stats 的 dict 封装(无映射/魔数不符/坏 JSON → None)。
+
+    断言脚本用本函数拿 body 字典;需要 magic/seq 原始三元组时仍走 read_stats。
+    """
+    import json
+    st = read_stats()
+    if not st:
+        return None
+    try:
+        return json.loads(st[2])
+    except json.JSONDecodeError:
+        return None

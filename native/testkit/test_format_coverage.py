@@ -42,9 +42,6 @@ def main():
         k32.GetPrivateProfileStringW(sec, key, None, buf, 64, testenv.INI)
         backup[(sec, key)] = buf.value
 
-    def set_ini(sec, key, val):
-        assert k32.WritePrivateProfileStringW(sec, key, val, testenv.INI), f"{sec}.{key}"
-
     testenv.kill_panel()
     testenv.kill_mpv()
     time.sleep(1.5)
@@ -52,11 +49,11 @@ def main():
     # 应为 nr=1 fg=0,正是"单独开 NR"这次被修直的路径。
     # saved=1 是 LoadDlssnrIni 的"存在档案"门槛(0458a6d):缺它整个 ini
     # 被跳过(ini=0),此前一直依赖部署树残留 ini 里的 saved 键 —— 显式写。
-    set_ini("dlssnr", "saved", "1")
-    set_ini("dlssnr", "nr_enabled", "1")
-    set_ini("dlssnr", "fg_enabled", "0")
-    set_ini("rtxvideo", "vsr_mode", "0")
-    set_ini("rtxvideo", "hdr_enabled", "0")
+    testenv.set_ini("dlssnr", "saved", "1")
+    testenv.set_ini("dlssnr", "nr_enabled", "1")
+    testenv.set_ini("dlssnr", "fg_enabled", "0")
+    testenv.set_ini("rtxvideo", "vsr_mode", "0")
+    testenv.set_ini("rtxvideo", "hdr_enabled", "0")
 
     media = testmedia.ensure(names=[c[0] for c in testmedia.CLIPS
                                     if c[0].startswith("dlssnr_fmt_")])

@@ -36,15 +36,11 @@ k32 = ctypes.windll.kernel32
 TIMING_LOG = testenv.MPV_TIMING_LOG  # 宿主 = mpv.exe → 部署根
 
 
-def set_ini(section, key, val):
-    assert k32.WritePrivateProfileStringW(section, key, val, testenv.INI), f"{section}:{key}"
-
-
 def ipc(cmd, retries=20):
     """管道连接重试(mpv 启动/前次残名释放均有竞态;同 hdr_hint_sync)。"""
     for _ in range(retries):
         try:
-            with open(r"\\.\pipe\mpvpipe", "r+b", buffering=0) as p:
+            with open(testenv.MPV_PIPE, "r+b", buffering=0) as p:
                 p.write((json.dumps({"command": cmd}) + "\n").encode("utf-8"))
                 time.sleep(0.3)
                 try:
@@ -102,11 +98,11 @@ def main():
     time.sleep(1.5)
 
     # 初始形态:NR only + HDR(源 640x360;HDR-only 会话 pipe/out=源,P10 输出)
-    set_ini("dlssnr", "nr_enabled", "1")
-    set_ini("dlssnr", "fg_enabled", "0")
-    set_ini("rtxvideo", "vsr_mode", "0")
-    set_ini("rtxvideo", "vsr_scale_x100", "150")
-    set_ini("rtxvideo", "hdr_enabled", "1")
+    testenv.set_ini("dlssnr", "nr_enabled", "1")
+    testenv.set_ini("dlssnr", "fg_enabled", "0")
+    testenv.set_ini("rtxvideo", "vsr_mode", "0")
+    testenv.set_ini("rtxvideo", "vsr_scale_x100", "150")
+    testenv.set_ini("rtxvideo", "hdr_enabled", "1")
 
     ok = True
     mpv = None
@@ -115,7 +111,7 @@ def main():
         env = dict(os.environ, VSDLSSNR_NO_PANEL="1")
         vf = '--vf=vapoursynth="~~/vs/DLSSNR_NV.vpy"'
         mpv = subprocess.Popen([
-            testenv.MPV_EXE, "--input-ipc-server=mpvpipe", "--really-quiet",
+            testenv.MPV_EXE, f"--input-ipc-server={testenv.MPV_IPC_SERVER}", "--really-quiet",
             "--volume=0", "--start=2", "--loop=inf", "--geometry=640x360",
             vf, media,
         ], cwd=testenv.ROOT, stderr=errf, stdout=subprocess.DEVNULL, env=env)
@@ -149,7 +145,7 @@ def main():
 
         # ---- HDR 开→关:输出回 SDR 源位深 ----
         off = testenv.log_size(TIMING_LOG)
-        set_ini("rtxvideo", "hdr_enabled", "0")
+        testenv.set_ini("rtxvideo", "hdr_enabled", "0")
         seek()
         hit, lines = window(off,
                             lambda ls: any("hot rebind shape" in l and "hdr=0" in l for l in ls),
@@ -160,7 +156,7 @@ def main():
 
         # ---- VSR off→mode2 1.5x:960x540(偶收口)----
         off = testenv.log_size(TIMING_LOG)
-        set_ini("rtxvideo", "vsr_mode", "2")
+        testenv.set_ini("rtxvideo", "vsr_mode", "2")
         seek()
         hit, lines = window(off,
                             lambda ls: any("hot rebind shape" in l and "vsr=1" in l for l in ls),
@@ -173,8 +169,8 @@ def main():
         # 用):本机/媒体组合下激活与降级都合法,共同点 = shape 段热运行 +
         # 无冷回落 + 结果有迹可查。
         off = testenv.log_size(TIMING_LOG)
-        set_ini("rtxvideo", "vsr_mode", "0")
-        set_ini("dlssnr", "fg_enabled", "1")
+        testenv.set_ini("rtxvideo", "vsr_mode", "0")
+        testenv.set_ini("dlssnr", "fg_enabled", "1")
         seek()
         hit, lines = window(off,
                             lambda ls: any("hot rebind shape" in l for l in ls)
@@ -195,7 +191,7 @@ def main():
         # FG 激活成功时本步是 shape 段(请求翻转);上一步降级已把 _fgRequested
         # 清 0 时,请求与实态一致 → 走 kept-feature。两者皆合法。
         off = testenv.log_size(TIMING_LOG)
-        set_ini("dlssnr", "fg_enabled", "0")
+        testenv.set_ini("dlssnr", "fg_enabled", "0")
         seek()
         hit, lines = window(off,
                             lambda ls: any(("hot rebind shape" in l and "fg=0" in l)
@@ -222,7 +218,7 @@ def main():
         testenv.kill_mpv()
         errf.close()
         for (sec, key), val in backup.items():
-            set_ini(sec, key, val)
+            testenv.set_ini(sec, key, val)
 
     print("SHAPE-HOTSWAP: PASS" if ok else "SHAPE-HOTSWAP: FAIL")
     return 0 if ok else 1
