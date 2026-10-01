@@ -44,8 +44,9 @@ foreach ($h in $ngxHeaders) {
 # COFF 归档魔数断言:HTML 错误页/LFS 指针文件拦下(同类防线见下文 dll)。
 $ngxLibPath = Join-Path $ngxLib "nvsdk_ngx_s.lib"
 Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" $ngxLibPath
-$libHead = [System.IO.File]::ReadAllBytes($ngxLibPath)[0..7]
-if (-not $libHead -or [System.Text.Encoding]::ASCII.GetString($libHead) -ne '!<arch>') {
+# ar 魔数 8 字节 = '!<arch>' + 换行;只比前 7 字节可见字符,避开换行符。
+$libHead = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($ngxLibPath)[0..6])
+if ($libHead -ne '!<arch>') {
     throw "nvsdk_ngx_s.lib sanity failed (not a COFF archive; delete and refetch)"
 }
 
@@ -102,7 +103,8 @@ if (Test-Path $fgProxyIni) {
     $iniText = Get-Content $fgProxyIni -Raw
     if ($iniText -notmatch '(?m)^MaxGeneratedFrames=5\s*$') {
         $iniText = $iniText -replace '(?m)^MaxGeneratedFrames=\d+\s*$', "MaxGeneratedFrames=5"
-        Set-Content -Path $fgProxyIni -Value $iniText -NoNewline -Encoding utf8NoBOM
+        # PS 5.1 无 utf8NoBOM 枚举值,用 .NET 无 BOM UTF8 写回(两代 PowerShell 通用)。
+        [System.IO.File]::WriteAllText($fgProxyIni, $iniText, [System.Text.UTF8Encoding]::new($false))
         Write-Host "fg proxy ini: MaxGeneratedFrames -> 5 (6X cap)"
     }
 }

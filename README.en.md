@@ -202,8 +202,6 @@ powershell -File native\scripts\build.ps1          # output: native\bin\{vs_dlss
 pwsh -File native\scripts\package.ps1 [-Version 2026.09.08]   # output: native\dist\mpv_PlayKit-dlssnr-v<version>-full.zip (version defaults to today's date)
 ```
 
-For the porting checklist, architecture notes, and pitfall log, see [docs/PORTING.md](docs/PORTING.md).
-
 `native/testkit/` is a reusable test toolbox (end-to-end assertions over real mpv playback; see the README inside for usage). Synthetic test media is generated deterministically by `native/testkit/testmedia.py` into `native/testkit/media/` (binaries not committed — delete and rerun `python testmedia.py` to regenerate); the folder also works as manual-testing material.
 
 ## Credits & license
