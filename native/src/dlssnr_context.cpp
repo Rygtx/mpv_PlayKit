@@ -2539,8 +2539,11 @@ bool DlssnrContext::ProcessFrame(
     }
     // 管线色 = DLSSG 的 backbuffer。两种形态(fg_hdr_interp 实验开关):
     //   0(默认)= SDR 域:vsrRun → vsrColor BGRA8 @PIPE;否则 outputColor
-    //     BGRA8 @src。DLSSG 的 ColorBuffersHDR 路径实测压高光(插值帧
-    //     276→70 nits,实验定案),插值在 SDR 域,每个输出帧再各自过一次
+    //     BGRA8 @src。DLSSG 的 ColorBuffersHDR 路径曾实测压高光(2026-09-24
+    //     单机观测插值帧 276→70 nits;2026-10-02 A/B 复核 384 帧未复现 ——
+    //     fg_hdr=1/0 插值帧 max-nits 比值 0.90/0.89 无塌陷,
+    //     testkit/hdr_interp_nits.py 可重跑;默认仍 0,转正待裁定),
+    //     插值在 SDR 域,每个输出帧再各自过一次
     //     TrueHDR → postB 转换(hdrPostSplit 三段提交)。
     //   1(实验)= HDR 域:TrueHDR 只做真实帧一次,hdrColor FP16 scRGB 即
     //     backbuffer,DLSSG 直接插出 HDR 插值帧(postA 内逐 gen 转换/回读,
@@ -2679,7 +2682,8 @@ bool DlssnrContext::ProcessFrame(
     // NOTE: timestamp disabled, see note above
     // NVOF flow 已在 StageFrame 里 CPU 等待完成(execute 后的输出栅栏),
     // 槽 CL 提交时 GPU 侧 flow 已就绪 —— 不再需要队列级 Wait(实测该栅栏
-    // 在队列 Wait 语义下可能永不满足,见 NvofContext::StageFrame 注释)。
+    // 在队列 Wait 语义下可能永不满足(2026-10-02 复核未复现,见
+    // NvofContext::FlushPendingDensify 注释)。
     // 冲刷点 B:NR 开时 base CL 的 NGX eval / guidance 降采样是首个 motion
     // 消费者 —— densify CL 必须先于 base CL 入队(FIFO)。CPU 等引擎在 eval
     // 录制期间已被消耗大半,此处常态所剩无几。NR 关帧跳过(base CL 无运动

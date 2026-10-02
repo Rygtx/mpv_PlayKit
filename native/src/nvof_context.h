@@ -14,7 +14,9 @@
 //   2. execute(n) [NVOF 内部引擎]      waits copyFence >= k_n(输入内容就绪)
 //                                      + doneFence >= m_{同槽位上一次}
 //   3. execute(n) 提交成功后 **CPU 等输出栅栏被延迟**(官方样例模式;队列级
-//      Wait 实测不可靠,故仍是 CPU 等):StageFrame 只做提交 + 门推进,门锁
+//      Wait 曾实测不可靠 —— 2026-10-02 旁路探针复核未复现,30/30 即刻放行,
+//      CPU 等仍保留:冲刷点重叠设计 + 僵尸引擎超时判定,见 FlushPendingDensify
+//      注释):StageFrame 只做提交 + 门推进,门锁
 //      随 OfStageResult::pendingDensify 移交给调用方;调用方在首个 motion
 //      消费者 CL(NGX base / FG fg CL)提交前调 FlushPendingDensify ——
 //      CPU 等 doneFence >= m_n 在那里进行,与 eval/FG 录制重叠,醒来后把
@@ -224,6 +226,19 @@ private:
     uint64_t _doneSeq = 0;        // doneFence 单调计数(注册 + execute 共用)
     uint64_t _lastDone = 0;       // 最近一次 execute 的 done 值(copy(n+1) 等它)
     uint64_t _doneByParity[2]{};  // 每个输入槽位最近一次被 execute 写入的 done 值
+    // 队列级 Wait 复核探针(2026-10-02,VSDLSSNR_NVOF_QWAIT=1):旁路 DIRECT
+    // 队列上 Wait(doneFence) → Signal(marker),冲刷点 CPU 等 marker 判定
+    // 队列 Wait 是否被 doneFence 满足。旁路隔离:主链路 CPU 等照旧,探针
+    // 卡死只耗自己的 5s 超时,不伤帧链。stuck×3 判成立停测;采样 30 帧未
+    // 现象自动收摊。
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> _qwaitQueue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> _qwaitMarker;
+    HANDLE _qwaitEvent = nullptr;
+    uint64_t _qwaitSeq = 0;          // marker 单调计数
+    uint64_t _qwaitPending = 0;      // 本帧 enqueue 的 marker 值(冲刷点核对)
+    LARGE_INTEGER _qwaitEnqueueQpc{};
+    int _qwaitSamples = 0;           // 已采 verdict 帧数(≥30 自动停)
+    int _qwaitStuck = 0;             // STUCK 计数(≥3 判成立停测)
     // 延迟 densify(2026-09-25):待冲刷帧的 execute done 值 + 输入槽位。
     // 0 = 无待冲刷。仅单在飞:门锁由调用方从 StageFrame 持到冲刷,期间无
     // 其它帧可入门置位。StageFrame 入门即清(失败路径残留作废 —— 其

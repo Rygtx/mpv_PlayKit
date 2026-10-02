@@ -36,6 +36,13 @@ constexpr NvofProfile ResolveProfile(int quality) noexcept {
     }
 }
 
+// 队列级 Wait 复核探针开关(VSDLSSNR_NVOF_QWAIT=1;2026-10-02 复核,平时
+// 关 —— 见 nvof_context.h 探针成员注释与 FlushPendingDensify 判定点)。
+static bool QwaitProbeEnabled() noexcept {
+    static const bool on = GetEnvironmentVariableA("VSDLSSNR_NVOF_QWAIT", nullptr, 0) != 0;
+    return on;
+}
+
 // NV_OF_BUFFER_FORMAT → DXGI(样例 NvOFBufferFormatToDxgiFormat 的三个用例)。
 constexpr DXGI_FORMAT ToDxgi(NV_OF_BUFFER_FORMAT fmt) noexcept {
     switch (fmt) {
@@ -186,6 +193,14 @@ void NvofContext::DestroySession() noexcept {
     _lastCopyFence = 0;
     _doneSeq = 0;
     _lastDone = 0;
+    _qwaitQueue.Reset();
+    _qwaitMarker.Reset();
+    if (_qwaitEvent) {
+        CloseHandle(_qwaitEvent);
+        _qwaitEvent = nullptr;
+    }
+    _qwaitSeq = _qwaitPending = 0;
+    _qwaitSamples = _qwaitStuck = 0;
     _doneByParity[0] = _doneByParity[1] = 0;
     _bidirectional = false;
     _costEnabled = false;
@@ -397,6 +412,22 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         _doneFenceEvent = fences.doneEvent;
         _copySeq = _lastCopyFence = _copyFence->GetCompletedValue();
         _doneSeq = _lastDone = _doneFence->GetCompletedValue();
+    }
+    // 探针旁路队列(仅 VSDLSSNR_NVOF_QWAIT=1):Wait/Signal 与主链路隔离,
+    // 探针卡死只耗自己的超时,不伤帧链。
+    if (QwaitProbeEnabled() && !_qwaitQueue) {
+        D3D12_COMMAND_QUEUE_DESC qd{};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (SUCCEEDED(device->CreateCommandQueue(
+                &qd, IID_PPV_ARGS(_qwaitQueue.GetAddressOf()))) &&
+            SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                          IID_PPV_ARGS(_qwaitMarker.GetAddressOf())))) {
+            _qwaitEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            _qwaitSeq = _qwaitMarker->GetCompletedValue();
+        } else {
+            _qwaitQueue.Reset();
+            TimingStatusLine("DLSSNR STATUS: nvof qwait probe init failed; probe off");
+        }
     }
     for (int i = 0; i < kClDepth; ++i) {
         if (FAILED(device->CreateCommandAllocator(
@@ -679,6 +710,17 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                     _pendingDensifyValue = outFence.value;
                     _pendingDensifyInput = cur;
                     result.pendingDensify = true;
+                    // 探针:旁路队列 Wait(输出栅栏)+ Signal(marker),
+                    // 冲刷点按 marker 是否落位判定"队列级 Wait 是否可靠"。
+                    if (QwaitProbeEnabled() && _qwaitQueue && _qwaitStuck < 3 &&
+                        _qwaitSamples < 30) {
+                        _qwaitQueue->Wait(_doneFence.Get(), outFence.value);
+                        _qwaitMarker->Signal(++_qwaitSeq);
+                        QueryPerformanceCounter(&_qwaitEnqueueQpc);
+                        _qwaitPending = _qwaitSeq;
+                    } else {
+                        _qwaitPending = 0;
+                    }
                 } else {
                     result.waitFenceValue = 0;
                 }
@@ -760,8 +802,11 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
     const int cur = _pendingDensifyInput;
     _pendingDensifyValue = 0; // 先清:任何出口不复冲刷
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) return;
-    // CPU 等引擎输出栅栏(官方样例模式;队列级 Wait 实测不可靠)。等待
-    // 落位后再提交 densify。超时 = 引擎状态不可信(僵尸 execute 会继续写
+    // CPU 等引擎输出栅栏(官方样例模式;队列级 Wait 曾实测不可靠 ——
+    // 2026-10-02 旁路探针复核未复现:30/30 帧对已满足栅栏即刻放行,
+    // VSDLSSNR_NVOF_QWAIT=1 可重跑。CPU 等保留的现行理由 = 冲刷点与 eval
+    // 录制重叠的设计 + 僵尸引擎 10s 超时判定,队列 Wait 无超时做不到后者)。
+    // 等待落位后再提交 densify。超时 = 引擎状态不可信(僵尸 execute 会继续写
     // 固定 flow 缓冲),会话立即作废,由 RebuildOf 重建。
     LARGE_INTEGER freq{}, te0{}, te1{};
     QueryPerformanceFrequency(&freq);
@@ -782,6 +827,36 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
         _gate.InvalidateHistory(); // 门锁由调用方持有,门状态可安全触碰
         _ready.store(false, std::memory_order_release);
         return;
+    }
+    // 探针判定(2026-10-02):doneFence 已被 CPU 侧确认落位(reached),此
+    // 时若旁路队列的 Wait→marker 链 5s 仍不满足 = 队列级 Wait 对已满足栅栏
+    // 卡死,"实测不可靠"成立;即刻满足 = 未复现。stuck×3 判成立停测,
+    // 30 帧无现象自动收摊。
+    if (_qwaitPending && _qwaitMarker) {
+        LARGE_INTEGER tf{}, tm0{}, tm1{};
+        QueryPerformanceFrequency(&tf);
+        QueryPerformanceCounter(&tm0);
+        const bool marker = WaitFenceReached(_qwaitMarker.Get(), _qwaitPending,
+                                             _qwaitEvent, 5000);
+        QueryPerformanceCounter(&tm1);
+        const double qwaitMs =
+            static_cast<double>(tm1.QuadPart - _qwaitEnqueueQpc.QuadPart) * 1000.0 /
+            static_cast<double>(tf.QuadPart);
+        const double markerMs =
+            static_cast<double>(tm1.QuadPart - tm0.QuadPart) * 1000.0 /
+            static_cast<double>(tf.QuadPart);
+        ++_qwaitSamples;
+        char msg[160];
+        std::snprintf(msg, sizeof(msg),
+                      "NVOF-QWAIT: done_wait=%.1fms marker=%s qwait_span=%.1fms marker_wait=%.1fms",
+                      _lastExeWaitMs, marker ? "ok" : "STUCK", qwaitMs, markerMs);
+        TimingStatusLine(msg);
+        if (!marker && ++_qwaitStuck >= 3) {
+            TimingStatusLine("NVOF-QWAIT: VERDICT claim CONFIRMED (3x stuck); probe off");
+        } else if (_qwaitSamples >= 30) {
+            TimingStatusLine("NVOF-QWAIT: VERDICT not reproduced (30 samples); probe off");
+        }
+        _qwaitPending = 0;
     }
     if (!postExecute) return; // 契约兜底(StageFrame 已挡,正常不可达)
     // densify 二次提交:flow 输出已就绪(CPU 等已落位),门锁串行下追加
