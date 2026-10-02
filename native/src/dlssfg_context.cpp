@@ -200,11 +200,10 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
     _height = height;
     _format = backbufferFormat;
     // ColorBuffersHDR 恒 0(2026-09-24 PQ 域插帧定案,与 FP16 格式解耦):
-    // DLSSG 的 HDR 路径对 >1.0 的 scRGB 线性值不保真(2026-09-24 单机观测
-    // 插值帧高光钳 ~0.875 ≈ 70 nits;2026-10-02 对 fg_hdr=1 实验路径复核未
-    // 复现塌陷 —— 见 dlssnr_context 帧路径注释,直喂 scRGB>1.0 的形态仍未
-    // 重测,但该路径恒关、由 PQ 码域替代)。实验 fgHdrInterp 的 backbuffer
-    // 是 FP16 载 **PQ 码域**(≤1.0,
+    // DLSSG 的 HDR 路径对 >1.0 的 scRGB 线性值不保真 —— 2026-10-02 复现
+    // 确认(scRGB 直喂 + ColorBuffersHDR=1:插值帧整帧垃圾,呈现形态见
+    // dlssnr_context 帧路径注释),恒 0 + PQ 码域替代是正解。实验
+    // fgHdrInterp 的 backbuffer 是 FP16 载 **PQ 码域**(≤1.0,
     // TrueHDR 产物经 HdrToPq 编码)—— 感知码域走本 LDR 路径,原生 HDR 直通
     // 同域实证无损;DLSSG 在感知域插值 = HDR10 游戏标准形态。
     _colorHdr = false;

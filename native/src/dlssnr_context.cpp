@@ -2539,10 +2539,12 @@ bool DlssnrContext::ProcessFrame(
     }
     // 管线色 = DLSSG 的 backbuffer。两种形态(fg_hdr_interp 实验开关):
     //   0(默认)= SDR 域:vsrRun → vsrColor BGRA8 @PIPE;否则 outputColor
-    //     BGRA8 @src。DLSSG 的 ColorBuffersHDR 路径曾实测压高光(2026-09-24
-    //     单机观测插值帧 276→70 nits;2026-10-02 A/B 复核 384 帧未复现 ——
-    //     fg_hdr=1/0 插值帧 max-nits 比值 0.90/0.89 无塌陷,
-    //     testkit/hdr_interp_nits.py 可重跑;默认仍 0,转正待裁定),
+    //     BGRA8 @src。DLSSG 的 HDR 路径对 >1.0 的 scRGB 线性值不保真
+    //     (2026-09-24 观测插值帧高光 276→70 nits;2026-10-02 复现确认 ——
+    //     scRGB 直喂 + ColorBuffersHDR=1 时插值帧整帧垃圾 ~4654 nits,
+    //     呈现形态随下游转换链而变,根因同为 >1.0 不保真)。现行 fg_hdr
+    //     实验路径经 HdrToPq 编码 ≤1.0 避开该缺陷(同日验证:插值/真实
+    //     max-nits 比 0.90 无塌陷;默认仍 0,"部分驱动闪烁"另行定夺),
     //     插值在 SDR 域,每个输出帧再各自过一次
     //     TrueHDR → postB 转换(hdrPostSplit 三段提交)。
     //   1(实验)= HDR 域:TrueHDR 只做真实帧一次,hdrColor FP16 scRGB 即
