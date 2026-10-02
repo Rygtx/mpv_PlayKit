@@ -997,6 +997,23 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
         return false;
     }
+    // 重建耗时分解打点(2026-10-02):VSR 切档"复制帧好几秒"的定位数据 ——
+    // 各段耗时随 STATUS 行落 timing log,一次复现即可定位大头(排空/RTX
+    // 模型加载/槽纹理/NR 特征)。
+    LARGE_INTEGER qpf, tTotal, tSeg;
+    QueryPerformanceFrequency(&qpf);
+    QueryPerformanceCounter(&tTotal);
+    tSeg = tTotal;
+    auto segMs = [&qpf, &tSeg](void) -> int {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const int ms = static_cast<int>((now.QuadPart - tSeg.QuadPart) * 1000 / qpf.QuadPart);
+        tSeg = now;
+        return ms;
+    };
+    // NR 特征跳过判定的格式基线:评估域格式随 RTX 组合变(10bit 消量化,
+    // NrColorFormat),格式变了 NGX 按创建格式理解数据,特征必须重建。
+    const DXGI_FORMAT nrFmtBefore = _d3d12->ColorFormat();
     // Preset / internal-resolution / scaling-toggle are create-time keys:
     // release the feature, rebuild scaling textures when needed, then
     // CreateFeature again (device/queues untouched). Scaling disabled means
@@ -1024,6 +1041,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         TimingStatusLine("DLSSNR STATUS: recreate ABORTED (finish tickets not drained)");
         return false;
     }
+    const int drainMs = segMs();
     // A video-size/shape change replaces every slot's frame resources first —
     // outside CtlMutex because the guidance clear inside takes it itself.
     // All GPU work is complete (slots are only released after WaitFrame).
@@ -1149,6 +1167,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
                       _pipeW, _pipeH, _outW, _outH);
         TimingLog(msg);
     }
+    const int shapeMs = segMs();
     if (resize && !_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested,
                                                 _pipeW, _pipeH, _outW, _outH,
                                                 _vsrRequested, _hdrActive, _fgHdrInterp,
@@ -1157,6 +1176,18 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         _ready.store(false, std::memory_order_release);
         return false;
     }
+    const int resMs = segMs();
+    // NR 特征段跳过判定:CreateFeature 参数块只含几何/质量键(源码验证
+    // 2026-10-02:Magpie SetCreateParametersUnsafe 无纹理;两仓 eval 模式
+    // 纹理均为每帧传入参数块)—— 纹理对象更换由 eval 参数块天然吸收,
+    // 只有 NR 创建键(尺寸/preset/res/scaling/评估域格式)变化才必须重建。
+    // 纯 RTX/FG 形态变化(vsrMode/fg 档位)时跳过 ~0.7s 的模型重建
+    // (实测日志 nr=617/775ms,是 VSR 切档重建的大头)。
+    const DXGI_FORMAT nrFmtAfter = _d3d12->ColorFormat();
+    const bool nrKeysChanged = dimsChange || preset != _curPreset ||
+                               resPercent != _curRes ||
+                               (scalingEnabled != 0) != _curScaling ||
+                               nrFmtBefore != nrFmtAfter;
     if (resize && _fgRequested) {
         if (_fg && _fg->Enabled()) {
             // FG feature 随尺寸/格式重建(proxy Release + CreateFeature;
@@ -1235,6 +1266,24 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             TimingLog(msg);
         }
     }
+    // scaling 纹理维护(原在 NR 特征段内,挪出使其独立于该段是否执行):
+    // 槽重造后 reduced 系纹理为空(CreateSlotResources 只 Reset 不建),
+    // scaling 启用时必须重建;键 = internalW/H(由 resPercent 定),键没变
+    // 时重建等价恢复,幂等。无 NGX 调用,与 NR 特征段无顺序耦合。
+    if (scalingEnabled) {
+        int iw = _width, ih = _height;
+        InternalSize(_width, _height, resPercent, iw, ih);
+        if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) {
+            _ready.store(false, std::memory_order_release);
+            return false;
+        }
+    } else {
+        _d3d12->ClearScalingResources();
+    }
+    const int postMs = segMs();
+    // ---- NR 特征段(仅创建键变化时执行;纯形态热化跳过)----
+    int nrMs = 0;
+    if (nrKeysChanged) {
     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
     {
         DWORD sehCode = 0;
@@ -1252,16 +1301,6 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: AllocateParameters failed");
             _ready.store(false, std::memory_order_release);
             return false;
-        }
-        if (scalingEnabled) {
-            int iw = _width, ih = _height;
-            InternalSize(_width, _height, resPercent, iw, ih);
-            if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) {
-                _ready.store(false, std::memory_order_release);
-                return false;
-            }
-        } else {
-            _d3d12->ClearScalingResources();
         }
     }
     if (!_d3d12->BeginCtlRecording()) {
@@ -1288,12 +1327,42 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         _ready.store(false, std::memory_order_release);
         return false;
     }
-    char msg[160];
+    nrMs = segMs();
+    } // end nrKeysChanged
+    if (!_d3d12->BeginCtlRecording()) {
+        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: BeginCtlRecording failed");
+        _ready.store(false, std::memory_order_release);
+        return false;
+    }
+    {
+        DWORD sehCode = 0;
+        if (!SetCreateParametersSafely(&sehCode)) {
+            if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: parameter setup raised SEH");
+            _ready.store(false, std::memory_order_release);
+            return false;
+        }
+        const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CtlCommandList(), _parameters, &sehCode);
+        if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_feature) {
+            if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: CreateFeature failed (0x%x)",
+                static_cast<unsigned>(sehCode ? 0xFFFFFFFFu : r));
+            _ready.store(false, std::memory_order_release);
+            return false;
+        }
+    }
+    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "nr recreate")) {
+        _ready.store(false, std::memory_order_release);
+        return false;
+    }
+    const int totalMs = static_cast<int>((tSeg.QuadPart - tTotal.QuadPart) * 1000 / qpf.QuadPart);
+    char msg[224];
     snprintf(msg, sizeof(msg),
-             "DLSSNR STATUS: preset=%d res=%d%% scaling=%d internal=%dx%d d=%d feature recreated%s frame=%d",
+             "DLSSNR STATUS: preset=%d res=%d%% scaling=%d internal=%dx%d d=%d %s%s frame=%d "
+             "rebuild[drain=%d shape=%d res=%d post=%d nr=%d total=%dms]",
              preset, scalingEnabled ? resPercent : 100, scalingEnabled,
              _d3d12->InternalWidth(), _d3d12->InternalHeight(), _depth,
-             resize ? " (size changed)" : "", _lastFrameN.load(std::memory_order_relaxed));
+             nrKeysChanged ? "feature recreated" : "feature reused (hot shape)",
+             resize ? " (size changed)" : "", _lastFrameN.load(std::memory_order_relaxed),
+             drainMs, shapeMs, resMs, postMs, nrMs, totalMs);
     DbgLine(msg);
     TimingLog(msg);
     _curPreset = preset;
@@ -1614,9 +1683,16 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
                                         shapeChanged ? (p.fgEnabled ? 1 : 0) : -1,
                                         shapeChanged ? (fgHdrDesired ? 1 : 0) : -1);
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
-    // 只处理尺寸,档位变化在这里补齐。历史已在会话(重)建时作废。会话输
-    // 入尺寸同样在此对齐(follow 开关/res% 变化)。单一裁决点见 SyncOfSession。
+    // 只处理尺寸,档位变化在这里补齐。会话输入尺寸同样在此对齐(follow 开
+    // 关/res% 变化)。单一裁决点见 SyncOfSession。
     if (nvofOk) {
+        // 重载 = reseek = 新时间线:与上方热复用分支同理,光流/FG 历史必须
+        // 作废。此前只写于热复用分支 —— vsr 形态变化时 OF 会话原样保留
+        // (dimsChange=false 不触发重建,"历史已在会话(重)建时作废"的
+        // 假设对它不成立),帧序门残留旧时间线的 _nextSeq;重载后 mpv 从
+        // 帧 0 重新送帧,每帧被判迟到 → 播种式复制帧爬满旧时间线长度
+        // (2026-10-02 门打点实锤:next=200,streak 爬到 188 才自愈)。
+        ResetNvofHistory();
         SyncOfSession(p, _width, _height, /*allowRetry=*/true, err, errLen);
     }
     return nvofOk;

@@ -288,6 +288,8 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         result.historyReset = true;
         return result;
     }
+    // 停摆观测④的连续迟到计数(函数级作用域:Expired 分支内外共用)。
+    static int s_expStreak = 0;
     LARGE_INTEGER freq{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
@@ -299,10 +301,24 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         std::unique_lock<std::mutex> lock(_gate.Mutex);
         const OfGateDecision decision = _gate.Arrive(frameIndex, lock);
         if (decision == OfGateDecision::Expired) {
+            // 连续迟到帧观测(正式保留):偶发 1-2 帧 = 线程乱序,正常;
+            // streak 累到 16+ = 门期望与帧号时间线错位(2026-10-02 vsr 切档
+            // 门残留旧 _nextSeq 实锤:重载后 mpv 从帧 0 重送,复制帧爬满旧
+            // 时间线长度才自愈)。阈值触达打一行,归零前不再刷 —— 常态零
+            // 输出,perf 行 s/x/r 不覆盖"过期"形态,此行是唯一信号。
+            ++s_expStreak;
+            if (s_expStreak == 16) {
+                char msg[128];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: of gate late streak=%d frame=%d next=%d",
+                              s_expStreak, frameIndex, static_cast<int>(_gate.NextSeq()));
+                TimingStatusLine(msg);
+            }
             _lastStageMs = 0.0;
             _lastGpuSpanMs = 0.0; // 过期帧无光流计算,nvof 段读 0
             return result;
         }
+        s_expStreak = 0;
         // 推进门:活性不变量要求过 Arrive 的帧所有路径必达 Advance,否则
         // 缺口=1 的等待方永久悬等(of_frame_gate.h)。
         if (_d3d12->IsDeviceLost()) {

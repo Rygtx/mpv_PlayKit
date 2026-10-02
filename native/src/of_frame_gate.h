@@ -77,6 +77,8 @@ public:
     }
 
     bool HistoryValid() const noexcept { return _historyValid; }
+    // 门期望序号(诊断观测用;Arrive/Advance 持锁内调用,无并发读)。
+    int64_t NextSeq() const noexcept { return _nextSeq; }
     // 播种帧拷贝成功:历史链已建立,下一帧可产出真运动。
     void MarkSeeded() noexcept { _historyValid = true; }
     // 失败帧:历史作废但门继续推进(下一帧重新播种)。
