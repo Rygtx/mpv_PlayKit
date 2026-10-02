@@ -1127,7 +1127,8 @@ void DrawUi() noexcept {
         const int mult = fgCadence ? g_app.fgMult : 1;
         const int src = static_cast<int>(g_app.fps + 0.5);
         if (mult > 1) {
-            ImGui::Text("帧率: %d 源 / %d 输出 FPS", src, src * mult);
+            // 箭头链与分辨率行同款:源 → 插帧输出
+            ImGui::Text("帧率: %d → %d FPS", src, src * mult);
         } else {
             ImGui::Text("帧率: %d FPS", src);
         }

@@ -4642,7 +4642,8 @@ void D3D12Context::RecordDebugDiff(FrameSlot &slot) noexcept {
     cl->ResourceBarrier(2, post);
 }
 
-void D3D12Context::RecordFlowView(FrameSlot &slot, bool useReduced, bool realMotion) noexcept {
+void D3D12Context::RecordFlowView(FrameSlot &slot, bool useReduced, bool realMotion,
+                                  D3D12_RESOURCE_STATES outColorIn) noexcept {
     // 光流场调试视图(契约见头文件)。dispatch 恒按源尺寸(OutExtent),
     // 运动场 texel 在 shader 内最近邻映射 —— follow 内部场(半尺寸)也铺
     // 满输出,_debugDiff 无陈旧边缘。dispatch 写共享 _debugDiff → COPY_
@@ -4672,11 +4673,12 @@ void D3D12Context::RecordFlowView(FrameSlot &slot, bool useReduced, bool realMot
     cl->SetComputeRoot32BitConstants(0, 1, &scale, 4);
     cl->SetComputeRoot32BitConstants(0, 1, &pad, 5);
 
-    // 入态:debugDiff→UAV / output→COPY_DEST(运动场三路取材全部 NSR 常
-    // 驻或由 evaluate 消费链保持,无需屏障)。
+    // 入态:debugDiff→UAV / output→COPY_DEST(outColorIn:NR 开帧 eval 留
+    // UAV,NR 关帧跨 ECL 衰减 COMMON —— 运动场三路取材全部 NSR 常驻或由
+    // evaluate 消费链保持,无需屏障)。
     D3D12_RESOURCE_BARRIER pre[2]{
         Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST),
+        Transition(slot.outputColor.Get(), outColorIn, D3D12_RESOURCE_STATE_COPY_DEST),
     };
     cl->ResourceBarrier(2, pre);
     cl->SetComputeRootDescriptorTable(1, gpu(srvIndex));        // t0 运动场/零纹理

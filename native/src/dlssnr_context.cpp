@@ -1936,8 +1936,14 @@ bool DlssnrContext::ProcessFrame(
     // 探针(VSDLSSNR_RTX_NOEVAL=1):只跑本地管线不调 RTX NGX —— eval 期
     // 问题二分定位(NGX eval 段 vs 本地录制段)。
     static const bool rtxNoEval = GetEnvironmentVariableA("VSDLSSNR_RTX_NOEVAL", nullptr, 0) != 0;
-    const bool vsrRun = vsrLive && !rtxNoEval;
-    const bool hdrRun = hdrLive && !rtxNoEval;
+    // 调试视图直出(NR 关):光流场调试图落在 outputColor,NR 关时下游
+    // 直连 inputColor/vsrColor,调试图无人消费 = 面板开了也看不到。本帧
+    // 旁路 VSR/HDR,让管线色 = outputColor(调试图),与 NR 开时"调试图
+    // 当管线色(VSR 照常放大/FG 照常当 backbuffer)"同语义。差异视图仍
+    // 需 NR(无 NR 改动 = 无差),维持 !nrOff 门不动。
+    const bool debugPipe = nrOff && frameParams.debugView == 2;
+    const bool vsrRun = vsrLive && !rtxNoEval && !debugPipe;
+    const bool hdrRun = hdrLive && !rtxNoEval && !debugPipe;
     const bool rtxIn = vsrRun || hdrRun; // 本帧有 RTX eval:base 尾转 NSR、真实帧输出移 post 段
     // fmParallel: VS feeds several frames concurrently, each on its own slot
     // (command list, staging, textures). The queue serializes the GPU work in
@@ -2512,8 +2518,9 @@ bool DlssnrContext::ProcessFrame(
     const bool hdrLegacyInterp = hdrRun && _fgHdrInterp;  // 实验模式
     ID3D12Resource *pipeColor = _d3d12->OutputColor(*slot);
     // NR 关直连:无 NGX 产出,管线色 = C1 产物 inputColor(下游 FG
-    // backbuffer / post 段 C2 直读,不经 outputColor 中转)。
-    if (nrOff) pipeColor = slot->inputColor.Get();
+    // backbuffer / post 段 C2 直读,不经 outputColor 中转)。debugPipe 帧
+    // 例外:outputColor 已是调试图,保持默认管线色(2513 赋值)。
+    if (nrOff && !debugPipe) pipeColor = slot->inputColor.Get();
     // 抗闪烁激活帧:无 RTX 覆盖时管线色 = 稳定帧(下游 FG backbuffer /
     // hdr-only DLSSG backbuffer / post 转换统一改读;vsrRun/hdrLegacyInterp
     // 的覆盖在其后 —— 它们的输出才是管线色)。
@@ -2577,7 +2584,12 @@ bool DlssnrContext::ProcessFrame(
     // 的 FIFO(差异视图不读运动场,不触发)。
     if (frameParams.debugView == 2) flushOfDensify();
     if (frameParams.debugView == 2) {
-        _d3d12->RecordFlowView(*slot, realMotion && densifyInternal, realMotion);
+        // outputColor 入态:NR 开帧 eval/直通拷贝同 CL 留 UAV(默认);
+        // NR 关帧本 CL 无人触碰,跨 ECL 衰减后实际 COMMON(skipEval 的
+        // 直通拷贝除外 —— 它先跑,同 CL 留 UAV)。
+        _d3d12->RecordFlowView(*slot, realMotion && densifyInternal, realMotion,
+                               nrOff && !skipEval ? D3D12_RESOURCE_STATE_COMMON
+                                                  : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     } else if (frameParams.debugView == 1 && !nrOff) {
         // 差异视图 = |NR 改动|:NR 关(直连)时 outputColor 无本帧内容,
         // diff 无语义 —— 跳过(画面原样),而非把陈旧 outputColor 当真。
@@ -2988,17 +3000,22 @@ bool DlssnrContext::ProcessFrame(
                                       fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                                : D3D12_RESOURCE_STATE_COMMON);
         } else if (nrOff) {
-            // pipeColor = inputColor(直连)。stateBefore 按实际落点:
-            // OF 会话已转换(inputIndex>=0,FFX/NVOF copy CL)= NSR;未转换
-            // (OF 关/失败)= 槽 CL RecordConvertInput 的 stateAfter(uploadPost)。
-            // 此前恒 COMMON,转换帧对已 NSR 的 inputColor 记错 from-state
-            // (2026-09-25 审查)。
+            // pipeColor = inputColor(直连)/ debugPipe 帧 = outputColor
+            // (光流场调试图 @src)。stateBefore 按实际落点:
+            // 直连帧:OF 会话已转换(inputIndex>=0,FFX/NVOF copy CL)= NSR;
+            // 未转换(OF 关/失败)= 槽 CL RecordConvertInput 的 stateAfter
+            // (uploadPost)。此前恒 COMMON,转换帧对已 NSR 的 inputColor
+            // 记错 from-state(2026-09-25 审查)。
+            // debugPipe 帧:outputColor 是 NGX 共享纹理,跨 ECL 隐式衰减
+            // COMMON(fgBar 的 NSR 化随 fg CL 完成同样衰减)—— post CL 恒
+            // 从 COMMON 对接,与 NR 开无 RTX 帧的 outputColor 同契约。
             _d3d12->RecordColorOutput(*postCl, *slot, pipeColor,
-                                      /* srvInput */ 0,
+                                      debugPipe ? D3D12Context::kSrvOutputColor : /* srvInput */ 0,
                                       ColorOutKind::Sdr,
                                       width, height, matrix, range,
-                                      convertedOnNvof ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                                      : uploadPost);
+                                      debugPipe ? D3D12_RESOURCE_STATE_COMMON
+                                                : (convertedOnNvof ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                                                   : uploadPost));
         } else if (_rtxActive) {
             // 抗闪烁帧:稳定帧由 RecordTemporal 显式 COMMON 落位,base 尾
             // NSR 化(若 DLSSG 消费)后经 inBack 归位 —— 恒 COMMON,与 FG

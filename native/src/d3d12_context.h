@@ -541,7 +541,8 @@ public:
     //               —— 零纹理保证"黑 = 无光流数据"的语义成立,无需屏障。
     //   dispatch 恒按源尺寸,运动场 texel 在 shader 内最近邻映射(follow
     //   半尺寸场放大铺满,_debugDiff 无陈旧边缘)。
-    void RecordFlowView(FrameSlot &slot, bool useReduced, bool realMotion) noexcept;
+    void RecordFlowView(FrameSlot &slot, bool useReduced, bool realMotion,
+                        D3D12_RESOURCE_STATES outColorIn = D3D12_RESOURCE_STATE_UNORDERED_ACCESS) noexcept;
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
