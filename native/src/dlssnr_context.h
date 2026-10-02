@@ -361,6 +361,26 @@ private:
     // (parameter setup + snippet call) is serialized; GPU-side dispatches
     // still overlap via each slot's own command list.
     std::mutex _evaluateMutex;
+    // 抗闪烁时域稳定器(上游 antiFlicker,Magpie v0.6.8 DLSSNRTemporal):
+    // _curAntiFlicker = 当前已建资源的模式(0 = 关)。时间线状态(上游
+    // DLSSNRTemporalState 移植,捕获时间戳 → 帧入口 QPC):weight =
+    // exp(-Δt/80ms),>250ms / 帧序不连续 / useMotion 翻转 / 重建帧一律
+    // weight 0(播种:历史写当前残差,下一帧起正常累积)。_tNext 由
+    // ProcessFrame 的 evaluate 串行域内推进,与 NGX 单例同一把
+    // _evaluateMutex 保护(记录序 ≠ 提交序的风险面与 NGX 时域历史一致:
+    // 乱序帧 weight 0 拒混,双缓冲容忍一帧偏斜)。
+    int _curAntiFlicker = 0;
+    long long _tLastFrame = -1;
+    double _tLastQpc = 0.0;
+    int _tNext = 0;
+    bool _tValid = false;
+    bool _tLastUseMotion = false;
+    // 抗闪烁状态发布(stats 通道):时域块/重建路径写,FinishFrame 的 stats
+    // JSON 读。跨帧线程普通成员会撕,atomics 与 _lastFrameN 同款惯例。
+    // state 0=off 1=seed 2=steady 3=failed。
+    std::atomic<int> _tPubState{ 0 };
+    std::atomic<int> _tPubRoute{ 0 };
+    std::atomic<float> _tPubWeight{ 0.0f };
     // 面板可见的死亡状态发布(passthrough / ngx_faulted):边缘触发,每状态
     // 每实例一次。存活态(ok / nvof_zero)由周期 stats tick 携带,不走这里。
     // 0 = passthrough,1 = ngx_faulted,-1 = 尚未发布过。

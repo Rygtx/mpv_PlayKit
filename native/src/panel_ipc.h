@@ -66,7 +66,11 @@ constexpr uint32_t PAYLOAD_SIZE = 2048;
 // 1)。部分驱动(SM86 移植内核)此路径插值帧压高光 = 闪烁,默认 0(SDR
 // 域插帧 + 逐帧 TrueHDR)。结构体尾部追加,新旧混跑按 magic 拒 —— 成对
 // 部署。
-constexpr uint32_t PAYLOAD_MAGIC = 0x4E4C5344u; // "DSLN" (v23, 版本位走 hex:9 之后是 A/B/C/D/E/F)
+// v24(payload DSLO):antiFlicker(0-4,抗闪烁时域稳定器,live)回归
+// —— v14 首引入、v18 随"维护成本 > 感知收益"裁定移除;NR 参数调强后
+// 闪烁复现,机制原样回植(d3d12 侧 TEMPORAL_* HLSL + dlssnr 侧时间线),
+// 结构体尾部追加,新旧混跑按 magic 拒 —— 成对部署。
+constexpr uint32_t PAYLOAD_MAGIC = 0x4F4C5344u; // "DSLO" (v24, 版本位走 hex:9 之后是 A/B/C/D/E/F)
 // v23(stats "DSL4",hex 实际末字节 '4'):stats JSON 新增 rtxvsr_last/
 // rtxhdr_last(RTX Video VSR/TrueHDR 专用队列 eval 分段拆账 —— 此前 RTX
 // 时间无账目:CPU 录制混进 gpu 段窗口,GPU 执行经 post CL 的队列 Wait 全落
@@ -78,7 +82,7 @@ constexpr uint32_t PAYLOAD_MAGIC = 0x4E4C5344u; // "DSLN" (v23, 版本位走 hex
 // VSR-only 时 fg 段显示的 3.5-8.9ms 实为 VSR 输出转换)。同时 nvof 段语义
 // 变化:OF 门按消费者决定(NR 关 + FG 关 = 整段跳过,恒 0)。键为纯增量,
 // bump 理由同 v21:成对部署约束,两端都有明确信号。
-constexpr uint32_t STATS_MAGIC = 0x364C5344u;   // "DSL6" (v25:PAYLOAD 2048 + queue_last + of_last 改名;hex 按内存序实为 DSL6)
+constexpr uint32_t STATS_MAGIC = 0x374C5344u;   // "DSL7" (v26:temporal/temporal_route/temporal_w 三键纯增量,抗闪烁诊断行;hex 按内存序实为 DSL7)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -121,6 +125,7 @@ struct PanelPayload {
     int32_t hdrMiddleGray;       // 10-100(live)
     int32_t hdrMaxLuminance;     // 400-2000 nits(live)
     int32_t fgHdrInterp;         // 0/1 实验性补帧 HDR 域插值(v23,创建时)
+    int32_t antiFlicker;         // 0-4 抗闪烁时域稳定器(v24,live)
 };
 #pragma pack(pop)
 
@@ -154,6 +159,7 @@ inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.fgMultiplier = std::clamp(pl.fgMultiplier, kFgMultMin, kFgMultMax);
     p.debugView = std::clamp(pl.debugView, 0, kDebugViewMax);
     p.ofBackend = std::clamp(pl.ofBackend, kOfBackendMin, kOfBackendMax);
+    p.antiFlicker = std::clamp(pl.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
     // RTX Video live 项(v22):VSR 质量 + HDR 四参,per-eval,下一帧生效。
     p.rtxVsrStrength = std::clamp(pl.vsrStrength, kVsrStrengthMin, kVsrStrengthMax);
     p.rtxHdrContrast = std::clamp(pl.hdrContrast, kHdrContrastMin, kHdrContrastMax);
@@ -208,6 +214,7 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.fgRoute = std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
     pl.debugView = std::clamp(p.debugView, 0, kDebugViewMax);
     pl.ofBackend = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
+    pl.antiFlicker = std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
     // RTX Video(v22):live 与创建时项全量随载荷(payload 单通道)。
     pl.vsrMode = std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax);
     pl.vsrScale = std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax);
@@ -354,6 +361,16 @@ inline constexpr const char *SK_LOCK_WAIT = "lock_wait";
 inline constexpr const char *SK_GATE_SKIPS = "gate_skips";
 inline constexpr const char *SK_GATE_EXPIRED = "gate_expired";
 inline constexpr const char *SK_GATE_RESETS = "gate_resets";
+// 抗闪烁时域稳定器(诊断页"请求 vs 实际"行):
+//   temporal       — 状态串:off(未开启)/ seed(播种,重新累积中)/
+//                    steady(稳态混合)/ failed(资源重建失败,已降级关闭)
+//   temporal_route — 实际生效档(0-4);请求档 >0 而实档 =0(非 off 态)或
+//                    failed = 降级,面板红显
+//   temporal_w     — 最近一帧混合权重 exp(-Δt/80ms);0 = 播种帧。它只反映
+//                    "旋钮位置"(由帧率决定),不是实际修正量
+inline constexpr const char *SK_TEMPORAL = "temporal";
+inline constexpr const char *SK_TEMPORAL_ROUTE = "temporal_route";
+inline constexpr const char *SK_TEMPORAL_W = "temporal_w";
 
 // stats JSON 的 detail 字段走面板的朴素解析(strstr + 下一个引号):剔除
 // 引号、反斜杠与控制字符,防止 D3D12 debug-layer 文本(VSDLSSNR_D3D12_DEBUG=1

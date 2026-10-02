@@ -853,6 +853,31 @@ bool DlssnrContext::Initialize(
         InternalSize(_width, _height, pct, iw, ih);
         if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) return failWithExistingErr();
     }
+    // 3c) 抗闪烁时域资源(上游 antiFlicker,Magpie v0.6.8):mode > 0 时建
+    // 历史/引导纹理。冷初始化单线程,直接 RebuildTemporal(不持槽,PoolHold
+    // 约束天然满足);失败降级 antiFlicker=0(模式还能 live 再切)。历史状态
+    // 随纹理作废。
+    {
+        const int af = std::clamp(_shared->Snapshot().antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
+        if (af > 0) {
+            char afErr[160]{};
+            if (_d3d12->RebuildTemporal(af, afErr, sizeof(afErr))) {
+                _curAntiFlicker = af;
+                _tValid = false;
+                _tPubState.store(1, std::memory_order_relaxed);
+                _tPubRoute.store(af, std::memory_order_relaxed);
+            } else {
+                _curAntiFlicker = 0;
+                _tPubState.store(3, std::memory_order_relaxed);
+                _tPubRoute.store(0, std::memory_order_relaxed);
+                char amsg[288];
+                std::snprintf(amsg, sizeof(amsg),
+                              "DLSSNR STATUS: temporal init failed (%s); anti-flicker off", afErr);
+                DbgLine(amsg);
+                TimingStatusLine(amsg);
+            }
+        }
+    }
 
     // 4a) DLSS FG 会话(挂 NR 之后;先于 NVOF 建立,使光流 follow 的会话
     // 输入尺寸决策能感知 FG)。失败优雅降级:滤镜回退 1:1 输出(不翻倍
@@ -1175,6 +1200,25 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
                                                 err, errLen)) {
         _ready.store(false, std::memory_order_release);
         return false;
+    }
+    // 时域资源随尺寸重建(CreateFrameResources 已作废;失败降级 0,模式
+    // 仍可 live 再切)。历史随纹理作废 —— 下帧播种。
+    if (resize && _curAntiFlicker > 0) {
+        char afErr[160]{};
+        if (_d3d12->RebuildTemporal(_curAntiFlicker, afErr, sizeof(afErr))) {
+            _tValid = false;
+            _tPubState.store(1, std::memory_order_relaxed);
+            _tPubRoute.store(_curAntiFlicker, std::memory_order_relaxed);
+        } else {
+            _curAntiFlicker = 0;
+            _tPubState.store(3, std::memory_order_relaxed);
+            _tPubRoute.store(0, std::memory_order_relaxed);
+            char amsg[288];
+            std::snprintf(amsg, sizeof(amsg),
+                          "DLSSNR STATUS: temporal resize rebuild failed (%s); anti-flicker off", afErr);
+            DbgLine(amsg);
+            TimingStatusLine(amsg);
+        }
     }
     const int resMs = segMs();
     // NR 特征段跳过判定:CreateFeature 参数块只含几何/质量键(源码验证
@@ -1663,6 +1707,11 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         // 失败的会话在热复用时重试一次。FG 同理(下一帧 eval 带 Reset,
         // 该帧插值输出降级复制)。
         ResetNvofHistory();
+        // seek = 新时间线,抗闪烁历史同样作废(_tLastFrame 与新帧序失配本会
+        // 触发播种式重置,显式复位让首帧就走 weight=0 播种,不留歧义)。
+        // 模式变化的资源重建不在此做:ProcessFrame 的逐帧同步持 PoolHold
+        // 兜住,热复用分支不持池,直接重建会在在飞帧脚下换纹理。
+        _tValid = false;
         // 会话输入尺寸同步(follow = 开关 + scaling 状态 + FG 未激活;热路
         // 径下内部尺寸未变,除非 ini/payload 同时带了 res% 变化 —— 那会走
         // 下方重建分支)。档位按后端取对应字段。单一裁决点见 SyncOfSession。
@@ -1821,6 +1870,37 @@ bool DlssnrContext::ProcessFrame(
         SyncOfSession(frameParams, width, height, /*allowRetry=*/false,
                       nvofErr, sizeof(nvofErr));
     }
+    // 抗闪烁模式逐帧同步(live 参数):PoolHold 封池重建时域资源(毫秒级
+    // 纹理分配,不动 NGX feature)。失败降级 0,模式仍可再切。PoolHold 保证
+    // 无在飞帧 —— 对 _tValid 的复位与 evaluate 域内的状态推进无交叠。
+    // (Rebind 热复用路径不在此重复同步:本同步逐帧兜住且天然持锁。)
+    if (const int af = std::clamp(frameParams.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
+        af != _curAntiFlicker) {
+        {
+            D3D12Context::PoolHold hold(*_d3d12);
+            char afErr[160]{};
+            if (_d3d12->RebuildTemporal(af, afErr, sizeof(afErr))) {
+                _curAntiFlicker = af;
+            } else {
+                _curAntiFlicker = 0;
+                char amsg[288];
+                std::snprintf(amsg, sizeof(amsg),
+                              "DLSSNR STATUS: temporal switch failed (%s); anti-flicker off", afErr);
+                DbgLine(amsg);
+                TimingStatusLine(amsg);
+                _tPubState.store(3, std::memory_order_relaxed);
+                _tPubRoute.store(0, std::memory_order_relaxed);
+                _tPubWeight.store(0.0f, std::memory_order_relaxed);
+            }
+        }
+        _tValid = false;
+        if (_curAntiFlicker == 0 && _tPubState.load(std::memory_order_relaxed) != 3) {
+            // 切到关(或重建后归 0):报 off;失败态保持 failed 不覆盖。
+            _tPubState.store(0, std::memory_order_relaxed);
+            _tPubRoute.store(0, std::memory_order_relaxed);
+            _tPubWeight.store(0.0f, std::memory_order_relaxed);
+        }
+    }
     const ResidualControls residual{
         std::clamp(frameParams.residualMultiplier, kResidualMultMin, kResidualMultMax),
         std::clamp(frameParams.residualSaturation, kResidualFineMin, kResidualFineMax),
@@ -1853,6 +1933,8 @@ bool DlssnrContext::ProcessFrame(
     // 不中转)。与诊断的 skipEval 互不相同:skipEval 连 NVOF/补帧一起跳
     // (测管线底价,直通拷贝保留)。
     const bool nrOff = frameParams.nrEnabled == 0;
+    // 抗闪烁本帧是否 dispatch(eval 路径内判定;下游消费点据此改读稳定帧)。
+    bool temporalRan = false;
     // RTX 实态(管线级常量,原定义在 eval 段后;前置到 C1 补做状态
     // uploadPost 之前 —— 纯定义上移,无行为变化):
     const bool vsrLive = _vsrRequested && !skipEval;
@@ -2344,6 +2426,61 @@ bool DlssnrContext::ProcessFrame(
             };
             cl->ResourceBarrier(1, back);
         }
+
+        // ---- 抗闪烁时域稳定(上游 DLSSNRTemporal::Draw 语义)----
+        // 仍在 evalLock 域内:_tNext/时间线状态推进与历史缓冲读写同锁串行。
+        // weight = exp(-Δt/80ms);帧序不连续/播种帧/useMotion 翻转/距上帧
+        // >250ms 一律 weight 0(仍 dispatch:历史播种为当前残差,下游正常)。
+        // dup 帧(同源帧重复评估)整帧跳过 —— 历史/EMA 双不动(上游
+        // Duplicate 语义),下游读原始 NR 输出。
+        if (_curAntiFlicker > 0 && frameParams.debugView == 0 &&
+            _d3d12->TemporalMode() == _curAntiFlicker) {
+            const bool dup = _tValid && _tLastFrame == static_cast<long long>(n);
+            if (!dup) {
+                const bool useMotion = _curAntiFlicker >= 2 && realMotion;
+                const bool reset = !_tValid || nvofHistoryReset ||
+                                   useMotion != _tLastUseMotion || _tLastFrame < 0 ||
+                                   static_cast<long long>(n) != _tLastFrame + 1;
+                LARGE_INTEGER tNow{};
+                QueryPerformanceCounter(&tNow);
+                const double nowSec =
+                    static_cast<double>(tNow.QuadPart) / static_cast<double>(qpcFreq.QuadPart);
+                const double dt = reset ? 0.0 : nowSec - _tLastQpc;
+                const float weight = (reset || dt <= 0.0 || dt > 0.25)
+                                         ? 0.0f
+                                         : static_cast<float>(std::exp(-dt / 0.08));
+                if (ProbeEnabled()) {
+                    char tp[96];
+                    std::snprintf(tp, sizeof(tp),
+                                  "PROBE: temporal n=%d reset=%d dt=%.1fms w=%.3f next=%d",
+                                  n, reset ? 1 : 0, dt * 1000.0, weight, _tNext);
+                    TimingStatusLine(tp);
+                }
+                UINT motionSrv = 10;
+                UINT motionW = static_cast<UINT>(width), motionH = static_cast<UINT>(height);
+                if (useMotion && densifyInternal) {
+                    // follow 内部管线:densify 直写 reducedMotion(内部尺寸,
+                    // 内部像素单位)—— shader 按 MotionExtent 比例采样并
+                    // 把向量换算回源像素。
+                    motionSrv = 18;
+                    motionW = static_cast<UINT>(_d3d12->InternalWidth());
+                    motionH = static_cast<UINT>(_d3d12->InternalHeight());
+                }
+                _d3d12->RecordTemporal(*slot, _curAntiFlicker, _tNext, useMotion,
+                                       motionSrv, motionW, motionH, weight);
+                _tLastFrame = static_cast<long long>(n);
+                _tLastQpc = nowSec;
+                _tLastUseMotion = useMotion;
+                _tValid = true;
+                _tNext ^= 1;
+                temporalRan = true;
+                // stats 发布(诊断页"请求 vs 实际"):weight==0 的播种帧报
+                // seed,正常混合报 steady。
+                _tPubState.store(weight > 0.0f ? 2 : 1, std::memory_order_relaxed);
+                _tPubRoute.store(_curAntiFlicker, std::memory_order_relaxed);
+                _tPubWeight.store(weight, std::memory_order_relaxed);
+            }
+        }
     }
 
     // ---- RTX Video 段(NR 输出 → VSR 放大 → TrueHDR)----
@@ -2383,6 +2520,10 @@ bool DlssnrContext::ProcessFrame(
     // NR 关直连:无 NGX 产出,管线色 = C1 产物 inputColor(下游 FG
     // backbuffer / post 段 C2 直读,不经 outputColor 中转)。
     if (nrOff) pipeColor = slot->inputColor.Get();
+    // 抗闪烁激活帧:无 RTX 覆盖时管线色 = 稳定帧(下游 FG backbuffer /
+    // hdr-only DLSSG backbuffer / post 转换统一改读;vsrRun/hdrLegacyInterp
+    // 的覆盖在其后 —— 它们的输出才是管线色)。
+    if (temporalRan) pipeColor = _d3d12->TemporalOut(*slot);
     int pipeW = width, pipeH = height;
     if (vsrRun) {
         pipeColor = slot->vsrColor.Get();
@@ -2455,10 +2596,16 @@ bool DlssnrContext::ProcessFrame(
     // 移 post CL 常驻转换段(记账归 conv,不再粘 base/fg CL)。
     auto *baseCl = slot->commandList.Get();
     if (rtxIn && !nrOff) {
+        // RTX 输入 NSR 化:常规帧 = outputColor(eval/残差帧末 UAV 不变量);
+        // 抗闪烁帧 = 稳定帧(RecordTemporal 已显式 COMMON 落位,outputColor
+        // 本帧无下游消费者、停在 COMMON 不动)。
         D3D12_RESOURCE_BARRIER inPrep[1]{
-            Transition(_d3d12->OutputColor(*slot),
-                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+            temporalRan ? TransitionFromTo(_d3d12->TemporalOut(*slot),
+                                           D3D12_RESOURCE_STATE_COMMON,
+                                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+                        : Transition(_d3d12->OutputColor(*slot),
+                                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
         };
         baseCl->ResourceBarrier(1, inPrep);
     }
@@ -2550,9 +2697,11 @@ bool DlssnrContext::ProcessFrame(
     LARGE_INTEGER tSub0{}, tSub1{};
     QueryPerformanceCounter(&tSub0);
     // RTX 输入源(直连接线):NR 开 = NGX 产出 outputColor;base 尾已 NSR。
-    // NR 关 = C1 产物 inputColor 直连(C1 已落 NSR),不经中转。
+    // 抗闪烁帧 = 稳定帧(同一屏障点 NSR 化)。NR 关 = C1 产物 inputColor
+    // 直连(C1 已落 NSR),不经中转。
     ID3D12Resource *rtxColorIn = nrOff ? slot->inputColor.Get()
-                                       : _d3d12->OutputColor(*slot);
+                                       : (temporalRan ? _d3d12->TemporalOut(*slot)
+                                                      : _d3d12->OutputColor(*slot));
     if (vsrRun) {
         std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
         char rtxErr[160]{};
@@ -2606,13 +2755,14 @@ bool DlssnrContext::ProcessFrame(
     // 不消费);零光流帧整块跳过。
     ID3D12GraphicsCommandList *fgCl = slot->fgCommandList.Get();
     if (rtxIn && !nrOff && !hdrPostSplit) {
-        // 非 HDR 拆分形态(NR 开):base 尾 outputColor 已 NSR 化作 RTX 输入;
-        // NSR 读不衰减,归位 COMMON。(hdrPostSplit 会话不在此归位 —— hdr-only
-        // 的 outputColor 还是 DLSSG backbuffer,vsrRun 的 vsrColor 才是,见
-        // fgBar。NR 关直连帧 outputColor 本帧无消费者、从未 NSR 化,同样
-        // 不做屏障。)
+        // 非 HDR 拆分形态(NR 开):base 尾 RTX 输入(outputColor/抗闪烁
+        // 稳定帧)已 NSR 化;NSR 读不衰减,归位 COMMON。(hdrPostSplit 会话
+        // 不在此归位 —— hdr-only 的 backbuffer 还是 DLSSG 输入,vsrRun 的
+        // vsrColor 才是管线色,见 fgBar;归位在 post 尾按 pipeColor 统一做。
+        // NR 关直连帧 outputColor 本帧无消费者、从未 NSR 化,同样不做屏障。)
         D3D12_RESOURCE_BARRIER inBack[1]{
-            TransitionFromTo(_d3d12->OutputColor(*slot),
+            TransitionFromTo(temporalRan ? _d3d12->TemporalOut(*slot)
+                                         : _d3d12->OutputColor(*slot),
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                              D3D12_RESOURCE_STATE_COMMON),
         };
@@ -2856,15 +3006,34 @@ bool DlssnrContext::ProcessFrame(
                                       convertedOnNvof ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
                                                       : uploadPost);
         } else if (_rtxActive) {
-            _d3d12->RecordColorOutput(*postCl, *slot,
-                                      _d3d12->OutputColor(*slot), D3D12Context::kSrvOutputColor,
-                                      ColorOutKind::Sdr, width, height, matrix, range,
-                                      fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
-                                               : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            // 抗闪烁帧:稳定帧由 RecordTemporal 显式 COMMON 落位,base 尾
+            // NSR 化(若 DLSSG 消费)后经 inBack 归位 —— 恒 COMMON,与 FG
+            // 无关(常规帧的 COMMON|UAV 分叉来自 NGX 衰减语义,不适用)。
+            if (temporalRan) {
+                _d3d12->RecordColorOutput(*postCl, *slot,
+                                          _d3d12->TemporalOut(*slot), D3D12Context::kSrvTemporalOut,
+                                          ColorOutKind::Sdr, width, height, matrix, range,
+                                          D3D12_RESOURCE_STATE_COMMON);
+            } else {
+                _d3d12->RecordColorOutput(*postCl, *slot,
+                                          _d3d12->OutputColor(*slot), D3D12Context::kSrvOutputColor,
+                                          ColorOutKind::Sdr, width, height, matrix, range,
+                                          fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
+                                                   : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            }
         } else {
+            // NR 开无 RTX:常规帧 = outputColor(FG 消费后 COMMON / 未消费
+            // UAV);抗闪烁帧 = 稳定帧(RecordTemporal 落 COMMON;FG 激活时
+            // fgBar 已 NSR 化作 DLSSG backbuffer —— NSR 直读免屏障,收尾由
+            // 本转换归位 COMMON)。
             _d3d12->RecordYuvOutput(*postCl, *slot, matrix, range,
-                                    fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
-                                             : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                                    temporalRan ? (fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                                            : D3D12_RESOURCE_STATE_COMMON)
+                                                : (fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
+                                                            : D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                                    temporalRan ? _d3d12->TemporalOut(*slot) : nullptr,
+                                    temporalRan ? D3D12Context::kSrvTemporalOut
+                                                : D3D12Context::kSrvOutputColor);
         }
         if (!_d3d12->RecordReadbackCopy(*postCl, *slot, err, errLen)) {
             return false;
@@ -3525,7 +3694,8 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      "\"%s\":%d,\"%s\":\"%s\","
                      "\"%s\":\"%s\",\"%s\":\"%s\","
                      "\"%s\":%.2f,\"%s\":%.2f,"
-                     "\"%s\":%u,\"%s\":%u,\"%s\":%u}",
+                     "\"%s\":%u,\"%s\":%u,\"%s\":%u,"
+                     "\"%s\":\"%s\",\"%s\":%d,\"%s\":%.3f}",
                      SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
                      SK_EVAL_CPU_LAST, evalCpuLast, SK_UNPACK_LAST, unpackLast,
                      SK_OF_LAST, nvofLast, SK_FG_LAST, fgLast,
@@ -3551,7 +3721,13 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      SK_LOCK_WAIT, lockWaitLast,
                      SK_GATE_SKIPS, nvStats ? nvStats->GateSkips() : 0u,
                      SK_GATE_EXPIRED, nvStats ? nvStats->GateExpired() : 0u,
-                     SK_GATE_RESETS, nvStats ? nvStats->ResetCount() : 0u);
+                     SK_GATE_RESETS, nvStats ? nvStats->ResetCount() : 0u,
+                     SK_TEMPORAL,
+                     _tPubState.load(std::memory_order_relaxed) == 3 ? "failed"
+                     : _tPubState.load(std::memory_order_relaxed) == 2 ? "steady"
+                     : _tPubState.load(std::memory_order_relaxed) == 1 ? "seed" : "off",
+                     SK_TEMPORAL_ROUTE, _tPubRoute.load(std::memory_order_relaxed),
+                     SK_TEMPORAL_W, _tPubWeight.load(std::memory_order_relaxed));
             PublishStatsJson(body);
         }
         if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)

@@ -37,6 +37,7 @@ Motion_Vector_Quality = 0
 Ffx_Quality = 2
 Nvof_Follow_Scaling = False
 Of_Backend = 0
+Anti_Flicker = 0
 Fg_Enabled = False
 Fg_Multiplier = 2
 Fg_Route = 0
@@ -81,6 +82,13 @@ H_Max = 0
 ##          1 = NVOF (NVIDIA 专属引擎); 面板"光流后端"同步此值
 ##          注意: 以上四参的注释顺序与变量顺序一致
 ##          (Motion_Vector_Quality → Ffx_Quality → Nvof_Follow_Scaling → Of_Backend)
+## <0-4> 整数, 抗闪烁时域稳定器 (默认 0 = 关): NR 对逐帧随机噪声的响应
+##          强度不同 = 画面闪烁; 本器把"NR 改动量"沿时间轴平均掉, 与
+##          分辨率缩放/残差乘数无关 (自己求差, 缩放关照样生效)
+##          1 = 静态累积 (不用运动矢量, 固定镜头); 2 = 光流累积 (通用档,
+##          动态画面首选, 建议光流质量非"无"); 3 = 光流累积+ (通断记忆,
+##          治噪点忽闪忽灭); 4 = 低频时域重建 (只平滑大面积慢闪不动细节,
+##          最贵)。切档即时生效, 首帧重新播种; 面板"抗闪烁"同步此值
 ## <True|False> DLSS 帧生成 (默认 False)
 ##          挂降噪之后: 每源帧产出 M 帧, 插值帧由 DLSS FG 模型合成,
 ##          落在相邻两真实帧之间; 依赖 ngx\version.dll (dlssg_for_sm86
@@ -191,6 +199,7 @@ else :
 		ffx_quality = Ffx_Quality,
 		nvof_follow_scaling = int(Nvof_Follow_Scaling),
 		of_backend = Of_Backend,
+		anti_flicker = Anti_Flicker,
 		fg_enabled = int(Fg_Enabled),
 		fg_multiplier = Fg_Multiplier,
 		fg_route = int(Fg_Route),

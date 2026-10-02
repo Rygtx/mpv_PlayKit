@@ -49,6 +49,7 @@
     X(fg_route, writeInt, (std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax))) \
     X(fg_hdr_interp, writeInt, p.fgHdrInterp ? 1 : 0) \
     X(of_backend, writeInt, (std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax))) \
+    X(anti_flicker, writeInt, (std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax))) \
     X(saved, writeInt, 1)
 
 // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管;
@@ -172,6 +173,7 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
     p.fgRoute = std::clamp(readInt(L"fg_route", p.fgRoute), kFgRouteMin, kFgRouteMax);
     p.fgHdrInterp = readBool(L"fg_hdr_interp", p.fgHdrInterp != 0);
     p.ofBackend = std::clamp(readInt(L"of_backend", p.ofBackend), kOfBackendMin, kOfBackendMax);
+    p.antiFlicker = std::clamp(readInt(L"anti_flicker", p.antiFlicker), kAntiFlickerMin, kAntiFlickerMax);
     // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管,
     // 与 WriteDlssnrIni 同键表)。旧部署样例的 vsr_height 键已作废(语义
     // 换成倍率 vsr_scale_x100),不读取 —— 旧值静默失效,面板重存即归位。

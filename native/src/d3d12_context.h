@@ -147,6 +147,10 @@ struct FrameSlot {
     ComPtr<ID3D12Resource> yuvOut[3];
     ComPtr<ID3D12Resource> inputColor;   // W×H BGRA8,UAV(YUV→RGB 转换直写)
     ComPtr<ID3D12Resource> outputColor;  // W×H BGRA8, UAV (NGX / composite write)
+    // 抗闪烁时域稳定器的稳定帧输出(仅 temporal 激活槽建立,RebuildTemporal;
+    // 尺寸/格式 = 管线色,RecordTemporal 写,下游 VSR/HDR/FG/输出转换改读
+    // 它)。未激活槽无纹理 —— 消费点以 TemporalMode()>0 分流。
+    ComPtr<ID3D12Resource> temporalOut;
     // residual scaling pipeline, sized by the current input_resolution
     ComPtr<ID3D12Resource> reducedColor;
     ComPtr<ID3D12Resource> reducedDenoised;
@@ -215,6 +219,12 @@ struct FrameSlot {
     // 非 HDR 槽 = hdrColor/outputColor 占位)
     // 49=uavFfxInput(FFX 会话输入,R8G8B8A8 OF extent;BindOfResources 填充)
     // 50=srvFfxSparse(FFX 稀疏流 R16G16_SINT,densify 读)
+    // 52-65=抗闪烁时域(RebuildTemporal 覆盖写;关闭态 = inputColor/
+    // outputColor 占位,同"绝不写 NULL 描述符"惯例):
+    //   52/53=temporalOut SRV/UAV(每槽) 54/55=hist0 UAV/SRV
+    //   56/57=hist1 UAV/SRV 58/59=guide0 UAV/SRV 60/61=guide1 UAV/SRV
+    //   62/63=low0 SRV/UAV 64/65=low1 SRV/UAV(context 级 ping-pong,每槽
+    //   堆各持视图;low 仅 mode4 真纹理)
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 };
 
@@ -535,6 +545,19 @@ public:
 
     ID3D12Resource *InputColor(FrameSlot &s) const noexcept { return s.inputColor.Get(); }
     ID3D12Resource *OutputColor(FrameSlot &s) const noexcept { return s.outputColor.Get(); }
+    ID3D12Resource *TemporalOut(FrameSlot &s) const noexcept { return s.temporalOut.Get(); }
+    // 抗闪烁时域稳定器(上游 Magpie v0.6.8 DLSSNRTemporal 移植):
+    // RebuildTemporal = 历史/引导 ping-pong(FP16)+ 每槽 temporalOut 建立与
+    // 视图覆盖(mode=0 拆纹理回占位);调用方持 PoolHold,mode 与当前一致时
+    // no-op(逐帧同步的免锁快路径据此判断)。模式属 live 参数,不动 NGX。
+    bool RebuildTemporal(int mode, char *err, size_t errLen) noexcept;
+    // 帧路径 dispatch(eval 串行域内调用:ping-pong 索引推进与历史缓冲
+    // 写读在 CPU 侧同锁串行,GPU 队列序天然保序)。next = 本帧写的历史槽
+    // (0/1),调用方自持翻转;motion SRV/尺寸由调用方按 follow 管线选择。
+    void RecordTemporal(FrameSlot &slot, int mode, int next, bool useMotion,
+                        UINT motionSrvIndex, UINT motionW, UINT motionH,
+                        float weight) noexcept;
+    int TemporalMode() const noexcept { return _temporalMode; }
     ID3D12Resource *FgInterp(FrameSlot &s, int gen) const noexcept { return s.fgInterp[gen].Get(); }
     // 描述符堆槽位(RecordYuvOutput / FG 转换共用)。
     static constexpr UINT kSrvOutputColor = 22;  // outputColor 的 SRV
@@ -545,6 +568,8 @@ public:
     static constexpr UINT kUavMotionDense = 38;  // motionDense 的 UAV(mvec 放大写)
     static constexpr UINT kSrvHdrFgBase = 44;    // hdrFg[0..4] 的 SRV(PQ 转换读)
     static constexpr UINT kUavFgBack = 51;       // fgBack 的 UAV(PQ 域插帧编码 pass 写)
+    static constexpr UINT kSrvTemporalOut = 52;  // temporalOut 的 SRV(稳定帧下游消费)
+    static constexpr UINT kUavTemporalOut = 53;  // temporalOut 的 UAV(RecordTemporal 写)
     // YUV 原生化 dump/调试:输出/输入平面([0]=Y [1]=U [2]=V)。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
     ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
@@ -739,6 +764,16 @@ private:
     ComPtr<ID3D12PipelineState> _psoFfxPrepare;
     ComPtr<ID3D12RootSignature> _rsFfxDensify;
     ComPtr<ID3D12PipelineState> _psoFfxDensify;
+    // 抗闪烁时域稳定器(PSO 无条件常驻,生命周期跟"使用条件"而不是
+    // "首次搭车路径";资源随 RebuildTemporal)。
+    ComPtr<ID3D12RootSignature> _rsTemporal;
+    ComPtr<ID3D12PipelineState> _psoTemporalMain;
+    ComPtr<ID3D12PipelineState> _psoTemporalReduce;
+    ComPtr<ID3D12Resource> _tempHist[2];   // 残差历史 ping-pong(FP16,alpha=有效性)
+    ComPtr<ID3D12Resource> _tempGuide[2];  // 原色引导 ping-pong(FP16,防历史漂移)
+    ComPtr<ID3D12Resource> _tempLow[2];    // mode4 半分辨率 [0]=残差 [1]=引导
+    int _temporalMode = 0;                 // 当前已建资源模式(0 = 关)
+
 
     // frame slot pool
     static constexpr int kSlotCount = 3;

@@ -86,6 +86,10 @@ constexpr const char *kOfQualityNames[] = {
 // FFX 质量档位(独立三档,与上游 6 档解耦:1 = Performance 半分辨率,
 // 2 = Quality 全分辨率 —— 上游 1-2/3-5 在 FFX 内各只对应一种行为)
 constexpr const char *kFfxQualityNames[] = { "无", "性能 (1/2 分辨率)", "质量 (全分辨率)" };
+// 抗闪烁时域稳定器(上游 antiFlicker 0-4)
+constexpr const char *kAntiFlickerNames[] = {
+    "无", "静态累积", "光流累积", "光流累积+", "低频时域重建"
+};
 // 预设/风格/光流质量/各滑块/开关原以 kEnums/kSliders/kFlags 成员指针表
 // 驱动通用循环;两列归并后每行控件异构(组合/滑块/复选框/整行),改为
 // DrawUi 内联 + pairLabel/pairCombo/pairSlider lambda,tip 随行内联。
@@ -145,6 +149,9 @@ struct AppState {
     int gateSkips = 0;       // SK_GATE_SKIPS: 光流帧序门跳帧累计(诊断页)
     int gateExpired = 0;     // SK_GATE_EXPIRED: 过期帧累计(诊断页)
     int gateResets = 0;      // SK_GATE_RESETS: 历史重置累计(诊断页)
+    char temporalState[10]{}; // SK_TEMPORAL: off / seed / steady / failed(诊断页)
+    int temporalRoute = 0;   // SK_TEMPORAL_ROUTE: 实际生效档 0-4(诊断页)
+    float temporalW = 0.0f;  // SK_TEMPORAL_W: 最近一帧混合权重(诊断页)
     double fps = 0.0;
     // 分段显示值(EMA 平滑,用户裁定"显示平滑、真实数据不平滑"):每拍从
     // 插件上报的裸 last 值就地喂 EMA;时间线/列表/tooltip 用平滑值,避免
@@ -856,6 +863,9 @@ void ClearSessionState() noexcept {
     g_app.fgMultMax = 0;
     g_app.slotWait = g_app.lockWait = 0.0f;
     g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
+    g_app.temporalState[0] = 0;
+    g_app.temporalRoute = 0;
+    g_app.temporalW = 0.0f;
 }
 
 // Read the plugin's per-frame stats from named shared memory (zero disk IO).
@@ -928,6 +938,11 @@ void LoadStats() noexcept {
     g_app.gateSkips = JsonGetInt(body, SK_GATE_SKIPS, 0);
     g_app.gateExpired = JsonGetInt(body, SK_GATE_EXPIRED, 0);
     g_app.gateResets = JsonGetInt(body, SK_GATE_RESETS, 0);
+    // 抗闪烁三键(v26):状态串 + 实际生效档 + 最近混合权重。
+    if (!JsonGetString(body, SK_TEMPORAL, g_app.temporalState, sizeof(g_app.temporalState)))
+        g_app.temporalState[0] = 0;
+    g_app.temporalRoute = JsonGetInt(body, SK_TEMPORAL_ROUTE, 0);
+    g_app.temporalW = JsonGetFloat(body, SK_TEMPORAL_W, 0.0f);
     if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
         // The hang payload has no gpu_last, so the gate below would keep
         // showing frozen pre-hang stats forever; surface it — with the
@@ -1392,6 +1407,26 @@ void DrawUi() noexcept {
     }
     pairLabel(1, "光流降采样", "光流按内部缩放尺寸计算,省光流开销、精度略降(需先开分辨率缩放)。\n帧生成激活时忽略。");
     pairCheck("nvof_follow_scaling", &DlssnrParams::nvofFollowScaling, 1);
+    y += rowH;
+
+    // (抗闪烁 | —):时域稳定器。NR 对逐帧随机噪声的响应强度不同 =
+    // 画面闪烁;本器把"NR 改动量"沿时间轴平均掉。档位即"怎么平均"。
+    pairLabel(0, "抗闪烁",
+              "跨帧时域平均,消除 NR 输出的逐帧闪烁(强度调高后易出现)。\n"
+              "档位选择:\n"
+              "  静态累积 —— 不用运动矢量,假设画面不动(固定镜头/静态场景);\n"
+              "    画面一动时门控自动拒绝混合,退回原样,不会拖影。\n"
+              "  光流累积 —— 按运动矢量把上一帧结果对齐到当前位置再平均;\n"
+              "    通用档,动态画面首选。2/3 档建议光流质量非\"无\"\n"
+              "    (没有运动场时自动退化为静态累积)。\n"
+              "  光流累积+ —— 在光流累积上增加\"通断记忆\"(噪点出现 60ms 渐入、\n"
+              "    消失 180ms 渐出),治\"噪点忽闪忽灭\"型闪烁,最强也最激进。\n"
+              "  低频时域重建 —— 把改动拆成低频(跨帧平均)+高频(逐帧保留),\n"
+              "    只平滑大面积慢闪、完全不动细节;多一次半分辨率 pass,最贵。\n"
+              "选档建议:先试 光流累积;仍有通断闪烁换 光流累积+;\n"
+              "大面积慢闪换 低频时域重建;固定镜头用 静态累积 最省。\n"
+              "切档立即生效(毫秒级重建,首帧重新播种)。");
+    pairCombo("anti_flicker", &DlssnrParams::antiFlicker, 5, kAntiFlickerNames, 0);
     y += rowH;
 
     // (强度 | 局部色调)
@@ -1907,6 +1942,45 @@ void DrawUi() noexcept {
                                    g_app.ofMode[0] ? g_app.ofMode : "(未加载)",
                                    ofFrame,
                                    g_app.ofDetail[0] ? " —— " : "", g_app.ofDetail);
+
+                // 抗闪烁请求 vs 实际:实际档 + 时间线状态 + 最近混合权重。
+                // 红显 = 请求开但插件降级(failed),或状态活跃而实档掉 0。
+                {
+                    const bool afReqOn = g_app.params.antiFlicker > 0;
+                    const bool afFailed = std::strcmp(g_app.temporalState, "failed") == 0;
+                    const bool afDegraded = afReqOn && g_app.temporalState[0] &&
+                                            std::strcmp(g_app.temporalState, "off") != 0 &&
+                                            g_app.temporalRoute == 0;
+                    const bool afBroken = afFailed || afDegraded;
+                    char afReq[32];
+                    std::snprintf(afReq, sizeof(afReq), "%s",
+                                  afReqOn ? kAntiFlickerNames[std::clamp(
+                                                g_app.params.antiFlicker,
+                                                kAntiFlickerMin, kAntiFlickerMax)]
+                                          : "关");
+                    char afEff[112];
+                    if (!g_app.temporalState[0]) {
+                        std::snprintf(afEff, sizeof(afEff), "(未加载)");
+                    } else if (afFailed) {
+                        std::snprintf(afEff, sizeof(afEff), "重建失败(已降级关闭)");
+                    } else if (!afReqOn || std::strcmp(g_app.temporalState, "off") == 0) {
+                        std::snprintf(afEff, sizeof(afEff), "未开启");
+                    } else {
+                        std::snprintf(afEff, sizeof(afEff), "档位 %d · %s · w=%.2f",
+                                      g_app.temporalRoute,
+                                      std::strcmp(g_app.temporalState, "steady") == 0 ? "稳态"
+                                                                                      : "播种",
+                                      g_app.temporalW);
+                    }
+                    if (afBroken) ImGui::TextColored(kErrRed, "抗闪烁");
+                    else ImGui::TextUnformatted("抗闪烁");
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosX(reqX);
+                    ImGui::TextUnformatted(afReq);
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosX(actX);
+                    TextColoredWrapped(afBroken ? kErrRed : kDimTxt, "%s", afEff);
+                }
 
                 // FG 请求 vs 实际路由
                 char fgReq[96];

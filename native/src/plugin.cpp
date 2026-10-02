@@ -1055,6 +1055,9 @@ static void VS_CC DlssnrCreate(
     // 此路径插值帧压高光 = 闪烁,默认 0。仅 HDR+FG 会话有意义。
     ApplyFlagArg(in, vsapi, "fg_hdr_interp", initial.fgHdrInterp);
     ApplyIntArg(in, vsapi, "of_backend", initial.ofBackend, kOfBackendMin, kOfBackendMax);
+    // 抗闪烁时域稳定器 0-4(live;0 = 关):NR 残差的跨帧时域平均,
+    // 见 kAntiFlickerMin 注释。
+    ApplyIntArg(in, vsapi, "anti_flicker", initial.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
     // Panel-saved profile (dlssnr_ui.ini) overrides .vpy values when present;
     // the panel's CURRENT payload (last live state) overrides the ini. Without
     // the adopt step a seek rebuilds the filter from stale ini/vpy values —
@@ -1085,14 +1088,15 @@ static void VS_CC DlssnrCreate(
                                       : d->subW == 1 && d->subH == 1 ? "420" : "?";
         char msg[288];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d %s ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d fg_hdr=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d %s ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d fg_hdr=%d af=%d",
                       d->width, d->height, d->depth, layout, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
                       initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.ffxQuality,
                       initial.nvofFollowScaling ? 1 : 0,
                       initial.fgEnabled ? 1 : 0,
-                      initial.fgMultiplier, initial.fgRoute, initial.fgHdrInterp ? 1 : 0);
+                      initial.fgMultiplier, initial.fgRoute, initial.fgHdrInterp ? 1 : 0,
+                      initial.antiFlicker);
         vsdlssnr::TimingStatusLine(msg);
     }
     d->params = std::make_shared<vsdlssnr::SharedParams>(initial);
@@ -1392,6 +1396,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI
         "fg_route:int:opt;"
         "fg_hdr_interp:int:opt;"
         "of_backend:int:opt;"
+        "anti_flicker:int:opt;"
         "vsr_mode:int:opt;"
         "vsr_scale:float:opt;"
         "vsr_strength:int:opt;"

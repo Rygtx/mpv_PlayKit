@@ -17,6 +17,18 @@ inline constexpr int kResPctMin = 25, kResPctMax = 100;          // internal res
 inline constexpr float kResidualMultMin = 1.0f, kResidualMultMax = 2.0f;
 // 残差精调 4 项(r1-r10 新增):saturation / lightness / shadow structure / reflection glow
 inline constexpr float kResidualFineMin = 0.0f, kResidualFineMax = 2.0f;
+// 抗闪烁时域稳定器(0-4,上游 Magpie v0.6.8 DLSSNRTemporal 移植,live 参数):
+// NR 输出对逐帧随机噪声的响应强度不同 = 残差逐帧抖动(闪烁)。本器在 NR 链
+// 末端把"NR 改动量"(输出−输入)沿时间轴做光流对齐的加权平均,输出稳定帧。
+// 与残差管线(缩放/residual_multiplier)无关:自己求差,缩放关照样生效。
+//   0 = 无;1 = 静态累积(不用光流,适合固定镜头);2 = 光流累积;
+//   3 = 光流累积+(支持度记忆,60ms 攻/180ms 放,治通断闪烁);
+//   4 = 低频时域重建(半分辨率残差分解,低频过时域、高频逐帧保留,最贵)。
+// 时间线:weight = exp(-Δt/80ms);帧序不连续/播种帧/光流翻转/Δt>250ms 一律
+// weight 0 重新播种;dup 帧整帧跳过。模式切换 PoolHold 内重建历史纹理
+// (毫秒级,不动 NGX feature);历史/引导 ping-pong FP16,2-4 档建议搭配
+// 光流质量非"无"(有真运动场才走光流,否则退化为带门控的静态累积)。
+inline constexpr int kAntiFlickerMin = 0, kAntiFlickerMax = 4;
 // NVOF 光流质量(上游 motionVectorQuality,0-5;0 = 无光流,保持零 guidance)
 inline constexpr int kOfQualityMin = 0, kOfQualityMax = 5;
 // FFX 光流质量(0-2;0 = 无光流,1 = 性能/OF extent 半分辨率,2 = 质量/
@@ -187,6 +199,8 @@ struct DlssnrParams {
     // 光流后端(0=ffx 1=nvof,创建时,下一帧生效):见 kOfBackendMin 注释。
     // 切换只影响下一次光流会话建立,不改 NGX feature。
     int ofBackend = 0;
+    // 抗闪烁时域稳定器(0-4,live 参数):见 kAntiFlickerMin 注释。
+    int antiFlicker = 0;
     // 调试视图(0-2,live 参数,**不持久化**):1 = 输出替换为 |NR改动|×20
     // 的灰度图 —— 白 = 改动大,一片灰 = 模型没动画面(OptiScaler DLSSNR fork
     // 的 DebugView=3 同语义);2 = 输出替换为光流场可视化 —— 方向→色相、
