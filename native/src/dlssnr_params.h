@@ -115,11 +115,11 @@ struct RtxVideoParams {
 };
 
 struct DlssnrParams {
-    // NR 总开关(0/1,默认 0)—— 只关降噪,不影响补帧/光流:
+    // NR 总开关(0/1,默认 0)—— 只关 NR,不影响补帧/光流:
     //   create-time —— 与 fgEnabled 皆关时跳过 D3D12/NGX 全部初始化(零
     //     设备/零显存/零 GPU),滤镜纯直通;FG 开时初始化照常(补帧需要
-    //     设备与 NVOF),仅降噪评估被跳过(模型驻留显存,即时重开)。
-    //   live —— 会话已激活时面板切换立即生效:关 = 跳过 NGX 降噪评估,
+    //     设备与 NVOF),仅 NR 评估被跳过(模型驻留显存,即时重开)。
+    //   live —— 会话已激活时面板切换立即生效:关 = 跳过 NGX 评估,
     //     Input→Output 直拷,补帧以直通帧为 backbuffer 照常插值(输出
     //     计数与 _Duration 时长契约不变);开 = 立即恢复评估。
     int nrEnabled = 0;

@@ -526,7 +526,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
 
     // NR 总开关 live 门(shared_lock 快照,fmParallel 并发安全)。FG 激活
-    // 的会话:NR 关由 ProcessFrame 内部门控(跳过降噪评估,补帧/光流照常
+    // 的会话:NR 关由 ProcessFrame 内部门控(跳过NR 评估,补帧/光流照常
     // —— 输出仍是增强管线的产物),不走此直通。开关边沿向面板发一次状态
     // (见 nrPubState 注释)。
     // 单帧一次参数快照(2026-09-25:此前此处与 FG 段各取一次,缓存命中
@@ -614,7 +614,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         const VSFrame *src = vsapi->getFrameFilter(k, d->node, frameCtx);
         if (!d->initOk) {
             // passthrough on setup failure(防御:fgActive 恒蕴含 initOk;
-            // NR 关不在此列 —— ProcessFrame 内部门控跳过降噪评估,补帧以
+            // NR 关不在此列 —— ProcessFrame 内部门控跳过NR 评估,补帧以
             // 直通帧为 backbuffer 照常插值)。FG 输出计数仍是 M0(帧率已
             // ×M0):源帧单次复制入缓存,各槽回落该帧,时长按 1/M0 摊分。
             // rtxActive 只在 initOk 后置位(Create 侧),此处恒 false,
@@ -1127,7 +1127,7 @@ static void VS_CC DlssnrCreate(
 
     // NR+FG 皆关时也照常解析 FG DLL 路径(重开时即最新值);热/冷初始化
     // 由下方各守卫跳过 —— 零设备、零显存、零 GPU。仅 NR 关而 FG 开:
-    // 初始化照常,降噪评估在 ProcessFrame 内部跳过。
+    // 初始化照常,NR 评估在 ProcessFrame 内部跳过。
 
     // FG hook 代理 DLL(dlssg_for_sm86 0.3.x 的 version.dll;用户自备部署,
     // 与模型 DLL 同目录约定)。默认 <plugin dir>/ngx/version.dll。
@@ -1260,7 +1260,7 @@ static void VS_CC DlssnrCreate(
     if (!initial.nrEnabled && !initial.fgEnabled && !rtxRequested) {
         // NR + FG + RTX 皆关:热/冷初始化全部跳过 —— 零设备、零显存、零 GPU,
         // 滤镜纯直通(getFrame 原帧交还)。仅 NR 关而 FG/RTX 开时不走此分支:
-        // 初始化照常,降噪评估由 ProcessFrame 内部门控跳过。桥接照常启动:
+        // 初始化照常,NR 评估由 ProcessFrame 内部门控跳过。桥接照常启动:
         // 面板仍被拉起并可实时控制 —— 已激活会话 live 重开立即恢复;创建即
         // 全关的实例重开需下个 seek(停泊热上下文原样保留,同参数重开走
         // 秒回的热复用)。

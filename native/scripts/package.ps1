@@ -118,11 +118,11 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   双击 vs-plugins\dlssnr_panel.exe 可在播放时实时调参, "保存为默认值"写入 dlssnr_ui.ini
   删除 vs-plugins\dlssnr_ui.ini 可恢复脚本默认参数
 帧生成 (可选)
-  vs\DLSSNR_NV.vpy 中 Fg_Enabled = True 开启: 输出帧率 x2-x4 (插值帧挂降噪之后)。
+  vs\DLSSNR_NV.vpy 中 Fg_Enabled = True 开启: 输出帧率 x2-x4 (插值帧挂 NR 之后)。
   RTX 40/50 系: 官方运行时直连 (NVIDIA 签名; 面板 "FG 路由" 可切纯官方跳过代理预载);
   RTX 30/20 系: 面板 "FG 路由" 默认自动, 预载 dlssg_for_sm86 0.3.x hook 代理 version.dll
   (拦截 nvngx_dlssg.dll 加载, 内嵌运行库接管 DLSS-G; 需 >=0.3.0, 重启 mpv 生效);
-  初始化失败自动回退 1:1, 降噪不受影响; 建议配合面板光流质量"质量"档或更高使用
+  初始化失败自动回退 1:1, NR 不受影响; 建议配合面板光流质量"质量"档或更高使用
 光流后端 (面板 "光流后端", 默认 FFX)
   FFX (AMD FidelityFX 光流) = 默认, 跨厂商通用 (需 D3D12 SM6.2 + WaveOps);
   NVOF (NVIDIA 专属引擎) = 可选。切档下一帧生效 (无需重启), 质量档位选项

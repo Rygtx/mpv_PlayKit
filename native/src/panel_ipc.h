@@ -34,7 +34,7 @@ constexpr uint32_t PAYLOAD_SIZE = 2048;
 // (插帧倍数 2-6,live,源帧边界生效 —— 结构体增长,新旧混跑按 magic 拒读);
 // v9 adds fgRouter (FG 路由 0=SM86/1=SM75,进程级,重启 mpv 生效); v10 adds
 // fgBackend (FG 后端 0=自动/1=官方 NGX/2=代理,下个 seek 生效); v11 adds
-// nrEnabled (NR 总开关 0/1,默认 1;0 = 跳过降噪推理,补帧/光流不受影响);
+// nrEnabled (NR 总开关 0/1,默认 1;0 = 跳过NR 推理,补帧/光流不受影响);
 // v12 merges fgRouter+fgBackend into fgRoute (0=自动/1=SM86/2=SM75/3=官方
 // NGX,进程级,重启 mpv 生效 —— 后端由硬件决定,自动档总能选对,单控件足够);
 // v13 adds debugView(差异调试 ×20 视图 0/1,live,不持久化 —— 输出被替换为
@@ -118,7 +118,7 @@ struct PanelPayload {
     int32_t fgEnabled;           // 0/1 DLSS 帧生成(原 reserved[0],v7)
     int32_t fgMultiplier;        // 2-6 插帧倍数(v8;live,会话内有效密度 = min(此值, 创建倍数))
     int32_t fgRoute;             // 0-1 FG 路由(v12;v20 两档化:0=自动预载 0.3.x 代理,1=纯官方,重启生效)
-    int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过降噪推理,补帧/光流不受影响)
+    int32_t nrEnabled;           // 0/1 NR 总开关(v11;0=跳过NR 推理,补帧/光流不受影响)
     int32_t debugView;           // 0-2 调试视图(v13;v19 起含光流场;live,不持久化)
     int32_t ofBackend;           // 0-1 光流后端(v16;0=ffx 默认 1=nvof;切档下一帧生效)
     // ---- RTX Video(v22)----

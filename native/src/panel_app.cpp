@@ -69,10 +69,10 @@ inline constexpr float kColGap = 24.0f;
 // 引用 dlssnr_params.h 的常量(文档注释里的 0-1 等只是给用户看的)。
 constexpr struct { const char *key; const char *label; const char *tip;
                    float lo, hi; float DlssnrParams::*field; } kFineSliders[] = {
-    { "residual_saturation", "残差饱和度", "对 DLSSNR 引起的饱和度变化的倍率(0-2,默认 1):\n1=保持,2=放大,0=移除。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualSaturation },
-    { "residual_lightness",  "残差亮度",   "对 DLSSNR 引起的明度变化的倍率(0-2,默认 1):\n1=保持,2=放大,0=移除。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualLightness },
-    { "shadow_structure",    "阴影结构",   "残差中变暗分量的倍率(0-2,默认 1):\n调低减轻暗部噪点,调高增强暗部结构。", kResidualFineMin, kResidualFineMax, &DlssnrParams::shadowStructureMultiplier },
-    { "reflection_glow",     "反射辉光",   "残差中变亮分量的倍率(0-2,默认 1):\n调低抑制高光泛光,调高增强辉光。", kResidualFineMin, kResidualFineMax, &DlssnrParams::reflectionGlowMultiplier },
+    { "residual_saturation", "残差饱和度", "DLSSNR 饱和度变化的倍率:1=保持,0=移除(默认 1)。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualSaturation },
+    { "residual_lightness",  "残差亮度",   "DLSSNR 明度变化的倍率:1=保持,0=移除(默认 1)。", kResidualFineMin, kResidualFineMax, &DlssnrParams::residualLightness },
+    { "shadow_structure",    "阴影结构",   "暗部分量倍率:调低减暗部噪点,调高增强暗部结构(默认 1)。", kResidualFineMin, kResidualFineMax, &DlssnrParams::shadowStructureMultiplier },
+    { "reflection_glow",     "反射辉光",   "亮部分量倍率:调低抑制高光泛光,调高增强辉光(默认 1)。", kResidualFineMin, kResidualFineMax, &DlssnrParams::reflectionGlowMultiplier },
 };
 constexpr const char *kStyleNames[] = { "0(默认)", "1(自然)", "2(电影)" };
 // 光流后端(0=ffx 1=nvof)
@@ -85,7 +85,7 @@ constexpr const char *kOfQualityNames[] = {
 };
 // FFX 质量档位(独立三档,与上游 6 档解耦:1 = Performance 半分辨率,
 // 2 = Quality 全分辨率 —— 上游 1-2/3-5 在 FFX 内各只对应一种行为)
-constexpr const char *kFfxQualityNames[] = { "无", "性能 (1/2 分辨率)", "质量 (全分辨率)" };
+constexpr const char *kFfxQualityNames[] = { "无", "性能 (1/2 分辨率)", "质量 (全分辨率,默认)" };
 // 抗闪烁时域稳定器(上游 antiFlicker 0-4)
 constexpr const char *kAntiFlickerNames[] = {
     "无", "静态累积", "光流累积", "光流累积+", "低频时域重建"
@@ -108,7 +108,7 @@ struct AppState {
                               // flush 时 WritePayload 后自动触发 mpv 原地 seek
     bool timingLog = true;
     bool advancedOpen = false; // 残差精调折叠区(ini [panel] advanced 记忆)
-    int page = 0;              // 功能页签:0=降噪增强,1=帧生成(ini [panel] page 记忆)
+    int page = 0;              // 功能页签:0=神经渲染,1=帧生成(ini [panel] page 记忆)
     bool pageRestore = true;   // 页签启动恢复锁:恢复期内每帧重喂 SetSelected 并
                                // 强制重绘,直到期望页真正可见(或预算烧完)才解除。
                                // 只喂首帧不够 —— SetSelected 排队到下一帧布局才
@@ -550,7 +550,7 @@ void LoadIni() noexcept {
     // (independent of the saved profile)
     g_app.timingLog = GetPrivateProfileIntW(L"panel", L"log", 1, path) != 0;
     g_app.advancedOpen = GetPrivateProfileIntW(L"panel", L"advanced", 0, path) != 0;
-    // 页签:0=降噪增强 1=帧生成 2=RTX 超分/HDR 3=诊断
+    // 页签:0=神经渲染 1=帧生成 2=RTX 超分/HDR 3=诊断
     g_app.page = static_cast<int>(std::clamp(GetPrivateProfileIntW(L"panel", L"page", 0, path), 0u, 3u));
     // 旧版 fg_route 越界值(v20 语义作废的 2/3 钉档)被 clamp 重解释:
     // 状态行提示,不再无声 —— 老用户"补帧怎么没了"的直接答案。
@@ -1145,7 +1145,7 @@ void DrawUi() noexcept {
             connTxt = "插件: 版本不匹配 —— 面板与 vs_dlssnr.dll 必须成对更新";
             col = kErrRed;
         } else {
-            connTxt = "插件: 未检测到(等待滤镜加载;不走滤镜路线则调参仅作默认值保存)";
+            connTxt = "插件: 未检测到(等待滤镜加载;调参会保存,滤镜加载后生效)";
         }
         ImGui::TextColored(col, "%s", connTxt);
     }
@@ -1171,7 +1171,7 @@ void DrawUi() noexcept {
             ImGui::TextColored(errCol, "NGX 故障,滤镜已停用 —— 重启 mpv 恢复");
             if (g_app.stateDetail[0]) TextDisabledWrapped(g_app.stateDetail);
         } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
-            ImGui::TextColored(warnCol, "光流已降级为零 guidance(增强继续)");
+            ImGui::TextColored(warnCol, "光流无运动数据,已降级(增强继续)");
             // 原因直达(of_detail):此前"为什么降级"只活在 timing log。
             if (g_app.ofDetail[0]) TextDisabledWrapped(g_app.ofDetail);
         }
@@ -1277,12 +1277,12 @@ void DrawUi() noexcept {
         }
     };
 
-    // --- 功能页签:降噪增强 / 帧生成分页,不再全挤在一页 ---
+    // --- 功能页签:神经渲染 / 帧生成分页,不再全挤在一页 ---
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     bool pgNrVis = false, pgFgVis = false, pgRtxVis = false, pgDiagVis = false; // 本帧各页可见性
     if (ImGui::BeginTabBar("##feature_tabs")) {
-        // --- 页:降噪增强(NR + 光流 + 分辨率缩放) ---
-        if (ImGui::BeginTabItem("降噪增强", nullptr,
+        // --- 页:神经渲染(NR + 光流 + 分辨率缩放) ---
+        if (ImGui::BeginTabItem("神经渲染", nullptr,
                                 (g_app.pageRestore && g_app.page == 0)
                                     ? ImGuiTabItemFlags_SetSelected
                                     : ImGuiTabItemFlags_None)) {
@@ -1294,12 +1294,11 @@ void DrawUi() noexcept {
             if (!g_app.pageRestore && g_app.page != 0) savePagePref(0);
             y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
 
-    // 降噪增强总开关(整行;live 即时,只关降噪不影响补帧/光流)
+    // 神经渲染总开关(整行;live 即时,只关 NR 不影响补帧/光流)
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y + labelDy));
-    ImGui::TextUnformatted("降噪增强");
+    ImGui::TextUnformatted("神经渲染");
     if (ImGui::IsItemHovered())
-        ShowTip("降噪总开关。关闭 = 跳过降噪,补帧/光流照常;与帧生成都关时滤镜零开销。\n"
-                "重开自动触发 mpv 重载(需 IPC,未启用时手动 seek)。面板优先于 vpy。");
+        ShowTip("关闭 = 跳过处理,补帧/光流/RTX 照常;全关时滤镜零开销。面板设置优先于 vpy 脚本。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + colCtrl, wpos.y + y));
     {
         bool v = g_app.params.nrEnabled != 0;
@@ -1324,11 +1323,10 @@ void DrawUi() noexcept {
     // 激活 preset 时(哨兵变 DIFF)面板加回下拉即可。
     // 光流后端为创建时参数:切档触发 OF 会话原位重建,下一帧生效,无需
     // mpv 重启;显式档失败不跨后端回落。
-    pairLabel(0, "风格", "处理风格:0=默认,1=自然(Natural),2=电影(Cinematic)。");
+    pairLabel(0, "风格", nullptr);
     pairCombo("style", &DlssnrParams::style, 3, kStyleNames, 0);
-    pairLabel(1, "光流后端", "光流引擎:FFX(AMD FidelityFX 光流)= 默认,跨厂商通用\n"
-              "(需 D3D12 SM6.2 + WaveOps);NVOF = NVIDIA 专属引擎,可选。\n"
-              "切档下一帧生效,无需重启 mpv;质量档位选项随之变化。");
+    pairLabel(1, "光流后端", "FFX = AMD 光流,通用;NVOF = NVIDIA 专属,备选。\n"
+              "切档下一帧生效,质量档位选项随之变化。");
     pairCombo("of_backend", &DlssnrParams::ofBackend, 2, kOfBackendNames, 1);
     y += rowH;
 
@@ -1338,9 +1336,8 @@ void DrawUi() noexcept {
         const int ofBackend = std::clamp(g_app.params.ofBackend, kOfBackendMin, kOfBackendMax);
         const char *ofQualityTip =
             ofBackend == kOfBackendFfx
-                ? "AMD FidelityFX 光流(跨厂商):性能 = 光流半分辨率(更快),\n质量 = 全分辨率(更精)。"
-                : "NVIDIA 光流引导,减轻运动场景的时域伪影;档位越高越精确也越耗时。\n"
-                  "需 RTX Turing+,不支持时自动回退\"无\"。";
+                ? nullptr
+                : "档位越高越精确也越耗时;不支持时自动回退\"无\"。";
         pairLabel(0, "光流质量", ofQualityTip);
         ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
         ImGui::SetNextItemWidth(trackW);
@@ -1360,50 +1357,42 @@ void DrawUi() noexcept {
         }
         if (changed) g_app.liveDirty = true;
     }
-    pairLabel(1, "光流降采样", "光流按内部缩放尺寸计算,省光流开销、精度略降(需先开分辨率缩放)。\n帧生成激活时忽略。");
+    pairLabel(1, "光流降采样", "按缩放后的分辨率算光流,省时但精度略降;未开缩放或开帧生成时无效。");
     pairCheck("nvof_follow_scaling", &DlssnrParams::nvofFollowScaling, 1);
     y += rowH;
 
     // (抗闪烁 | —):时域稳定器。NR 对逐帧随机噪声的响应强度不同 =
     // 画面闪烁;本器把"NR 改动量"沿时间轴平均掉。档位即"怎么平均"。
     pairLabel(0, "抗闪烁",
-              "跨帧时域平均,消除 NR 输出的逐帧闪烁(强度调高后易出现)。\n"
-              "档位选择:\n"
-              "  静态累积 —— 不用运动矢量,假设画面不动(固定镜头/静态场景);\n"
-              "    画面一动时门控自动拒绝混合,退回原样,不会拖影。\n"
-              "  光流累积 —— 按运动矢量把上一帧结果对齐到当前位置再平均;\n"
-              "    通用档,动态画面首选。2/3 档建议光流质量非\"无\"\n"
-              "    (没有运动场时自动退化为静态累积)。\n"
-              "  光流累积+ —— 在光流累积上增加\"通断记忆\"(噪点出现 60ms 渐入、\n"
-              "    消失 180ms 渐出),治\"噪点忽闪忽灭\"型闪烁,最强也最激进。\n"
-              "  低频时域重建 —— 把改动拆成低频(跨帧平均)+高频(逐帧保留),\n"
-              "    只平滑大面积慢闪、完全不动细节;多一次半分辨率 pass,最贵。\n"
-              "选档建议:先试 光流累积;仍有通断闪烁换 光流累积+;\n"
-              "大面积慢闪换 低频时域重建;固定镜头用 静态累积 最省。\n"
-              "切档立即生效(毫秒级重建,首帧重新播种)。");
+              "跨帧平均,消除 NR 的逐帧闪烁(强度调高后易出现)。\n"
+              "静态累积:假设画面不动,固定镜头用,不会拖影。\n"
+              "光流累积:按运动对齐再平均,动态画面首选。\n"
+              "光流累积+:加通断记忆,治噪点忽闪忽灭,最强也最激进。\n"
+              "低频时域重建:只平滑大面积慢闪,不动细节,最贵。\n"
+              "2/3 档需光流质量非\"无\";切档立即生效。");
     pairCombo("anti_flicker", &DlssnrParams::antiFlicker, 5, kAntiFlickerNames, 0);
     y += rowH;
 
     // (强度 | 局部色调)
-    pairLabel(0, "强度", "整体处理强度(0-2,默认 1)。数值越高降噪/增强越明显。");
+    pairLabel(0, "强度", "越高处理越明显(默认 1)。");
     pairSlider("intensity", &DlssnrParams::intensity, kStrengthMin, kStrengthMax, 0);
-    pairLabel(1, "局部色调", "局部色调强度(0-2,默认 1)。影响明暗过渡区域的处理力度。");
+    pairLabel(1, "局部色调", "明暗过渡区域的处理力度(默认 1)。");
     pairSlider("local_tone", &DlssnrParams::localToneStrength, kStrengthMin, kStrengthMax, 1);
     y += rowH;
 
     // (局部结构 | 皮肤结构)
-    pairLabel(0, "局部结构", "局部结构强度(0-2,默认 1)。越高保留越多细节纹理。");
+    pairLabel(0, "局部结构", "越高保留越多细节纹理(默认 1)。");
     pairSlider("local_structure", &DlssnrParams::localStructureStrength, kStrengthMin, kStrengthMax, 0);
-    pairLabel(1, "皮肤结构", "皮肤结构强度(0-2,默认 0)。影响人物皮肤区域的细节保留。");
+    pairLabel(1, "皮肤结构", "人物皮肤区域的细节保留(默认 0)。");
     pairSlider("skin_structure", &DlssnrParams::skinStructureStrength, kSkinMin, kSkinMax, 1);
     y += rowH;
 
     // (分辨率缩放 | 残差乘数):缩放总开关独占标准控件位,不与滑杆同行
     // 挤占 —— 开关前置会把 %滑杆推出轨道列(与其他滑块左缘不齐)。
     pairLabel(0, "分辨率缩放",
-              "按百分比分辨率推理再重建回源,降耗省帧;关闭则按源分辨率直接处理。");
+              "按缩小的分辨率推理再重建回源,省性能。");
     pairCheck("scaling_enabled", &DlssnrParams::scalingEnabled, 0);
-    pairLabel(1, "残差乘数", "重建细节的增强倍率(1-2,默认 1),配合分辨率缩放使用。");
+    pairLabel(1, "残差乘数", "缩放重建时细节的增强倍率(默认 1)。");
     pairSlider("residual_multiplier", &DlssnrParams::residualMultiplier,
                kResidualMultMin, kResidualMultMax, 1);
     y += rowH;
@@ -1411,7 +1400,7 @@ void DrawUi() noexcept {
     // (缩放比例 | 自动蒙版):%滑杆占标准控件位(与全局轨道对齐),缩放
     // 关闭时置灰。百分比改动会短暂重建模型(毫秒级),松手才推送(live)。
     pairLabel(0, "缩放比例",
-              "内部推理分辨率占源分辨率的百分比(25-100%);\"分辨率缩放\"关闭时无效。");
+              "推理分辨率占源分辨率的比例;缩放关闭时无效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     ImGui::SetNextItemWidth(trackW);
     {
@@ -1428,7 +1417,7 @@ void DrawUi() noexcept {
         }
         if (!scalingOn) ImGui::EndDisabled();
     }
-    pairLabel(1, "自动蒙版", "自动蒙版。模型自动识别区域并区别处理。");
+    pairLabel(1, "自动蒙版", "由模型自动识别画面中需区别处理的区域,无需手动指定。");
     pairCheck("auto_mask", &DlssnrParams::useAutoMask, 1);
     y += rowH;
 
@@ -1455,7 +1444,7 @@ void DrawUi() noexcept {
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     const bool advanced = ImGui::CollapsingHeader("残差精调(高级)");
     if (ImGui::IsItemHovered())
-        ShowTip("残差微调:1 = 保持 DLSSNR 的变化,默认全部中性,一般无需调整。");
+        ShowTip("1 = 保持 DLSSNR 原变化,一般无需调整。");
     if (advanced != g_app.advancedOpen) {
         g_app.advancedOpen = advanced;
         wchar_t base[MAX_PATH], path[MAX_PATH];
@@ -1484,11 +1473,8 @@ void DrawUi() noexcept {
     // (帧生成 | FG 路由):档位与路由都是创建期参数并排 —— 改档位触发
     // mpv 重载,路由进程级重启生效。倍数选择 关/2x/3x/4x/5x/6x,同步
     // fgEnabled + fgMultiplier 两键。
-    pairLabel(0, "帧生成", "DLSS 补帧,输出帧率 ×2–×6,插值帧落在相邻真实帧之间。\n"
-              "需光流质量非\"无\"(否则只复制帧)和 ngx 下的帧生成运行时,失败自动回退 1:1。\n"
-              "改档位/开关自动触发 mpv 重载(需 IPC,未启用时升档需手动 seek)。\n"
-              "运行库上限默认开到 6x(部署 ini MaxGeneratedFrames=5);\n"
-              "输出帧率 = 源 ×M,显示端刷新率建议不低于输出帧率。");
+    pairLabel(0, "帧生成", "输出帧率 = 源 ×2–×6。需光流质量非\"无\",否则只复制帧;失败自动回退 1:1。\n"
+              "显示端刷新率建议不低于输出帧率。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     ImGui::SetNextItemWidth(trackW);
     {
@@ -1511,19 +1497,14 @@ void DrawUi() noexcept {
             g_app.reseekDirty = true;
         }
     }
-    pairLabel(1, "FG 路由", "自动 = 预载 0.3.x hook 代理(RTX 30/20 系由其接管 DLSS-G,\n"
-              "仍走官方签名链;需 ngx\\version.dll)。\n"
-              "纯官方 = 不预载代理,直连官方运行时(RTX 40/50)。\n"
-              "进程级,重启 mpv 生效。实际生效档在\"诊断\"页显示。");
+    pairLabel(1, "FG 路由", "自动 = 预载代理,20/30 系需要;纯官方 = 直连官方运行时,40/50 用。\n"
+              "重启 mpv 生效,实际路由见\"诊断\"页。");
     pairCombo("fg_route", &DlssnrParams::fgRoute, 2, kFgRouteNames, 1);
     y += rowH;
 
     // Optimized 内核档(整行;dlssg_for_sm86 一致性档位。代理只在进程加载
     // 时读一次 ini → 重启 mpv 生效;存储单点 = 代理 ini,面板启动回读)
-    pairLabel(0, "内核档位", "dlssg_for_sm86 一致性档位:0 = 原厂内核不加速;\n"
-              "1 = 全部逐位一致加速(推荐,默认,与官方画面完全相同);\n"
-              "2/3 = 再开有损内核,更快但画面渐让。\n"
-              "写入 ngx\\dlssg_sm86.ini,重启 mpv 生效。");
+    pairLabel(0, "内核档位", "1 = 与官方画面完全相同(默认);2/3 更快但画质有损。重启 mpv 生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     ImGui::SetNextItemWidth(trackW);
     {
@@ -1545,7 +1526,7 @@ void DrawUi() noexcept {
     y += rowH;
 
             // 跨页依赖提示:光流是 NR(主消费者)与 FG 的共享资源,设置留在
-            // 降噪增强页不复制控件;此处按钮跳转,复用启动页签恢复机制
+            // 神经渲染页不复制控件;此处按钮跳转,复用启动页签恢复机制
             //(SetSelected 需逐帧重喂 + 强制重绘,见 pageRestore 注释)。
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
             ImGui::TextDisabled("帧生成需光流质量非\"无\",否则只复制帧。");
@@ -1573,11 +1554,8 @@ void DrawUi() noexcept {
     // (VSR 超分 | VSR 质量):开关为创建时参数(变化触发 mpv 原地重载);
     // 质量 1-4 为 per-eval live,拖动即时生效(官方 bicubic 0 档不暴露 ——
     // 关闭走开关,不再付一份 GPU 价买双线性)。
-    pairLabel(0, "VSR 超分", "NVIDIA RTX Video 超分(SDR RGB,RTX 显卡)。模式:自动 = 插件直读\n"
-              "mpv 窗口客户区(= osd-dimensions)按实际显示矩形适配并 clamp 显示器,\n"
-              "1:1/缩小时自动旁路(VSR 只做放大);手动 = 按倍率放大。\n"
-              "开关/模式/倍率为创建时参数:变化自动触发 mpv 原地重载(需 IPC)。\n"
-              "需插件 ngx\\ 下有 nvngx_vsr.dll(RTX Video SDK 1.1)。");
+    pairLabel(0, "VSR 超分", "RTX Video AI 超分,只做放大;1:1/缩小时自动旁路。\n"
+              "需 ngx\\ 下有 nvngx_vsr.dll。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     {
         // 勾选框记忆:非零模式恒同步进 lastVsrMode(ini 载入/payload
@@ -1594,7 +1572,7 @@ void DrawUi() noexcept {
             g_app.reseekDirty = true;
         }
     }
-    pairLabel(1, "VSR 质量", "AI 档位 1-4(4 = 最优,耗时最长;1 = 最快)。per-eval,拖动下一帧生效。");
+    pairLabel(1, "VSR 质量", "数字越大越精细也越慢。拖动下一帧生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
     ImGui::SetNextItemWidth(trackW);
     {
@@ -1610,8 +1588,7 @@ void DrawUi() noexcept {
     y += rowH;
 
     // (模式 | RTX Video HDR):模式与 HDR 开关都是创建时参数并排。
-    pairLabel(0, "模式", "自动 = mpv 窗口客户区适配(窗口/全屏的显示矩形即目标,免配置);\n"
-              "手动 = 按下方倍率放大(不跟随窗口)。切档触发 mpv 原地重载。");
+    pairLabel(0, "模式", "自动 = 跟随窗口大小;手动 = 按下方倍率固定放大。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     ImGui::SetNextItemWidth(trackW);
     {
@@ -1629,11 +1606,8 @@ void DrawUi() noexcept {
         }
         if (!vsrOn) ImGui::EndDisabled();
     }
-    pairLabel(1, "RTX Video HDR", "TrueHDR(SDR → HDR10):输出切 YUV420P10(BT.2020 PQ),\n"
-              "HDR 上屏(打标 + 色彩空间)由面板自动同步。官方明文必须排在 VSR 之后\n"
-              "(VSR 不吃 HDR 输入),管线顺序 NR→VSR→HDR→FG。\n"
-              "开关为创建时参数:变化自动触发 mpv 原地重载。\n"
-              "需插件 ngx\\ 下有 nvngx_truehdr.dll(RTX Video SDK 1.1)。");
+    pairLabel(1, "RTX Video HDR", "SDR → HDR10,输出切 10bit BT.2020;显示切换面板自动完成。\n"
+              "需 ngx\\ 下有 nvngx_truehdr.dll。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
     {
         bool hdr = g_app.params.rtxHdrEnabled != 0;
@@ -1647,8 +1621,7 @@ void DrawUi() noexcept {
 
     // (放大倍率 | HDR 对比度):倍率为创建时参数(松手才推送,免拖动连环
     // 重载),模式=手动时启用;对比度为 per-eval live。
-    pairLabel(0, "放大倍率", "手动模式的目标倍率(1.0-4.0,官方单 pass 上限 4x)。\n"
-              "改动松手后自动触发 mpv 原地重载(免拖动过程连环重建)。");
+    pairLabel(0, "放大倍率", "手动模式的目标倍率,松手后生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     {
         const bool manual = g_app.params.rtxVsrMode == 2;
@@ -1690,34 +1663,29 @@ void DrawUi() noexcept {
         }
         if (!hdrOn) ImGui::EndDisabled();
     };
-    pairLabel(1, "HDR 对比度", "TrueHDR Contrast(0-200,默认 100):明暗差强度。per-eval,拖动下一帧生效。");
+    pairLabel(1, "HDR 对比度", "明暗差强度(默认 100),拖动下一帧生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
     hdrSlider(&DlssnrParams::rtxHdrContrast, kHdrContrastMin, kHdrContrastMax, "##hdr_contrast", "%.0f", false);
     y += rowH;
 
     // (HDR 饱和度 | HDR 中间灰)
-    pairLabel(0, "HDR 饱和度", "TrueHDR Saturation(0-200,默认 100):色彩强度。per-eval。");
+    pairLabel(0, "HDR 饱和度", "色彩强度(默认 100),拖动下一帧生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     hdrSlider(&DlssnrParams::rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax, "##hdr_saturation", "%.0f", false);
-    pairLabel(1, "HDR 中间灰", "TrueHDR MiddleGray(10-100,默认 50):平均亮度。per-eval。");
+    pairLabel(1, "HDR 中间灰", "平均亮度基准(默认 50),拖动下一帧生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
     hdrSlider(&DlssnrParams::rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax, "##hdr_middle_gray", "%.0f", false);
     y += rowH;
 
     // HDR 峰值亮度(整行;HDR 关时置灰)+ 跨页提示
-    pairLabel(0, "HDR 峰值亮度", "TrueHDR MaxLuminance(400-2000 nits,默认 1000):显示器峰值亮度,\n"
-              "与显示器的实际峰值一致时色调映射最准。per-eval。");
+    pairLabel(0, "HDR 峰值亮度", "填显示器实际峰值亮度,色调映射最准(默认 1000),拖动下一帧生效。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     hdrSlider(&DlssnrParams::rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax, "##hdr_peak_nits", "%d nits", true);
     y += rowH;
 
     // 补帧 HDR 域插帧(整行;HDR/FG 关时置灰)+ 代价提示。
     // 标签 ≤5 中文字宽(标签列宽限制,超宽侵入控件列与开关重叠,#53e 同款)。
-    pairLabel(0, "HDR域插帧", "实验性:HDR 转换只对真实帧做一次,插值帧直接在 HDR 域生成 ——\n"
-              "省去每个插值帧各自做一次 HDR 转换的开销,高倍数或高分辨率下\n"
-              "收益更明显。插值帧的画面口径与默认模式略有不同;若出现闪烁、\n"
-              "亮度跳变等画面异常,关闭本开关即恢复默认行为。\n"
-              "创建时参数:变化自动触发 mpv 原地重载,需 HDR 与补帧同时开启。");
+    pairLabel(0, "HDR域插帧", "插值帧直接在 HDR 域生成,省去每帧一次 HDR 转换;高倍数/高分辨率收益更大。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + pairLabelW, wpos.y + y));
     {
         const bool usable = g_app.params.rtxHdrEnabled != 0 && g_app.params.fgEnabled != 0;
@@ -1738,7 +1706,7 @@ void DrawUi() noexcept {
 
             // 跨页依赖提示
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
-            ImGui::TextDisabled("提示: 实际生效状态见\"诊断\"页;HDR 上屏(打标 + 显示色彩空间)由面板自动同步,无需改 mpv.conf。");
+            ImGui::TextDisabled("提示: 实际生效状态见\"诊断\"页;HDR 显示切换由面板自动完成,无需改 mpv.conf。");
             y += rowH;
 
             ImGui::EndTabItem();
@@ -1756,17 +1724,15 @@ void DrawUi() noexcept {
             y = ImGui::GetCursorPosY() - wpos.y + 6 * s;
             ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
 
-            // ---- 调试与日志(从降噪增强页/全局行迁入:监控与诊断类控件
+            // ---- 调试与日志(从神经渲染页/全局行迁入:监控与诊断类控件
             // 集中在本页,调参页只留调参控件)----
             ImGui::TextUnformatted("—— 调试与日志 ——");
             {
                 ImGui::TextUnformatted("调试视图");
                 if (ImGui::IsItemHovered())
-                    ShowTip("输出替换为调试图,仅当前会话有效,不写入保存设置:\n"
-                            "差异 ×20 = |NR改动|×20 灰度(需 NR 开):白 = 改动大,一片灰 = 模型没动画面。\n"
-                            "光流场 = 运动可视化(NR 开关均可;NR 关时本帧旁路 VSR/HDR 直出调试图):\n"
-                            "方向→色相(红=右/绿=下/青=左/紫=上),亮度=速度,\n"
-                            "一片黑 = 无运动数据(光流关/播种帧)。确认光流是否真的在流。");
+                    ShowTip("仅当前会话有效,不写入保存设置。\n"
+                            "差异 ×20:NR 改动量灰度,白 = 改动大,灰 = 没动画面(需 NR 开)。\n"
+                            "光流场:色相 = 方向(红右/绿下/青左/紫上),亮度 = 速度,黑 = 无运动数据。");
                 ImGui::SameLine(0, 8 * s);
                 // 三态:关 / 差异 ×20 / 光流场(live,不持久化)
                 {
@@ -1793,7 +1759,7 @@ void DrawUi() noexcept {
                     g_app.liveDirty = false;
                 }
                 if (ImGui::IsItemHovered())
-                    ShowTip("每秒追加一行性能统计到 mpv 同目录 dlssnr_timing.log;排查性能问题时附上该文件。");
+                    ShowTip("每秒记录性能数据到 dlssnr_timing.log,排查问题时附上。");
             }
 
             ImGui::Spacing();
@@ -1819,7 +1785,7 @@ void DrawUi() noexcept {
                                       g_app.stateDetail[0] ? ": " : "", g_app.stateDetail);
                         stRed = true;
                     } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
-                        std::snprintf(stDesc, sizeof(stDesc), "增强中,光流零 guidance");
+                        std::snprintf(stDesc, sizeof(stDesc), "增强中,光流无运动数据");
                         stRed = true;
                     } else {
                         // ok / 空(存活态由周期 tick 携带)。"增强中"必须真
@@ -1837,7 +1803,7 @@ void DrawUi() noexcept {
                         if (nrOn || fgOn || rtxOn) {
                             std::snprintf(stDesc, sizeof(stDesc),
                                           "增强中(NGX 推理运行)%s",
-                                          nrOn ? "" : ";降噪已关(NR off,跳过评估)");
+                                          nrOn ? "" : ";NR 已关(跳过评估)");
                         } else {
                             std::snprintf(stDesc, sizeof(stDesc),
                                           "直通(画面未增强):面板全关");
@@ -2038,19 +2004,19 @@ void DrawUi() noexcept {
             ImGui::SetCursorPosX(qValX);
             ImGui::Text("%.2f ms", g_app.slotWait);
             if (ImGui::IsItemHovered())
-                ShowTip("3 槽全在飞时帧线程等槽的时长。此值大而 GPU 段正常 = GPU 超容量;\n两者都小而帧率低 = 宿主侧没来帧(与 perf 行 slot= 同源)。");
+                ShowTip("槽池全占时等槽的时长:大 = GPU 超载;与 NGX 等待都小而帧率低 = 上游没来帧。");
             ImGui::TextUnformatted("NGX 串行等待");
             ImGui::SameLine();
             ImGui::SetCursorPosX(qValX);
             ImGui::Text("%.2f ms", g_app.lockWait);
             if (ImGui::IsItemHovered())
-                ShowTip("evaluate 互斥排队(NGX feature 单例的 CPU 侧串行)。并发槽互相\n等待的时长;与 eval_cpu 互斥等待部分重叠,perf 行 lock= 同源。");
+                ShowTip("并发槽等 NGX 互斥的时长(与 perf 行 lock= 同源)。");
             ImGui::TextUnformatted("光流门");
             ImGui::SameLine();
             ImGui::SetCursorPosX(qValX);
             ImGui::Text("跳帧 %d / 过期 %d / 重置 %d", g_app.gateSkips, g_app.gateExpired, g_app.gateResets);
             if (ImGui::IsItemHovered())
-                ShowTip("光流帧序门累计:跳帧 = 缺口超时播种,过期 = 迟到帧播种,重置 =\nseek/显式复位。seek 后重置数增加属正常;持续增长 = 时序异常\n(与 perf 行 s/x/r 同源)。FFX 后端无引擎探针,数值恒 0。");
+                ShowTip("跳帧 = 缺口超时,过期 = 帧迟到,重置 = seek(其后增加属正常);\n持续增长 = 时序异常。FFX 后端恒 0。");
 
             ImGui::Spacing();
             ImGui::TextDisabled("全页无红 = 插件正常工作。红色 = 与面板请求不一致。");
@@ -2089,7 +2055,7 @@ void DrawUi() noexcept {
         }
     }
     if (ImGui::IsItemHovered()) {
-        ShowTip("当前设置即时生效(下一帧画面);保存为默认值(dlssnr_ui.ini)后,下次加载滤镜自动生效。");
+        ShowTip("调参即时生效;保存后作为默认值,下次加载滤镜自动应用。");
     }
     ImGui::SameLine(0, 14 * s);
     if (ImGui::Button("重置默认", ImVec2(120 * s, 30 * s))) {
@@ -2670,7 +2636,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             g_app.lastSeekInitReseek = nowSec;
             if (TriggerMpvReseek()) {
                 snprintf(g_app.status, sizeof(g_app.status),
-                         "降噪待初始化:已通知 mpv 原地重载滤镜会话");
+                         "NR 待初始化:已通知 mpv 原地重载滤镜会话");
             }
         }
 

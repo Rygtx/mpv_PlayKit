@@ -1922,7 +1922,7 @@ bool DlssnrContext::ProcessFrame(
     // Diagnostic: VSDLSSNR_SKIP_EVAL=1 measures the pipe without NGX evaluate
     static const bool skipEval = GetEnvironmentVariableA("VSDLSSNR_SKIP_EVAL", nullptr, 0) != 0;
     static const bool dumpEnabled = GetEnvironmentVariableA("VSDLSSNR_DUMP", nullptr, 0) != 0;
-    // NR 总开关(live,shared_lock 快照):关 = 跳过 NGX 降噪评估,下游
+    // NR 总开关(live,shared_lock 快照):关 = 跳过 NGX 评估,下游
     // (VSR/HDR/FG/输出转换)直连 C1 产物 inputColor(解耦:关闭的中间级
     // 不中转)。与诊断的 skipEval 互不相同:skipEval 连 NVOF/补帧一起跳
     // (测管线底价,直通拷贝保留)。
@@ -2214,7 +2214,7 @@ bool DlssnrContext::ProcessFrame(
     // 相应跳过。
     const bool guidanceDown = realMotion && scaling && !densifyInternal && !nrOff;
     if (skipEval) {
-        // 直通拷贝(诊断底价,字节级保留):Input → Output,不经 NGX 降噪,
+        // 直通拷贝(诊断底价,字节级保留):Input → Output,不经 NR 推理,
         // NVOF/补帧整体跳过。输入状态:nvof CL 转换落 NSR(convertedOnNvof)/
         // 槽 CL 补转换落 COMMON,拷贝后统一归 COMMON。
         D3D12_RESOURCE_BARRIER bar[2]{

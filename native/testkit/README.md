@@ -180,7 +180,7 @@ python fake_panel_env.py --scene vsr_scaling --shot d.png   # 截图留档
 python fake_panel_env.py --scene vsr --keep                 # 人工核对
 ```
 
-场景:alloff(全关直通)/ nr(只降噪)/ fg(帧生成)/ vsr(VSR)/
+场景:alloff(全关直通)/ nr(仅 NR)/ fg(帧生成)/ vsr(VSR)/
 vsr_scaling(内部缩放+VSR 并存)/ vsr_broken(RTX 降级红显)。
 
 脚本管理面板生命周期(已在跑会被杀掉重启;`--keep` 保留),并临时把
