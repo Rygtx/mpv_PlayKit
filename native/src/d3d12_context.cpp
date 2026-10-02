@@ -1177,13 +1177,14 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     if (_gpuTsEnabled) {
         D3D12_QUERY_HEAP_DESC qh{};
         qh.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qh.Count = 8; // 0=preBase 1=postBase 2=preFg 3=postFg 4=post0 5=post1(布局见头文件)
+        qh.Count = 16; // 0..5 常驻段 6..11 RTX 段 14/15 TS-INLINE 探针(布局见头文件)
         qh.NodeMask = 0;
         if (FAILED(_device->CreateQueryHeap(&qh, IID_PPV_ARGS(slot.tsQueryHeap.GetAddressOf())))) {
             SetErr(err, errLen, E_FAIL, "CreateQueryHeap(ts) failed");
             return false;
         }
-        // 4 对微型括号 CL:postBase(原有)+ preBase + preFg + postFg。
+        // 10 对微型括号 CL:postBase(原有)+ preBase + preFg/postFg +
+        // RTX 段 preVsr/postVsr/preHdr/postHdr/preGen/postGen(6..11)。
         // 同帧内全部在飞,须各自独立 allocator(在飞 Reset = UB)。
         const auto createBracket = [&](ComPtr<ID3D12CommandAllocator> &alloc,
                                        ComPtr<ID3D12GraphicsCommandList> &cl) -> bool {
@@ -1201,14 +1202,20 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         if (!createBracket(slot.tsAllocator, slot.tsCommandList) ||
             !createBracket(slot.tsPreBaseAllocator, slot.tsPreBaseCommandList) ||
             !createBracket(slot.tsPreFgAllocator, slot.tsPreFgCommandList) ||
-            !createBracket(slot.tsPostFgAllocator, slot.tsPostFgCommandList)) {
+            !createBracket(slot.tsPostFgAllocator, slot.tsPostFgCommandList) ||
+            !createBracket(slot.tsPreVsrAllocator, slot.tsPreVsrCommandList) ||
+            !createBracket(slot.tsPostVsrAllocator, slot.tsPostVsrCommandList) ||
+            !createBracket(slot.tsPreHdrAllocator, slot.tsPreHdrCommandList) ||
+            !createBracket(slot.tsPostHdrAllocator, slot.tsPostHdrCommandList) ||
+            !createBracket(slot.tsPreGenAllocator, slot.tsPreGenCommandList) ||
+            !createBracket(slot.tsPostGenAllocator, slot.tsPostGenCommandList)) {
             return false;
         }
         D3D12_HEAP_PROPERTIES rbHeap{};
         rbHeap.Type = D3D12_HEAP_TYPE_READBACK;
         D3D12_RESOURCE_DESC rbDesc{};
         rbDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        rbDesc.Width = 64; // 6×UINT64(布局见头文件)
+        rbDesc.Width = 128; // 16×UINT64(布局见头文件)
         rbDesc.Height = 1;
         rbDesc.DepthOrArraySize = 1;
         rbDesc.MipLevels = 1;
@@ -1561,6 +1568,11 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, char *err, size_t errLen) no
     // 给出;preBase 时刻 − 本入口 QPC = 帧间排队(burst 等前帧尾部),单独
     // 成段,不折进任何处理段。
     slot.submitQpc = s0.QuadPart;
+    // 本帧擦账(2026-10-02):readback 常驻映射跨帧残留 —— 某括号录制失败时
+    // 该格子留旧帧 tick,与另一半新章混减 = 虚高/无符号回绕巨值(Finish 检
+    // "0 = 本帧没盖章")。清零时槽刚从池子取出:上帧 WaitFrame 已闭合或设备
+    // 丢失域,GPU 不会再写,CPU 独占安全;64 字节擦除开销可忽略。
+    if (slot.tsReadbackMapped) std::memset(slot.tsReadbackMapped, 0, 128);
     const bool preBaseOk = RecordTsBracket(slot, slot.tsPreBaseAllocator.Get(),
                                            slot.tsPreBaseCommandList.Get(), 0);
     if (preBaseOk) {
@@ -1615,6 +1627,20 @@ bool D3D12Context::RecordTsBracket(FrameSlot &slot, ID3D12CommandAllocator *allo
     return SUCCEEDED(cl->Close());
 }
 
+bool D3D12Context::SubmitTsBracket(FrameSlot &slot, ID3D12CommandQueue *rtxQueue,
+                                   ID3D12CommandAllocator *alloc,
+                                   ID3D12GraphicsCommandList *cl, UINT tsIdx,
+                                   ID3D12Fence *waitFence, uint64_t waitValue) noexcept {
+    if (!_gpuTsEnabled || !rtxQueue) return false;
+    if (!RecordTsBracket(slot, alloc, cl, tsIdx)) return false;
+    // pre 括号的生产者等待:与被测 eval 的等待同 fence 同值 —— 章落点 =
+    // 段纯执行起点(不含队列空闲);post 括号 fence 传空(FIFO 紧贴前序)。
+    if (waitFence && waitValue) rtxQueue->Wait(waitFence, waitValue);
+    ID3D12CommandList *lists[]{ cl };
+    rtxQueue->ExecuteCommandLists(1, lists);
+    return true;
+}
+
 bool D3D12Context::SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64_t waitValue,
                                  char *err, size_t errLen) noexcept {
     HRESULT hr = slot.fgCommandList->Close();
@@ -1662,7 +1688,7 @@ bool D3D12Context::BeginPostRecording(FrameSlot &slot) noexcept {
     hr = slot.postCommandList->Reset(slot.postAllocator.Get(), nullptr);
     if (FAILED(hr)) return false;
     // post CL 首时间戳(2026-09-25 账目诚实化):post 是自绘 shader(无
-    // NGX,timestamp 同 CL SEH 约束不适用),首尾同 CL 打点量出纯执行时间
+    // NGX,"同 CL 打点 SEH" 的单次观测只涉及 NGX 段),首尾同 CL 打点量出纯执行时间
     // —— 其跨队列栅栏等待(A/B)与队列积压属排队,不计入 conv。
     if (_gpuTsEnabled) {
         slot.postCommandList->EndQuery(slot.tsQueryHeap.Get(),

@@ -70,6 +70,10 @@ public:
     // 此前"背压保持 INFINITE"的语义已随 5e239eb 修复废弃)。
     bool Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs) noexcept;
     ID3D12Fence *Fence() const noexcept { return _fence.Get(); }
+    // 原生队列句柄(时间戳括号夹提交用,2026-10-02):帧路径在本线程、
+    // Evaluate 前后紧邻提交括号 CL —— 与 Execute 的提交是同线程程序序,
+    // FIFO 保证括号包住 eval;跨帧线程经 _evaluateMutex 串行,无乱序。
+    ID3D12CommandQueue *Native() const noexcept { return _queue.Get(); }
 
 private:
     ComPtr<ID3D12CommandQueue> _queue;

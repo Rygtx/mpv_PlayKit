@@ -78,9 +78,10 @@ struct FrameSlot {
     uint64_t fenceValue = 0;          // fence value of this slot's last submission
     // FG 分段提交(处理用时拆账):base CL(基础管线:NR/直通 + 真实帧输出)
     // 先提交并 signal baseFenceValue,FG 插帧链(推理 + 插值输出)录在独立
-    // fg CL 上后提交并 signal fenceValue。两段 GPU 耗时 = 两个栅栏完成点的
-    // CPU 墙钟差 —— timestamp query 与 NGX 同 CL 会 SEH(2026-09-05 实锤),
-    // 栅栏差分是唯一无损精确拆分法。
+    // fg CL 上后提交并 signal fenceValue。GPU 耗时现以时间戳括号记账
+    // (2026-09-25 起,布局见下方 ts 段;括号 CL 独立于 NGX CL —— 同 CL
+    // 内联打点 2026-09-05 单次观测 SEH,2026-10-02 复核 363 eval 未复现,
+    // 见 dlssnr_context.cpp 的 NOTE),栅栏完成点差分仅作括号失败时的回退账目。
     ComPtr<ID3D12CommandAllocator> fgAllocator;
     ComPtr<ID3D12GraphicsCommandList> fgCommandList;
     HANDLE baseFenceEvent = nullptr;  // base 段栅栏等待专用事件(fg 等待用 fenceEvent)
@@ -96,8 +97,9 @@ struct FrameSlot {
     uint64_t postFenceValue = 0;      // postB 段提交的栅栏值
     uint64_t fgFenceValue = 0;        // postA(fg CL)提交的栅栏值(计时锚)
     // base 段 GPU 完成时间戳路径(2026-09-25:WaitBaseFrame CPU 阻塞删除,
-    // RTX/fg/post 提交链与 base GPU 执行重叠)。timestamp query 与 NGX 同 CL
-    // 会 SEH(2026-09-05 实锤)—— 独立微型 CL 括号对夹住各段(同一
+    // RTX/fg/post 提交链与 base GPU 执行重叠)。timestamp 打点不与 NGX 同 CL
+    // 内联(2026-09-05 单次观测 SEH;2026-10-02 复核未复现,见
+    // dlssnr_context.cpp NOTE)—— 独立微型 CL 括号对夹住各段(同一
     // _submitMutex 保证队列序),EndQuery + ResolveQueryData 写 READBACK 缓冲;
     // post CL FIFO 在其后,WaitFrame(post 栅栏)完成即蕴含全部 ts 完成,
     // Finish 无额外等待直接读。GetClockCalibration 在提交时采样,GPU tick →
@@ -112,6 +114,10 @@ struct FrameSlot {
     //                                      可同 CL 打点;其跨队列栅栏等待
     //                                      属于排队,不属 conv)
     //   0=preBase 1=postBase 2=preFg 3=postFg 4=post0 5=post1(readback 布局)
+    //   6=preVsr 7=postVsr 8=preHdr 9=postHdr 10=preGen 11=postGen(RTX 段,
+    //   2026-10-02 括号化;VSR/HDR 专用队列,括号与 eval 同锁同线程程序序
+    //   提交,FIFO 包住 eval;槽复用纪律兜底 allocator —— 槽归还蕴含上一帧
+    //   RTX 链完成);14/15 = TS-INLINE 探针(VSDLSSNR_TS_INLINE)
     ComPtr<ID3D12QueryHeap> tsQueryHeap;    // 6 查询(容量 8 取整)
     ComPtr<ID3D12CommandAllocator> tsAllocator;   // postBase 括号
     ComPtr<ID3D12GraphicsCommandList> tsCommandList;
@@ -121,6 +127,21 @@ struct FrameSlot {
     ComPtr<ID3D12GraphicsCommandList> tsPreFgCommandList;
     ComPtr<ID3D12CommandAllocator> tsPostFgAllocator;
     ComPtr<ID3D12GraphicsCommandList> tsPostFgCommandList;
+    // RTX 段括号 ×3 对(索引 6..11,见上方布局):VSR / TrueHDR 真实帧 /
+    // TrueHDR 插值链。未提交(段未跑)时 readback 索引保持帧首清零值,
+    // Finish 按缺账记 0。
+    ComPtr<ID3D12CommandAllocator> tsPreVsrAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsPreVsrCommandList;
+    ComPtr<ID3D12CommandAllocator> tsPostVsrAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsPostVsrCommandList;
+    ComPtr<ID3D12CommandAllocator> tsPreHdrAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsPreHdrCommandList;
+    ComPtr<ID3D12CommandAllocator> tsPostHdrAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsPostHdrCommandList;
+    ComPtr<ID3D12CommandAllocator> tsPreGenAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsPreGenCommandList;
+    ComPtr<ID3D12CommandAllocator> tsPostGenAllocator;
+    ComPtr<ID3D12GraphicsCommandList> tsPostGenCommandList;
     ComPtr<ID3D12Resource> tsReadback;      // 64 字节 READBACK(6×UINT64),persist-mapped
     void *tsReadbackMapped = nullptr;
     UINT64 tsGpuCal = 0;                    // 校准点 GPU tick(base 提交时)
@@ -491,6 +512,14 @@ public:
                          ID3D12Fence *waitFenceA, uint64_t waitValueA,
                          ID3D12Fence *waitFenceB, uint64_t waitValueB,
                          char *err, size_t errLen) noexcept;
+    // RTX 专用队列时间戳括号(2026-10-02 vsr/hdr 账目括号化):RecordTsBracket
+    // 同款录制 + rtxQueue Wait(waitFence) + ECL。pre 括号传生产者 fence(章落
+    // 点 = 被测段纯执行起点,不含队列空闲);post 括号 fence 传空(FIFO 紧贴
+    // 前序 eval)。调用方在 _evaluateMutex 锁内、Evaluate 前后紧邻调用 ——
+    // 与 Execute 同线程程序序,GPU FIFO 包住被测段。失败仅放弃本段账目。
+    bool SubmitTsBracket(FrameSlot &slot, ID3D12CommandQueue *rtxQueue,
+                         ID3D12CommandAllocator *alloc, ID3D12GraphicsCommandList *cl,
+                         UINT tsIdx, ID3D12Fence *waitFence, uint64_t waitValue) noexcept;
     bool WaitBaseFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;
     bool WaitFrame(FrameSlot &slot, char *err, size_t errLen) noexcept;   // fence wait, device-lost aware
     // base 完成时间戳路径可用性(GetTimestampFrequency 失败 = 0,ProcessFrame

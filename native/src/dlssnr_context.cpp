@@ -221,6 +221,13 @@ bool ProbeEnabled() noexcept {
     return on;
 }
 
+// TS-INLINE 探针开关(VSDLSSNR_TS_INLINE=1):timestamp 内联 NGX 同 CL 的
+// A/B 复核(协议见帧路径 NOTE,2026-10-02),平时关。
+static bool TsInlineProbeEnabled() noexcept {
+    static const bool on = GetEnvironmentVariableA("VSDLSSNR_TS_INLINE", nullptr, 0) != 0;
+    return on;
+}
+
 // Internal NGX processing size for a resolution percent (25-100; aligned to even)
 // Internal NGX processing size (aligned to even). scalingEnabled == 0 forces
 // the full source size (internal-resolution scaling off).
@@ -2186,7 +2193,16 @@ bool DlssnrContext::ProcessFrame(
         if (err && errLen) std::snprintf(err, errLen, "BeginFrameRecording(frame) failed");
         return false;
     }
-    // NOTE: D3D12 timestamp queries crash NGX snippet evaluate (SEH) when on the same command list - do not re-enable (verified 2026-09-05)
+    // NOTE: 2026-09-05 单次观测:NR snippet eval 的宿主 CL 内联 timestamp
+    // EndQuery 后该帧 SEH 崩溃,改独立括号 CL 后消失。"同 CL 内联 = 危险"
+    // 曾作假设(n=1,异常码未留痕)。2026-10-02 按协议复核(testkit/
+    // ts_inline_probe.py,VSDLSSNR_TS_INLINE=1):内联组 3 会话 × 121 eval
+    // = 363 次全部存活、零 SEH、零设备移除(内联 delta 读数正常 5-8ms),
+    // 对照组同规模 0 失败 —— 本机(RTX 3080 / 驱动 617.14 / snippet
+    // 2026-09-27)假设不成立,当年单次崩溃应归因于未留痕的混淆项(旧查询
+    // 堆用法/当时驱动版本),真因不可考。生产路径仍维持独立括号 CL:零成
+    // 本、已证稳定,且 base 段 GPU 时间戳账目依赖它;内联探针保留备用。
+    // RTX 队列独立括号化不受此条任何约束。
 
     // C1 产物落点(直连接线):本帧有 RTX eval → NSR(VSR/HDR/NGX 直读,
     // NR 关时 VSR 直接吃 inputColor);否则 COMMON(下游 fgBar/C2 统一
@@ -2336,7 +2352,22 @@ bool DlssnrContext::ProcessFrame(
             }
             return false;
         }
+        // TS-INLINE 探针(2026-10-02 复核协议,见帧路径 NOTE):EndQuery/
+        // Resolve 内联在 NGX eval 同一 CL —— 被验证的正是这个组合。查询堆
+        // 索引 14/15(常驻账目 0..5 + RTX 括号 6..11),Resolve 落 readback
+        // 偏移 112/120;Finish 的 WaitFrame 后读账。故障面与协议一致:录制
+        // 期 SEH 由 SnippetEvaluateSafely 接,GPU 侧故障走既有设备移除熔断,
+        // 均留痕。
+        const bool tsInline = TsInlineProbeEnabled() && slot->tsQueryHeap.Get() != nullptr;
+        if (tsInline) {
+            cl->EndQuery(slot->tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 14);
+        }
         const NVSDK_NGX_Result r = SnippetEvaluateSafely(cl, _parameters, &sehCode);
+        if (tsInline) {
+            cl->EndQuery(slot->tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 15);
+            cl->ResolveQueryData(slot->tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                 14, 2, slot->tsReadback.Get(), 112);
+        }
         QueryPerformanceCounter(&t2);
         if (sehCode) {
             char buf[160];
@@ -2545,8 +2576,9 @@ bool DlssnrContext::ProcessFrame(
     const bool fgPipeOk = vsrRun || hdrLegacyInterp || !_vsrRequested;
 
     // ---- base/postA(TrueHDR 链)/postB 分段提交(处理用时拆账)----
-    // 各段 GPU 耗时靠提交 + 栅栏完成点差分(timestamp query 与 NGX 同 CL
-    // 会 SEH,2026-09-05 实锤,栅栏差分是无损精确拆分):
+    // 各段 GPU 耗时:自绘段 = 时间戳括号差分,RTX 段 = 栅栏墙钟等待(NGX
+    // 同 CL 内联打点 2026-09-05 单次观测 SEH,2026-10-02 复核未复现;旁路
+    // 括号 CL,见上方 NOTE):
     //   base CL          = 基础管线(NR 推理/残差/直通)
     //   postA(fg CL)    = DLSSG 推理链(HDR 会话;非 HDR = 推理+转换旧形态)
     //   TrueHDR 专用队列 = 真实帧 + 逐插值帧(每输出帧一次 eval)
@@ -2710,6 +2742,14 @@ bool DlssnrContext::ProcessFrame(
                                                       : _d3d12->OutputColor(*slot));
     if (vsrRun) {
         std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
+        // 计时括号(6/7):pre 自带队列 Wait(base fence,与 eval 生产者等待
+        // 同值)—— 章落点 = VSR 纯执行起点,队列空闲不入账。括号与 eval 同
+        // 锁同线程程序序提交,FIFO 包住;失败路径 post 括号不提交 → 缺账
+        // 记 0(帧已失败)。
+        _d3d12->SubmitTsBracket(*slot, _vsr->Queue().Native(),
+                                slot->tsPreVsrAllocator.Get(),
+                                slot->tsPreVsrCommandList.Get(), 6,
+                                _d3d12->Fence(), slot->baseFenceValue);
         char rtxErr[160]{};
         uint64_t fv = 0;
         if (!_vsr->Evaluate(rtxColorIn, width, height,
@@ -2720,6 +2760,9 @@ bool DlssnrContext::ProcessFrame(
             if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
             return false;
         }
+        _d3d12->SubmitTsBracket(*slot, _vsr->Queue().Native(),
+                                slot->tsPostVsrAllocator.Get(),
+                                slot->tsPostVsrCommandList.Get(), 7, nullptr, 0);
         vsrDoneFence = _vsr->Queue().Fence();
         vsrDoneVal = fv;
     }
@@ -2728,6 +2771,12 @@ bool DlssnrContext::ProcessFrame(
     // 在 VSR 之后(fence 链保证)。输出 hdrColor(FP16 scRGB @PIPE)。
     if (hdrRun) {
         std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
+        // 计时括号(8/9):TrueHDR 真实帧(生产者等待与 eval 同值)。
+        _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
+                                slot->tsPreHdrAllocator.Get(),
+                                slot->tsPreHdrCommandList.Get(), 8,
+                                vsrRun ? _vsr->Queue().Fence() : _d3d12->Fence(),
+                                vsrRun ? vsrDoneVal : slot->baseFenceValue);
         char rtxErr[160]{};
         uint64_t fv = 0;
         if (!_hdr->Evaluate(vsrRun ? slot->vsrColor.Get()
@@ -2741,6 +2790,9 @@ bool DlssnrContext::ProcessFrame(
             if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
             return false;
         }
+        _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
+                                slot->tsPostHdrAllocator.Get(),
+                                slot->tsPostHdrCommandList.Get(), 9, nullptr, 0);
         hdrDoneFence = _hdr->Queue().Fence();
         hdrDoneVal = fv;
         hdrChainFence = hdrDoneFence;
@@ -2924,9 +2976,20 @@ bool DlssnrContext::ProcessFrame(
     // 等 postA 栅栏(同队列 FIFO 保序);链尾栅栏 = postB 消费锚 + 计时锚。
     // 仅 hdrPostSplit 形态(实验模式无插值帧 TrueHDR)。
     if (hdrPostSplit && fgOnFgCl && fgGenOk) {
+        // 单锁包整链(此前逐笔加锁):括号(10/11)与 eval 的 FIFO 顺序靠
+        // 同锁程序序;Submit 已被 fgMutex 串行,无并发竞争者。preGen 惰性
+        // 提交(首个有效 gen 才开括号),全跳过帧不白提交。
+        std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
+        bool genBracketOpen = false;
         for (int g = 0; g < fgM - 1; ++g) {
             if (!fgGenOk[g]) continue;
-            std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
+            if (!genBracketOpen) {
+                _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
+                                        slot->tsPreGenAllocator.Get(),
+                                        slot->tsPreGenCommandList.Get(), 10,
+                                        _d3d12->Fence(), slot->fgFenceValue);
+                genBracketOpen = true;
+            }
             char rtxErr[160]{};
             uint64_t fv = 0;
             if (!_hdr->Evaluate(slot->fgInterp[g].Get(), pipeW, pipeH,
@@ -2947,6 +3010,11 @@ bool DlssnrContext::ProcessFrame(
             hdrDoneVal = fv;
             hdrChainFence = hdrDoneFence;
             hdrChainVal = fv;
+        }
+        if (genBracketOpen) {
+            _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
+                                    slot->tsPostGenAllocator.Get(),
+                                    slot->tsPostGenCommandList.Get(), 11, nullptr, 0);
         }
     }
     if (!fgBeginOk) {
@@ -3321,13 +3389,32 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
     // 不折进任何处理段。段差异用 GPU tick 直接换算(同钟,免校准);排队
     // 需要绝对墙钟锚(preBase − 提交时刻),走校准点换算。
     double baseGpuMs = 0.0, queueWaitMs = 0.0, fgGpuMs = 0.0, convGpuMs = 0.0;
+    double rtxVsrGpuMs = 0.0, rtxHdrRealMs = 0.0, rtxHdrGenMs = 0.0;
     const bool tsAcc = ff->slot->tsValid;
+    const UINT64 *tsq = ff->slot->tsReadbackMapped
+                            ? static_cast<const UINT64 *>(ff->slot->tsReadbackMapped)
+                            : nullptr;
+    const double tickMs = 1000.0 / _d3d12->GpuTsFreq();
+    // 括号差分防线(2026-10-02):readback 帧首已清零(SubmitBaseFrame),
+    // 格子为 0 = 本帧该括号录制失败(无账);负差分 = 时钟异常;两者钳 0,
+    // 杜绝新旧混搭的虚高/无符号回绕巨值。正常路径与裸差分完全一致。
+    const auto tickDiffMs = [&](UINT64 a, UINT64 b) -> double {
+        if (!a || !b) return 0.0;
+        const INT64 d = static_cast<INT64>(b) - static_cast<INT64>(a);
+        return d > 0 ? static_cast<double>(d) * tickMs : 0.0;
+    };
     if (tsAcc) {
-        const UINT64 *tsq = static_cast<const UINT64 *>(ff->slot->tsReadbackMapped);
-        const double tickMs = 1000.0 / _d3d12->GpuTsFreq();
-        baseGpuMs = static_cast<double>(tsq[1] - tsq[0]) * tickMs;
-        convGpuMs = static_cast<double>(tsq[5] - tsq[4]) * tickMs;
-        if (ff->fgBeginOk) fgGpuMs = static_cast<double>(tsq[3] - tsq[2]) * tickMs;
+        baseGpuMs = tickDiffMs(tsq[0], tsq[1]);
+        convGpuMs = tickDiffMs(tsq[4], tsq[5]);
+        if (ff->fgBeginOk) fgGpuMs = tickDiffMs(tsq[2], tsq[3]);
+        // RTX 段括号(2026-10-02):vsr/hdr 与常驻段同语义 —— GPU 纯执行,
+        // 提交链遮盖/队列空闲不入账(CPU-bound 帧不再显示假 0,九段语义
+        // 统一);hdr = 真实帧括号(8/9)+ 插值链括号(10/11)之和,两段间
+        // 等 postA 的队列空闲天然留在括号外。括号未提交(段未跑/失败帧)
+        // 索引保持帧首清零,记 0。
+        rtxVsrGpuMs = tickDiffMs(tsq[6], tsq[7]);
+        rtxHdrRealMs = tickDiffMs(tsq[8], tsq[9]);
+        rtxHdrGenMs = tickDiffMs(tsq[10], tsq[11]);
         const double qpcPerGpuTick =
             static_cast<double>(ff->qpcFreq.QuadPart) / _d3d12->GpuTsFreq();
         const double preBaseQpc = static_cast<double>(ff->slot->tsCpuCal) +
@@ -3336,6 +3423,26 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         queueWaitMs = (preBaseQpc - static_cast<double>(ff->slot->submitQpc)) *
                       1000.0 / static_cast<double>(ff->qpcFreq.QuadPart);
         if (queueWaitMs < 0.0) queueWaitMs = 0.0; // 时钟换算噪声钳零
+    }
+    // TS-INLINE 探针读账(2026-10-02):索引 14/15 = eval 前后内联章(帧首已
+    // 随整本清零),等待已由 WaitFrame 蕴含。每帧一行 —— 计数证据:ok 行数
+    // = 内联组合存活帧数;NO-TS = 本帧没走 eval(播种/直通);SEH/设备移除
+    // 在别处留痕(帧路径 eval 域与 WaitFrame 失败路径)。
+    if (TsInlineProbeEnabled() && ff->slot->tsReadbackMapped) {
+        const UINT64 *tsqP = static_cast<const UINT64 *>(ff->slot->tsReadbackMapped);
+        char pbuf[128];
+        if (tsqP[14] && tsqP[15] && tsqP[15] > tsqP[14]) {
+            std::snprintf(pbuf, sizeof(pbuf), "TS-INLINE: f=%d ok delta=%.3fms",
+                          _lastFrameN.load(std::memory_order_relaxed),
+                          static_cast<double>(tsqP[15] - tsqP[14]) * 1000.0 /
+                              _d3d12->GpuTsFreq());
+        } else {
+            std::snprintf(pbuf, sizeof(pbuf), "TS-INLINE: f=%d NO-TS t14=%llu t15=%llu",
+                          _lastFrameN.load(std::memory_order_relaxed),
+                          static_cast<unsigned long long>(tsqP[14]),
+                          static_cast<unsigned long long>(tsqP[15]));
+        }
+        TimingStatusLine(pbuf);
     }
     const bool rb = _d3d12->UnpackOutput(*ff->slot, dstPlanes, dstStrides, _outW, _outH, err, errLen);
     // unpack 段 = 真实帧回读(t3b→t3c);插值帧回读(t3c→t4)是 FG 的
@@ -3511,7 +3618,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         };
         const double packMs = ms(ff->t0, ff->t1, ff->qpcFreq);
         // eval_cpu = "NGX 调用" 的 CPU 成本:NR eval 窗口(t1→ff->t2,扣 nvof)
-        // **+ RTX evals 的 CPU 提交链(ff->t3a→ff->tSub1,vsr/TrueHDR/DLSSG 逐笔
+        // **+ RTX evals 的 CPU 提交链(ff->tSub0→ff->tSub1,vsr/TrueHDR/DLSSG 逐笔
         // 参数录制,~1.8ms/次,全家桶 8 笔 ≈ 14ms,2026-09-24 探针定案)**。
         // 提交链与 GPU 执行并行,但它是真实的每帧 CPU 串行成本 —— 唯一
         // 诚实呈现的位置就是本段(NR 关时不再恒 0,RTX 关时仍 0)。
@@ -3521,14 +3628,13 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                                 : evalCpuMs > ff->nvofMs ? evalCpuMs - ff->nvofMs
                                                      : 0.0;
         const double evalOnlyMs = evalBase + subWaitMs;
-        // 分段 GPU 时间 = 各提交的栅栏完成点差(timestamp query 与 NGX 同
-        // CL 会 SEH,见 NOTE;栅栏差分是无损精确拆分):
+        // 分段 GPU 时间 = 时间戳括号差分(布局见 d3d12_context.h;栅栏差分
+        // 仅 tsAcc=false 的回退账目):
         // gpu 段 = base CL(NR 推理/残差/直通),
-        // vsr 段 = VSR eval(ff->t3a 后有界 CPU 等待完成栅栏),
+        // vsr 段 = VSR eval(RTX 专用队列括号,2026-10-02 起纯执行账),
         // fg 段 = postA(HDR 会话 = 纯 DLSSG 推理;非 HDR = post 全部:
         // 推理 + 转换/回读 旧形态),
-        // hdr 段 = TrueHDR 链 + postB 转换/回读窗口(每输出帧一次 eval;
-        // 仅 HDR 会话非零),
+        // hdr 段 = TrueHDR 真实帧 + 插值链两括号之和(仅 HDR 会话非零),
         // 门关帧 fg 段 ≈ 0(WaitFrame 等的就是 base 值,立即满足)。
         const double gpuWaitMs = ms(ff->t2, ff->t3a, ff->qpcFreq);
         // NR 关直连帧:base CL 为空(零 NR 工作)。时间戳括号路径 base 纯执行
@@ -3540,38 +3646,33 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         // 并入 fg 段(无 FG 帧两者差 ≈0)。
         const double unpackMs = ms(t3b, t3c, ff->qpcFreq);
         const double fgReadbackMs = ms(t3c, t4, ff->qpcFreq);
-        // RTX 各段起点 = ff->tSub1(提交链结束,CPU 开始按 GPU 完成序等待):
-        // vsr 段 = 提交链后的真实 vsr 等待(GPU-bound 时 = vsr GPU 剩余;
-        // CPU-bound 时 ≈0 = "vsr 不构成瓶颈",其 GPU 执行与提交链并行被
-        // 覆盖);fg/hdr/conv 段同理。GPU-bound 才逐段真实,总量恒真。
-        const double rtxVsrMs = ff->vsrDoneFence ? ms(ff->tSub1, tVsrDone, ff->qpcFreq) : 0.0;
-        // 解耦后四段拆账(fg CL = 纯 DLSSG 推理;post CL = 全部输出转换,
-        // 账归 conv;NR 关直连帧的 base CL 窗口 = C1 补做,也归 conv ——
-        // gpu 段记 0 保持"各段不重叠、可加"):
-        //   fg  段 = fgStart → tFgDone(FG 提交了才有)+ 插值帧回读;
-        //   hdr 段 = TrueHDR 真实帧/链窗口(下方,两账目分支同式);
-        //   conv 段 = convAnchor → t3b(post CL 窗口)+ ff->nrOff 的 base 窗口。
+        // 九段拆账(2026-10-02 起 vsr/hdr 括号化):tsAcc 时全 GPU 段统一
+        // "纯执行"语义;回退路径(括号失败帧)整体退回栅栏墙钟账 —— 段间
+        // 含队列空闲/等待,不精确,总量恒真(旧账目,历史细节留分支内)。
+        double rtxVsrMs = 0.0;
         double fgMs = 0.0, rtxHdrMs = 0.0, convMs = 0.0;
-        // hdr 段(TrueHDR 链,RTX 专用队列:无 ts 括号,墙钟账,语义同
-        // vsr 段 —— GPU-bound 时真实,CPU-bound 时被提交链覆盖 ≈0)。
-        // 必须放在 tsAcc 分支之外:ce6970b 后 tsValid 恒真,原账目只在
-        // 栅栏差分回退分支算 hdr —— 结果 TrueHDR 用时整段消失(面板/日志
-        // hdr 恒 0,2026-09-26 实测)。
-        if (ff->hdrPostSplit) {
-            const LARGE_INTEGER &fgStart = ff->vsrDoneFence ? tVsrDone : ff->tSub1;
-            rtxHdrMs = ms(ff->fgBeginOk ? tFgDone : fgStart, tHdrDone, ff->qpcFreq);
-        } else if (ff->hdrRun) {
-            rtxHdrMs = ms(ff->tSub1, tHdrDone, ff->qpcFreq);
-        }
         if (tsAcc) {
             // 时间戳括号:fg = DLSSG 纯执行(+ 回读拷贝见下);conv = post CL
             // 纯执行(CL 内嵌首尾打点,跨队列栅栏等待与队列积压不计入)。
             // NR 关直连帧的 base 窗口(队列积压)归 queue 段,不折进 conv。
+            // vsr/hdr = RTX 专用队列括号(索引 6..11),hdr = 真实帧 + 插值链
+            // 两括号之和。
             fgMs = ff->fgBeginOk ? fgGpuMs : 0.0;
             convMs = convGpuMs;
+            rtxVsrMs = rtxVsrGpuMs;
+            rtxHdrMs = rtxHdrRealMs + rtxHdrGenMs;
         } else {
             // 栅栏差分回退(旧账目;段间含队列空闲/等待,不精确)
             const LARGE_INTEGER &fgStart = ff->vsrDoneFence ? tVsrDone : ff->tSub1;
+            // vsr/hdr 墙钟账(GPU-bound 时真实,CPU-bound 时被提交链覆盖
+            // ≈0;ce6970b 后 tsValid 恒真,此分支只在括号失败帧走 —— 2026-
+            // 09-26 曾因 hdr 只在回退分支算而整段消失,勿再挪回主路径)。
+            rtxVsrMs = ff->vsrDoneFence ? ms(ff->tSub1, tVsrDone, ff->qpcFreq) : 0.0;
+            if (ff->hdrPostSplit) {
+                rtxHdrMs = ms(ff->fgBeginOk ? tFgDone : fgStart, tHdrDone, ff->qpcFreq);
+            } else if (ff->hdrRun) {
+                rtxHdrMs = ms(ff->tSub1, tHdrDone, ff->qpcFreq);
+            }
             if (ff->fgBeginOk) fgMs = ms(fgStart, tFgDone, ff->qpcFreq);
             if (ff->hdrPostSplit) {
                 convMs = ms(tHdrDone, t3b, ff->qpcFreq);
