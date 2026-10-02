@@ -25,7 +25,7 @@ $binDll     = Join-Path $native "bin\vs_dlssnr.dll"
 $binPanel   = Join-Path $native "bin\dlssnr_panel.exe"
 $binDllPdb  = Join-Path $native "bin\vs_dlssnr.pdb"
 $binPanelPdb = Join-Path $native "bin\dlssnr_panel.pdb"
-$model      = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"
+$model      = Join-Path $native "vendor_manual\nvngx_dlssnr.dll"
 $fgDll      = Join-Path $native "vendor\ngx\version.dll"
 $fgIni      = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
 $fgOfficial = Join-Path $native "vendor\ngx\nvngx_dlssg.dll"
@@ -33,7 +33,8 @@ $rtxVsr     = Join-Path $native "vendor\ngx\nvngx_vsr.dll"
 $rtxHdr     = Join-Path $native "vendor\ngx\nvngx_truehdr.dll"
 $rtxLicense = Join-Path $native "vendor\rtxvideo\NVIDIA_RTX_Video_SDK_License.pdf"
 # 全部文件必须齐备(fetch-deps.ps1 自动落地官方 runtime / dlssg_for_sm86
-# 代理 / NVOF·NGX·RTX Video 依赖;仅模型 nvngx_dlssnr.dll 为手工 vendor 部署)。
+# 代理 / NVOF·NGX·RTX Video 依赖;仅模型 nvngx_dlssnr.dll 为手工部署,与
+# 可重建的 vendor\ 分开存放于 vendor_manual\)。
 # 缺任一件 = 打包失败,杜绝残缺发行包。
 if (-not (Test-Path $binDll))     { throw "缺少编译产物: $binDll (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $binPanel))   { throw "缺少编译产物: $binPanel (先运行 scripts\build.ps1)" }
@@ -41,7 +42,7 @@ if (-not (Test-Path $binPanel))   { throw "缺少编译产物: $binPanel (先运
 # build.ps1 增量编译不会产生错位:每次链接都重写两个 pdb。
 if (-not (Test-Path $binDllPdb))   { throw "缺少符号文件: $binDllPdb (先运行 scripts\build.ps1)" }
 if (-not (Test-Path $binPanelPdb)) { throw "缺少符号文件: $binPanelPdb (先运行 scripts\build.ps1)" }
-if (-not (Test-Path $model))      { throw "缺少模型文件: $model (把 nvngx_dlssnr.dll 复制到 native\vendor\ngx\)" }
+if (-not (Test-Path $model))      { throw "缺少模型文件: $model (把 nvngx_dlssnr.dll 复制到 native\vendor_manual\)" }
 if (-not (Test-Path $fgDll))      { throw "缺少帧生成代理: $fgDll (先运行 scripts\fetch-deps.ps1 自动拉取)" }
 if (-not (Test-Path $fgIni))      { throw "缺少帧生成代理配置: $fgIni (先运行 scripts\fetch-deps.ps1 自动拉取)" }
 if (-not (Test-Path $fgOfficial)) { throw "缺少官方帧生成运行时: $fgOfficial (先运行 scripts\fetch-deps.ps1 自动下载)" }

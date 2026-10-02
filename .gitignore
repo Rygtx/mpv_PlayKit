@@ -10,8 +10,10 @@ native/testkit/media/
 __pycache__/
 # 本地路线图/进展文档, 不随仓库分发
 native/PORTING.md
-# 打包: 仓库内暂存的模型等大文件 (package.ps1 输入) 与 zip 输出
+# 打包: 仓库内暂存的大文件 (package.ps1 输入) 与 zip 输出
 native/vendor/
+# 手动下载的打包输入 (模型 nvngx_dlssnr.dll; 与可重建的 vendor\ 分开, 删 vendor 不误伤)
+native/vendor_manual/
 native/dist/
 
 # IDE 本地配置 (VSCode 生成的 cmake.sourceDirectory 为本机绝对路径, 不共享)

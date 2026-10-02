@@ -199,7 +199,7 @@ pwsh -File native\scripts\fetch-deps.ps1
 # 2. Build (MSVC x64, /MT static CRT; requires Visual Studio + CMake 4.0+)
 powershell -File native\scripts\build.ps1          # output: native\bin\{vs_dlssnr.dll, dlssnr_panel.exe}
 
-# 3. Package (must be on the dlssnr branch; place the nvngx_dlssnr.dll model into native\vendor\ngx\ first)
+# 3. Package (must be on the dlssnr branch; place the nvngx_dlssnr.dll model into native\vendor_manual\ first)
 pwsh -File native\scripts\package.ps1 [-Version 2026.09.08]   # output: native\dist\mpv_PlayKit-dlssnr-v<version>-full.zip (version defaults to today's date)
 ```
 

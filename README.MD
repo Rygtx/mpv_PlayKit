@@ -205,7 +205,7 @@ pwsh -File native\scripts\fetch-deps.ps1
 # 2. 编译 (MSVC x64, /MT 静态 CRT; 需 Visual Studio + CMake 4.0+)
 powershell -File native\scripts\build.ps1          # 产物: native\bin\{vs_dlssnr.dll, dlssnr_panel.exe}
 
-# 3. 打包整包 (必须在 dlssnr 分支; 模型 nvngx_dlssnr.dll 需先放入 native\vendor\ngx\)
+# 3. 打包整包 (必须在 dlssnr 分支; 模型 nvngx_dlssnr.dll 需先放入 native\vendor_manual\)
 pwsh -File native\scripts\package.ps1 [-Version 2026.09.08]   # 产物: native\dist\mpv_PlayKit-dlssnr-v<版本>-full.zip(默认版本号取当日日期)
 ```
 
