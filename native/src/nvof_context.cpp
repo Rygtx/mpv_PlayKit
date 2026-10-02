@@ -802,10 +802,13 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
     const int cur = _pendingDensifyInput;
     _pendingDensifyValue = 0; // 先清:任何出口不复冲刷
     if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) return;
-    // CPU 等引擎输出栅栏(官方样例模式;队列级 Wait 曾实测不可靠 ——
-    // 2026-10-02 旁路探针复核未复现:30/30 帧对已满足栅栏即刻放行,
-    // VSDLSSNR_NVOF_QWAIT=1 可重跑。CPU 等保留的现行理由 = 冲刷点与 eval
-    // 录制重叠的设计 + 僵尸引擎 10s 超时判定,队列 Wait 无超时做不到后者)。
+    // CPU 等引擎输出栅栏(官方样例模式)。"队列级 Wait 不可靠"的原始观测
+    // (2026-09-07)根因是自家 bug:91ea1d1 栅栏计数器从 0 重计,重建会话后
+    // Signal 值低于单例栅栏完成值被忽略 —— 任何 Wait 都永不满足;b0a669f
+    // 于观测后 45 分钟修复(计数器按完成值播种)。2026-10-02 旁路探针复核
+    // 现行机制:30/30 即刻放行(VSDLSSNR_NVOF_QWAIT=1 可重跑)。CPU 等保留
+    // 的现行理由 = 冲刷点与 eval 录制重叠的设计 + 僵尸引擎 10s 超时判定,
+    // 队列 Wait 无超时做不到后者 —— 与"队列 Wait 不可靠"无关。
     // 等待落位后再提交 densify。超时 = 引擎状态不可信(僵尸 execute 会继续写
     // 固定 flow 缓冲),会话立即作废,由 RebuildOf 重建。
     LARGE_INTEGER freq{}, te0{}, te1{};

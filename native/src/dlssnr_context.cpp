@@ -2684,8 +2684,9 @@ bool DlssnrContext::ProcessFrame(
     // NOTE: timestamp disabled, see note above
     // NVOF flow 已在 StageFrame 里 CPU 等待完成(execute 后的输出栅栏),
     // 槽 CL 提交时 GPU 侧 flow 已就绪 —— 不再需要队列级 Wait(实测该栅栏
-    // 在队列 Wait 语义下可能永不满足(2026-10-02 复核未复现,见
-    // NvofContext::FlushPendingDensify 注释)。
+    // 在队列 Wait 语义下可能永不满足(根因系 91ea1d1 栅栏计数器重计 bug,
+    // b0a669f 即日修复,队列 Wait 无过错;见 NvofContext::FlushPendingDensify
+    // 注释)。
     // 冲刷点 B:NR 开时 base CL 的 NGX eval / guidance 降采样是首个 motion
     // 消费者 —— densify CL 必须先于 base CL 入队(FIFO)。CPU 等引擎在 eval
     // 录制期间已被消耗大半,此处常态所剩无几。NR 关帧跳过(base CL 无运动

@@ -151,14 +151,16 @@ struct FrameSlot {
 
     // YUV 原生管道:VS 帧(YUV420P8/P10 三平面)与 GPU 之间纯行拷贝。
     // [0]=Y 全分辨率,[1]=U [2]=V 半分辨率;pitch 256 对齐,persist-mapped。
-    // **不直接对 upload buffer 建 buffer SRV**:typed buffer SRV 曾在本机
-    // 驱动(RTX 3080)上触发异步 DEVICE_HUNG(创建成功、下一次驱动调用报
-    // device removed,2026-09-07 单机二分定位;与 NULL 描述符异步 TDR 同族,
-    // #41-②)。2026-10-02 独立探针(tools/tsrv_probe.cpp)复核未复现:
-    // 50 轮创建+后续调用 + 20 轮 GPU 真消费(upload SRV 经 CS 读)零
-    // device removed。绕道照旧:拷贝成本小、长期稳定,不为省两次拷贝换
-    // 未全驱动矩阵验证的形态。GPU 侧消费一律经 yuvIn 纹理(Texture2D SRV,
-    // 全仓惯用形态)。
+    // **不直接对 upload buffer 建 buffer SRV**:typed buffer SRV(R32_UINT)
+    // 曾在本机驱动上触发异步 DEVICE_HUNG(创建成功、下一次驱动调用 = 分配器
+    // 创建报 device removed,2026-09-07 fe56401;无 TDR 事件,debug layer
+    // 零报错,#41-② NULL 描述符同族)。2026-10-02 独立探针(tools/
+    // tsrv_probe.cpp)按原形态复核未复现:R32_UINT typed SRV 绑 UPLOAD +
+    // 分配器触发序列 + CS 真消费 + debug layer,70 轮零 device removed。
+    // 与当年代码无交集(不存在被修复/绕过的中间层),唯一未控变量是驱动
+    // 版本本身。绕道照旧:拷贝成本小、长期稳定,不为省两次拷贝赌单机
+    // 单驱动结论。GPU 侧消费一律经 yuvIn 纹理(Texture2D SRV,全仓惯用
+    // 形态)。
     ComPtr<ID3D12Resource> uploadYuv[3];
     void *uploadYuvMapped[3] = {};
     size_t uploadPitchYuv[3] = {};

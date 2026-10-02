@@ -13,10 +13,11 @@
 //         已经读完它(queue Wait,顺序无关)。
 //   2. execute(n) [NVOF 内部引擎]      waits copyFence >= k_n(输入内容就绪)
 //                                      + doneFence >= m_{同槽位上一次}
-//   3. execute(n) 提交成功后 **CPU 等输出栅栏被延迟**(官方样例模式;队列级
-//      Wait 曾实测不可靠 —— 2026-10-02 旁路探针复核未复现,30/30 即刻放行,
-//      CPU 等仍保留:冲刷点重叠设计 + 僵尸引擎超时判定,见 FlushPendingDensify
-//      注释):StageFrame 只做提交 + 门推进,门锁
+//   3. execute(n) 提交成功后 **CPU 等输出栅栏被延迟**(官方样例模式;"队列
+//      级 Wait 不可靠"的原观测根因是 91ea1d1 栅栏计数器重计 bug,b0a669f
+//      即日修复 —— 队列 Wait 本身无过错;CPU 等仍保留:冲刷点重叠设计 +
+//      僵尸引擎超时判定,见 FlushPendingDensify 注释):StageFrame 只做提交
+//      + 门推进,门锁
 //      随 OfStageResult::pendingDensify 移交给调用方;调用方在首个 motion
 //      消费者 CL(NGX base / FG fg CL)提交前调 FlushPendingDensify ——
 //      CPU 等 doneFence >= m_n 在那里进行,与 eval/FG 录制重叠,醒来后把

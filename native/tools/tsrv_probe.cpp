@@ -40,6 +40,10 @@ int main(int argc, char **argv) {
     ID3D12CommandQueue *queue = nullptr;
     ID3D12Fence *fence = nullptr;
     HANDLE fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    // 对齐原始观测环境(2026-09-07 fe56401:debug layer 开启)。
+    ID3D12Debug *dbg = nullptr;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
+    Rel(&dbg);
     D3D12_COMMAND_QUEUE_DESC qd{};
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
         FAILED(factory->EnumAdapters1(0, &adapter)) ||
