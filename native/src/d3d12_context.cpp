@@ -72,12 +72,14 @@ double D3D12Context::FrameRateWindow() noexcept {
     // now 取最后写入的 tick:读路径不需要 QPC。停顿期间无人发布统计,面板
     // 本来就冻结;恢复后第一帧的发布会以新 now 淘汰窗口外的旧条目。
     const double now = _tickRing[(_tickHead + kTickRingCap - 1) % kTickRingCap];
-    const double since = now - 1.0;
+    // 4s 窗:1s 窗计数对 25fps 类源因窗沿相位对齐落在 ±1 tick(24/25/26
+    // 跳变,2026-10-02);拉宽窗把量化误差压到 ±0.25fps,显示取整稳定。
+    const double since = now - 4.0;
     int count = 0;
     for (int i = 0; i < _tickCount; ++i) {
         if (_tickRing[i] >= since) ++count;
     }
-    return static_cast<double>(count); // 固定 1s 窗:窗口内帧数即 fps
+    return static_cast<double>(count) / 4.0; // 固定 4s 窗:窗口内帧数 / 4 = fps
 }
 
 void D3D12Context::SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept {

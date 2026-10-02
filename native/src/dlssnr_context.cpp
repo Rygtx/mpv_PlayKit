@@ -3662,7 +3662,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                 // s/x/r = 门跳帧/过期帧/历史重置累计(探针保留:时序类问题的
                 // 第一手证据)。ff->slot/lock = 槽池等待 / evaluate 互斥等待
                 // (ema/last);f = 本行前一帧的帧号(与 STATUS 行对齐用);
-                // fps = 1s 窗口帧入口计数,处理帧率 < 源帧率 = 宿主侧没来帧。
+                // fps = 4s 窗口帧入口计数均值,处理帧率 < 源帧率 = 宿主侧没来帧。
             }
         }
         // stats 每帧发布(九段 last + 共享内存写,开销可忽略):面板

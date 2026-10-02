@@ -589,10 +589,11 @@ public:
         if (!realMotion) return _motion.Get();
         return scaling ? s.reducedMotion.Get() : s.motion.Get();
     }
-    // 最近 1 秒的帧数即帧率(计数式)。播放节奏由宿主决定:卡顿时宿主积压,
+    // 最近 4 秒的帧数 / 4 即帧率(计数式)。播放节奏由宿主决定:卡顿时宿主积压,
     // 恢复后突发+并发拉帧(fmParallel 入口 Δt 可到亚毫秒),倒数式 EMA 会把
     // 追赶吞吐当帧率冲高;计数对并发与突发免疫,停顿(窗口内无新帧)读数
-    // 自然回落。
+    // 自然回落。窗宽 4s(原 1s):窗沿相位对齐让固定帧率源读数跳 ±1
+    // (25fps 实测 24/25/26),拉宽窗压量化误差,显示取整才稳。
     double FrameRateWindow() noexcept;
     void NotifyFrameTick(double qpcSeconds) noexcept; // 帧入口计数打点
     // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
@@ -798,7 +799,7 @@ private:
     bool _scalingReady = false;
     bool _fgSlots = false; // 槽池当前含 FG 资源(CreateFrameResources 的 fg 旗标)
     std::mutex _tickMutex;
-    static constexpr int kTickRingCap = 1024; // 1s 窗的容量上限(超出按 1024fps 封顶)
+    static constexpr int kTickRingCap = 4096; // 4s 窗的容量上限(超出按 1024fps 封顶)
     double _tickRing[kTickRingCap] = {};
     int _tickHead = 0;  // 下一写入位
     int _tickCount = 0; // 有效条目数(绕环前等于已写个数)
