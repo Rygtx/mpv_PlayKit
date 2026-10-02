@@ -24,10 +24,30 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <cstdint>
 #include <windows.h>
 
 namespace vsdlssnr {
 namespace dlssfg_gate {
+
+// NV_GPU_ARCHITECTURE_ID(官方 nvapi.h 枚举;0x170 另为 RTX40MFG-Unlock
+// 实证值)。Blackwell(GB200=0x1B0)原生 MFG,不碰。本文件对外共享——
+// NR 模型按 GPU 系列选型(plugin.cpp)也用这组常量与探测。
+constexpr uint32_t kArchTuring = 0x160;    // TU100
+constexpr uint32_t kArchAmpere = 0x170;    // GA100
+constexpr uint32_t kArchAda = 0x190;       // AD100 = mfg gate 解锁唯一目标
+constexpr uint32_t kArchBlackwell = 0x1B0; // GB200
+
+// NVAPI 枚举首块 NVIDIA 物理卡的架构与 implementation;探测失败
+// (NVAPI 缺失/初始化失败/全部查询失败)时 arch == 0。implementation 是
+// 族内芯片编号(官方 NV_GPU_ARCH_IMPLEMENTATION_ID:GA102=0x2 实测、
+// AD102=0x2 文档值),跨族撞号 —— 分档必须 arch+impl 联合判断。
+// 多卡混插不按 LUID 细分(同 GpuFamilyPrefersProxy 的超界声明)。
+struct GpuArchProbe {
+    uint32_t arch;
+    uint32_t implementation;
+};
+GpuArchProbe ProbePrimaryGpuArch() noexcept;
 
 // 当前机器是否应预载 dlssg_for_sm86 代理(存在 Turing/Ampere 物理 GPU)。
 // NVAPI 枚举不可用/失败时 fail-open 返回 true(维持无条件预载的现状,30 系

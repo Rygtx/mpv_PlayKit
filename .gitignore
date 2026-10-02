@@ -12,7 +12,7 @@ __pycache__/
 native/PORTING.md
 # 打包: 仓库内暂存的大文件 (package.ps1 输入) 与 zip 输出
 native/vendor/
-# 手动下载的打包输入 (模型 nvngx_dlssnr.dll; 与可重建的 vendor\ 分开, 删 vendor 不误伤)
+# 手动提供的打包输入 (模型社区改版 nvngx_dlssnr.{4090,40xx,2030}.dll; 原版在可重建的 vendor\)
 native/vendor_manual/
 native/dist/
 

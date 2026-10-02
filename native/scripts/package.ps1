@@ -25,7 +25,12 @@ $binDll     = Join-Path $native "bin\vs_dlssnr.dll"
 $binPanel   = Join-Path $native "bin\dlssnr_panel.exe"
 $binDllPdb  = Join-Path $native "bin\vs_dlssnr.pdb"
 $binPanelPdb = Join-Path $native "bin\dlssnr_panel.pdb"
-$model      = Join-Path $native "vendor_manual\nvngx_dlssnr.dll"
+$model      = Join-Path $native "vendor\ngx\nvngx_dlssnr.dll"   # NVIDIA 原版(fetch-deps 自动拉取)
+# 模型社区改版(按 GPU 系列选装, 插件按 GPU 探测自动选用, 缺失回落原版):
+# 文件名后缀即选档依据, 不可改名 (plugin.cpp SelectNgxDllVariant)。
+$model4090  = Join-Path $native "vendor_manual\nvngx_dlssnr.4090.dll"
+$model40xx  = Join-Path $native "vendor_manual\nvngx_dlssnr.40xx.dll"
+$model2030  = Join-Path $native "vendor_manual\nvngx_dlssnr.2030.dll"
 $fgDll      = Join-Path $native "vendor\ngx\version.dll"
 $fgIni      = Join-Path $native "vendor\ngx\dlssg_sm86.ini"
 $fgOfficial = Join-Path $native "vendor\ngx\nvngx_dlssg.dll"
@@ -69,6 +74,10 @@ Copy-Item $fgIni      (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $fgOfficial (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $rtxVsr     (Join-Path $stage "vs-plugins\ngx")
 Copy-Item $rtxHdr     (Join-Path $stage "vs-plugins\ngx")
+# 变体选装: 不进断言 (缺席 = 纯原版部署, 合法); 每颗 160MB+, 放几颗 zip 涨几颗。
+foreach ($v in @($model4090, $model40xx, $model2030)) {
+    if (Test-Path $v) { Copy-Item $v (Join-Path $stage "vs-plugins\ngx") }
+}
 
 # --- PDB 调试符号随包分发 (pdb\ 子目录;配 installer\mpv-诊断设置.bat 收到的
 #     崩溃 dump,用 WinDbg 载入同包 pdb 即可还原闪退调用栈,用户可整目录删除) ---
@@ -98,7 +107,11 @@ mpv_PlayKit DLSSNR 完整包 v$Version
   portable_config\                    完整配置目录 (官方配置上接入 DLSSNR)
   vs-plugins\vs_dlssnr.dll            VapourSynth 插件 (Magpie DLSSNR 移植, NGX Feature 18)
   vs-plugins\dlssnr_panel.exe         ImGui 独立调参面板 (运行时实时调参)
-  vs-plugins\ngx\nvngx_dlssnr.dll     DLSSNR 模型 (NVIDIA DLSS SDK 310.9.0)
+  vs-plugins\ngx\nvngx_dlssnr.dll     DLSSNR 模型 (NVIDIA 原版 310.8.0.0, 签名完好)
+  vs-plugins\ngx\nvngx_dlssnr.4090.dll  模型改版 (如有; RTX 4090 专用, 插件自动选用)
+  vs-plugins\ngx\nvngx_dlssnr.40xx.dll  模型改版 (如有; RTX 4080/70/60 等其余 Ada 用)
+  vs-plugins\ngx\nvngx_dlssnr.2030.dll  模型改版 (如有; RTX 20/30 用)
+  (替换模型文件前先退出 mpv, 运行中 DLL 被锁定无法覆盖)
   vs-plugins\ngx\version.dll          DLSS 帧生成 hook 代理 0.3.x (dlssg_for_sm86, 自签名, RTX 30/20 系)
   vs-plugins\ngx\dlssg_sm86.ini       帧生成代理出厂配置 (上游原样分发, 插件不再写入)
   vs-plugins\ngx\nvngx_dlssg.dll      DLSS 官方帧生成运行时 (NVIDIA 签名, 官方链载体; 面板 "FG 路由" 可选)

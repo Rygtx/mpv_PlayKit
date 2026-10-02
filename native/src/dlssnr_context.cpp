@@ -724,6 +724,14 @@ bool DlssnrContext::Initialize(
         ngxDllPath, nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!_snippetModule) return fail("LoadLibraryExW(nvngx_dlssnr.dll) failed");
+    // 模型文件名(诊断页:实际用的原版还是哪档变体)。
+    {
+        const wchar_t *base = ngxDllPath;
+        for (const wchar_t *p = ngxDllPath; *p; ++p)
+            if (*p == L'\\' || *p == L'/') base = p + 1;
+        WideCharToMultiByte(CP_UTF8, 0, base, -1,
+                            _modelDllUtf8, sizeof(_modelDllUtf8), nullptr, nullptr);
+    }
     // 探针:snippet 模型文件的部署指纹(大小 + 修改时间)。模型 DLL 与
     // 插件/面板是三件套分离部署,#11 模型 fallback、装错/装旧模型这类
     // 问题从这一行直接核对。
@@ -956,6 +964,7 @@ bool DlssnrContext::Initialize(
         RefreshRtxStateString();
         StatsPayload st{}; // 未携带字段保持零/空;gpuLast 保持 -1 哨兵
         CopyStatStr(st.gpuName, _gpuNameUtf8);
+        CopyStatStr(st.modelDll, _modelDllUtf8);
         st.width = static_cast<uint32_t>(_width);
         st.height = static_cast<uint32_t>(_height);
         CopyStatStr(st.rtx, _rtxStateStr);
@@ -3823,6 +3832,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             st.scaling = _d3d12->HasScaling() ? 1u : 0u;
             st.fps = static_cast<float>(_d3d12->FrameRateWindow());
             CopyStatStr(st.gpuName, _gpuNameUtf8);
+            CopyStatStr(st.modelDll, _modelDllUtf8);
             CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
             CopyStatStr(st.ofMode, OfModeString());
             CopyStatStr(st.fgState, fgState);

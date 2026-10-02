@@ -22,14 +22,6 @@ constexpr uint32_t kNvapiIdEnumPhysicalGPUs = 0xe5ac921f;
 // versioned struct 接管(官方 nvapi64.lib nvlib_gen.obj 反汇编实证同 ID)。
 constexpr uint32_t kNvapiIdGetArchInfo = 0xd8265d24;
 
-// NVAPI_GPU_ARCHITECTURE(NV_GPU_ARCHITECTURE_ID,官方 nvapi.h 枚举;
-// 0x170 另为 RTX40MFG-Unlock 实证值):TU100=0x160 Turing、GA100=0x170
-// Ampere = dlssg_for_sm86 代理的适用族;AD100=0x190 Ada = mfg gate 解锁的
-// 唯一目标(GB200=0x1B0 Blackwell 原生 MFG,不碰)。
-constexpr uint32_t kArchTuring = 0x160;
-constexpr uint32_t kArchAmpere = 0x170;
-constexpr uint32_t kArchAda = 0x190;
-
 // ---- Ada count gate 字节判定(RTX40MFG-Unlock ngx_mfg_gate.h 同源)----
 // test dl,dl ; je <reject> ; mov esi,<cap>  —— cap = 运行库多帧上限常量
 constexpr std::array<uint8_t, 13> kGatePattern{
@@ -127,7 +119,7 @@ struct ArchInfoV2 {
 // *archCount 可能为 0。成功初始化后 nvapi64.dll 进程常驻(内部工作线程
 // 存活期不明,FreeLibrary 死锁风险;与 nvofapi64.dll 同哲学,进程退出
 // OS 回收);未成功初始化即卸载。
-bool GetGpuArchs(uint32_t *archs, size_t cap, size_t *archCount) noexcept {
+bool GetGpuArchs(uint32_t *archs, uint32_t *impls, size_t cap, size_t *archCount) noexcept {
     *archCount = 0;
     HMODULE nvapi = LoadLibraryW(L"nvapi64.dll");
     if (!nvapi) return false;
@@ -158,7 +150,10 @@ bool GetGpuArchs(uint32_t *archs, size_t cap, size_t *archCount) noexcept {
         if (getArch(gpus[i], &info) != 0) continue;
         const uint32_t arch = info.architecture ? info.architecture : info.version;
         if (!arch) continue;
-        if (*archCount < cap) archs[*archCount] = arch;
+        if (*archCount < cap) {
+            archs[*archCount] = arch;
+            if (impls) impls[*archCount] = info.implementation;
+        }
         ++*archCount;
         any = true;
     }
@@ -170,7 +165,7 @@ bool GetGpuArchs(uint32_t *archs, size_t cap, size_t *archCount) noexcept {
 bool GpuFamilyPrefersProxy() noexcept {
     uint32_t archs[64]{};
     size_t count = 0;
-    if (!GetGpuArchs(archs, 64, &count)) {
+    if (!GetGpuArchs(archs, nullptr, 64, &count)) {
         // fail-open:维持无条件预载的现状(30 系无损)。留痕:40/50 系 +
         // NVAPI 异常时会给 Ada 预载 SM86 代理(未定义行为场景),排查
         // "为什么 40 系也走了预载"必须有迹可循。
@@ -199,12 +194,20 @@ bool GpuFamilyPrefersProxy() noexcept {
     return prefersProxy;
 }
 
+GpuArchProbe ProbePrimaryGpuArch() noexcept {
+    uint32_t arch = 0, impl = 0;
+    size_t count = 0;
+    if (GetGpuArchs(&arch, &impl, 1, &count) && count >= 1)
+        return {arch, impl};
+    return {0, 0};
+}
+
 unsigned UnlockMfgCountGate(HMODULE provider, unsigned currentMax) noexcept {
     // 仅 Ada:50 系原生 MFG,不碰官方运行库;非 Ada/探测失败保守跳过。
     uint32_t archs[64]{};
     size_t archCount = 0;
     bool ada = false;
-    const bool probed = GetGpuArchs(archs, 64, &archCount);
+    const bool probed = GetGpuArchs(archs, nullptr, 64, &archCount);
     if (probed) {
         for (size_t i = 0; i < archCount; ++i)
             if (archs[i] == kArchAda) { ada = true; break; }

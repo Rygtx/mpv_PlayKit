@@ -123,6 +123,7 @@ struct AppState {
     char statsBig[64]{};
     char statsRes[96]{};
     char gpuName[128]{};
+    char modelDll[64]{};     // StatsPayload.modelDll: 加载的模型 dll 文件名(诊断页)
     char filterState[16]{};  // StatsPayload.filterState: ok / nvof_zero / passthrough / ngx_faulted
     char stateDetail[208]{}; // StatsPayload.stateDetail: 死亡状态的原因串
                              // (生产端 %.200s 封顶,缓冲须容 200+NUL,见 plugin.cpp)
@@ -991,6 +992,7 @@ void LoadStats() noexcept {
                                  g_app.segDispQueue) > 0.0f;
             g_app.fps = st.fps;
             CopyStatStr(g_app.gpuName, st.gpuName);
+            CopyStatStr(g_app.modelDll, st.modelDll);
         } else {
             // 死亡 body(passthrough / ngx_faulted):清掉冻结的旧统计与
             // 分段,让状态行成为唯一内容。
@@ -1811,6 +1813,10 @@ void DrawUi() noexcept {
                     }
                 }
                 TextColoredWrapped(stRed ? kErrRed : kDimTxt, "滤镜状态: %s", stDesc);
+                // 实际加载的模型 dll(原版/哪档变体,一眼核对;等价 timing log
+                // 的 "ngx model tier=" 行 + "snippet dll" 指纹)。
+                ImGui::TextDisabled("模型: %s",
+                                    g_app.modelDll[0] ? g_app.modelDll : "(未知)");
 
                 // 请求 vs 实际三列手动网格(参数页 SameLine 网格同款,不用
                 // BeginTable:其列宽在此自绘 DPI 体系下不可预期):项目列

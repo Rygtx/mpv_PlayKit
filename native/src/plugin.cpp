@@ -1,10 +1,11 @@
 // vs_dlssnr - NVIDIA DLSSNR (NGX Feature 18) filter for VapourSynth.
 // Ported from Magpie experimental (github.com/SAOG0721/Magpie).
-// Model file: nvngx_dlssnr.dll (310.9.0), zero-guidance mode (Magpie
+// Model file: nvngx_dlssnr.dll (310.8.0.0, NVIDIA original), zero-guidance mode (Magpie
 // guidanceMode=1 Force Zero), same-resolution processing.
 
 #include "bridge.h"
 #include "d3d12_context.h"
+#include "dlssfg_gate.h"
 #include "dlssnr_context.h"
 #include "dlssnr_params.h"
 #include "panel_ipc.h"
@@ -32,6 +33,11 @@ constexpr char PLUGIN_NAMESPACE[] = "dlssnr";
 constexpr char PLUGIN_NAME[] = "NVIDIA DLSSNR filter (Magpie port)";
 constexpr char SNIPPET_DLL_NAME[] = "nvngx_dlssnr.dll";
 constexpr char FG_PROXY_DLL_NAME[] = "version.dll"; // dlssg_for_sm86 0.3.x hook 型代理
+// 社区改版模型按 GPU 系列选装(后缀即选档依据,不可改名);缺失回落原版。
+constexpr char NGX_VARIANT_DLL_4090[] = "nvngx_dlssnr.4090.dll"; // RTX 4090 ONLY(AD102)
+constexpr char NGX_VARIANT_DLL_40XX[] = "nvngx_dlssnr.40xx.dll"; // RTX 4080/70/60 ONLY(其余 Ada)
+constexpr char NGX_VARIANT_DLL_2030[] = "nvngx_dlssnr.2030.dll"; // RTX 20,30 PLAIN FP16
+constexpr uint32_t kImplAd102 = 0x2; // NVAPI implementation 是族内芯片编号(AD102=0x2,官方 NV_GPU_ARCH_IMPLEMENTATION_ID;与 GA102=0x2 跨族撞号,分档必须 arch+impl 联合判断)
 
 // vpy explicit arguments overwrite the DlssnrParams member initializers —
 // the struct defaults in dlssnr_params.h are the single authority, so a
@@ -56,6 +62,46 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
     int err = 0;
     const long long v = vsapi->mapGetInt(in, key, 0, &err);
     if (!err) field = v != 0;
+}
+
+// 默认模型路径选档:按 GPU 系列在 ngx\ 下挑社区改版,原版无条件兜底
+// (探测失败/50 系/未选装 = 纯原版,行为与现状一致)。选档是 (arch, impl,
+// 文件存在性) 的纯函数,会话内确定 —— 热重绑定按 ngxDllPath 比较不受影响。
+// 变体与原版同目录,NGX core 的 app dir 取 dll.parent_path() 不受选择影响。
+std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
+    const auto probe = vsdlssnr::dlssfg_gate::ProbePrimaryGpuArch();
+    const char *tier = "stock";
+    const char *candidates[2] = {SNIPPET_DLL_NAME, SNIPPET_DLL_NAME};
+    if (probe.arch == vsdlssnr::dlssfg_gate::kArchAda) {
+        if (probe.implementation == kImplAd102) {
+            tier = "4090";
+            candidates[0] = NGX_VARIANT_DLL_4090;
+        } else {
+            tier = "40xx";
+            candidates[0] = NGX_VARIANT_DLL_40XX;
+        }
+    } else if (probe.arch == vsdlssnr::dlssfg_gate::kArchTuring ||
+               probe.arch == vsdlssnr::dlssfg_gate::kArchAmpere) {
+        tier = "20/30";
+        candidates[0] = NGX_VARIANT_DLL_2030;
+    }
+    std::filesystem::path chosen;
+    for (const char *name : candidates) {
+        std::error_code ec;
+        if (const auto p = ngxDir / name; std::filesystem::exists(p, ec)) {
+            chosen = p;
+            break;
+        }
+    }
+    if (chosen.empty()) chosen = ngxDir / SNIPPET_DLL_NAME; // 全缺也走原版:下游 LoadLibrary 失败 → 既有 passthrough
+    const auto chosenUtf8 = chosen.u8string();
+    char msg[512];
+    std::snprintf(msg, sizeof(msg),
+                  "DLSSNR STATUS: ngx model tier=%s arch=0x%X impl=0x%X -> %s", tier,
+                  probe.arch, probe.implementation,
+                  reinterpret_cast<const char *>(chosenUtf8.c_str()));
+    vsdlssnr::TimingStatusLine(msg);
+    return chosen.wstring();
 }
 
 struct FilterData {
@@ -1118,7 +1164,7 @@ static void VS_CC DlssnrCreate(
                 // getPluginPath is UTF-8 as well (see above)
                 const std::filesystem::path dir =
                     std::filesystem::path(reinterpret_cast<const char8_t *>(selfPath)).parent_path() / "ngx";
-                d->ngxDllPath = (dir / SNIPPET_DLL_NAME).wstring();
+                d->ngxDllPath = SelectNgxDllVariant(dir);
             } catch (...) {
                 d->ngxDllPath.clear();
             }

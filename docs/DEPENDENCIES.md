@@ -7,7 +7,9 @@
 
 | 依赖 | 链接 | 用途 | 落地位置 |
 |---|---|---|---|
-| nvngx_dlssnr.dll | (待填) | DLSSNR 神经渲染模型(NVIDIA DLSS SDK 310.9.0)。公开 NVIDIA/DLSS 仓库不含此文件(钉值 commit 下实测 404),打包必需,`package.ps1` 缺件即断言失败 | `native\vendor_manual\`(随包进 `vs-plugins\ngx\`) |
+| nvngx_dlssnr.4090.dll | https://discord.com/channels/1408098019194310818/1551422945203855370 | RTX4090 ONLY 改版(RenoDX Discord,需登录并加入服务器);插件按 GPU 探测自动选用([plugin.cpp](../native/src/plugin.cpp) `SelectNgxDllVariant`),**文件名后缀即选档依据,不可改名**;选装,缺失回落原版 | `native\vendor_manual\`(随包进 `vs-plugins\ngx\`) |
+| nvngx_dlssnr.40xx.dll | 同上 | RTX4080_70_60 ONLY 改版,其余 Ada(4080/70/60 及移动版等)用;选装规则同上 | `native\vendor_manual\`(随包进 `vs-plugins\ngx\`) |
+| nvngx_dlssnr.2030.dll | 同上 | RTX 20,30 PLAIN FP16 改版;选装规则同上 | `native\vendor_manual\`(随包进 `vs-plugins\ngx\`) |
 
 ## 自动拉取的依赖
 
@@ -19,6 +21,7 @@
 | nvsdk_ngx_s.lib | 同上,SHA-256 钉死 | `NVIDIA/DLSS` raw | NGX 静态核心库 | `native/dependencies/ngx/lib/` |
 | nvngx_dlssg.dll(官方运行库) | 同上,SHA-256 钉死 | `NVIDIA/DLSS` raw | 官方帧生成后端(40/50 系直连) | `native/vendor/ngx/` |
 | dlssg_for_sm86 代理 | tag `0.3.5`,DLL SHA-256 双钉 | codeload tag 归档 | RTX 30/20 系帧生成接管(version.dll + 出厂 ini) | `native/vendor/ngx/` |
+| nvngx_dlssnr.dll(NR 原版模型) | v310.8.0.0,DLL SHA-256 钉死 | Magpie Release 资产 `DLSSNR-DLL-Options-310.8.0.0.zip`(取 `NVIDIA-Original\`;公开 NVIDIA/DLSS 仓库 404) | NR 神经渲染模型,必备兜底;变体缺失/非 40/30 系卡走它 | `native/vendor/ngx/` |
 | RTX Video SDK | v1.1.0,zip SHA-256 钉死 | NGC `nvidia/multimedia/dlpp:1.5`(URL/校验和出处:Magpie `scripts/Fetch-RtxVideoSdk.ps1`) | VSR 超分 / TrueHDR 头与运行库(执行模型对照包内 D3D12 样例 CDx12NGXVSR) | `native/vendor/rtxvideo/`、`native/vendor/ngx/` |
 | VapourSynth 头 | R73 | `VapourSynth/VapourSynth` raw | 插件 API4 接口(运行时用 mpv-lazy 自带) | `native/dependencies/vapoursynth/include/` |
 | NVOF 头 | commit `54e68293` | `mbucchia/Optical-Flow-SDK` raw | NVIDIA 光流接口(D3D12) | `native/vendor/nvof/` |

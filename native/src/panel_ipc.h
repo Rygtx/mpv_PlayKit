@@ -287,6 +287,8 @@ struct StatsPayload {
     // the struct itself can never be corrupted (CopyStatStr below). Detail
     // strings still go through SanitizeJsonDetail upstream (display hygiene).
     char gpuName[160];       // render adapter name (UTF-8)
+    char modelDll[64];       // loaded NR model dll filename (UTF-8; e.g.
+                             // "nvngx_dlssnr.2030.dll" — 变体选型诊断,diag 页)
     char stateDetail[200];   // dead/passthrough state reason (producer-capped at 200)
     char filterState[16];    // ok / nvof_zero (alive, per-tick; default ok)
                              // passthrough / ngx_faulted (dead, edge-published once)

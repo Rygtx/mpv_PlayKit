@@ -64,8 +64,8 @@ $ngxLibPath = Join-Path $ngxLib "nvsdk_ngx_s.lib"
 Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" $ngxLibPath $ngxLibSha256
 
 # --- Official signed NGX FG runtime (PORTING #8 官方帧生成后端) ---
-# 落到 vendor\ngx\(vendor 只放脚本可拉取件,手动模型在 vendor_manual\),
-# 打包脚本按存在与否选装;官方链是 FG
+# 落到 vendor\ngx\(与官方 FG 运行库同目录;NR 原版模型同样脚本拉取,
+# 社区变体才放 vendor_manual\),打包脚本按存在与否选装;官方链是 FG
 # 唯一路径,RTX 30/20 由 dlssg_for_sm86 0.3.x hook 代理接管交付(自动档
 # 预载)。SHA-256 钉死(commit 已钉,raw 文件 immutable):HTML 错误页/
 # LFS 指针/截断/漂移全拦,与 RTX SDK 的 zip 哈希钉同一机制。
@@ -125,6 +125,31 @@ if (Test-Path $fgProxyIni) {
         [System.IO.File]::WriteAllText($fgProxyIni, $iniText, [System.Text.UTF8Encoding]::new($false))
         Write-Host "fg proxy ini: MaxGeneratedFrames -> 5 (6X cap)"
     }
+}
+
+# --- nvngx_dlssnr 模型(NR 神经渲染;官方 NVIDIA 签名原版)---
+# 公开 NVIDIA/DLSS 仓库不含此文件(各 310.x tag 实测 404),唯一可验证的
+# 公开载体是 Magpie experimental 的 Release 资产 DLSSNR-DLL-Options zip
+# (内含 NVIDIA-Original + 社区改版,只取原版;社区改版由用户手动放置于
+# vendor_manual\,命名约定见 plugin.cpp SelectNgxDllVariant)。Release
+# 资产上游可重传/可变,zip 本身不钉,钉解出物哈希:变动即炸,不静默。
+$nrModel = Join-Path $root "vendor\ngx\nvngx_dlssnr.dll"
+$nrModelSha256 = 'E16BCF15E16E13F527491CDF7845B2FE6521A738D8F7C9C721866A8496E1FC8E'
+if (-not (Test-Path $nrModel) -or (Get-FileHash -LiteralPath $nrModel -Algorithm SHA256).Hash -ne $nrModelSha256) {
+    $nrZip = Join-Path $env:TEMP "DLSSNR-DLL-Options-310.8.0.0.zip"
+    Fetch "https://github.com/SAOG0721/Magpie/releases/download/v0.6.9-experimental/DLSSNR-DLL-Options-310.8.0.0.zip" $nrZip
+    $nrExtract = Join-Path $env:TEMP "dlssnr-model-extract"
+    if (Test-Path $nrExtract) { Remove-Item $nrExtract -Recurse -Force }
+    New-Item -ItemType Directory -Force $nrExtract | Out-Null
+    Expand-Archive $nrZip $nrExtract -Force
+    $nrSrc = Join-Path $nrExtract "NVIDIA-Original\nvngx_dlssnr.dll"
+    if (-not (Test-Path $nrSrc)) { throw "DLSSNR-DLL-Options zip: NVIDIA-Original\nvngx_dlssnr.dll missing" }
+    $gotNrSha = (Get-FileHash -LiteralPath $nrSrc -Algorithm SHA256).Hash
+    if ($gotNrSha -ne $nrModelSha256) { throw "nvngx_dlssnr.dll SHA-256 mismatch`ngot  $gotNrSha`nwant $nrModelSha256`n(upstream asset changed? re-pin deliberately or pick a new source)" }
+    Copy-Item $nrSrc $nrModel -Force
+    Remove-Item $nrExtract -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $nrZip -Force -ErrorAction SilentlyContinue
+    Write-Host "nvngx_dlssnr 310.8.0.0 (NVIDIA original): $nrModel (SHA256 verified)"
 }
 
 # --- RTX Video SDK 1.1(VSR / TrueHDR 官方 NGX feature;公开 NGC 工件,

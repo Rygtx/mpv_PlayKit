@@ -287,6 +287,9 @@ private:
     // Adapter description in UTF-8, filled once in Initialize and reused by
     // every per-frame stats publish (GetDesc per frame is wasted work).
     char _gpuNameUtf8[160] = "UNAVAILABLE";
+    // Loaded model dll filename in UTF-8 (Initialize 填一次,per-frame stats
+    // 复用):面板诊断页显示实际用的是原版还是哪档社区改版。
+    char _modelDllUtf8[64] = "";
     bool _coreInitialized = false;
     bool _snippetInitialized = false;
     // Cross-thread: written by one frame thread (device-lost latch /
