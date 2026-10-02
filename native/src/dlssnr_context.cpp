@@ -2581,9 +2581,9 @@ bool DlssnrContext::ProcessFrame(
     const bool fgPipeOk = vsrRun || hdrLegacyInterp || !_vsrRequested;
 
     // ---- base/postA(TrueHDR 链)/postB 分段提交(处理用时拆账)----
-    // 各段 GPU 耗时:自绘段 = 时间戳括号差分,RTX 段 = 栅栏墙钟等待(NGX
-    // 同 CL 内联打点 2026-09-05 单次观测 SEH,2026-10-02 复核未复现;旁路
-    // 括号 CL,见上方 NOTE):
+    // 各段 GPU 耗时 = 时间戳括号差分(NGX 同 CL 内联打点 2026-09-05 单次
+    // 观测 SEH,2026-10-02 复核未复现;全部段旁路括号 CL,见上方 NOTE;
+    // RTX 段括号化同日落地,SubmitTsBracket,索引 6..11):
     //   base CL          = 基础管线(NR 推理/残差/直通)
     //   postA(fg CL)    = DLSSG 推理链(HDR 会话;非 HDR = 推理+转换旧形态)
     //   TrueHDR 专用队列 = 真实帧 + 逐插值帧(每输出帧一次 eval)
