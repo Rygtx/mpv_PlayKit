@@ -943,13 +943,34 @@ void LoadStats() noexcept {
         const double gpuLast = JsonGetFloat(body, SK_GPU_LAST, -1);
         if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
-            // 分辨率展示:未开启缩放 -> 原生分辨率;开启 -> 处理分辨率 → 回源分辨率
+            // 分辨率展示:VSR 生效(rtx_state 携带 "vsr WxH"/"vsr+hdr WxH")
+            // -> 源 → VSR 输出;未开启缩放 -> 原生分辨率;开启 -> 处理分辨率
+            // → 回源分辨率。width/height 恒为源尺寸,不含 VSR 输出。
             const int scaling = JsonGetInt(body, SK_SCALING, 0);
             const int iw = JsonGetInt(body, SK_INTERNAL_W, 0);
             const int ih = JsonGetInt(body, SK_INTERNAL_H, 0);
             const int w = JsonGetInt(body, SK_WIDTH, 0);
             const int h = JsonGetInt(body, SK_HEIGHT, 0);
-            if (scaling && iw > 0 && ih > 0) {
+            // rtx_state 格式(dlssnr_context.cpp):"vsr WxH"/"vsr+hdr WxH"/
+            // "hdr WxH"/"off" —— 跳到首个数字 sscanf WxH;off 无数字得 0。
+            int rw = 0, rh = 0;
+            char rtxState[48];
+            if (JsonGetString(body, SK_RTX, rtxState, sizeof(rtxState))) {
+                const char *p = rtxState;
+                while (*p && (*p < '0' || *p > '9')) ++p;
+                if (*p) sscanf(p, "%dx%d", &rw, &rh);
+            }
+            if (rw > 0 && rh > 0 && (rw != w || rh != h)) {
+                // VSR 生效:内部评估 → 回源 → VSR 输出,箭头链
+                if (scaling && iw > 0 && ih > 0) {
+                    snprintf(g_app.statsRes, sizeof(g_app.statsRes),
+                             "分辨率 %dx%d → %dx%d → %dx%d",
+                             iw, ih, w, h, rw, rh);
+                } else {
+                    snprintf(g_app.statsRes, sizeof(g_app.statsRes),
+                             "分辨率 %dx%d → %dx%d", w, h, rw, rh);
+                }
+            } else if (scaling && iw > 0 && ih > 0) {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d → %dx%d", iw, ih, w, h);
             } else {
@@ -1810,12 +1831,43 @@ void DrawUi() noexcept {
                         std::snprintf(stDesc, sizeof(stDesc), "增强中,光流零 guidance");
                         stRed = true;
                     } else {
-                        // ok / 空(存活态由周期 tick 携带)
-                        std::snprintf(stDesc, sizeof(stDesc), "增强中(NGX 推理运行)%s",
-                                      g_app.params.nrEnabled ? "" : ";降噪已关(NR off,跳过评估)");
+                        // ok / 空(存活态由周期 tick 携带)。"增强中"必须真
+                        // 有增强段在跑才成立:NR 关/FG 关是 live 热生效(跳过
+                        // 评估/回落真实帧),会话壳仍在但 filter_state 恒 ok
+                        // —— 插件有意不发 passthrough(plugin.cpp nrPubState:
+                        // RTX 独立消费勿误标),面板按意图补每帧真相,与光流
+                        // 行"每帧"门控显形同理;RTX 用实际状态(create 参数,
+                        // reseek 未落地前可能仍在跑)。
+                        const bool nrOn = g_app.params.nrEnabled != 0;
+                        const bool fgOn = g_app.params.fgEnabled != 0 &&
+                                          g_app.params.fgMultiplier > 1;
+                        const bool rtxOn = g_app.rtxState[0] &&
+                                           std::strcmp(g_app.rtxState, "off") != 0;
+                        if (nrOn || fgOn || rtxOn) {
+                            std::snprintf(stDesc, sizeof(stDesc),
+                                          "增强中(NGX 推理运行)%s",
+                                          nrOn ? "" : ";降噪已关(NR off,跳过评估)");
+                        } else {
+                            std::snprintf(stDesc, sizeof(stDesc),
+                                          "直通(画面未增强):面板全关");
+                        }
                     }
                 }
                 TextColoredWrapped(stRed ? kErrRed : kDimTxt, "滤镜状态: %s", stDesc);
+
+                // 请求 vs 实际三列手动网格(参数页 SameLine 网格同款,不用
+                // BeginTable:其列宽在此自绘 DPI 体系下不可预期):项目列
+                // colCtrl 与参数页控件列对齐,请求列 180s(容下"FFX 质量
+                // (全分辨率)"),实际列占余宽,折行 detail 不裁。
+                const float reqX = marginX + colCtrl;
+                const float actX = reqX + 180 * s;
+                ImGui::TextDisabled("项目");
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(reqX);
+                ImGui::TextDisabled("请求");
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(actX);
+                ImGui::TextDisabled("实际");
 
                 // 光流请求 vs 实际
                 char ofReq[64];
@@ -1844,9 +1896,15 @@ void DrawUi() noexcept {
                                       : (ofNr || ofFg) ? (ofNr && ofFg ? "算(NR+FG)"
                                                           : ofNr ? "算(NR)" : "算(FG)")
                                       : "门控跳过(NR/FG 均关,零提交)";
-                TextColoredWrapped(ofBroken ? kErrRed : kDimTxt,
-                                   "光流: 请求 %s | 实际 %s | 每帧:%s%s%s",
-                                   ofReq, g_app.ofMode[0] ? g_app.ofMode : "(未加载)",
+                if (ofBroken) ImGui::TextColored(kErrRed, "光流");
+                else ImGui::TextUnformatted("光流");
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(reqX);
+                ImGui::TextUnformatted(ofReq);
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(actX);
+                TextColoredWrapped(ofBroken ? kErrRed : kDimTxt, "%s · 每帧:%s%s%s",
+                                   g_app.ofMode[0] ? g_app.ofMode : "(未加载)",
                                    ofFrame,
                                    g_app.ofDetail[0] ? " —— " : "", g_app.ofDetail);
 
@@ -1873,8 +1931,14 @@ void DrawUi() noexcept {
                     std::snprintf(fgEff, sizeof(fgEff), "%s%s%s", rl[0] ? rl : g_app.fgRouteEff,
                                   g_app.fgDetail[0] ? " —— " : "", g_app.fgDetail);
                 }
-                TextColoredWrapped(fgBroken ? kErrRed : kDimTxt, "帧生成: 请求 %s | 实际 %s",
-                                   fgReq, fgEff);
+                if (fgBroken) ImGui::TextColored(kErrRed, "帧生成");
+                else ImGui::TextUnformatted("帧生成");
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(reqX);
+                ImGui::TextUnformatted(fgReq);
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(actX);
+                TextColoredWrapped(fgBroken ? kErrRed : kDimTxt, "%s", fgEff);
 
                 // 创建倍数 vs live 倍数 vs 运行库上限:上限 < 创建值 = gate
                 // 解锁失败回落(输出按高倍率节拍,超出槽位全是复制真实帧)
@@ -1886,19 +1950,25 @@ void DrawUi() noexcept {
                     // 误判成被压档红显 —— 曾致"5x 能开 6x 开不了"的假警。
                     const bool capped = g_app.fgMultMax >= 1 &&
                                         g_app.fgMultMax + 1 < g_app.fgMultCreate;
+                    char fgAct[224];
                     if (capped) {
-                        TextColoredWrapped(
-                            kErrRed,
-                            "FG 倍数: 会话创建 %dx | 面板 %dx | 运行库上限 %dx"
-                            "(超出槽位为复制帧 —— gate 解锁失败?驱动更新后重试)",
-                            g_app.fgMultCreate, g_app.params.fgMultiplier,
-                            g_app.fgMultMax + 1);
+                        std::snprintf(fgAct, sizeof(fgAct),
+                                      "会话创建 %dx | 运行库上限 %dx"
+                                      "(超出槽位为复制帧 —— gate 解锁失败?驱动更新后重试)",
+                                      g_app.fgMultCreate, g_app.fgMultMax + 1);
                     } else {
-                        TextColoredWrapped(multClipped ? kErrRed : kDimTxt,
-                                           "FG 倍数: 会话创建 %dx | 面板 %dx%s",
-                                           g_app.fgMultCreate, g_app.params.fgMultiplier,
-                                           multClipped ? "(超出部分需重载生效)" : "");
+                        std::snprintf(fgAct, sizeof(fgAct), "会话创建 %dx%s",
+                                      g_app.fgMultCreate,
+                                      multClipped ? "(超出部分需重载生效)" : "");
                     }
+                    if (capped || multClipped) ImGui::TextColored(kErrRed, "FG 倍数");
+                    else ImGui::TextUnformatted("FG 倍数");
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosX(reqX);
+                    ImGui::Text("面板 %dx", g_app.params.fgMultiplier);
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosX(actX);
+                    TextColoredWrapped((capped || multClipped) ? kErrRed : kDimTxt, "%s", fgAct);
                 }
 
                 // RTX 请求 vs 实际:请求开(vsrMode>0 / hdrEnabled)而实态
@@ -1916,34 +1986,44 @@ void DrawUi() noexcept {
                     }
                     const bool rtxDown = (vsrReq || hdrReq) &&
                                          std::strcmp(g_app.rtxState, "off") == 0;
-                    TextColoredWrapped(rtxDown ? kErrRed : kDimTxt,
-                                       "RTX Video: 请求 %s | 实际 %s%s%s",
-                                       rtxReq,
+                    if (rtxDown) ImGui::TextColored(kErrRed, "RTX Video");
+                    else ImGui::TextUnformatted("RTX Video");
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosX(reqX);
+                    ImGui::TextUnformatted(rtxReq);
+                    ImGui::SameLine();
+                    ImGui::SetCursorPosX(actX);
+                    TextColoredWrapped(rtxDown ? kErrRed : kDimTxt, "%s%s%s",
                                        g_app.rtxState[0] ? g_app.rtxState : "(未加载)",
                                        g_app.rtxDetail[0] ? " —— " : "", g_app.rtxDetail);
                 }
             }
-            // 处理分辨率(读 stats 缓存的八段之外字段:LoadStats 已存在
-            // internal_w/h 到 statsRes 展示串;此处直接从共享内存的解析结果
-            // 复述 —— 分辨率信息主面板已有,诊断页仅回显会话事实)
-            ImGui::TextDisabled("分辨率: %s", g_app.statsRes[0] ? g_app.statsRes : "(未加载)");
 
             ImGui::Spacing();
             ImGui::TextUnformatted("—— 排队细分(每帧 last)——");
-            ImGui::Text("%s: %.2f ms", "槽池等待", g_app.slotWait);
+            // 两列:标签在 marginX,值列与上方"请求"列对齐
+            const float qValX = marginX + colCtrl;
+            ImGui::TextUnformatted("槽池等待");
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(qValX);
+            ImGui::Text("%.2f ms", g_app.slotWait);
             if (ImGui::IsItemHovered())
                 ShowTip("3 槽全在飞时帧线程等槽的时长。此值大而 GPU 段正常 = GPU 超容量;\n两者都小而帧率低 = 宿主侧没来帧(与 perf 行 slot= 同源)。");
-            ImGui::Text("%s: %.2f ms", "NGX 串行等待", g_app.lockWait);
+            ImGui::TextUnformatted("NGX 串行等待");
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(qValX);
+            ImGui::Text("%.2f ms", g_app.lockWait);
             if (ImGui::IsItemHovered())
                 ShowTip("evaluate 互斥排队(NGX feature 单例的 CPU 侧串行)。并发槽互相\n等待的时长;与 eval_cpu 互斥等待部分重叠,perf 行 lock= 同源。");
-            ImGui::Text("光流门: 跳帧 %d / 过期 %d / 重置 %d", g_app.gateSkips, g_app.gateExpired, g_app.gateResets);
+            ImGui::TextUnformatted("光流门");
+            ImGui::SameLine();
+            ImGui::SetCursorPosX(qValX);
+            ImGui::Text("跳帧 %d / 过期 %d / 重置 %d", g_app.gateSkips, g_app.gateExpired, g_app.gateResets);
             if (ImGui::IsItemHovered())
                 ShowTip("光流帧序门累计:跳帧 = 缺口超时播种,过期 = 迟到帧播种,重置 =\nseek/显式复位。seek 后重置数增加属正常;持续增长 = 时序异常\n(与 perf 行 s/x/r 同源)。FFX 后端无引擎探针,数值恒 0。");
 
             ImGui::Spacing();
-            ImGui::TextDisabled("全页无红 = 插件正常工作。红色 = 与面板请求不一致。\n"
-                                "本页数据与 dlssnr_timing.log 的 perf/STATUS 行同源,更细的\n"
-                                "历史(EMA/p99/门细分)仍以日志为准。");
+            ImGui::TextDisabled("全页无红 = 插件正常工作。红色 = 与面板请求不一致。");
             y = ImGui::GetCursorPosY() - wpos.y + 4 * s;
 
             ImGui::EndTabItem();
