@@ -168,3 +168,21 @@ powershell -File panel_ui_tools.ps1 -Action size|poll|dpi|windows
 5. **测试源别用 `std.Expr` 坐标语义**(TrueHDR 排查踩坑:表达式产出
    全 40):确定性两值图案用 `std.BlankClip`(左右半不同 Y)+
    `std.StackHorizontal` 拼,逐位可预期。
+
+## 面板 UI 回归(fake_panel_env.py)
+
+不经过 mpv/插件,直接往 stats 共享内存写合成 JSON,让面板渲染出完整
+诊断页,供人工核对或截图留档(真插件链路验收走 test_e2e_panel.py):
+
+```
+python fake_panel_env.py --list                             # 列出场景
+python fake_panel_env.py --scene vsr_scaling --shot d.png   # 截图留档
+python fake_panel_env.py --scene vsr --keep                 # 人工核对
+```
+
+场景:alloff(全关直通)/ nr(只降噪)/ fg(帧生成)/ vsr(VSR)/
+vsr_scaling(内部缩放+VSR 并存)/ vsr_broken(RTX 降级红显)。
+
+脚本管理面板生命周期(已在跑会被杀掉重启;`--keep` 保留),并临时把
+面板 ini 页签写到诊断页(自动备份恢复)。**改本脚本前先读文件头"踩坑
+记录"**:紧凑 JSON / 映射句柄存活 / DPI aware 截图,三个坑都真实咬过人。
