@@ -943,30 +943,24 @@ bool DlssnrContext::Initialize(
             WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
                                 _gpuNameUtf8, sizeof(_gpuNameUtf8), nullptr, nullptr);
         }
-        // 960:gpu_name(≤128)+ fg_detail(≤128)+ of_detail(≤96)全满时
-        // 512 会截断(PublishStatsJson 超长静默截断 = 尾键丢失,面板读不到
-        // 还不报错 —— v19 扩容 tick body 的同一教训)。
-        // RTX 实态串(缓存进成员:每帧 stats 体(_rtx 键)复用 —— 每帧体
-        // 覆盖 init 体后若缺 rtx 键,面板诊断恒 "(未加载)"(2026-09-22
-        // 实锤)。刷新点 = init 与 Rebind 形态重建(RefreshRtxStateString)。
+        // RTX 实态串(缓存进成员:每帧 stats 体复用 —— 每帧体覆盖 init 体
+        // 后若缺 rtx 字段,面板诊断恒 "(未加载)"(2026-09-22 实锤)。
+        // 刷新点 = init 与 Rebind 形态重建(RefreshRtxStateString)。
         RefreshRtxStateString();
-        char body[1024];
-        std::snprintf(body, sizeof(body),
-                      "{\"gpu_name\":\"%s\",\"width\":%d,\"height\":%d,"
-                      "\"rtx\":\"%s\",\"rtx_detail\":\"%s\","
-                      "\"%s\":\"%s\",\"%s\":\"%s\","
-                      "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
-                      "\"%s\":%d,\"%s\":\"%s\"}",
-                      _gpuNameUtf8, _width, _height,
-                      _rtxStateStr, _rtxDetail,
-                      SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
-                      SK_OF_MODE, OfModeString(),
-                      SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
-                      SK_FG_MULT_CREATE, _fgCreateMult,
-                      SK_FG_DETAIL, _fgDetail,
-                      SK_FG_MULT_MAX, _fg ? _fg->MaxGen() : 0,
-                      SK_OF_DETAIL, _ofDetail);
-        PublishStatsJson(body);
+        StatsPayload st{}; // 未携带字段保持零/空;gpuLast 保持 -1 哨兵
+        CopyStatStr(st.gpuName, _gpuNameUtf8);
+        st.width = static_cast<uint32_t>(_width);
+        st.height = static_cast<uint32_t>(_height);
+        CopyStatStr(st.rtx, _rtxStateStr);
+        CopyStatStr(st.rtxDetail, _rtxDetail);
+        CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
+        CopyStatStr(st.ofMode, OfModeString());
+        CopyStatStr(st.fgRouteEff, _fgRouteEff);
+        st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult);
+        CopyStatStr(st.fgDetail, _fgDetail);
+        st.fgMultMax = static_cast<uint32_t>(_fg ? _fg->MaxGen() : 0);
+        CopyStatStr(st.ofDetail, _ofDetail);
+        PublishStats(st);
     }
 
     // 5) CreateFeature on the control-path command list, then close+execute
@@ -3667,68 +3661,61 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             NvofContext *nvStats =
                 (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                     ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
-            char body[2040]; // 上限 = StatsPayload.json(2048-8);v25 扩容后余量充足
+            StatsPayload st{}; // 未携带字段保持零/空;gpuLast 保持 -1 哨兵
             // FG 状态:on = 本帧有真插值(附当前倍数);dup = 复制真实帧
             // (复位/零光流/面板关/降级);off = 本会话未激活;unavailable =
             // official 初始化或 eval 失败闩停(帧率仍 ×M,内容为复制帧)。
-            // fg_mult = 当前倍数(面板显示 "3x" 用;未激活 = 0)。
-            // fg_route_eff = 实际生效路由(off/official-hook/official/
-            // copy),fg_mult_create = 会话创建倍数 —— "auto 档这次到底
-            // 走没走 hook 代理""4x 为什么只跑 2x"面板直读,不翻 timing log。
+            // fgMult = 当前倍数(面板显示 "3x" 用;未激活 = 0)。
+            // fgRouteEff = 实际生效路由(off/official-hook/official/copy),
+            // fgMultCreate = 会话创建倍数 —— "auto 档这次到底走没走 hook
+            // 代理""4x 为什么只跑 2x"面板直读,不翻 timing log。
             const char *fgState = !_fg ? "off"
                 : (!_fg->Enabled() ? "unavailable"
                                    : (ff->fgEvaluatedCount > 0 ? "on" : "dup"));
-            // fg_mult_max = 运行库插值帧上限(gate 解锁结果定格值):40 系
+            // fgMultMax = 运行库插值帧上限(gate 解锁结果定格值):40 系
             // 解锁失败回落 2x 时创建/面板仍报 6,没有它面板无从知道实际
             // 密度只有 (max+1)x。
             const int fgMultMax = _fg ? _fg->MaxGen() : 0;
-            snprintf(body, sizeof(body),
-                     "{\"%s\":%.1f,\"%s\":%.1f,"
-                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
-                     "\"%s\":%.1f,\"%s\":%.1f,\"%s\":%.1f,"
-                     "\"%s\":%.1f,"
-                     "\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,"
-                     "\"%s\":%d,\"%s\":%.1f,\"%s\":\"%s\","
-                     "\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":\"%s\",\"%s\":%d,"
-                     "\"%s\":\"%s\",\"%s\":%d,\"%s\":\"%s\","
-                     "\"%s\":%d,\"%s\":\"%s\","
-                     "\"%s\":\"%s\",\"%s\":\"%s\","
-                     "\"%s\":%.2f,\"%s\":%.2f,"
-                     "\"%s\":%u,\"%s\":%u,\"%s\":%u,"
-                     "\"%s\":\"%s\",\"%s\":%d,\"%s\":%.3f}",
-                     SK_GPU_LAST, gpuLast, SK_PACK_LAST, packLast,
-                     SK_EVAL_CPU_LAST, evalCpuLast, SK_UNPACK_LAST, unpackLast,
-                     SK_OF_LAST, nvofLast, SK_FG_LAST, fgLast,
-                     SK_RTXVSR_LAST, rtxVsrLast, SK_RTXHDR_LAST, rtxHdrLast,
-                     SK_CONV_LAST, convLast,
-                     SK_QUEUE_LAST, queueWaitMs,
-                     SK_INTERNAL_W, _d3d12->InternalWidth(), SK_INTERNAL_H, _d3d12->InternalHeight(),
-                     SK_WIDTH, _width, SK_HEIGHT, _height,
-                     SK_SCALING, _d3d12->HasScaling() ? 1 : 0,
-                     SK_FPS, _d3d12->FrameRateWindow(), SK_GPU_NAME, _gpuNameUtf8,
-                     SK_FILTER_STATE, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok",
-                     SK_OF_MODE, OfModeString(),
-                     SK_FG, fgState,
-                     SK_FG_MULT, ff->fgM,
-                     SK_FG_ROUTE_EFFECTIVE, _fgRouteEff,
-                     SK_FG_MULT_CREATE, _fgCreateMult,
-                     SK_FG_DETAIL, _fgDetail,
-                     SK_FG_MULT_MAX, fgMultMax,
-                     SK_OF_DETAIL, _ofDetail,
-                     SK_RTX, _rtxStateStr,
-                     SK_RTX_DETAIL, _rtxDetail,
-                     SK_SLOT_WAIT, slotWaitLast,
-                     SK_LOCK_WAIT, lockWaitLast,
-                     SK_GATE_SKIPS, nvStats ? nvStats->GateSkips() : 0u,
-                     SK_GATE_EXPIRED, nvStats ? nvStats->GateExpired() : 0u,
-                     SK_GATE_RESETS, nvStats ? nvStats->ResetCount() : 0u,
-                     SK_TEMPORAL,
-                     _tPubState.load(std::memory_order_relaxed) == 3 ? "failed"
-                     : _tPubState.load(std::memory_order_relaxed) == 2 ? "steady"
-                     : _tPubState.load(std::memory_order_relaxed) == 1 ? "seed" : "off",
-                     SK_TEMPORAL_ROUTE, _tPubRoute.load(std::memory_order_relaxed),
-                     SK_TEMPORAL_W, _tPubWeight.load(std::memory_order_relaxed));
-            PublishStatsJson(body);
+            st.gpuLast = static_cast<float>(gpuLast);
+            st.packLast = static_cast<float>(packLast);
+            st.evalCpuLast = static_cast<float>(evalCpuLast);
+            st.unpackLast = static_cast<float>(unpackLast);
+            st.ofLast = static_cast<float>(nvofLast);
+            st.fgLast = static_cast<float>(fgLast);
+            st.rtxVsrLast = static_cast<float>(rtxVsrLast);
+            st.rtxHdrLast = static_cast<float>(rtxHdrLast);
+            st.convLast = static_cast<float>(convLast);
+            st.queueLast = static_cast<float>(queueWaitMs);
+            st.internalW = static_cast<uint32_t>(_d3d12->InternalWidth());
+            st.internalH = static_cast<uint32_t>(_d3d12->InternalHeight());
+            st.width = static_cast<uint32_t>(_width);
+            st.height = static_cast<uint32_t>(_height);
+            st.scaling = _d3d12->HasScaling() ? 1u : 0u;
+            st.fps = static_cast<float>(_d3d12->FrameRateWindow());
+            CopyStatStr(st.gpuName, _gpuNameUtf8);
+            CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
+            CopyStatStr(st.ofMode, OfModeString());
+            CopyStatStr(st.fgState, fgState);
+            st.fgMult = static_cast<uint32_t>(ff->fgM);
+            CopyStatStr(st.fgRouteEff, _fgRouteEff);
+            st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult);
+            CopyStatStr(st.fgDetail, _fgDetail);
+            st.fgMultMax = static_cast<uint32_t>(fgMultMax);
+            CopyStatStr(st.ofDetail, _ofDetail);
+            CopyStatStr(st.rtx, _rtxStateStr);
+            CopyStatStr(st.rtxDetail, _rtxDetail);
+            st.slotWait = static_cast<float>(slotWaitLast);
+            st.lockWait = static_cast<float>(lockWaitLast);
+            st.gateSkips = nvStats ? nvStats->GateSkips() : 0u;
+            st.gateExpired = nvStats ? nvStats->GateExpired() : 0u;
+            st.gateResets = nvStats ? nvStats->ResetCount() : 0u;
+            CopyStatStr(st.temporal,
+                        _tPubState.load(std::memory_order_relaxed) == 3 ? "failed"
+                        : _tPubState.load(std::memory_order_relaxed) == 2 ? "steady"
+                        : _tPubState.load(std::memory_order_relaxed) == 1 ? "seed" : "off");
+            st.temporalRoute = static_cast<uint32_t>(_tPubRoute.load(std::memory_order_relaxed));
+            st.temporalW = _tPubWeight.load(std::memory_order_relaxed);
+            PublishStats(st);
         }
         if (line[0]) TimingLog(line); // outside g_timingMutex (TimingLog locks it)
 
@@ -3758,14 +3745,10 @@ void DlssnrContext::PublishDeadState(const char *state, const char *detail) noex
         TimingLog(msg);
         DbgLine(msg);
     }
-    char body[512];
-    if (safe[0]) {
-        std::snprintf(body, sizeof(body), "{\"%s\":\"%s\",\"%s\":\"%.200s\"}",
-                      SK_FILTER_STATE, state, SK_STATE_DETAIL, safe);
-    } else {
-        std::snprintf(body, sizeof(body), "{\"%s\":\"%s\"}", SK_FILTER_STATE, state);
-    }
-    PublishStatsJson(body);
+    StatsPayload st{};
+    CopyStatStr(st.filterState, state);
+    CopyStatStr(st.stateDetail, safe); // 空串 = 无原因(面板同缺键清空)
+    PublishStats(st);
 }
 
 void DlssnrContext::Shutdown() noexcept {

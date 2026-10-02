@@ -125,7 +125,7 @@ public:
     virtual double LastStageTotalMs() const noexcept { return 0.0; }
     // 诊断 dump 探针:本帧写入的输入纹理(index 0/1)。
     virtual ID3D12Resource *InputTexture(int index) const noexcept = 0;
-    // SK_OF_MODE 能力串(backend 特有段;off/zero 前缀由 DlssnrContext 统一)。
+    // StatsPayload.ofMode 能力串(backend 特有段;off/zero 前缀由 DlssnrContext 统一)。
     virtual const char *ModeString(char *buf, size_t len) noexcept = 0;
     // 后端种类(kOfBackendNvof/Ffx;densify lambda 分支与 NVOF 专属
     // 探针判定用 —— 免 RTTI/dynamic_cast)。

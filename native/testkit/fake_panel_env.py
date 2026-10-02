@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 r"""假 stats 喂面板 + 诊断页截图 —— 面板 UI 改动的快速回归工具。
 
-不经过 mpv/插件,直接往 stats 共享内存写合成 JSON,让面板渲染出完整的
+不经过 mpv/插件,直接往 stats 共享内存写合成 struct,让面板渲染出完整的
 诊断页(滤镜状态/请求 vs 实际/排队细分),供人工核对或截图留档。
 真插件链路的验收走 test_e2e_panel.py,本工具只管 UI 呈现。
 
 踩坑记录(2026-10-02 固化,改本脚本前先读):
-  1. stats JSON 必须紧凑( separators=(",", ":") )且 ensure_ascii=False:
-     面板 JsonGetString 精确匹配 `"key":"` —— json.dumps 默认的 `": "`
-     空格让所有字符串键静默失配;默认 ASCII 转义让中文 detail 显示成
-     \\uXXXX。
+  1. stats body v27 起为定长 struct(旧 JSON 文本退役):合成数据经
+     panel_ipc.pack_stats 编码(数字缺省 0、字符串超长按格宽截断),
+     键名沿用旧 JSON 名(SK 表),勿手写字面量或自行 json.dumps。
   2. params 预置的映射句柄必须保持到面板启动之后:python 进程退出 =
      共享映射对象销毁,面板启动时 CreateFileMappingW 拿到的是全新空映射,
      adopt(magic/seq 门)静默失败,面板回落 ini/零值 —— "明明 push 了
@@ -33,10 +32,8 @@ r"""假 stats 喂面板 + 诊断页截图 —— 面板 UI 改动的快速回归
 """
 import argparse
 import ctypes
-import json
 import os
 import shutil
-import struct
 import subprocess
 import sys
 import threading
@@ -63,12 +60,13 @@ STATS_BASE = {
     "gpu_hang": 0, "removed_reason": "",
     "filter_state": "ok", "state_detail": "",
     "of_mode": "both", "of_detail": "FFX 质量(全分辨率)",
-    "fg": 0, "fg_mult": 0, "fg_route_eff": "off",
+    "fg": "off", "fg_mult": 0, "fg_route_eff": "off",
     "fg_mult_create": 0, "fg_mult_max": 5,
     "fg_detail": "",
     "rtx": "off", "rtx_detail": "",
     "slot_wait": 1.23, "lock_wait": 0.45,
     "gate_skips": 3, "gate_expired": 1, "gate_resets": 2,
+    "temporal": "off", "temporal_route": 0, "temporal_w": 0.0,
 }
 
 SCENES = {
@@ -84,7 +82,7 @@ SCENES = {
     ),
     # FG 开:帧生成行走 official-hook 路由显示
     "fg": (
-        {"fg": 1, "fg_mult": 4, "fg_route_eff": "official-hook",
+        {"fg": "on", "fg_mult": 4, "fg_route_eff": "official-hook",
          "fg_mult_create": 4, "fg_detail": "官方 NGX(0.3.x 代理接管)"},
         {"nrEnabled": 1, "fgEnabled": 1, "fgMultiplier": 4},
     ),
@@ -148,10 +146,7 @@ class StatsFeed:
     """持续写 stats 映射(句柄存活 = 映射存活,见文件头坑 2)。"""
 
     def __init__(self, stats):
-        body = json.dumps(stats, separators=(",", ":"),
-                          ensure_ascii=False).encode("utf-8")
-        assert 8 + len(body) < ipc.PAYLOAD_SIZE, "stats body overflow"
-        self._payload_body = body
+        self._stats = stats
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.CreateFileMappingW.restype = ctypes.c_void_p
         k32.MapViewOfFile.restype = ctypes.c_void_p
@@ -169,7 +164,7 @@ class StatsFeed:
         t0 = time.time()
         while not self._stop and time.time() - t0 < duration:
             self._seq += 1
-            data = struct.pack("<II", ipc.STATS_MAGIC, self._seq) + self._payload_body
+            data = ipc.pack_stats(self._stats, seq=self._seq)
             ctypes.memmove(ctypes.c_void_p(self._v), data, len(data))
             time.sleep(0.1)
 

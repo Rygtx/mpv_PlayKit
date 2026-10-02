@@ -200,7 +200,7 @@ private:
     // 源×4)、偶尺寸收口。写 _vsrRequested/_hdrActive/_rtxActive 与
     // _pipeW/_pipeH/_outW/_outH。第二份几何换算在构造上不可能。
     void DecideRtxGeometry(const RtxVideoParams &rtx, int srcW, int srcH) noexcept;
-    // RTX 会话实态串刷新(_rtxStateStr:SK_RTX 键数据源;init 与形态重建
+    // RTX 会话实态串刷新(_rtxStateStr:StatsPayload.rtx 键数据源;init 与形态重建
     // 共用)。逐帧 tick 复用成员,刷新即面板可见。
     void RefreshRtxStateString() noexcept;
     // FG 会话建立(冷初始化 4a 与 Rebind 形态重建共用;_fgRequested 已由
@@ -215,7 +215,7 @@ private:
     // q > 0;err 带最后一个失败原因(冷初始化 4b 与 RebuildOf 共用)。
     std::unique_ptr<IOpticalFlowBackend> CreateOfBackend(int q, int dstW, int dstH,
                                                          char *err, size_t errLen) noexcept;
-    // OF 实际模式串(SK_OF_MODE):档位关闭 = "off",会话死亡 = "zero",
+    // OF 实际模式串(StatsPayload.ofMode):档位关闭 = "off",会话死亡 = "zero",
     // 存活 = backend 能力段(NvofContext "both+cost q2 grid4" /
     // FxofContext "fxof q3 qual 1920x1080")
     // —— 能力在同一块 GPU 上不随档位变化,档位才是切档可见的反馈。
@@ -227,13 +227,13 @@ private:
         return _ofBackend->ModeString(_ofModeBuf, sizeof(_ofModeBuf));
     }
 
-    // ---- FG 会话级事实(stats 通道 SK_FG_ROUTE_EFFECTIVE / SK_FG_MULT_CREATE
-    // / SK_FG_DETAIL 的数据源;"auto 档到底走了谁 / 为什么没插帧"不再翻
+    // ---- FG 会话级事实(stats 通道 StatsPayload.fgRouteEff / StatsPayload.fgMultCreate
+    // / StatsPayload.fgDetail 的数据源;"auto 档到底走了谁 / 为什么没插帧"不再翻
     // timing log)----
     // 实际生效路由:off(FG 未请求)/ official-hook(官方链,0.3.x hook
     // 代理接管)/ official(官方链直连)/ copy(请求了但初始化失败 → 复制
     // 帧)。Initialize 的 FG 段一次性定值,此后只读(路由进程级,会话内
-    // 不变;运行期 eval 失败闩停由 SK_FG=unavailable 表达,路由值保留
+    // 不变;运行期 eval 失败闩停由 StatsPayload.fgState=unavailable 表达,路由值保留
     // "最后是谁在跑"的的事实)。
     char _fgRouteEff[16] = "off";
     // 最近一次 FG 初始化失败原因(消毒串;成功路径清空)。失败通常发生在

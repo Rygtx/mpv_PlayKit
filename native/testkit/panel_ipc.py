@@ -7,23 +7,24 @@ panel_ipc.h 是唯一权威;本文件是测试用的字节级镜像 —— 改�
 
 通道:
   - 参数通道 PARAMS_MAPPING(面板写 -> 插件 40ms 轮询,seq 门控)
-  - stats 通道 STATS_MAPPING(插件写 JSON -> 面板 0.1s 读,每帧发布)
+  - stats 通道 STATS_MAPPING(插件写定长 struct -> 面板 0.1s 读,每帧发布;
+    v27 起 body 为二进制结构体,原 JSON 文本退役)
   - ALIVE_EVENT:滤镜生命周期标记(面板 watchdog 据此自动退出)
 """
 import ctypes
+import re
 import struct
 
 PAYLOAD_SIZE = 2048
 PAYLOAD_MAGIC = 0x4E4C5344  # "DSLN" (v23, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
-STATS_MAGIC = 0x364C5344  # "DSL6" (stats v25: PAYLOAD 2048 + queue_last + of_last)
+STATS_MAGIC = 0x384C5344  # "DSL8" (v27: stats body JSON → 定长 struct)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
 ALIVE_EVENT = "vs_dlssnr_bridge_alive"
 
-# Stats JSON schema 键名镜像(panel_ipc.h SK_* 单一权威的 python 侧;
-# 2026-09-25 收敛 —— 此前 verify_stats_keys/test_* 手抄键名字符串,头文件
-# 加键/改名时 python 侧无同步防线)。断言一律从本表取键,勿手抄字面量。
+# Stats 字段名镜像(panel_ipc.h StatsPayload 字段单一权威的 python 侧;
+# 历史上是 JSON 键名,断言脚本从本表取键,勿手抄字面量)。
 SK = {
     "gpu_last": "gpu_last",
     "pack_last": "pack_last",
@@ -61,8 +62,55 @@ SK = {
     "gate_skips": "gate_skips",
     "gate_expired": "gate_expired",
     "gate_resets": "gate_resets",
+    "temporal": "temporal",
+    "temporal_route": "temporal_route",
+    "temporal_w": "temporal_w",
 }
 assert len(set(SK.values())) == len(SK), "SK 键名表内有重复值"
+
+# mirror of StatsPayload (panel_ipc.h #pragma pack push,8;v27 起定长 struct,
+# 旧 JSON 键名保留为 dict 键)。布局:2I magic,seq | 14f 计时/权重 |
+# 13I 尺寸/倍数/门累计 | 12 段定长字符串。错位 = 读出乱码,断言即炸 ——
+# 尺寸断言是同步防线(与 _STRUCT 同一教训)。
+_STATS_STRUCT = struct.Struct("<II14f13I160s200s16s40s16s16s128s96s96s96s10s16s")
+assert _STATS_STRUCT.size == 1006, "StatsPayload 布局与 panel_ipc.h 不一致"
+_STATS_FIELDS = (
+    "magic", "seq",
+    "gpu_last", "pack_last", "eval_cpu_last", "unpack_last",
+    "of_last", "fg_last", "rtxvsr_last", "rtxhdr_last",
+    "conv_last", "queue_last", "slot_wait", "lock_wait", "fps", "temporal_w",
+    "internal_w", "internal_h", "width", "height", "scaling",
+    "fg_mult", "fg_mult_create", "fg_mult_max",
+    "gate_skips", "gate_expired", "gate_resets", "gpu_hang", "temporal_route",
+    "gpu_name", "state_detail", "filter_state", "of_mode", "fg", "fg_route_eff",
+    "fg_detail", "of_detail", "rtx", "rtx_detail", "temporal", "removed_reason",
+)
+assert len(_STATS_FIELDS) == 2 + 14 + 13 + 12 == len(set(_STATS_FIELDS))
+_STATS_STR_START = 2 + 14 + 13  # 首个字符串字段在字段元组中的下标
+_STATS_STR_WIDTHS = [int(w) for w in re.findall(r"(\d+)s", _STATS_STRUCT.format)]
+assert len(_STATS_STR_WIDTHS) == 12
+assert sum(_STATS_STR_WIDTHS) == _STATS_STRUCT.size - 8 - 14 * 4 - 13 * 4
+
+
+def pack_stats(stats, seq=1):
+    """stats dict(旧 JSON 键名)→ StatsPayload 定长字节。
+
+    数字缺省 0;字符串缺省空串,超长按格宽截断(UTF-8 字节截断,可能切在
+    多字节中间 —— 测试数据自守,不追求字符边界)。fake_panel_env(合成
+    stats 喂面板)与断言脚本共用,布局只此一处。
+    """
+    vals = []
+    for i, name in enumerate(_STATS_FIELDS):
+        if name == "magic":
+            vals.append(STATS_MAGIC)
+        elif name == "seq":
+            vals.append(seq)
+        elif i >= _STATS_STR_START:
+            w = _STATS_STR_WIDTHS[i - _STATS_STR_START]
+            vals.append(str(stats.get(name, "")).encode("utf-8")[: w - 1])
+        else:
+            vals.append(stats.get(name, 0))
+    return _STATS_STRUCT.pack(*vals)
 
 # mirror of PanelPayload (#pragma pack push, 全 4 字节字段无对齐缝隙):
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
@@ -159,11 +207,13 @@ def open_params_mapping_readonly():
 
 
 def read_stats(require_magic=True):
-    """读 stats 通道 JSON(插件 -> 面板),无映射时返回 None。
+    """读 stats 通道(插件 -> 面板),无映射时返回 None。
 
-    返回 (magic, seq, body)。require_magic=True(默认)时 magic 失配即
-    返回 None —— 面板/插件版本位不配对(成对部署被破坏)不该被当成
-    "stats 缺键"消音;旧行为(不校验)用 require_magic=False 取得。
+    返回 (magic, seq, raw)。raw = StatsPayload 的原始字节(定长 struct,
+    v27 起不再是 JSON 文本;解码走 read_stats_json)。require_magic=True
+    (默认)时 magic 失配即返回 None —— 面板/插件版本位不配对(成对部署
+    被破坏)不该被当成"stats 缺键"消音;旧行为(不校验)用
+    require_magic=False 取得。
     2026-09-25 修:kernel32 函数补 restype/argtypes(此前 64 位下句柄
     截断侥幸可用),magic 校验默认开启。
     """
@@ -188,20 +238,21 @@ def read_stats(require_magic=True):
     magic, seq = struct.unpack_from("<II", raw, 0)
     if require_magic and magic != STATS_MAGIC:
         return None
-    body = raw[8:].split(b"\0")[0].decode("utf-8", "replace")
-    return magic, seq, body
+    return magic, seq, raw
 
 
 def read_stats_json():
-    """read_stats 的 dict 封装(无映射/魔数不符/坏 JSON → None)。
+    """read_stats 的 dict 封装(无映射/魔数不符/未发布 → None)。
 
-    断言脚本用本函数拿 body 字典;需要 magic/seq 原始三元组时仍走 read_stats。
+    断言脚本用本函数拿 stats 字典(键 = 旧 JSON 时代的 SK 名,延续不断
+    旧脚本);需要 magic/seq 原始三元组时仍走 read_stats。
     """
-    import json
     st = read_stats()
     if not st:
         return None
-    try:
-        return json.loads(st[2])
-    except json.JSONDecodeError:
-        return None
+    raw = st[2][: _STATS_STRUCT.size]
+    vals = _STATS_STRUCT.unpack(raw)
+    d = dict(zip(_STATS_FIELDS, vals))
+    for name in _STATS_FIELDS[_STATS_STR_START:]:
+        d[name] = d[name].split(b"\0")[0].decode("utf-8", "replace")
+    return d

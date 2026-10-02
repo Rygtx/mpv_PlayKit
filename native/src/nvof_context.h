@@ -92,7 +92,7 @@ public:
     uint32_t GridSize() const noexcept { return _gridSize; }
     bool Bidirectional() const noexcept { return _bidirectional; }
     bool CostEnabled() const noexcept { return _costEnabled; }
-    // SK_OF_MODE 能力段(实际模式,逐级回退的可见反馈)。
+    // StatsPayload.ofMode 能力段(实际模式,逐级回退的可见反馈)。
     const char *ModeString(char *buf, size_t len) noexcept override {
         std::snprintf(buf, len, "%s q%d grid%u",
                       _bidirectional ? (_costEnabled ? "both+cost" : "both")

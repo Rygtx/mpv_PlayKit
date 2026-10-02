@@ -40,7 +40,9 @@ while time.time() - t0 < 12:
 # stats channel (plugin -> panel)
 st = panel_ipc.read_stats()
 if st:
-    print("STATS:", st[2][:160], flush=True)
+    body = panel_ipc.read_stats_json()
+    print("STATS:", {k: body[k] for k in ("filter_state", "of_mode", "gpu_name", "fps")}
+          if body else "(unparsed)", flush=True)
 else:
     print("STATS: MAPPING MISSING", flush=True)
 

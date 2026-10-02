@@ -415,13 +415,12 @@ bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_
                      "GPU hang/removed: reason=0x%08lX fence=%llu",
                      static_cast<unsigned long>(rr), static_cast<unsigned long long>(value));
             // surface through the stats mapping so the panel shows it
-            // (gpu_hang numeric + the removal reason — keys from panel_ipc.h)
-            char json[224];
-            snprintf(json, sizeof(json),
-                     "{\"%s\":1,\"%s\":\"0x%08lX\"}",
-                     SK_GPU_HANG, SK_REMOVED_REASON,
+            // (gpuHang flag + the removal reason — fields from panel_ipc.h)
+            StatsPayload st{};
+            st.gpuHang = 1;
+            snprintf(st.removedReason, sizeof(st.removedReason), "0x%08lX",
                      static_cast<unsigned long>(rr));
-            PublishStatsJson(json);
+            PublishStats(st);
             // 项目惯例:GPU 级失败必须进 timing log —— 之前只上面板+DebugView,
             // 跨进程观测时(面板没开)日志完全静默,无法定位。
             TimingStatusLine(buf);

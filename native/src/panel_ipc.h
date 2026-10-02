@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <type_traits>
 #include <windows.h>
 
 namespace vsdlssnr {
@@ -20,11 +21,10 @@ constexpr wchar_t STATS_MAPPING[] = L"vs_dlssnr_stats";
 constexpr wchar_t PARAMS_EVENT[] = L"vs_dlssnr_panel_params_event"; // auto-reset; panel signals after each payload write
 constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";             // saved profile (written/read by both sides)
 constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive"; // filter-lifetime marker (bridge + panel watchdog)
-// v19 起 1024:stats JSON 加了 fg 路由/失败原因/排队细分等 8 个键,512 的
-// body 在长 GPU 名 + 能力串下已逼近截断线(PublishStatsJson 超长静默截断 =
-// 尾键丢失,面板读不到还不报错)。参数结构体本身 ~140B,扩容无布局影响。
-// v25 起 2048:账目诚实化新增 queue/of_engine 两键,1024 的 json 已无余量
-// (v19 同族截断风险)。混跑安全:小视图映射大对象合法,旧面板只看前 1024B。
+// v25 起 2048:v25 时账目诚实化新增 queue/of_engine 两键,1024 的 json 已无
+// 余量(v19 同族截断风险)。混跑安全:小视图映射大对象合法,旧面板只看前
+// 1024B。v27 stats 转 struct 后布局有 static_assert 兜底,扩容压力消失,
+// 2048 作为容量余量保留(混部署的 VirtualQuery 钳制语义不变)。
 constexpr uint32_t PAYLOAD_SIZE = 2048;
 // "DSSL6": v3 added the four residual fine-control floats; v4 drops the
 // write-only resetRequest command field (a reset is just a payload full of
@@ -82,7 +82,13 @@ constexpr uint32_t PAYLOAD_MAGIC = 0x4F4C5344u; // "DSLO" (v24, 版本位走 hex
 // VSR-only 时 fg 段显示的 3.5-8.9ms 实为 VSR 输出转换)。同时 nvof 段语义
 // 变化:OF 门按消费者决定(NR 关 + FG 关 = 整段跳过,恒 0)。键为纯增量,
 // bump 理由同 v21:成对部署约束,两端都有明确信号。
-constexpr uint32_t STATS_MAGIC = 0x374C5344u;   // "DSL7" (v26:temporal/temporal_route/temporal_w 三键纯增量,抗闪烁诊断行;hex 按内存序实为 DSL7)
+// stats 契约史:DSL4(v23)rtxvsr/hdr_last 拆账;DSL5(v24)conv_last +
+// OF 门语义;DSL6(v25)queue/of_last;DSL7(v26)temporal 三键。
+// DSL8(v27,0x384C5344):stats body 从 JSON 文本转定长二进制结构体
+// —— JSON 时代的超长静默截断(v19/v25 两次扩容事故)与引号炸体
+// (SanitizeJsonDetail 的存在缘由)两事故类分别被 static_assert 与定长
+// 拷贝消灭,键名三处人肉对齐(SK_ 常量/格式串/strstr 模式)由编译器接管。
+constexpr uint32_t STATS_MAGIC = 0x384C5344u;   // "DSL8" (v27:stats JSON → struct)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -229,153 +235,93 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Stats channel. Same publish protocol as PanelPayload: the body lands with
-// seq held at 0 (readers skip 0), then the counter is moved alone, so a
-// concurrent reader never parses a torn JSON blob.
+// Stats channel. v27 body = fixed-layout binary struct (was a JSON text —
+// the silent-truncation incident class, paid twice at v19/v25, dies at
+// compile time via the static_assert below). Publish protocol unchanged:
+// the body lands with seq held at 0 (readers skip 0), then the counter is
+// moved alone, so a concurrent reader never sees a torn body.
 // ---------------------------------------------------------------------------
 #pragma pack(push, 8)
 struct StatsPayload {
     uint32_t magic; // STATS_MAGIC
     uint32_t seq;   // publisher increments per write; 0 = write in progress
-    char json[PAYLOAD_SIZE - 8];
+
+    // ---- numbers: 14 float + 13 uint32 (pack(8), no padding gaps) ----
+    // Render timings are per-frame last values (EMA is the 120-frame rolling
+    // mean, consumed by the perf log line only — steady-state EMA reads
+    // frozen on the panel). gpuLast sentinel: partial bodies (dead state /
+    // passthrough / GPU hang / init) carry no render timing — the default
+    // member init is -1, and the panel gates on >= 0 (the equivalent of the
+    // old JSON "key missing" default).
+    float gpuLast = -1.0f;
+    float packLast;      // input packing segment
+    float evalCpuLast;   // "NGX call" CPU cost: NR eval + RTX evals submit chain
+    float unpackLast;    // output unpack segment
+    float ofLast;        // optical-flow segment, backend-neutral full span
+    float fgLast;        // DLSS FG segment = all visible frame-gen cost
+    float rtxVsrLast;    // RTX Video VSR eval (dedicated queue GPU wall clock)
+    float rtxHdrLast;    // TrueHDR chain window (real + per-interpolated frame)
+    float convLast;      // post CL output conversion (C2 -> YUV420 + readback; always > 0)
+    float queueLast;     // inter-frame queue wait (submit -> preBase timestamps)
+    float slotWait;      // slot-pool wait last (3 slots in flight; diag page)
+    float lockWait;      // evaluate mutex wait last (diag page)
+    float fps;           // 1s window processed frame rate
+    float temporalW;     // anti-flicker last-frame blend weight exp(-dt/80ms); 0 = seed frame
+    uint32_t internalW;  // internal evaluation resolution
+    uint32_t internalH;
+    uint32_t width;      // source size (never includes VSR output)
+    uint32_t height;
+    uint32_t scaling;    // 0/1 internal downscale active
+    uint32_t fgMult;        // current frame-gen multiple 2-6 (inactive = 0; panel shows "3x")
+    uint32_t fgMultCreate;  // FG session creation multiple (inactive = 0)
+    uint32_t fgMultMax;     // runtime generated-frame cap (0-5). Sole signal when a
+                            // 40-series gate unlock falls back to 2x; panel red-rule:
+                            // fgMultMax + 1 < fgMultCreate
+    uint32_t gateSkips;     // OF frame-gate counters (diag page)
+    uint32_t gateExpired;
+    uint32_t gateResets;
+    uint32_t gpuHang;       // non-0 = GPU hang/device removed (body carries only removedReason)
+    uint32_t temporalRoute; // anti-flicker effective level 0-4 (diag page)
+
+    // ---- strings: fixed width; overlong copies truncate at the field edge,
+    // the struct itself can never be corrupted (CopyStatStr below). Detail
+    // strings still go through SanitizeJsonDetail upstream (display hygiene).
+    char gpuName[160];       // render adapter name (UTF-8)
+    char stateDetail[200];   // dead/passthrough state reason (producer-capped at 200)
+    char filterState[16];    // ok / nvof_zero (alive, per-tick; default ok)
+                             // passthrough / ngx_faulted (dead, edge-published once)
+    char ofMode[40];         // off / zero / backend capability string (max "fxof q5 qual 1920x1080" = 23)
+    char fgState[16];        // on / dup / off / unavailable
+    char fgRouteEff[16];     // off / official-hook / official / copy
+    char fgDetail[128];      // last FG init failure reason (sanitized; cleared on success)
+    char ofDetail[96];       // last OF session creation failure reason (same)
+    char rtx[96];            // RTX Video live state: off / vsr WxH / hdr WxH / vsr+hdr WxH
+    char rtxDetail[96];      // last VSR/TrueHDR failure reason (same)
+    char temporal[10];       // off / seed / steady / failed (anti-flicker diag)
+    char removedReason[16];  // "0x%08lX" (gpuHang body only)
 };
 #pragma pack(pop)
-static_assert(sizeof(StatsPayload) == PAYLOAD_SIZE, "stats payload must fit the mapping");
+static_assert(sizeof(StatsPayload) <= PAYLOAD_SIZE, "stats payload must fit the mapping");
+static_assert(std::is_trivially_copyable_v<StatsPayload>, "stats payload crosses shared memory");
 
-// Stats JSON schema keys — the single authority. The writers' snprintf
-// format strings (dlssnr_context.cpp / d3d12_context.cpp) interpolate exactly
-// these; the panel reader is constant-driven.
-inline constexpr const char *SK_GPU_LAST = "gpu_last";
-// 八段用时走每帧 last(与 gpu_last 同语义):EMA 是 120 帧滚动平均,稳态
-// 播放时逐帧变化 <0.1ms,面板"处理用时"会冻结成"停几秒 + 突跳"的观感;
-// last 随帧呼吸。perf 日志行仍用 EMA(诊断要看趋势,不受影响)。
-inline constexpr const char *SK_PACK_LAST = "pack_last";
-// eval_cpu = "NGX 调用" 的 CPU 成本:NR eval(NR 开时)+ RTX evals 的 CPU
-// 提交链(vsr/TrueHDR/DLSSG 逐笔参数录制,~1.8ms/笔;TrueHDR 后置 + FG 4x
-// = 每帧 8 笔 ≈ 14ms,2026-09-24 探针定案)。NR 关但 RTX 开时非零 —— 高的
-// 来源是 RTX evals 的提交,不是 NR。
-inline constexpr const char *SK_EVAL_CPU_LAST = "eval_cpu_last";
-// DLSS FG 段 = 补帧的全部可见成本:postA 栅栏差(DLSSG 推理;HDR 会话
-// 被 CPU 提交链遮盖时常为 0,**插值帧回读的 CPU 行拷贝归本段** —— FG 4x
-// @OUT 几何可达 10ms+,是补帧成本的主要可见账目)。非 HDR 会话含旧 post
-// 全部(推理 + 转换/回读)。fg 关/门关帧 ≈ 0,面板零值段自动隐藏。
-inline constexpr const char *SK_FG_LAST = "fg_last";
-// RTX Video 分段(专用队列 eval 的 GPU 墙钟,t3a 后有界 CPU 等待完成栅栏
-// 拆账):vsr = VSR eval;hdr = TrueHDR 真实帧/链窗口(每输出帧一次:真实
-// + 逐插值帧;post CL 转换窗口已拆入 conv_last)。TrueHDR 后置
-// (2026-09-24):DLSSG 恒 SDR 域插值(ColorBuffersHDR 路径实测压高光),
-// 逐帧 TrueHDR 提升为 FP16 scRGB。vsr/hdr 关闭时恒 0,面板零值段自动隐藏
-// (面板另有 EMA 平滑防忽隐忽现)。
-inline constexpr const char *SK_RTXVSR_LAST = "rtxvsr_last";
-inline constexpr const char *SK_RTXHDR_LAST = "rtxhdr_last";
-// 输出转换段(v24,管线全流程解耦):post CL 常驻转换窗口 —— C2(管线色
-// →YUV420 + readback)+ 逐 gen 转换;NR 关直连帧并入 base CL 的 C1 补做
-// 窗口。此前转换粘在 base/fg CL 被错记进 gpu/fg 段(VSR-only 时 fg 段
-// 3.5-8.9ms 实为 VSR 输出转换)。恒非 0(格式契约必需)。
-// v25 账目诚实化:GPU 时间戳括号,本键 = post CL 纯执行(其跨队列栅栏
-// 等待与队列积压不再折入 —— 那归 queue_last)。
-inline constexpr const char *SK_CONV_LAST = "conv_last";
-// 帧间排队段(v25 账目诚实化):base CL 的 preBase 时间戳时刻 − base 提交
-// 时刻 = burst 等待上一帧尾部/队列空闲。引擎超预算(如 NVOF of=4/5)推挤
-// 下一帧时在此显形 —— 此前这笔账被 nrOff 折叠误记进 conv。
-// (nvof_last 同批语义修正:上报值 = 光流阶段全跨度 LastStageTotalMs,即
-// 真实光流处理用时,含提交 + 引擎计算 + 暴露等待 —— 引擎计算不再以
-// "引擎等待"名义独立成段,独立段 = 与 nvof 重复计账,已撤销。)
-inline constexpr const char *SK_QUEUE_LAST = "queue_last";
-// 光流段(v25 语义修正 + 后端中立改名:键名不再绑定 NVOF —— 后端有
-// NVIDIA NVOF 与 AMD FFX 两种,各自量出真实光流处理用时):
-//   NVOF = 阶段全跨度(门入口 → 冲刷完成:提交 + 专有引擎计算 + 暴露等待),
-//          随档位单调(of=1 ≈8ms / of=2 ≈12ms / of=5 ≈68ms @4K);
-//   FFX  = dispatch CL 纯执行(首尾同 CL 内嵌 EndQuery,自绘 compute 无
-//          NGX;copy/densify 胶水 µs 级不计),未落位时回退提交跨度。
-// of=0 或无消费者(NR 关 + FG 关,解耦后整段跳过)时恒 0,面板零值段自动
-// 隐藏。
-inline constexpr const char *SK_OF_LAST = "of_last";
-inline constexpr const char *SK_UNPACK_LAST = "unpack_last";
-inline constexpr const char *SK_INTERNAL_W = "internal_w";
-inline constexpr const char *SK_INTERNAL_H = "internal_h";
-inline constexpr const char *SK_WIDTH = "width";
-inline constexpr const char *SK_HEIGHT = "height";
-inline constexpr const char *SK_SCALING = "scaling";
-inline constexpr const char *SK_FPS = "fps";
-inline constexpr const char *SK_GPU_NAME = "gpu_name";
-inline constexpr const char *SK_GPU_HANG = "gpu_hang";        // published as numeric 1
-inline constexpr const char *SK_REMOVED_REASON = "removed_reason";
-// 滤镜状态(面板可见的降级报告;GUI mpv 看不到日志,timing log 没人看):
-//   ok / nvof_zero  — 存活态,由周期 stats tick 携带(缺省 = ok)
-//   passthrough / ngx_faulted — 死亡态,边缘发布一次,替换冻结的旧统计 body
-inline constexpr const char *SK_FILTER_STATE = "filter_state";
-// 死亡状态的原因串(已经 SanitizeJsonDetail 消毒:无引号/控制字符)
-inline constexpr const char *SK_STATE_DETAIL = "state_detail";
+// Fixed-width truncating copy — the single entry point for every stats
+// string field, both writer and panel side. Truncation clips at the field
+// edge and cannot corrupt the struct: the JSON-era incident class (quotes
+// breaking the body, overlong bodies silently dropping tail keys) has no
+// struct-world equivalent.
+template <size_t N>
+inline void CopyStatStr(char (&dst)[N], const char *src) noexcept {
+    strncpy_s(dst, N, src ? src : "", _TRUNCATE);
+}
+
 // 插件发布(state_detail)、面板消费的会话态字符串(单一出处,防两侧漂移):
 // NR 已开但会话未初始化(全关直通实例上开 NR)—— 面板见此应自动 reseek
 // 补触发重建(闭环兜底,覆盖开关瞬间 stats 漏判等一切误判路径)。
 inline constexpr const char *kStateNrSeekInit = "NR on; seek to initialize";
-// NVOF 实际模式(请求档位 ≠ 实际能力时在这里暴露,如 Turing 无 cost):
-// off | zero | forward | forward+cost | both | both+cost
-inline constexpr const char *SK_OF_MODE = "of_mode";
-// DLSS 帧生成状态:on(eval)/ dup(复制真实帧:复位帧/零光流/面板关)/
-// off(本会话未激活)/ unavailable(初始化失败,回退 1:1)
-inline constexpr const char *SK_FG = "fg";
-// 当前插帧倍数(2-6;FG 未激活 = 0。面板显示 "3x")
-inline constexpr const char *SK_FG_MULT = "fg_mult";
-// FG 路由实际生效档(面板核心诉求:auto 档下"这次到底走了谁"不再翻
-// timing log):
-//   off           — 创建时 FG 未请求(面板 FG = 关)
-//   official-hook — 官方 NGX 链,0.3.x hook 代理在托接管 DLSS-G(RTX 30/20
-//                   唯一路径;进程级,与本次是否预载解耦)
-//   official      — 官方 NGX 链直连(无 hook 代理在托;RTX 40/50)
-//   copy          — FG 已请求但初始化失败 → 输出回落 1:1/复制帧(与 SK_FG
-//                   的 unavailable/dup 互补:那个说"帧是什么",这个说"谁产的")
-inline constexpr const char *SK_FG_ROUTE_EFFECTIVE = "fg_route_eff";
-// FG 会话创建倍数(2-6;FG 未激活 = 0)。live 倍数超过它时多出的档位本
-// 会话无槽可填(面板红色提示"需 seek 重建")。
-inline constexpr const char *SK_FG_MULT_CREATE = "fg_mult_create";
-// FG 会话运行库插值帧上限(0-5;FG 未激活 = 0,含义与 fg_mult_create 的
-// 0 同语义)。MaxGeneratedFrames 查询值(含 mfg gate 解锁结果)。没有它,
-// 40 系 gate 解锁失败回落 2x 时创建/面板仍全绿显示 6x —— 输出按 6x 节拍
-// 但只有 2x 密度(超限槽复制真实帧),用户毫无感知。面板红显条件(注意
-// 口径:本键是插值帧数,创建键是倍数):fg_mult_max + 1 < fg_mult_create,
-// 即实效倍数低于创建倍数;直接拿本键与倍数比较会把健康的 6x 误报红显。
-inline constexpr const char *SK_FG_MULT_MAX = "fg_mult_max";
-// FG 最近一次初始化失败原因(消毒串;成功后清空)。"为什么没插帧"的
-// 面板侧直接答案,不再翻 timing log。
-inline constexpr const char *SK_FG_DETAIL = "fg_detail";
-// 光流最近一次会话创建失败原因(消毒串;成功后清空;fg_detail 的光流
-// 同款)。诊断页"光流: 请求 X | 实际 zero"只说降级事实,原因(SM6.2
-// 不支持/驱动拒双向/dll 缺失)在这里直达面板。
-inline constexpr const char *SK_OF_DETAIL = "of_detail";
-// RTX Video 实际管线态(off / vsr / hdr / vsr+hdr,带 out 几何)与最近
-// 一次 VSR/TrueHDR 初始化失败原因(消毒串;成功后清空)。请求开但实态
-// off = 降级(能力/部署问题),面板诊断页红显,原因在 rtx_detail。
-inline constexpr const char *SK_RTX = "rtx";
-inline constexpr const char *SK_RTX_DETAIL = "rtx_detail";
-// ---- 排队细分(诊断页专供;主面板只留八段用时,这里放"要翻 perf 行
-// 才有"的次级数据)----
-// 槽池等待 last(3 槽全在飞时的排队;gpu 段正常而此值大 = GPU 超容量)
-inline constexpr const char *SK_SLOT_WAIT = "slot_wait";
-// evaluate 互斥等待 last(NGX feature 单例的 CPU 侧串行排队)
-inline constexpr const char *SK_LOCK_WAIT = "lock_wait";
-// 光流帧序门累计(播种/过期/显式重置;NVOF/FFX 门语义见 of_frame_gate.h,
-// FFX 无探针时恒 0)
-inline constexpr const char *SK_GATE_SKIPS = "gate_skips";
-inline constexpr const char *SK_GATE_EXPIRED = "gate_expired";
-inline constexpr const char *SK_GATE_RESETS = "gate_resets";
-// 抗闪烁时域稳定器(诊断页"请求 vs 实际"行):
-//   temporal       — 状态串:off(未开启)/ seed(播种,重新累积中)/
-//                    steady(稳态混合)/ failed(资源重建失败,已降级关闭)
-//   temporal_route — 实际生效档(0-4);请求档 >0 而实档 =0(非 off 态)或
-//                    failed = 降级,面板红显
-//   temporal_w     — 最近一帧混合权重 exp(-Δt/80ms);0 = 播种帧。它只反映
-//                    "旋钮位置"(由帧率决定),不是实际修正量
-inline constexpr const char *SK_TEMPORAL = "temporal";
-inline constexpr const char *SK_TEMPORAL_ROUTE = "temporal_route";
-inline constexpr const char *SK_TEMPORAL_W = "temporal_w";
-
-// stats JSON 的 detail 字段走面板的朴素解析(strstr + 下一个引号):剔除
-// 引号、反斜杠与控制字符,防止 D3D12 debug-layer 文本(VSDLSSNR_D3D12_DEBUG=1
-// 时可含引号)截断或污染 JSON。plugin.cpp 与 dlssnr_context 的死亡状态
-// 发布共用。
+// Detail/state strings are plain char fields now (no JSON to corrupt), but
+// D3D12 debug-layer text (VSDLSSNR_D3D12_DEBUG=1) still carries quotes and
+// control characters — scrub them for display hygiene. plugin.cpp and
+// dlssnr_context dead-state publishes share this.
 inline void SanitizeJsonDetail(const char *src, char *dst, size_t dstLen) noexcept {
     if (!dst || !dstLen) return;
     if (!src) { dst[0] = '\0'; return; }
@@ -403,14 +349,14 @@ inline void PublishWithSeq(volatile uint32_t *seq, uint32_t newSeq, WriteBody &&
 // process; readers map read-only per refresh). Replacing the mapping handle
 // per write would leak one handle per publish.
 
-// stats 通道自身建立失败的留痕钩子:PublishStatsJson 属于头文件层,够不
+// stats 通道自身建立失败的留痕钩子:PublishStats 属于头文件层,够不
 // 着 dlssnr_context 的 timing log;本头文件只声明函数指针,插件侧启动时
 // 注册(见 dlssnr_context.cpp)。没有它,映射创建失败只有 OutputDebugString
 // 一个出口 —— GUI mpv 场景没人看,面板从此空白而用户常看的日志零痕迹,
 // 与"插件没加载"无法区分。
 inline void (*g_statsChannelFailLog)(const char *) = nullptr;
 
-inline bool PublishStatsJson(const char *json) noexcept {
+inline bool PublishStats(const StatsPayload &st) noexcept {
     // Every publisher (the per-frame stats publish in ProcessFrame, the
     // GPU-hang path in WaitFenceValue, Initialize) serializes
     // here: two writers must never interleave the invalidate/body/publish
@@ -454,11 +400,8 @@ inline bool PublishStatsJson(const char *json) noexcept {
             return false;
         }
     }
-    size_t n = strlen(json);
-    if (n > sizeof(view->json) - 1) n = sizeof(view->json) - 1;
     PublishWithSeq(&view->seq, ++seq, [&] {
-        memcpy(view->json, json, n);
-        view->json[n] = '\0';
+        *view = st; // plain field copy; no format step, nothing to truncate
         view->magic = STATS_MAGIC;
     });
     return true;

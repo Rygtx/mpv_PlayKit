@@ -123,35 +123,35 @@ struct AppState {
     char statsBig[64]{};
     char statsRes[96]{};
     char gpuName[128]{};
-    char filterState[16]{};  // SK_FILTER_STATE: ok / nvof_zero / passthrough / ngx_faulted
-    char stateDetail[208]{}; // SK_STATE_DETAIL: 死亡状态的原因串
+    char filterState[16]{};  // StatsPayload.filterState: ok / nvof_zero / passthrough / ngx_faulted
+    char stateDetail[208]{}; // StatsPayload.stateDetail: 死亡状态的原因串
                              // (生产端 %.200s 封顶,缓冲须容 200+NUL,见 plugin.cpp)
-    char ofMode[40]{};       // SK_OF_MODE: off / zero / 后端能力串(最长
+    char ofMode[40]{};       // StatsPayload.ofMode: off / zero / 后端能力串(最长
                              // "fxof q5 qual 1920x1080" = 23+1;与插件 _ofModeBuf 同尺寸)
-    char fgState[16]{};      // SK_FG: on / dup / off / unavailable
-    int fgMult = 0;          // SK_FG_MULT: 当前插帧倍数(未激活 = 0)
-    char fgRouteEff[16]{};   // SK_FG_ROUTE_EFFECTIVE: off/official-hook/official/copy
-    int fgMultCreate = 0;    // SK_FG_MULT_CREATE: 会话创建倍数(FG 未激活 = 0)
-    char fgDetail[128]{};    // SK_FG_DETAIL: FG 最近一次初始化失败原因(成功 = 空)
-    int fgMultMax = 0;       // SK_FG_MULT_MAX: 运行库插值帧上限(FG 未激活 = 0)。
+    char fgState[16]{};      // StatsPayload.fgState: on / dup / off / unavailable
+    int fgMult = 0;          // StatsPayload.fgMult: 当前插帧倍数(未激活 = 0)
+    char fgRouteEff[16]{};   // StatsPayload.fgRouteEff: off/official-hook/official/copy
+    int fgMultCreate = 0;    // StatsPayload.fgMultCreate: 会话创建倍数(FG 未激活 = 0)
+    char fgDetail[128]{};    // StatsPayload.fgDetail: FG 最近一次初始化失败原因(成功 = 空)
+    int fgMultMax = 0;       // StatsPayload.fgMultMax: 运行库插值帧上限(FG 未激活 = 0)。
                              // gate 解锁失败回落 2x 的唯一面板侧信号源
-    char ofDetail[96]{};     // SK_OF_DETAIL: 光流会话创建失败原因(成功 = 空)
-    char rtxState[32]{};     // SK_RTX: off / vsr / hdr / vsr+hdr + 实际输出分辨率
+    char ofDetail[96]{};     // StatsPayload.ofDetail: 光流会话创建失败原因(成功 = 空)
+    char rtxState[32]{};     // StatsPayload.rtx: off / vsr / hdr / vsr+hdr + 实际输出分辨率
                              // ("vsr+hdr 15360x8640" = 18+NUL;原 16 字节把分辨率
                              // 截成 "7680x43" —— 诊断页"实际"显示不全的根因)
-    char rtxDetail[96]{};    // SK_RTX_DETAIL: VSR/TrueHDR 最近失败原因(成功 = 空)
+    char rtxDetail[96]{};    // StatsPayload.rtxDetail: VSR/TrueHDR 最近失败原因(成功 = 空)
     int connState = 0;       // stats 通道连接态:0=未检测到插件 1=已连接
                              // 2=magic 不匹配(面板/插件版本未成对更新)
     int fgOptimized = 1;     // dlssg_for_sm86 [FrameGeneration] Optimized 0-3
                              // (存储单点 = 代理 ini;面板启动回读,重启 mpv 生效)
-    float slotWait = 0.0f;   // SK_SLOT_WAIT: 槽池等待 last(诊断页)
-    float lockWait = 0.0f;   // SK_LOCK_WAIT: evaluate 互斥等待 last(诊断页)
-    int gateSkips = 0;       // SK_GATE_SKIPS: 光流帧序门跳帧累计(诊断页)
-    int gateExpired = 0;     // SK_GATE_EXPIRED: 过期帧累计(诊断页)
-    int gateResets = 0;      // SK_GATE_RESETS: 历史重置累计(诊断页)
-    char temporalState[10]{}; // SK_TEMPORAL: off / seed / steady / failed(诊断页)
-    int temporalRoute = 0;   // SK_TEMPORAL_ROUTE: 实际生效档 0-4(诊断页)
-    float temporalW = 0.0f;  // SK_TEMPORAL_W: 最近一帧混合权重(诊断页)
+    float slotWait = 0.0f;   // StatsPayload.slotWait: 槽池等待 last(诊断页)
+    float lockWait = 0.0f;   // StatsPayload.lockWait: evaluate 互斥等待 last(诊断页)
+    int gateSkips = 0;       // StatsPayload.gateSkips: 光流帧序门跳帧累计(诊断页)
+    int gateExpired = 0;     // StatsPayload.gateExpired: 过期帧累计(诊断页)
+    int gateResets = 0;      // StatsPayload.gateResets: 历史重置累计(诊断页)
+    char temporalState[10]{}; // StatsPayload.temporal: off / seed / steady / failed(诊断页)
+    int temporalRoute = 0;   // StatsPayload.temporalRoute: 实际生效档 0-4(诊断页)
+    float temporalW = 0.0f;  // StatsPayload.temporalW: 最近一帧混合权重(诊断页)
     double fps = 0.0;
     // 分段显示值(EMA 平滑,用户裁定"显示平滑、真实数据不平滑"):每拍从
     // 插件上报的裸 last 值就地喂 EMA;时间线/列表/tooltip 用平滑值,避免
@@ -576,33 +576,6 @@ void LoadIni() noexcept {
     g_app.fgOptimized = ReadFgOptimizedIni();
 }
 
-// Flat-object JSON extraction for the stats blob (our own writer's format)
-float JsonGetFloat(const char *body, const char *key, float def) noexcept {
-    char pat[48];
-    std::snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *k = strstr(body, pat);
-    if (!k) return def;
-    const char *c = strchr(k + strlen(pat), ':');
-    if (!c) return def;
-    return strtof(c + 1, nullptr);
-}
-
-int JsonGetInt(const char *body, const char *key, int def) noexcept {
-    return static_cast<int>(JsonGetFloat(body, key, static_cast<float>(def)));
-}
-
-bool JsonGetString(const char *body, const char *key, char *out, size_t outLen) noexcept {
-    char pat[48];
-    std::snprintf(pat, sizeof(pat), "\"%s\":\"", key);
-    const char *k = strstr(body, pat);
-    if (!k) return false;
-    k += strlen(pat);
-    const char *end = strchr(k, '"');
-    std::snprintf(out, outLen, "%.*s",
-                  end ? static_cast<int>(end - k) : static_cast<int>(strlen(k)), k);
-    return true;
-}
-
 // Stats 映射句柄/视图进程级缓存(2026-09-25):两个消费方(UI 10Hz + 打标
 // 线程 ~4Hz)此前每拍 Open/Map/Unmap/Close 全套内核往返 + 页表工作;与插件
 // 侧协议(映射句柄进程级保留,panel_ipc.h 注释明示)对齐。插件重启 = 同名
@@ -822,7 +795,7 @@ bool HdrTagTick(HdrTagConn &c, int want) noexcept {
     return false;
 }
 
-// 打标 worker:want 来自插件本体的 SK_RTX 实态,与 UI 可见性完全解耦。
+// 打标 worker:want 来自插件本体的 StatsPayload.rtx 实态,与 UI 可见性完全解耦。
 // 退出轮询 g_quit(与看门狗同款);进程退出会硬杀本线程,残留管道句柄
 // 随进程回收,无需 join。
 DWORD WINAPI HdrTagProc(LPVOID) noexcept {
@@ -833,13 +806,10 @@ DWORD WINAPI HdrTagProc(LPVOID) noexcept {
         StatsPayload st{};
         bool badMagic = false;
         if (ReadStatsSnapshot(&st, &badMagic) != 2) continue; // 插件未跑/快照未稳
-        // rtx 缓冲对齐 AppState.rtxState[32](生产端封头 "vsr+hdr %dx%d")。
-        // rtx 键缺失 ≠ 死 body:NR+FG+RTX 皆关时插件发布 passthrough 简体,
-        // 本身无此键(2026-09-24 实锤:关 HDR 后标签残留)—— 缺键即 SDR
-        // 实态,与 LoadStats"缺键即清"同款语义,发 remove 摘标。
-        char rtx[32]{};
-        JsonGetString(st.json, SK_RTX, rtx, sizeof(rtx)); // 缺键 → 空 → want=0
-        HdrTagTick(conn, strstr(rtx, "hdr") ? 1 : 0);
+        // rtx 字段为空 ≠ 死 body:NR+FG+RTX 皆关时插件发布 passthrough 简体,
+        // 本身不带 rtx(2026-09-24 实锤:关 HDR 后标签残留)—— 空即 SDR
+        // 实态,发 remove 摘标。
+        HdrTagTick(conn, strstr(st.rtx, "hdr") ? 1 : 0);
     }
     if (conn.pipe) CloseHandle(conn.pipe);
     return 0;
@@ -902,76 +872,62 @@ void LoadStats() noexcept {
     }
     const AppState before = g_app; // display snapshot for the redraw gate below
     g_app.connState = 1;           // after the snapshot: 0→1 跳变要进下方 diff
-    const char *body = st.json;
-    // 缺键即清零(JsonGetString 命中失败不写 out;旧版本插件的 body 没有
-    // 新键,残留旧值会让状态行说谎)。
-    if (!JsonGetString(body, SK_FILTER_STATE, g_app.filterState, sizeof(g_app.filterState)))
-        g_app.filterState[0] = 0;
-    if (!JsonGetString(body, SK_STATE_DETAIL, g_app.stateDetail, sizeof(g_app.stateDetail)))
-        g_app.stateDetail[0] = 0;
-    if (!JsonGetString(body, SK_OF_MODE, g_app.ofMode, sizeof(g_app.ofMode)))
-        g_app.ofMode[0] = 0;
-    if (!JsonGetString(body, SK_FG, g_app.fgState, sizeof(g_app.fgState)))
-        g_app.fgState[0] = 0;
-    g_app.fgMult = JsonGetInt(body, SK_FG_MULT, 0);
-    // FG 实际路由/创建倍数/失败原因 + 排队细分(缺键即清:死亡 body 不带
-    // 这些键,残留旧值会让状态行说谎 —— 与 filter_state 同款规则)。
-    if (!JsonGetString(body, SK_FG_ROUTE_EFFECTIVE, g_app.fgRouteEff, sizeof(g_app.fgRouteEff)))
-        g_app.fgRouteEff[0] = 0;
-    g_app.fgMultCreate = JsonGetInt(body, SK_FG_MULT_CREATE, 0);
-    if (!JsonGetString(body, SK_FG_DETAIL, g_app.fgDetail, sizeof(g_app.fgDetail)))
-        g_app.fgDetail[0] = 0;
-    // v21 键:运行库上限 + 光流失败原因(旧插件 body 无键,缺键即清,
-    // 与 fgDetail 同款规则 —— 残留旧值会让状态行说谎)。
-    g_app.fgMultMax = JsonGetInt(body, SK_FG_MULT_MAX, 0);
-    if (!JsonGetString(body, SK_OF_DETAIL, g_app.ofDetail, sizeof(g_app.ofDetail)))
-        g_app.ofDetail[0] = 0;
-    // v22 键:RTX Video 实态 + 失败原因(缺键即清,同款规则)。
-    if (!JsonGetString(body, SK_RTX, g_app.rtxState, sizeof(g_app.rtxState)))
-        g_app.rtxState[0] = 0;
-    if (!JsonGetString(body, SK_RTX_DETAIL, g_app.rtxDetail, sizeof(g_app.rtxDetail)))
-        g_app.rtxDetail[0] = 0;
+    // 字段直读。空/零字段 = 本 body 未携带(死亡/简体 body 只填部分字段),
+    // 等价旧 JSON 的"缺键即清"语义:残留旧值会让状态行说谎。
+    CopyStatStr(g_app.filterState, st.filterState);
+    CopyStatStr(g_app.stateDetail, st.stateDetail);
+    CopyStatStr(g_app.ofMode, st.ofMode);
+    CopyStatStr(g_app.fgState, st.fgState);
+    g_app.fgMult = static_cast<int>(st.fgMult);
+    // FG 实际路由/创建倍数/失败原因 + 排队细分(死亡 body 不带这些字段,
+    // 零/空即清:与 filterState 同款规则)。
+    CopyStatStr(g_app.fgRouteEff, st.fgRouteEff);
+    g_app.fgMultCreate = static_cast<int>(st.fgMultCreate);
+    CopyStatStr(g_app.fgDetail, st.fgDetail);
+    // v21 字段:运行库上限 + 光流失败原因(与 fgDetail 同款规则)。
+    g_app.fgMultMax = static_cast<int>(st.fgMultMax);
+    CopyStatStr(g_app.ofDetail, st.ofDetail);
+    // v22 字段:RTX Video 实态 + 失败原因(同款规则)。
+    CopyStatStr(g_app.rtxState, st.rtx);
+    CopyStatStr(g_app.rtxDetail, st.rtxDetail);
     // HDR 打标不再走这里:已独立为 HdrTagProc 线程(本函数只在窗口可见时
     // 被调,曾把打标一并拖进"隐藏即休眠"的门里)。
-    g_app.slotWait = static_cast<float>(JsonGetFloat(body, SK_SLOT_WAIT, 0));
-    g_app.lockWait = static_cast<float>(JsonGetFloat(body, SK_LOCK_WAIT, 0));
-    g_app.gateSkips = JsonGetInt(body, SK_GATE_SKIPS, 0);
-    g_app.gateExpired = JsonGetInt(body, SK_GATE_EXPIRED, 0);
-    g_app.gateResets = JsonGetInt(body, SK_GATE_RESETS, 0);
-    // 抗闪烁三键(v26):状态串 + 实际生效档 + 最近混合权重。
-    if (!JsonGetString(body, SK_TEMPORAL, g_app.temporalState, sizeof(g_app.temporalState)))
-        g_app.temporalState[0] = 0;
-    g_app.temporalRoute = JsonGetInt(body, SK_TEMPORAL_ROUTE, 0);
-    g_app.temporalW = JsonGetFloat(body, SK_TEMPORAL_W, 0.0f);
-    if (JsonGetInt(body, SK_GPU_HANG, 0) != 0) {
-        // The hang payload has no gpu_last, so the gate below would keep
-        // showing frozen pre-hang stats forever; surface it — with the
-        // device-removal reason the plugin publishes alongside the flag.
+    g_app.slotWait = st.slotWait;
+    g_app.lockWait = st.lockWait;
+    g_app.gateSkips = static_cast<int>(st.gateSkips);
+    g_app.gateExpired = static_cast<int>(st.gateExpired);
+    g_app.gateResets = static_cast<int>(st.gateResets);
+    // 抗闪烁三字段(v26):状态串 + 实际生效档 + 最近混合权重。
+    CopyStatStr(g_app.temporalState, st.temporal);
+    g_app.temporalRoute = static_cast<int>(st.temporalRoute);
+    g_app.temporalW = st.temporalW;
+    if (st.gpuHang != 0) {
+        // The hang body has no gpuLast (sentinel -1), so the gate below
+        // would keep showing frozen pre-hang stats forever; surface it —
+        // with the device-removal reason the plugin publishes alongside.
         snprintf(g_app.statsBig, sizeof(g_app.statsBig), "GPU 挂起/设备移除(滤镜已回退)");
-        char reason[32];
-        if (JsonGetString(body, SK_REMOVED_REASON, reason, sizeof(reason)) && reason[0]) {
-            snprintf(g_app.statsRes, sizeof(g_app.statsRes), "移除原因 %s", reason);
+        if (st.removedReason[0]) {
+            snprintf(g_app.statsRes, sizeof(g_app.statsRes), "移除原因 %s", st.removedReason);
         }
         // hang 有自己的展示行,清掉状态字段防上一 body 的残留
         ClearSessionState();
     } else {
-        const double gpuLast = JsonGetFloat(body, SK_GPU_LAST, -1);
+        const double gpuLast = st.gpuLast;
         if (gpuLast >= 0) {
             snprintf(g_app.statsBig, sizeof(g_app.statsBig), "NGX 延迟 %.1f ms", gpuLast);
-            // 分辨率展示:VSR 生效(rtx_state 携带 "vsr WxH"/"vsr+hdr WxH")
+            // 分辨率展示:VSR 生效(rtx 字段携带 "vsr WxH"/"vsr+hdr WxH")
             // -> 源 → VSR 输出;未开启缩放 -> 原生分辨率;开启 -> 处理分辨率
             // → 回源分辨率。width/height 恒为源尺寸,不含 VSR 输出。
-            const int scaling = JsonGetInt(body, SK_SCALING, 0);
-            const int iw = JsonGetInt(body, SK_INTERNAL_W, 0);
-            const int ih = JsonGetInt(body, SK_INTERNAL_H, 0);
-            const int w = JsonGetInt(body, SK_WIDTH, 0);
-            const int h = JsonGetInt(body, SK_HEIGHT, 0);
-            // rtx_state 格式(dlssnr_context.cpp):"vsr WxH"/"vsr+hdr WxH"/
+            const int scaling = static_cast<int>(st.scaling);
+            const int iw = static_cast<int>(st.internalW);
+            const int ih = static_cast<int>(st.internalH);
+            const int w = static_cast<int>(st.width);
+            const int h = static_cast<int>(st.height);
+            // rtx 字段格式(dlssnr_context.cpp):"vsr WxH"/"vsr+hdr WxH"/
             // "hdr WxH"/"off" —— 跳到首个数字 sscanf WxH;off 无数字得 0。
             int rw = 0, rh = 0;
-            char rtxState[48];
-            if (JsonGetString(body, SK_RTX, rtxState, sizeof(rtxState))) {
-                const char *p = rtxState;
+            {
+                const char *p = st.rtx;
                 while (*p && (*p < '0' || *p > '9')) ++p;
                 if (*p) sscanf(p, "%dx%d", &rw, &rh);
             }
@@ -993,7 +949,7 @@ void LoadStats() noexcept {
                          "分辨率 %dx%d(原生)", w, h);
             }
             // 八段读每帧 last 值(与 NGX 延迟同语义):EMA 稳态冻结,
-            // last 随帧呼吸(见 panel_ipc.h SK_*_LAST 注释)。
+            // last 随帧呼吸(见 panel_ipc.h StatsPayload 计时字段注释)。
             // **裸 last 恒存 segX(真实数据不平滑);EMA 只推进显示值
             // segDispX(用户裁定)**:分段计时锚存在 CPU 唤醒竞争 —— 极快的
             // 段(vsr ~0.5ms)会因 CPU 迟到测得瞬时 0,时间线忽隐忽现。
@@ -1003,16 +959,16 @@ void LoadStats() noexcept {
             auto segSmooth = [kSegAlpha](float prev, float v) {
                 return prev + (v - prev) * kSegAlpha;
             };
-            const float rawPack = static_cast<float>(JsonGetFloat(body, SK_PACK_LAST, 0));
-            const float rawEval = static_cast<float>(JsonGetFloat(body, SK_EVAL_CPU_LAST, 0));
-            const float rawGpu = static_cast<float>(JsonGetFloat(body, SK_GPU_LAST, 0));
-            const float rawUnpack = static_cast<float>(JsonGetFloat(body, SK_UNPACK_LAST, 0));
-            const float rawNvof = static_cast<float>(JsonGetFloat(body, SK_OF_LAST, 0));
-            const float rawFg = static_cast<float>(JsonGetFloat(body, SK_FG_LAST, 0));
-            const float rawRtxVsr = static_cast<float>(JsonGetFloat(body, SK_RTXVSR_LAST, 0));
-            const float rawRtxHdr = static_cast<float>(JsonGetFloat(body, SK_RTXHDR_LAST, 0));
-            const float rawConv = static_cast<float>(JsonGetFloat(body, SK_CONV_LAST, 0));
-            const float rawQueue = static_cast<float>(JsonGetFloat(body, SK_QUEUE_LAST, 0));
+            const float rawPack = st.packLast;
+            const float rawEval = st.evalCpuLast;
+            const float rawGpu = st.gpuLast;
+            const float rawUnpack = st.unpackLast;
+            const float rawNvof = st.ofLast;
+            const float rawFg = st.fgLast;
+            const float rawRtxVsr = st.rtxVsrLast;
+            const float rawRtxHdr = st.rtxHdrLast;
+            const float rawConv = st.convLast;
+            const float rawQueue = st.queueLast;
             g_app.segDispPack = segSmooth(g_app.segDispPack, rawPack);
             g_app.segDispEval = segSmooth(g_app.segDispEval, rawEval);
             g_app.segDispGpu = segSmooth(g_app.segDispGpu, rawGpu);
@@ -1033,10 +989,8 @@ void LoadStats() noexcept {
                                  g_app.segDispUnpack + g_app.segDispNvof + g_app.segDispFg +
                                  g_app.segDispRtxVsr + g_app.segDispRtxHdr + g_app.segDispConv +
                                  g_app.segDispQueue) > 0.0f;
-            g_app.fps = JsonGetFloat(body, SK_FPS, 0);
-            // 缺键即清(与状态字段同款规则;旧手写版缺键保留旧值,换卡残留)。
-            if (!JsonGetString(body, SK_GPU_NAME, g_app.gpuName, sizeof(g_app.gpuName)))
-                g_app.gpuName[0] = 0;
+            g_app.fps = st.fps;
+            CopyStatStr(g_app.gpuName, st.gpuName);
         } else {
             // 死亡 body(passthrough / ngx_faulted):清掉冻结的旧统计与
             // 分段,让状态行成为唯一内容。
@@ -1068,7 +1022,7 @@ void ShowTip(const char *u8tip) noexcept {
     ImGui::EndTooltip();
 }
 
-// SK_FG_ROUTE_EFFECTIVE → 中文标签(状态带与诊断页共用;off/空/未知 = 不显示)
+// StatsPayload.fgRouteEff → 中文标签(状态带与诊断页共用;off/空/未知 = 不显示)
 const char *FgRouteLabel(const char *v) noexcept {
     if (!v || !v[0]) return "";
     if (std::strcmp(v, "official-hook") == 0) return "官方 NGX(0.3.x 代理接管)";
@@ -1203,7 +1157,7 @@ void DrawUi() noexcept {
     if (g_app.statsRes[0]) {
         ImGui::TextDisabled("%s", g_app.statsRes);
     }
-    // 滤镜状态行(SK_FILTER_STATE):这是降级/故障在面板上的唯一可见信号
+    // 滤镜状态行(StatsPayload.filterState):这是降级/故障在面板上的唯一可见信号
     // (GUI mpv 看不到日志,timing log 没人看)。空 = 正常。主面板保持
     // 纯净调参体验:请求 vs 实际的分级红显集中在"诊断"页。
     {

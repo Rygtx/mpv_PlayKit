@@ -546,15 +546,12 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         // ("NR+FG+RTX disabled")/init 失败/死亡态 —— 那些状态 NR 本就
         // 不可能 live 恢复,面板 needsReseek 判据随之简化为
         // "passthrough 恒重建"。
-        char body[160];
         if (nrLive && !d->initOk) {
-            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"%s\"}",
-                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL,
-                          vsdlssnr::kStateNrSeekInit);
-        } else {
-            body[0] = '\0';
+            vsdlssnr::StatsPayload st{};
+            vsdlssnr::CopyStatStr(st.filterState, "passthrough");
+            vsdlssnr::CopyStatStr(st.stateDetail, vsdlssnr::kStateNrSeekInit);
+            vsdlssnr::PublishStats(st);
         }
-        if (body[0]) vsdlssnr::PublishStatsJson(body);
     }
 
     if (d->fgActive) {
@@ -1251,13 +1248,13 @@ static void VS_CC DlssnrCreate(
             vsapi->logMessage(mtWarning, msg, core);
             vsdlssnr::TimingStatusLine(msg); // GUI mpv 不透传 logMessage,失败必须进 timing log
             // 面板可见状态:D3D12/NGX 初始化失败 = 本实例整体直通。原因串
-            // 可能含 D3D12 debug-layer 文本(引号),消毒后再进 stats。
+            // 可能含 D3D12 debug-layer 文本,消毒控制字符后再进 stats。
             char safe[288];
             vsdlssnr::SanitizeJsonDetail(err, safe, sizeof(safe));
-            char body[384];
-            std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"%.200s\"}",
-                          vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL, safe);
-            vsdlssnr::PublishStatsJson(body);
+            vsdlssnr::StatsPayload st{};
+            vsdlssnr::CopyStatStr(st.filterState, "passthrough");
+            vsdlssnr::CopyStatStr(st.stateDetail, safe);
+            vsdlssnr::PublishStats(st);
         }
     }
     if (!initial.nrEnabled && !initial.fgEnabled && !rtxRequested) {
@@ -1267,10 +1264,10 @@ static void VS_CC DlssnrCreate(
         // 面板仍被拉起并可实时控制 —— 已激活会话 live 重开立即恢复;创建即
         // 全关的实例重开需下个 seek(停泊热上下文原样保留,同参数重开走
         // 秒回的热复用)。
-        char body[192];
-        std::snprintf(body, sizeof(body), "{\"%s\":\"passthrough\",\"%s\":\"NR+FG+RTX disabled (panel/vpy)\"}",
-                      vsdlssnr::SK_FILTER_STATE, vsdlssnr::SK_STATE_DETAIL);
-        vsdlssnr::PublishStatsJson(body);
+        vsdlssnr::StatsPayload st{};
+        vsdlssnr::CopyStatStr(st.filterState, "passthrough");
+        vsdlssnr::CopyStatStr(st.stateDetail, "NR+FG+RTX disabled (panel/vpy)");
+        vsdlssnr::PublishStats(st);
         if (!vsdlssnr::BridgeStart(d->params)) WarnBridgeFailed(core, vsapi);
         vsdlssnr::TimingStatusLine("DLSSNR STATUS: NR+FG+RTX disabled; passthrough (zero GPU)");
     }
