@@ -142,7 +142,7 @@ struct FrameSlot {
     ComPtr<ID3D12GraphicsCommandList> tsPreGenCommandList;
     ComPtr<ID3D12CommandAllocator> tsPostGenAllocator;
     ComPtr<ID3D12GraphicsCommandList> tsPostGenCommandList;
-    ComPtr<ID3D12Resource> tsReadback;      // 64 字节 READBACK(6×UINT64),persist-mapped
+    ComPtr<ID3D12Resource> tsReadback;      // 128 字节 READBACK(16×UINT64,布局见上),persist-mapped
     void *tsReadbackMapped = nullptr;
     UINT64 tsGpuCal = 0;                    // 校准点 GPU tick(base 提交时)
     UINT64 tsCpuCal = 0;                    // 校准点 QPC
