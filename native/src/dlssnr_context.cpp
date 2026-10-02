@@ -3561,7 +3561,12 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     {
                         const wchar_t *names[3]{ L"dump_yuvin_y.bin", L"dump_yuvin_u.bin", L"dump_yuvin_v.bin" };
                         for (int i = 0; i < 3; ++i) {
-                            dumpOrLog(_d3d12->YuvInPlane(*ff->slot, i), names[i]);
+                            if (!_d3d12->DumpYuvInPlane(*ff->slot, i, (base / names[i]).c_str())) {
+                                char msg[160];
+                                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED",
+                                              names[i]);
+                                TimingStatusLine(msg);
+                            }
                         }
                     }
                     // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):

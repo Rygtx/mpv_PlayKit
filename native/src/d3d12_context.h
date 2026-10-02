@@ -158,19 +158,18 @@ struct FrameSlot {
     // tsrv_probe.cpp)按原形态复核未复现:R32_UINT typed SRV 绑 UPLOAD +
     // 分配器触发序列 + CS 真消费 + debug layer,70 轮零 device removed。
     // 与当年代码无交集(不存在被修复/绕过的中间层),唯一未控变量是驱动
-    // 版本本身。绕道照旧:拷贝成本小、长期稳定,不为省两次拷贝赌单机
-    // 单驱动结论。GPU 侧消费一律经 yuvIn 纹理(Texture2D SRV,全仓惯用
-    // 形态)。
+    // 版本本身。2026-10-02 用户裁定:输入侧启用直读(typed buffer SRV,
+    // 3×upload→yuvIn 拷贝与 yuvIn 纹理已撤);输出侧仍绕道 —— READBACK 堆
+    // 不允许 UAV,shader 无法直写 CPU 可见内存,一趟拷贝是 D3D12 地板。
     ComPtr<ID3D12Resource> uploadYuv[3];
     void *uploadYuvMapped[3] = {};
     size_t uploadPitchYuv[3] = {};
     ComPtr<ID3D12Resource> readbackYuv[3];
     void *readbackYuvMapped[3] = {};
     size_t readbackPitchYuv[3] = {};
-    // GPU 侧 YUV 纹理:In = upload 拷贝进来供 YUV→RGB 采样;Out = RGB→YUV
-    // dispatch 写出供 readback。格式 R8_UNORM(8bit)/R16_UNORM(10bit),
-    // 10bit 存储字 = VS P10 采样值(右对齐 0-1023,2026-09-08 实测)。
-    ComPtr<ID3D12Resource> yuvIn[3];
+    // GPU 侧 YUV 纹理:Out = RGB→YUV dispatch 写出供 readback。格式
+    // R8_UNORM(8bit)/R16_UNORM(10bit),10bit 存储字 = VS P10 采样值
+    // (右对齐 0-1023,2026-09-08 实测)。
     ComPtr<ID3D12Resource> yuvOut[3];
     ComPtr<ID3D12Resource> inputColor;   // W×H BGRA8,UAV(YUV→RGB 转换直写)
     ComPtr<ID3D12Resource> outputColor;  // W×H BGRA8, UAV (NGX / composite write)
@@ -393,10 +392,10 @@ public:
     // **cl 由调用方显式给定** —— postCopy 回调拿到的是 nvof CL,槽 CL 路径
     // 传 slot.commandList;录错列表 = 命令被对方 Reset 销毁(首测实锤:
     // 转换被 Reset 吃掉,NVOF/NGX 全链吃零 → 黑帧)。
-    // ConvertInput:3×yuvUpload→yuvIn 拷贝(COPY_DEST→NSR)→ dispatch 采样
-    // Y/U/V 双线性上采色度、按矩阵/范围展开 → UAV 直写 inputColor →
-    // stateAfter(NSR=NGX 待读 / COMMON=直通拷贝);yuvIn 收尾归 COMMON。
-    // 纯录制,无失败路径(void)。
+    // ConvertInput:dispatch 以 typed buffer SRV 直读 uploadYuv(t0-t2)——
+    // 采样 Y/U/V 双线性上采色度、按矩阵/范围展开 → UAV 直写 inputColor →
+    // stateAfter(NSR=NGX 待读 / COMMON=直通拷贝)。UPLOAD 堆 buffer 恒
+    // GENERIC_READ,SRV 绑定免屏障。纯录制,无失败路径(void)。
     void RecordConvertInput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                             ColorMatrix matrix, ColorRange range,
                             D3D12_RESOURCE_STATES stateAfter) noexcept;
@@ -606,9 +605,10 @@ public:
     static constexpr UINT kUavFgBack = 51;       // fgBack 的 UAV(PQ 域插帧编码 pass 写)
     static constexpr UINT kSrvTemporalOut = 52;  // temporalOut 的 SRV(稳定帧下游消费)
     static constexpr UINT kUavTemporalOut = 53;  // temporalOut 的 UAV(RecordTemporal 写)
-    // YUV 原生化 dump/调试:输出/输入平面([0]=Y [1]=U [2]=V)。
+    // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V);输入平面直落
+    // upload 映射(DumpYuvInPlane,行宽挤掉 pitch 填充,GPU 已收敛后调用)。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
-    ID3D12Resource *YuvInPlane(FrameSlot &s, int plane) const noexcept { return s.yuvIn[plane].Get(); }
+    bool DumpYuvInPlane(FrameSlot &s, int plane, const wchar_t *path) noexcept;
     // 管线色缓冲格式:>8bit 且无 RTX = RGBA16F(NR 全程 10bit);VSR-only
     // 10bit = R10G10B10A2(消 2bit 量化);其余 RTX 会话 BGRA8(TrueHDR 拒
     // FP16,否决制);VSDLSSNR_NR_FORMAT=fp16/bgra8/rgb10a2 强制覆盖。
