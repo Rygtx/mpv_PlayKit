@@ -64,7 +64,8 @@ $ngxLibPath = Join-Path $ngxLib "nvsdk_ngx_s.lib"
 Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" $ngxLibPath $ngxLibSha256
 
 # --- Official signed NGX FG runtime (PORTING #8 官方帧生成后端) ---
-# 落到 vendor\ngx\ 与模型 DLL 同目录,打包脚本按存在与否选装;官方链是 FG
+# 落到 vendor\ngx\(vendor 只放脚本可拉取件,手动模型在 vendor_manual\),
+# 打包脚本按存在与否选装;官方链是 FG
 # 唯一路径,RTX 30/20 由 dlssg_for_sm86 0.3.x hook 代理接管交付(自动档
 # 预载)。SHA-256 钉死(commit 已钉,raw 文件 immutable):HTML 错误页/
 # LFS 指针/截断/漂移全拦,与 RTX SDK 的 zip 哈希钉同一机制。
@@ -110,7 +111,10 @@ if (-not (Test-Path $fgProxyDll) -or (Get-FileHash -LiteralPath $fgProxyDll -Alg
 # 上限只是钳位,倍数由插件按面板请求,常开无副作用,免去"首次切 5x/6x
 # 需重启"的过渡态。仅裁剪部署副本,vendor 是可重建暂存区。
 if (Test-Path $fgProxyIni) {
-    $iniText = Get-Content $fgProxyIni -Raw
+    # 必须显式 UTF8:无 BOM 文件 PS 5.1 默认按 ANSI(GBK)读,中文注释
+    # 过一遍会变乱码,且句号尾字节+换行会被当 GBK 双字节吞掉 —— 换行一丢,
+    # Optimized=1 粘上前一行,面板"内核档位"下拉就地找不到键,写入必失败。
+    $iniText = Get-Content $fgProxyIni -Raw -Encoding UTF8
     if ($iniText -notmatch '(?m)^MaxGeneratedFrames=5\s*$') {
         $iniText = $iniText -replace '(?m)^MaxGeneratedFrames=\d+\s*$', "MaxGeneratedFrames=5"
         # 替换必须命中:上游删键/改名的话静默丢 6X 上限,不如当场炸。
