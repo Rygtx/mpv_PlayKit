@@ -50,4 +50,61 @@ wchar_t *MpvParseIpcServerName(const wchar_t *confPath) noexcept {
     return nullptr;
 }
 
+void MpvPipeDefaultNames(const wchar_t *candidates[kMpvPipeMaxCandidates]) noexcept {
+    candidates[0] = nullptr;
+    candidates[1] = L"mpvpipe";
+    candidates[2] = L"mpvsocket";
+    candidates[3] = L"umpv";
+}
+
+HANDLE MpvPipeOpen(const wchar_t *const *candidates, bool overlapped,
+                   wchar_t *nameOut, size_t nameLen) noexcept {
+    for (int i = 0; i < kMpvPipeMaxCandidates; ++i) {
+        if (!candidates[i] || !candidates[i][0]) continue;
+        wchar_t pipePath[MAX_PATH];
+        swprintf_s(pipePath, L"\\\\.\\pipe\\%s", candidates[i]);
+        HANDLE pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
+                                  0, nullptr, OPEN_EXISTING,
+                                  overlapped ? FILE_FLAG_OVERLAPPED : 0,
+                                  nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) continue;
+        if (nameOut && nameLen) swprintf_s(nameOut, nameLen, L"%ls", candidates[i]);
+        return pipe;
+    }
+    return nullptr;
+}
+
+bool MpvPipeSendBounded(HANDLE pipe, const char *cmd, size_t len) noexcept {
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) return false;
+    OVERLAPPED ov{};
+    ov.hEvent = ev;
+    const DWORD cmdLen = static_cast<DWORD>(len);
+    DWORD written = 0;
+    // 写入有界等待:ERROR_IO_PENDING 后等事件,超时视为失败。
+    bool ok = WriteFile(pipe, cmd, cmdLen, &written, &ov) ||
+              (GetLastError() == ERROR_IO_PENDING &&
+               WaitForSingleObject(ev, 500) == WAIT_OBJECT_0 &&
+               GetOverlappedResult(pipe, &ov, &written, FALSE));
+    ok = ok && written == cmdLen;
+    if (ok) {
+        // 回执只排空,成败不影响 ok(两侧同语义);超时按无回执放行。
+        ResetEvent(ev);
+        char ack[128]{};
+        DWORD got = 0;
+        if (!ReadFile(pipe, ack, sizeof(ack) - 1, &got, &ov) &&
+            GetLastError() == ERROR_IO_PENDING &&
+            WaitForSingleObject(ev, 500) != WAIT_OBJECT_0) {
+            CancelIoEx(pipe, &ov);
+            GetOverlappedResult(pipe, &ov, &got, TRUE); // 收割中止态,防悬悬
+        }
+    } else {
+        CancelIoEx(pipe, &ov);
+        DWORD got = 0;
+        GetOverlappedResult(pipe, &ov, &got, TRUE);
+    }
+    CloseHandle(ev);
+    return ok;
+}
+
 } // namespace vsdlssnr

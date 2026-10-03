@@ -1,8 +1,10 @@
 #pragma once
-// d3d12 子系统 TU 共享内部助手(2026-10-04 拆出):根签名/PSO 工厂与 YUV
-// 系数。消费者 = d3d12_context.cpp 与各 d3d12_<子系统>.cpp。
+// d3d12 子系统 TU 共享内部助手(2026-10-04 拆出):根签名/PSO 工厂与槽堆
+// 句柄绑定(多 TU 真共用件)。单消费者助手不下放此处:YuvCoeffsFor 归
+// d3d12_convert.cpp 本地、CreateOfPso 归 d3d12_of.cpp 本地(2026-10-05)。
 #include "d3d12_context.h"
 #include <d3dcompiler.h>
+#include <cstdio>
 #include <cstring>
 
 namespace vsdlssnr {
@@ -38,46 +40,6 @@ struct HeapBinder {
     // 录制侧调用形态:句柄实例直接当函数用(替代原 gpu lambda)。
     D3D12_GPU_DESCRIPTOR_HANDLE operator()(UINT i) const { return gpu(i); }
 };
-
-
-// YUV↔RGB 转换系数(按位深/矩阵/范围推导,root constants 下发)。全程
-// 归一域 [0,1](Y)/[-0.5,0.5](C);shader 端与 CPU 参考实现共用同一组
-// 公式。10-bit 的有限范围常量 = 8-bit ×4(16→64 等)。
-// containerMax = UNORM 容器满值(255/65535):round(UNORM读出×containerMax)
-// 精确还原整数采样字;sampleMax = 采样值域上限(255/1023)。
-struct YuvCoeffs {
-    float containerMax;
-    float sampleMax;
-    float yLo, ySpan;   // limited: 16/219(8bit) 64/876(10bit);full: 0/sampleMax
-    float cMid, cSpan;  // limited: 128/224 512/896;full: sampleMax/2
-    float kr, kb;       // 709: 0.2126/0.0722;601: 0.299/0.114
-};
-
-inline YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept {
-    YuvCoeffs c{};
-    // 容器字宽:8bit 单字节;>8bit(VS 10/12/14/16)统一 16bit 容器右对齐
-    // 采样字(VS 约定),R16 footprint 直传,无位移。
-    c.containerMax = depth > 8 ? 65535.0f : 255.0f;
-    c.sampleMax = static_cast<float>((1 << depth) - 1);
-    // limited 阶梯 = 8bit 基准按位左移(10bit: 64/876/512/896;12bit:
-    // 256/3504/2048/3584 —— ITU 量化表同构)。注意是 ×(1<<(depth-8)) 而非
-    // ×(sampleMax/255):1023/255=4.0118 ≠ 4,等比会偏出 0.2 个码。
-    const float shift = depth > 8 ? static_cast<float>(1 << (depth - 8)) : 1.0f;
-    if (range == ColorRange::Limited) {
-        c.yLo = 16.0f * shift;
-        c.ySpan = 219.0f * shift;
-        c.cMid = 128.0f * shift;
-        c.cSpan = 224.0f * shift;
-    } else {
-        c.yLo = 0.0f;
-        c.ySpan = c.sampleMax;
-        c.cMid = c.sampleMax * 0.5f;
-        c.cSpan = c.sampleMax * 0.5f;
-    }
-    c.kr = matrix == ColorMatrix::BT709 ? 0.2126f : 0.299f;
-    c.kb = matrix == ColorMatrix::BT709 ? 0.0722f : 0.114f;
-    return c;
-}
 
 
 // 通用 compute 根签名工厂:b0(numConsts)+ srvCount 张独立 SRV 表 +
@@ -170,17 +132,6 @@ inline bool CreateComputePsoFor(ID3D12Device *device, const char *hlsl, const ch
         return fail("CreateComputePipelineState failed");
     }
     return true;
-}
-
-// AMD 光流后端通用 cs_5_0 PSO 构造(CreateComputeRs + CreateComputePsoFor
-// 的单入口封装,FFX/motion scale 三处调用保留原签名)。
-inline bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
-                 UINT numConsts, UINT srvCount, UINT uavCount,
-                 ID3D12RootSignature **rs, ID3D12PipelineState **pso,
-                 const char *label, char *err, size_t errLen) noexcept {
-    return CreateComputeRs(device, numConsts, srvCount, uavCount, rs, label,
-                           nullptr, err, errLen) &&
-           CreateComputePsoFor(device, hlsl, entry, *rs, pso, label, err, errLen);
 }
 
 

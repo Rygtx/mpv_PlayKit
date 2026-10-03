@@ -1,6 +1,7 @@
 // mpv 管道 IPC(2026-10-03 自 panel_app.cpp 拆出):一次性命令(reseek)与
-// HDR 打标持久连接两条路径此前各写一份候选连接循环,本件连同连接层一起
-// 收口(OpenMpvPipe)。
+// HDR 打标持久连接两条路径此前各写一份候选连接循环,连接/发送层已收口
+// mpv_pipe_common(MpvPipeOpen/MpvPipeSendBounded;2026-10-05 起与插件
+// resize watcher 同一份实现)。
 
 #include "panel_shared.h"
 #include "mpv_pipe_common.h"
@@ -35,10 +36,9 @@ LARGE_INTEGER g_pipeFailQpc{};
 bool g_pipeFailStamped = false;
 
 wchar_t *ResolveMpvPipeCandidates(const wchar_t **candidates) noexcept {
-    candidates[0] = nullptr;
-    candidates[1] = L"mpvpipe";
-    candidates[2] = L"mpvsocket";
-    candidates[3] = L"umpv";
+    // 默认兜底名收口 mpv_pipe_common(与插件 resize watcher 同一份,
+    // 2026-10-05 —— 候选列表/连接/有界发送三条轴此前各写一份)。
+    MpvPipeDefaultNames(candidates);
     if (g_pipeResolved) {
         candidates[0] = g_pipeResolved;
         return _wcsdup(g_pipeResolved);
@@ -72,26 +72,8 @@ wchar_t *ResolveMpvPipeCandidates(const wchar_t **candidates) noexcept {
     return parsedName;
 }
 
-// 候选管道连接(一次性命令与打标持久连接两客户端共用;此前各写一份
-// 候选循环):按序尝试 CreateFileW,命中即返回。overlapped = 命令路径
-// (500ms 有界 IO);打标走阻塞形态(线程私有连接,生命周期语义自管)。
-// nameOut 可空;调用方传单一候选指针即得"逐候选"语义。
-static HANDLE OpenMpvPipe(const wchar_t *const *candidates, bool overlapped,
-                          wchar_t *nameOut, size_t nameLen) noexcept {
-    for (int i = 0; i < 4; ++i) {
-        if (!candidates[i] || !candidates[i][0]) continue;
-        wchar_t pipePath[MAX_PATH];
-        swprintf_s(pipePath, L"\\\\.\\pipe\\%s", candidates[i]);
-        HANDLE pipe = CreateFileW(pipePath, GENERIC_READ | GENERIC_WRITE,
-                                  0, nullptr, OPEN_EXISTING,
-                                  overlapped ? FILE_FLAG_OVERLAPPED : 0,
-                                  nullptr);
-        if (pipe == INVALID_HANDLE_VALUE) continue;
-        if (nameOut && nameLen) swprintf_s(nameOut, nameLen, L"%ls", candidates[i]);
-        return pipe;
-    }
-    return nullptr;
-}
+// 候选管道连接/有界发送已收口 mpv_pipe_common(MpvPipeOpen/MpvPipeSendBounded,
+// 2026-10-05;与插件 resize watcher 同一份实现)。
 } // namespace
 
 // 面板→mpv 原地重载请求(唯一消费者 = reseek;原"通用 MpvIpcSendCmd"单
@@ -113,41 +95,9 @@ bool TriggerMpvReseek() noexcept {
     for (int i = 0; i < 4 && !ok; ++i) {
         if (!candidates[i] || !candidates[i][0]) continue;
         // 逐候选连接(单一候选指针 = 逐候选语义;写失败继续下一候选)。
-        HANDLE pipe = OpenMpvPipe(&candidates[i], /*overlapped=*/true, nullptr, 0);
+        HANDLE pipe = MpvPipeOpen(&candidates[i], /*overlapped=*/true, nullptr, 0);
         if (!pipe) continue;
-        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ev) {
-            CloseHandle(pipe);
-            continue;
-        }
-        OVERLAPPED ov{};
-        ov.hEvent = ev;
-        const DWORD cmdLen = static_cast<DWORD>(sizeof(kSeekCmd) - 1);
-        DWORD written = 0;
-        // 写入有界等待:ERROR_IO_PENDING 后等事件,超时视为该候选失败。
-        const bool wrote =
-            WriteFile(pipe, kSeekCmd, cmdLen, &written, &ov) ||
-            (GetLastError() == ERROR_IO_PENDING &&
-             WaitForSingleObject(ev, 500) == WAIT_OBJECT_0 &&
-             GetOverlappedResult(pipe, &ov, &written, FALSE));
-        ok = wrote && written == cmdLen;
-        if (ok) {
-            // 回执只做排空,成败不影响 ok(原语义);超时按无回执放行。
-            ResetEvent(ev);
-            char ack[128]{};
-            DWORD got = 0;
-            if (!ReadFile(pipe, ack, sizeof(ack) - 1, &got, &ov) &&
-                GetLastError() == ERROR_IO_PENDING &&
-                WaitForSingleObject(ev, 500) != WAIT_OBJECT_0) {
-                CancelIoEx(pipe, &ov);
-                GetOverlappedResult(pipe, &ov, &got, TRUE); // 收割中止态,防悬悬
-            }
-        } else {
-            CancelIoEx(pipe, &ov);
-            DWORD got = 0;
-            GetOverlappedResult(pipe, &ov, &got, TRUE);
-        }
-        CloseHandle(ev);
+        ok = MpvPipeSendBounded(pipe, kSeekCmd, sizeof(kSeekCmd) - 1);
         CloseHandle(pipe);
         if (ok) {
             PanelLog("panel: mpv reseek via IPC pipe %ls", candidates[i]);
@@ -238,7 +188,7 @@ bool HdrTagTick(HdrTagConn &c, int want) noexcept {
     if (!c.pipe) {
         const wchar_t *candidates[4];
         wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
-        c.pipe = OpenMpvPipe(candidates, /*overlapped=*/false,
+        c.pipe = MpvPipeOpen(candidates, /*overlapped=*/false,
                              c.name, std::size(c.name));
         free(parsedName);
         if (!c.pipe) return false; // mpv 不在/IPC 未起:下拍重试,不闩锁

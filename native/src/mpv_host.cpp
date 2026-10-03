@@ -2,17 +2,17 @@
 // plugin.cpp 拆出)。
 #include "mpv_host.h"
 #include "mpv_pipe_common.h"
-#include "dlssnr_context.h" // TimingStatusLine
+#include "status_line.h" // TimingStatusLine(前置声明收拢件)
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <filesystem>
 #include <memory>
+#include <new>
 
 namespace vsdlssnr {
-
-void TimingStatusLine(const char *line) noexcept; // 本体在 dlssnr_context(免重 include)
 
 // ---- RTX Video:目标尺寸的"跟随播放器"落点 ----
 // 探测本进程 mpv vo 窗口:**客户区尺寸 = mpv 的 osd-dimensions 等价**
@@ -94,75 +94,38 @@ bool ResizeWatchSendSeek() noexcept {
     // 名部署下面板 reseek 正常而本线程静默失效,双实现分叉的实害)。
     // conf 按 mpv.exe 目录(宿主进程可执行文件)定位。解析结果进程级缓存
     // (conf 中途改动需重启 mpv,与面板侧同语义)。
-    // 写/读 overlapped + 500ms 有界(2026-09-25):原同步 ReadFile 无超时,
-    // mpv 挂起时本线程永久滞留 —— watcher 名额上限 2,滞留 = 自动跟随静默
-    // 失效到进程退出。
-    const wchar_t *candidates[4] = { nullptr, L"mpvpipe", L"mpvsocket", L"umpv" };
+    // 候选列表/连接/写读 overlapped + 500ms 有界均已收口 mpv_pipe_common
+    // (2026-10-05,与面板 reseek 同一份实现;原同步 ReadFile 无超时,mpv
+    // 挂起时本线程永久滞留 —— watcher 名额上限 2,滞留 = 自动跟随静默失效)。
+    const wchar_t *candidates[kMpvPipeMaxCandidates];
+    MpvPipeDefaultNames(candidates);
     static wchar_t *g_confPipe = nullptr; // 进程级缓存(nullptr = 解析过且无)
     static bool g_confProbed = false;
     if (!g_confProbed) {
         g_confProbed = true;
         wchar_t exe[MAX_PATH];
         if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-            wchar_t *slash = nullptr;
-            for (wchar_t *p = exe; *p; ++p)
-                if (*p == L'\\' || *p == L'/') slash = p;
-            if (slash) {
-                wchar_t confPath[MAX_PATH];
-                swprintf_s(confPath, L"%.*s\\portable_config\\mpv.conf",
-                           static_cast<int>(slash - exe), exe);
-                g_confPipe = vsdlssnr::MpvParseIpcServerName(confPath);
-            }
+            const std::filesystem::path confPath =
+                std::filesystem::path(exe).parent_path() / L"portable_config" / L"mpv.conf";
+            g_confPipe = MpvParseIpcServerName(confPath.c_str());
         }
     }
     candidates[0] = g_confPipe;
+    static constexpr char kSeekCmd[] =
+        "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
     for (const wchar_t *name : candidates) {
-        wchar_t path[MAX_PATH];
-        swprintf_s(path, L"\\\\.\\pipe\\%s", name);
-        HANDLE pipe = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-                                  0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
-                                  nullptr);
-        if (pipe == INVALID_HANDLE_VALUE) continue;
-        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ev) {
+        HANDLE pipe = MpvPipeOpen(&name, /*overlapped=*/true, nullptr, 0);
+        if (!pipe) continue;
+        if (!MpvPipeSendBounded(pipe, kSeekCmd, sizeof(kSeekCmd) - 1)) {
             CloseHandle(pipe);
             continue;
         }
-        OVERLAPPED ov{};
-        ov.hEvent = ev;
-        const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
-        const DWORD cmdLen = static_cast<DWORD>(strlen(cmd));
-        DWORD written = 0;
-        bool ok =
-            WriteFile(pipe, cmd, cmdLen, &written, &ov) ||
-            (GetLastError() == ERROR_IO_PENDING &&
-             WaitForSingleObject(ev, 500) == WAIT_OBJECT_0 &&
-             GetOverlappedResult(pipe, &ov, &written, FALSE));
-        ok = ok && written == cmdLen;
-        if (ok) {
-            ResetEvent(ev);
-            char ack[128]{};
-            DWORD got = 0;
-            if (!ReadFile(pipe, ack, sizeof(ack) - 1, &got, &ov) &&
-                GetLastError() == ERROR_IO_PENDING &&
-                WaitForSingleObject(ev, 500) != WAIT_OBJECT_0) {
-                CancelIoEx(pipe, &ov);
-                GetOverlappedResult(pipe, &ov, &got, TRUE);
-            }
-        } else {
-            CancelIoEx(pipe, &ov);
-            DWORD got = 0;
-            GetOverlappedResult(pipe, &ov, &got, TRUE);
-        }
-        CloseHandle(ev);
         CloseHandle(pipe);
-        if (ok) {
-            char msg[128];
-            std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: resize reload seek via IPC pipe %ls", name);
-            vsdlssnr::TimingStatusLine(msg);
-            return true;
-        }
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: resize reload seek via IPC pipe %ls", name);
+        TimingStatusLine(msg);
+        return true;
     }
     return false;
 }
@@ -207,7 +170,14 @@ HANDLE MpvResizeWatchStart(int srcW, int srcH, int refH, bool vsrAutoMode) noexc
     HANDLE stop = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset 停旗
     if (!stop) return nullptr;
     g_resizeWatchers.fetch_add(1, std::memory_order_relaxed);
-    auto *ctx = new ResizeWatchCtx{ srcW, srcH, refH, stop };
+    // nothrow new:本函数 noexcept,抛式 new 的分配失败会变 std::terminate
+    // 杀掉整个 mpv 进程 —— 按本函数既有契约优雅降级(nullptr = 跟随关闭)。
+    auto *ctx = new (std::nothrow) ResizeWatchCtx{ srcW, srcH, refH, stop };
+    if (!ctx) {
+        CloseHandle(stop);
+        g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
+        return nullptr;
+    }
     HANDLE th = CreateThread(nullptr, 0, ResizeWatchProc, ctx, 0, nullptr);
     if (th) {
         CloseHandle(th);

@@ -1,6 +1,7 @@
 // NGX NR 模型选档实现(契约见 ngx_variant.h;2026-10-04 自 plugin.cpp 拆出)。
 #include "ngx_variant.h"
 #include "nv_gpu_probe.h"
+#include "status_line.h" // TimingStatusLine(前置声明收拢件)
 
 #include <windows.h>
 
@@ -8,9 +9,6 @@
 #include <algorithm>
 
 namespace vsdlssnr {
-
-// 闩锁留痕出口(本体在 dlssnr_context;避免重 include,重复声明合法)。
-void TimingStatusLine(const char *line) noexcept;
 
 namespace {
 
@@ -47,10 +45,8 @@ bool ForeignVersionDllResident() noexcept {
     for (int i = 0; i < n; ++i) {
         wchar_t path[MAX_PATH]{};
         if (!modName(GetCurrentProcess(), mods[i], path, MAX_PATH)) continue;
-        const wchar_t *base = path;
-        for (const wchar_t *p = path; *p; ++p)
-            if (*p == L'\\' || *p == L'/') base = p + 1;
-        if (lstrcmpiW(base, L"version.dll") != 0) continue;
+        const std::wstring base = std::filesystem::path(path).filename().wstring();
+        if (lstrcmpiW(base.c_str(), L"version.dll") != 0) continue;
         if (sysLen && sysLen < MAX_PATH &&
             CompareStringOrdinal(path, static_cast<int>(sysLen),
                                  sysDir, static_cast<int>(sysLen), TRUE) == CSTR_EQUAL &&
@@ -140,7 +136,5 @@ std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
     vsdlssnr::TimingStatusLine(msg);
     return chosen.wstring();
 }
-
-
 
 } // namespace vsdlssnr

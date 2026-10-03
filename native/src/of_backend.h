@@ -29,12 +29,9 @@
 
 #include "dlssnr_params.h" // kOfBackend* 常量(Kind() 返回值;params 为唯一权威)
 #include "d3d12_context.h" // OfClRotator:IsDeviceLost / ResetAllocatorHealed(自身不含本件,无环)
+#include "status_line.h"   // TimingStatusLine(前置声明收拢件;本体在 dlssnr_context)
 
 namespace vsdlssnr {
-
-// 闩锁留痕出口(本体内 TimingStatusLine 在 dlssnr_context;避免反向 include,
-// 重复声明合法)。
-void TimingStatusLine(const char *line) noexcept;
 
 // 栅栏值到达等待(两光流后端共用):共享 auto-reset 事件的唤醒可能被同
 // 事件的其它等待者窃取(单次 Wait 返回不代表本等待的目标值已达成),循环

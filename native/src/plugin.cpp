@@ -8,10 +8,8 @@
 #include "dlssfg_gate.h"
 #include "dlssnr_context.h"
 #include "dlssnr_params.h"
-#include "mpv_pipe_common.h" // resize watcher 的 mpv.conf 管道名解析(与面板共用)
 #include "mpv_host.h"
 #include "ngx_variant.h"
-#include "nv_gpu_probe.h" // NR 模型选档的 GPU 架构探测(中立件,非 FG 门所属)
 #include "panel_ipc.h"
 #include "shared_params.h"
 
@@ -41,7 +39,7 @@ using vsdlssnr::kFgGenSlots; // FG 插值槽数上界(d3d12_context.h,kFgMultMax
 // plugin.cpp 是 vsrAutoHeight 的唯一写入点)。srcW/srcH = 源分辨率。
 // 探测失败(无可见窗口)写 0:mode=1 消费侧按"目标=源"处理 = VSR 旁路,
 // 窗口出现后的链重建重新探测并启用。
-void ResolveRtxParams(DlssnrParams &p, int srcW, int srcH) noexcept {
+static void ResolveRtxParams(DlssnrParams &p, int srcW, int srcH) noexcept {
     if (p.rtxVsrMode == 1) {
         const vsdlssnr::MpvDisplayPick disp = vsdlssnr::MpvDetectTargetSize(srcW, srcH);
         p.rtxVsrAutoHeight = disp.height > 0 ? disp.height : 0;

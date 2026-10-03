@@ -1,16 +1,27 @@
 #include "d3d12_context.h"
 #include "d3d12_internal.h"
 #include "d3d12_shaders.h"
-
-#include <algorithm>
-#include <cstdio>
+#include "status_line.h" // TimingStatusLine/ProbeEnabled(前置声明收拢件)
 
 // 光流 guidance 子系统(NVOF densify/guidance、FFX、mvec 放大; CreateOfObjects)—— 方法体逐字迁移。
 
 namespace vsdlssnr {
 
-void TimingStatusLine(const char *line) noexcept; // 本体在 dlssnr_context(免重 include)
-bool ProbeEnabled() noexcept;                    // 同上(VSDLSSNR_PROBE)
+namespace {
+
+// AMD 光流后端通用 cs_5_0 PSO 构造(CreateComputeRs + CreateComputePsoFor
+// 的单入口封装,FFX/motion scale 三处调用保留原签名;2026-10-05 自
+// d3d12_internal.h 下沉 —— 本 TU 唯一消费者)。
+bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
+                 UINT numConsts, UINT srvCount, UINT uavCount,
+                 ID3D12RootSignature **rs, ID3D12PipelineState **pso,
+                 const char *label, char *err, size_t errLen) noexcept {
+    return CreateComputeRs(device, numConsts, srvCount, uavCount, rs, label,
+                           nullptr, err, errLen) &&
+           CreateComputePsoFor(device, hlsl, entry, *rs, pso, label, err, errLen);
+}
+
+} // namespace
 
 bool D3D12Context::CreateOfObjects(char *err, size_t errLen) noexcept {
     // OF guidance/densify + NVOF 输入降采样 + FFX prepare/densify + mvec 放大。
@@ -53,12 +64,12 @@ bool D3D12Context::CreateOfObjects(char *err, size_t errLen) noexcept {
             return false;
         }
     }
-        // mvec 放大(源→PIPE):CreateOfPso 通用形态(1 SRV + 1 UAV + 4 常量)。
-        if (!CreateOfPso(_device.Get(), MVEC_SCALE_HLSL, "ScaleMotion", 4, 1, 1,
-                         _rsMotionScale.GetAddressOf(), _psoMotionScale.GetAddressOf(),
-                         "motion scale", err, errLen)) {
-            return false;
-        }
+    // mvec 放大(源→PIPE):CreateOfPso 通用形态(1 SRV + 1 UAV + 4 常量)。
+    if (!CreateOfPso(_device.Get(), MVEC_SCALE_HLSL, "ScaleMotion", 4, 1, 1,
+                     _rsMotionScale.GetAddressOf(), _psoMotionScale.GetAddressOf(),
+                     "motion scale", err, errLen)) {
+        return false;
+    }
     return true;
 }
 

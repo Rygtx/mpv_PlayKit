@@ -2,15 +2,20 @@
 #include "d3d12_internal.h"
 #include "d3d12_shaders.h"
 
-#include <algorithm>
-#include <cstdio>
-
-// 内部分辨率降采样残差子系统(RebuildScaling/RecordPass 族; CreateResidualObjects)—— 方法体逐字迁移。
+// 内部分辨率降采样残差子系统(RebuildScaling/RecordPass 族; CreateResidualObjects)
+// —— 2026-10-04 Pass 组拆分的派生件,方法体逐字迁移。
+//
+// Residual pipeline (ported from Magpie DLSSNRFilter.cpp, 2d37f8c0 / v0.6.6):
+// two-pass Lanczos2 color downsample (vertical -> horizontal, 1cde1bae
+// "lanczos2-aa"; at equal extents Lanczos2 degenerates to an exact copy) ->
+// NGX evaluate at internal resolution ->
+// PrepareResidual (per-pixel fine controls in the low-resolution domain) ->
+// Catmull-Rom horizontal residual upsample (skipped at equal width) ->
+// Catmull-Rom vertical + composite (saturate(original + residual)).
 
 namespace vsdlssnr {
 
 bool D3D12Context::CreateResidualObjects(char *err, size_t errLen) noexcept {
-    //     残差内部分辨率降采样五段管线(Catmull-Rom;实现归 d3d12_residual.cpp)。
     // 残差五段:b0 = 12 root constants (Magpie ResampleConstants, 48B),
     // t0/t1 独立 SRV 表(the passes need non-adjacent descriptor pairs)+ u0。
     if (!CreateComputeRs(_device.Get(), 12, 2, 1, _rsCompute.GetAddressOf(),

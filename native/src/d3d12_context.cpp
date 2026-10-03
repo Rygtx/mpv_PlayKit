@@ -1,15 +1,12 @@
 #include "d3d12_context.h"
-#include "d3d12_internal.h" // 根签名/PSO 工厂 + YUV 系数(子系统 TU 共享助手)
+#include "d3d12_internal.h" // 槽堆句柄绑定 + RS/PSO 工厂(子系统 TU 共享助手)
 #include "dlssnr_context.h" // TimingStatusLine
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <d3d12sdklayers.h>
-#include <d3dcompiler.h>
-#include <dxgidebug.h>
 #include <thread>
-#include "d3d12_shaders.h" // 全部 HLSL(本 TU 唯一消费者)
 
 namespace vsdlssnr {
 
@@ -1267,8 +1264,6 @@ bool D3D12Context::BeginFrameRecording(FrameSlot &slot) noexcept {
     return ResetAllocatorHealed(slot.allocator.Get(), slot.commandList.Get());
 }
 
-
-
 bool D3D12Context::BeginFgRecording(FrameSlot &slot) noexcept {
     // 与 BeginFrameRecording 同款防砖:上次录制中途失败遗留 open CL 会让
     // allocator Reset 报 E_FAIL —— force-close 一次再试。
@@ -1501,17 +1496,6 @@ bool D3D12Context::UnpackOutput(
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Residual pipeline (ported from Magpie DLSSNRFilter.cpp, 2d37f8c0 / v0.6.6):
-// two-pass Lanczos2 color downsample (vertical -> horizontal, 1cde1bae
-// "lanczos2-aa"; at equal extents Lanczos2 degenerates to an exact copy) ->
-// NGX evaluate at internal resolution ->
-// PrepareResidual (per-pixel fine controls in the low-resolution domain) ->
-// Catmull-Rom horizontal residual upsample (skipped at equal width) ->
-// Catmull-Rom vertical + composite (saturate(original + residual)).
-// ---------------------------------------------------------------------------
-
-
 bool D3D12Context::DumpYuvInPlane(FrameSlot &s, int plane, const wchar_t *path) noexcept {
     // dump_yuvin_*:uploadYuv 已无 Texture2D 中转,从 persist 映射直落 ——
     // 逐行拷 pw×texel 字节(挤掉 pitch 填充,与旧 DumpTextureToFile 布局
@@ -1612,40 +1596,6 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, const wchar_t *path,
     if (!ok) SetErr(err, errLen, E_FAIL, "dump write failed");
     return ok;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// ---------------------------------------------------------------------------
-// NVOF guidance(PORTING 清单 #6)
-// ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-// ---------------------------------------------------------------------------
-// AMD 光流后端(FFX;PSO 录制助手,由 ffxof context 编排)
-// ---------------------------------------------------------------------------
-
-
-
-
-
-
 
 bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
     // 全部根签名/PSO 由子系统 Pass 组 Create*Objects 建立(实现分居各

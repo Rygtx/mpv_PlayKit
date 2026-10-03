@@ -2,12 +2,54 @@
 #include "d3d12_internal.h"
 #include "d3d12_shaders.h"
 
-#include <algorithm>
-#include <cstdio>
-
-// 输出色域转换子系统(RecordColorOutput/HdrToPq/readback 拷贝; CreateConvertObjects)—— 2026-10-04 Pass 组拆分的派生件,方法体逐字迁移。
+// 色域转换子系统(RecordConvertInput/RecordColorOutput/HdrToPq/readback 拷贝;
+// CreateConvertObjects)—— 2026-10-04 Pass 组拆分的派生件,方法体逐字迁移。
 
 namespace vsdlssnr {
+
+namespace {
+
+// YUV↔RGB 转换系数(按位深/矩阵/范围推导,root constants 下发)。全程
+// 归一域 [0,1](Y)/[-0.5,0.5](C);shader 端与 CPU 参考实现共用同一组
+// 公式。10-bit 的有限范围常量 = 8-bit ×4(16→64 等)。
+// containerMax = UNORM 容器满值(255/65535):round(UNORM读出×containerMax)
+// 精确还原整数采样字;sampleMax = 采样值域上限(255/1023)。
+// (2026-10-05 自 d3d12_internal.h 下沉 —— 本 TU 唯一消费者。)
+struct YuvCoeffs {
+    float containerMax;
+    float sampleMax;
+    float yLo, ySpan;   // limited: 16/219(8bit) 64/876(10bit);full: 0/sampleMax
+    float cMid, cSpan;  // limited: 128/224 512/896;full: sampleMax/2
+    float kr, kb;       // 709: 0.2126/0.0722;601: 0.299/0.114
+};
+
+YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept {
+    YuvCoeffs c{};
+    // 容器字宽:8bit 单字节;>8bit(VS 10/12/14/16)统一 16bit 容器右对齐
+    // 采样字(VS 约定),R16 footprint 直传,无位移。
+    c.containerMax = depth > 8 ? 65535.0f : 255.0f;
+    c.sampleMax = static_cast<float>((1 << depth) - 1);
+    // limited 阶梯 = 8bit 基准按位左移(10bit: 64/876/512/896;12bit:
+    // 256/3504/2048/3584 —— ITU 量化表同构)。注意是 ×(1<<(depth-8)) 而非
+    // ×(sampleMax/255):1023/255=4.0118 ≠ 4,等比会偏出 0.2 个码。
+    const float shift = depth > 8 ? static_cast<float>(1 << (depth - 8)) : 1.0f;
+    if (range == ColorRange::Limited) {
+        c.yLo = 16.0f * shift;
+        c.ySpan = 219.0f * shift;
+        c.cMid = 128.0f * shift;
+        c.cSpan = 224.0f * shift;
+    } else {
+        c.yLo = 0.0f;
+        c.ySpan = c.sampleMax;
+        c.cMid = c.sampleMax * 0.5f;
+        c.cSpan = c.sampleMax * 0.5f;
+    }
+    c.kr = matrix == ColorMatrix::BT709 ? 0.2126f : 0.299f;
+    c.kb = matrix == ColorMatrix::BT709 ? 0.0722f : 0.114f;
+    return c;
+}
+
+} // namespace
 
 bool D3D12Context::CreateConvertObjects(char *err, size_t errLen) noexcept {
     // YUV↔RGB 与 RTX 输出色域转换(_rsConvertIn/_rsConvertOut 两 RS 的 PSO 族)。

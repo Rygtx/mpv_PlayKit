@@ -1,6 +1,7 @@
 #include "d3d12_context.h"
 #include "d3d12_internal.h"
 #include "d3d12_shaders.h"
+#include "status_line.h" // TimingStatusLine/ProbeEnabled(前置声明收拢件)
 
 #include <algorithm>
 #include <cstdio>
@@ -9,11 +10,7 @@
 
 namespace vsdlssnr {
 
-void TimingStatusLine(const char *line) noexcept; // 本体在 dlssnr_context(免重 include)
-bool ProbeEnabled() noexcept;                    // 同上(VSDLSSNR_PROBE)
-
 bool D3D12Context::CreateTemporalObjects(char *err, size_t errLen) noexcept {
-    // 抗闪烁时域稳定器(静态采样器;main/reduce 两 PSO 无条件常驻)。
     // 抗闪烁时域稳定器:b0 14 常量(Size2/UseMotion/Route/Weight/
     // MotionExtent2/LowSize2/Pad + Region4)+ t0-t7 八张独立 SRV 表 +
     // u0/u1/u2 三张独立 UAV 表 + 线性静态采样器。主 shader 一份覆盖
