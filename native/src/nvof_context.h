@@ -104,6 +104,7 @@ public:
         return buf;
     }
     int Kind() const noexcept override { return kOfBackendNvof; }
+    NvofContext *AsNvof() noexcept override { return this; }
 
     // 历史失效(seek = 新滤镜实例):下一帧重新播种(清零发布,不 execute)。
     // 同时复位帧序门 —— 新时间线的帧号与旧时间线无关,不清会让新帧被判
@@ -227,19 +228,8 @@ private:
     uint64_t _doneSeq = 0;        // doneFence 单调计数(注册 + execute 共用)
     uint64_t _lastDone = 0;       // 最近一次 execute 的 done 值(copy(n+1) 等它)
     uint64_t _doneByParity[2]{};  // 每个输入槽位最近一次被 execute 写入的 done 值
-    // 队列级 Wait 复核探针(2026-10-02,VSDLSSNR_NVOF_QWAIT=1):旁路 DIRECT
-    // 队列上 Wait(doneFence) → Signal(marker),冲刷点 CPU 等 marker 判定
-    // 队列 Wait 是否被 doneFence 满足。旁路隔离:主链路 CPU 等照旧,探针
-    // 卡死只耗自己的 5s 超时,不伤帧链。stuck×3 判成立停测;采样 30 帧未
-    // 现象自动收摊。
-    Microsoft::WRL::ComPtr<ID3D12CommandQueue> _qwaitQueue;
-    Microsoft::WRL::ComPtr<ID3D12Fence> _qwaitMarker;
-    HANDLE _qwaitEvent = nullptr;
-    uint64_t _qwaitSeq = 0;          // marker 单调计数
-    uint64_t _qwaitPending = 0;      // 本帧 enqueue 的 marker 值(冲刷点核对)
-    LARGE_INTEGER _qwaitEnqueueQpc{};
-    int _qwaitSamples = 0;           // 已采 verdict 帧数(≥30 自动停)
-    int _qwaitStuck = 0;             // STUCK 计数(≥3 判成立停测)
+    // 队列级 Wait 复核探针(VSDLSSNR_NVOF_QWAIT)已删:2026-10-02 复核
+    // 30/30 未复现,"队列 Wait 无过错"结论归档(git 史 docs(reverify))。
     // 延迟 densify(2026-09-25):待冲刷帧的 execute done 值 + 输入槽位。
     // 0 = 无待冲刷。仅单在飞:门锁由调用方从 StageFrame 持到冲刷,期间无
     // 其它帧可入门置位。StageFrame 入门即清(失败路径残留作废 —— 其

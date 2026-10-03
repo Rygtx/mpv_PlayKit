@@ -3,13 +3,16 @@
 // NGX static core (nvsdk_ngx_s.lib) owns the parameter block; the signed
 // snippet nvngx_dlssnr.dll (Feature 18) performs CreateFeature/EvaluateFeature.
 // Guidance:零 guidance(静态零纹理,等价 Magpie guidanceMode=1 Force Zero)
-// 或 NVOF 真运动矢量(PORTING #6,NvofContext),由 motionVectorQuality 切换。
+// 或真运动矢量(NVIDIA NVOF / AMD FFX,由 of_backend 选型;见 of_backend.h),
+// 由 motionVectorQuality / ffxQuality 切换。
 
 #include "d3d12_context.h"
+#include "frame_rate_meter.h"
 #include "dlssfg_context.h"
 #include "dlssnr_params.h"
 #include "iat_hook.h"
 #include "of_backend.h" // 光流后端接口(NvofContext/FxofContext 在 cpp 内具化)
+#include "panel_ipc.h"  // StatsPayload(FillStatsCommon 签名;无环)
 #include "rtx_video_context.h"
 #include "shared_params.h"
 #include <atomic>
@@ -62,18 +65,29 @@ public:
     bool Rebind(SharedParams *shared, int width, int height, int depth,
                 const RtxVideoParams &rtx, char *err, size_t errLen) noexcept;
 
+    // RecreateFeature 请求(create 键恒提供;其余 = "提供才参与" 的显式
+    // 旗标,替代原 -1/nullptr 哨兵位 —— 哪个字段触发哪段由此自明,新增
+    // 维度加字段而非加哨兵参数)。
+    struct RecreateRequest {
+        int preset = 0;                 // create 键(preset / 内部分辨率 / scaling)
+        int resPercent = 100;
+        bool scalingEnabled = false;
+        bool dims = false;              // 提供时 = 重建槽资源(newWidth/Height/Depth)
+        int newWidth = 0, newHeight = 0, newDepth = 0;
+        bool shape = false;             // 提供时 = 形态段(RTX/FG 会话热重建)
+        RtxVideoParams rtx{};           // shape 段的新 RTX 几何(DecideRtxGeometry 入参)
+        bool hasFg = false;             // shape 段内:提供 FG 请求态(否则维持现状)
+        bool fgRequested = false;
+        bool hasFgHdr = false;          // shape 段内:提供 fgHdrInterp 请求态
+        bool fgHdr = false;
+    };
     // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
     // on panel change the frame thread rebuilds the feature (and scaling
     // textures for resolution changes; disabled = residual pipeline dropped).
-    // newWidth/newHeight/depth >= 0 additionally rebuild the per-slot frame
-    // resources for that geometry (used by Rebind across resolutions/depth).
-    // newRtx/fgReq/fgHdrReq(>=0 = 提供)驱动形态段:RTX/FG 会话形态热重建
-    // (capability 补查 + VSR/HDR 上下文建退 + FG 会话建/重建,降级不整体
-    // 失败)。bridge 的 preset 重建路径传默认值,形态段整体跳过。
-    bool RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
-                         int newWidth = -1, int newHeight = -1, int newDepth = -1,
-                         const RtxVideoParams *newRtx = nullptr,
-                         int fgReq = -1, int fgHdrReq = -1) noexcept;
+    // dims/shape 提供时驱动:槽资源按新几何重建(Rebind 跨分辨率/位深);
+    // 形态段 = capability 补查 + VSR/HDR 上下文建退 + FG 会话建/重建(降级
+    // 不整体失败)。bridge 的 preset 重建路径只填 create 键,形态段整体跳过。
+    bool RecreateFeature(const RecreateRequest &req, char *err, size_t errLen) noexcept;
 
     // 光流会话重建(quality / of_backend / 会话输入尺寸变化)。只重建光流
     // 会话(PoolHold 内,毫秒级),NGX feature 不动。quality == 0 时停用会话
@@ -189,12 +203,29 @@ private:
     // 串,内部消毒)。发布即替换共享内存里的旧统计 body —— 帧已不再成功,
     // tick 停摆,不替换面板就会一直显示冻结的"NGX 延迟"。
     void PublishDeadState(const char *state, const char *detail) noexcept;
+    // 帧诊断 dump(VSDLSSNR_DUMP;原内联在 Finish 中段的旁路,迁出):
+    // 锁存一次性,颜色/motion 分开,ctl 锁内逐纹理落盘。
+    void DumpFrameDiagnostics(FrameFinish &ff) noexcept;
+    // StatsPayload 公共体(init 发布与逐帧发布共用的 11 个字段;原两份
+    // 手抄清单靠人肉对齐)。帧态字段(pipeline 用时/fgState/slotWait 等)
+    // 由调用方在公共体之外填充 —— init 体本就不该携带它们。
+    void FillStatsCommon(StatsPayload &st) noexcept;
     // RTX feature 降级收口(capability 不过 / CreateFeature 失败共用):清对应
     // 旗标 + VSR 失败时几何回落源尺寸 + _rtxActive 重算 + _rtxDetail 记因。
     // 必须在 CreateFrameResources 之前调用 —— 资源随后按降级形态建,管线
     // 自洽,NR/FG 不连坐。上下文对象直接 reset(析构 no-op 不重入 NGX,
     // 已建的 feature handle 留在 core 内随进程回收)。
     void DegradeRtxFeature(bool vsr, const char *why) noexcept;
+    // RTX capability 参数块获取(RecreateFeature 形态段 vsr/hdr 两处同构
+    // 补查的收敛;2b 预检的可用性语义在 Rtx*Context::Initialize 内复读):
+    // 取块失败留痕并返回 false,成功落 paramsOut(不可用也留块,Shutdown
+    // 不触碰)。what = 日志标签("vsr"/"hdr")。
+    bool FetchRtxCapabilityParams(NVSDK_NGX_Parameter **paramsOut, const char *what) noexcept;
+    // 抗闪烁时域重建三连调用点(冷初始化 / resize 重建 / live 切换)的收敛:
+    // 成功 = 建账 _curAntiFlicker=af;失败 = 降级 0 + failed 发布(state 3/
+    // route 0/weight 0)+ 降级日志。why 进日志(如 "init"/"resize rebuild")。
+    // 调用点各自保留成功路径的收尾差异(_tValid 复位与 running 发布节奏)。
+    bool RebuildTemporalOrDegrade(int af, const char *why) noexcept;
     // RTX 几何单一裁决(Initialize 与 RecreateFeature 形态段共用):dstW/dstH
     // 换算(mode=1 autoHeight / mode=2 scale)、ratio 旁路、pipe=min(目标,
     // 源×4)、偶尺寸收口。写 _vsrRequested/_hdrActive/_rtxActive 与
@@ -256,6 +287,9 @@ private:
     std::atomic<bool> _fgDupLogged{false};
 
     D3D12Context *_d3d12 = nullptr;
+    // 帧率环形计数(纯 QPC 数学;原住 D3D12Context,2026-10-03 迁出 ——
+    // 与设备无关的统计不该住在设备上下文里)。
+    FrameRateMeter _fpsMeter;
     NVSDK_NGX_Parameter *_parameters = nullptr;
     NVSDK_NGX_Handle *_feature = nullptr;
     HMODULE _snippetModule = nullptr;

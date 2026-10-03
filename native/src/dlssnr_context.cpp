@@ -471,6 +471,46 @@ void DlssnrContext::DegradeRtxFeature(bool vsr, const char *why) noexcept {
     _rtxActive = _vsrRequested || _hdrActive;
 }
 
+// RTX capability 参数块获取(RecreateFeature 形态段 vsr/hdr 两处同构补查
+// 的收敛):取块失败留痕并返回 false;成功落 paramsOut(不可用也留块,
+// Shutdown 不触碰 —— 与 2b 预检同语义)。
+bool DlssnrContext::FetchRtxCapabilityParams(NVSDK_NGX_Parameter **paramsOut,
+                                             const char *what) noexcept {
+    DWORD sehCode = 0;
+    NVSDK_NGX_Parameter *cap = nullptr;
+    const NVSDK_NGX_Result r = CoreGetCapabilityParametersSafely(&cap, &sehCode);
+    if (sehCode || !NVSDK_NGX_SUCCEED(r) || !cap) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+                      "DLSSNR STATUS: rtx %s capability block unavailable", what);
+        TimingStatusLine(msg);
+        return false;
+    }
+    *paramsOut = cap;
+    return true;
+}
+
+// 抗闪烁时域重建三连调用点(冷初始化 3c / RecreateFeature resize / 帧路径
+// live 切换)的收敛:成功 = 建账 _curAntiFlicker=af;失败 = 降级 0 +
+// failed 发布(state 3 / route 0 / weight 0)+ 降级日志。why 进日志。
+bool DlssnrContext::RebuildTemporalOrDegrade(int af, const char *why) noexcept {
+    char afErr[160]{};
+    if (_d3d12->RebuildTemporal(af, afErr, sizeof(afErr))) {
+        _curAntiFlicker = af;
+        return true;
+    }
+    _curAntiFlicker = 0;
+    char amsg[288];
+    std::snprintf(amsg, sizeof(amsg),
+                  "DLSSNR STATUS: temporal %s failed (%s); anti-flicker off", why, afErr);
+    DbgLine(amsg);
+    TimingStatusLine(amsg);
+    _tPubState.store(3, std::memory_order_relaxed);
+    _tPubRoute.store(0, std::memory_order_relaxed);
+    _tPubWeight.store(0.0f, std::memory_order_relaxed);
+    return false;
+}
+
 // RTX 几何单一裁决(Initialize 与 RecreateFeature 形态段共用):
 //   ratio = 目标高 / 源高;≤ 1.001 → VSR 旁路(只支持放大,对齐浏览器
 //   端官方语义;1:1 与缩小场景本就不该付 VSR 的 GPU 价)。
@@ -844,10 +884,10 @@ bool DlssnrContext::Initialize(
     _fgDetail[0] = '\0';
     // 预载失败归因并入(appendProxyNote)与 FG 会话建立一起迁入
     // SetupFgSession —— 冷初始化与 Rebind 形态重建共用同一条链。
-    if (!_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested,
-                                      _pipeW, _pipeH, _outW, _outH,
-                                      _vsrRequested, _hdrActive, _fgHdrInterp,
-                                      _subW, _subH, _isRgb,
+    if (!_d3d12->CreateFrameResources({_width, _height, _depth, _fgRequested,
+                                       _pipeW, _pipeH, _outW, _outH,
+                                       _vsrRequested, _hdrActive, _fgHdrInterp,
+                                       _subW, _subH, _isRgb},
                                       err, errLen)) return failWithExistingErr();
     // 显形记账:管线色格式(">8bit 无 RTX = FP16;VSR-only 10bit =
     // R10G10B10A2")及其回落原因,防"10bit 源怎么不是 FP16"无头案
@@ -878,23 +918,10 @@ bool DlssnrContext::Initialize(
     // 随纹理作废。
     {
         const int af = std::clamp(pInit.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
-        if (af > 0) {
-            char afErr[160]{};
-            if (_d3d12->RebuildTemporal(af, afErr, sizeof(afErr))) {
-                _curAntiFlicker = af;
-                _tValid = false;
-                _tPubState.store(1, std::memory_order_relaxed);
-                _tPubRoute.store(af, std::memory_order_relaxed);
-            } else {
-                _curAntiFlicker = 0;
-                _tPubState.store(3, std::memory_order_relaxed);
-                _tPubRoute.store(0, std::memory_order_relaxed);
-                char amsg[288];
-                std::snprintf(amsg, sizeof(amsg),
-                              "DLSSNR STATUS: temporal init failed (%s); anti-flicker off", afErr);
-                DbgLine(amsg);
-                TimingStatusLine(amsg);
-            }
+        if (af > 0 && RebuildTemporalOrDegrade(af, "init")) {
+            _tValid = false;
+            _tPubState.store(1, std::memory_order_relaxed);
+            _tPubRoute.store(af, std::memory_order_relaxed);
         }
     }
 
@@ -967,19 +994,9 @@ bool DlssnrContext::Initialize(
         // 刷新点 = init 与 Rebind 形态重建(RefreshRtxStateString)。
         RefreshRtxStateString();
         StatsPayload st{}; // 未携带字段保持零/空;gpuLast 保持 -1 哨兵
-        CopyStatStr(st.gpuName, _gpuNameUtf8);
-        CopyStatStr(st.modelDll, _modelDllUtf8);
+        FillStatsCommon(st);
         st.width = static_cast<uint32_t>(_width);
         st.height = static_cast<uint32_t>(_height);
-        CopyStatStr(st.rtx, _rtxStateStr);
-        CopyStatStr(st.rtxDetail, _rtxDetail);
-        CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
-        CopyStatStr(st.ofMode, OfModeString());
-        CopyStatStr(st.fgRouteEff, _fgRouteEff);
-        st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult);
-        CopyStatStr(st.fgDetail, _fgDetail);
-        st.fgMultMax = static_cast<uint32_t>(_fg ? _fg->MaxGen() : 0);
-        CopyStatStr(st.ofDetail, _ofDetail);
         PublishStats(st);
     }
 
@@ -1029,9 +1046,17 @@ bool DlssnrContext::Initialize(
     return true;
 }
 
-bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabled, char *err, size_t errLen,
-                                    int newWidth, int newHeight, int newDepth,
-                                    const RtxVideoParams *newRtx, int fgReq, int fgHdrReq) noexcept {
+bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_t errLen) noexcept {
+    // 请求解包(函数体沿用原局部名;哨兵语义在此一次性翻译):
+    const int preset = req.preset;
+    const int resPercent = req.resPercent;
+    const bool scalingEnabled = req.scalingEnabled;
+    const int newWidth = req.dims ? req.newWidth : -1;
+    const int newHeight = req.dims ? req.newHeight : -1;
+    const int newDepth = req.dims ? req.newDepth : -1;
+    const RtxVideoParams *const newRtx = req.shape ? &req.rtx : nullptr;
+    const int fgReq = req.shape ? (req.hasFg ? (req.fgRequested ? 1 : 0) : -1) : -1;
+    const int fgHdrReq = req.shape ? (req.hasFgHdr ? (req.fgHdr ? 1 : 0) : -1) : -1;
     if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
         return false;
@@ -1147,25 +1172,13 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     if (shapeChange) {
         // capability 补查:2b 只在请求时查询,关→开场景参数块可能从未取过
         // (不可用时也留块,与 2b 同语义)。失败 = 降级收口。
-        if (_vsrRequested && !_vsrParams) {
-            DWORD sehCode = 0;
-            NVSDK_NGX_Parameter *cap = nullptr;
-            const NVSDK_NGX_Result r = CoreGetCapabilityParametersSafely(&cap, &sehCode);
-            if (sehCode || !NVSDK_NGX_SUCCEED(r) || !cap) {
-                DegradeRtxFeature(/*vsr=*/true, "vsr capability block unavailable");
-            } else {
-                _vsrParams = cap;
-            }
+        if (_vsrRequested && !_vsrParams &&
+            !FetchRtxCapabilityParams(&_vsrParams, "vsr")) {
+            DegradeRtxFeature(/*vsr=*/true, "vsr capability block unavailable");
         }
-        if (_hdrActive && !_hdrParams) {
-            DWORD sehCode = 0;
-            NVSDK_NGX_Parameter *cap = nullptr;
-            const NVSDK_NGX_Result r = CoreGetCapabilityParametersSafely(&cap, &sehCode);
-            if (sehCode || !NVSDK_NGX_SUCCEED(r) || !cap) {
-                DegradeRtxFeature(/*vsr=*/false, "hdr capability block unavailable");
-            } else {
-                _hdrParams = cap;
-            }
+        if (_hdrActive && !_hdrParams &&
+            !FetchRtxCapabilityParams(&_hdrParams, "hdr")) {
+            DegradeRtxFeature(/*vsr=*/false, "hdr capability block unavailable");
         }
         // VSR/HDR 上下文建/退:feature 与尺寸无关(热复用键 = 请求态)。
         // SEH 本地闩锁;CreateFeature 失败走 DegradeRtxFeature(清旗标 +
@@ -1213,10 +1226,10 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         TimingLog(msg);
     }
     const int shapeMs = segMs();
-    if (resize && !_d3d12->CreateFrameResources(_width, _height, _depth, _fgRequested,
-                                                _pipeW, _pipeH, _outW, _outH,
-                                                _vsrRequested, _hdrActive, _fgHdrInterp,
-                                                _subW, _subH, _isRgb,
+    if (resize && !_d3d12->CreateFrameResources({_width, _height, _depth, _fgRequested,
+                                                 _pipeW, _pipeH, _outW, _outH,
+                                                 _vsrRequested, _hdrActive, _fgHdrInterp,
+                                                 _subW, _subH, _isRgb},
                                                 err, errLen)) {
         _ready.store(false, std::memory_order_release);
         return false;
@@ -1224,20 +1237,10 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // 时域资源随尺寸重建(CreateFrameResources 已作废;失败降级 0,模式
     // 仍可 live 再切)。历史随纹理作废 —— 下帧播种。
     if (resize && _curAntiFlicker > 0) {
-        char afErr[160]{};
-        if (_d3d12->RebuildTemporal(_curAntiFlicker, afErr, sizeof(afErr))) {
+        if (RebuildTemporalOrDegrade(_curAntiFlicker, "resize rebuild")) {
             _tValid = false;
             _tPubState.store(1, std::memory_order_relaxed);
             _tPubRoute.store(_curAntiFlicker, std::memory_order_relaxed);
-        } else {
-            _curAntiFlicker = 0;
-            _tPubState.store(3, std::memory_order_relaxed);
-            _tPubRoute.store(0, std::memory_order_relaxed);
-            char amsg[288];
-            std::snprintf(amsg, sizeof(amsg),
-                          "DLSSNR STATUS: temporal resize rebuild failed (%s); anti-flicker off", afErr);
-            DbgLine(amsg);
-            TimingStatusLine(amsg);
         }
     }
     const int resMs = segMs();
@@ -1608,10 +1611,26 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
         if (!_ofBackend || _nvofFailed ||
             _ofBackend->Quality() != q || _ofBackend->Width() != dstW ||
             _ofBackend->Height() != dstH || _ofBackend->Kind() != backendReq) {
+            // 退役名单全等复用:Kind/档位/尺寸一致 = 会话即所需(反复拖
+            // 光流质量滑条不再线性累积显存;名单上限哲学见 _retiredOf 注释)。
+            // 只捞存活会话 —— 轮转池超时退役的死会话(_ready=false)留在
+            // 名单里(它们本就是"销毁不安全"的弃置体)。捞回即复位历史,
+            // 下一帧重新播种。当前会话(如有)照常退役。
+            std::unique_ptr<IOpticalFlowBackend> revived;
+            for (auto it = _retiredOf.begin(); it != _retiredOf.end(); ++it) {
+                if ((*it)->Enabled() && (*it)->Kind() == backendReq &&
+                    (*it)->Quality() == q &&
+                    (*it)->Width() == dstW && (*it)->Height() == dstH) {
+                    revived = std::move(*it);
+                    _retiredOf.erase(it);
+                    revived->ResetHistory();
+                    break;
+                }
+            }
             // 先建新会话再弃旧(旧会话仅弃引用,不销毁 —— 见 _retiredOf 注释)。
             // 弃旧的 GPU 资源随 PoolHold 排空后不再被引用,纹理显存由驱动
             // 按引用回收(对象随进程生存)。
-            auto next = CreateOfBackend(q, dstW, dstH, err, errLen);
+            auto next = revived ? std::move(revived) : CreateOfBackend(q, dstW, dstH, err, errLen);
             if (next) {
                 if (_ofBackend) _retiredOf.push_back(std::move(_ofBackend)); // 退役,不销毁
                 _ofBackend = std::move(next);
@@ -1728,12 +1747,21 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         TimingLog(msg);
         return true;
     }
-    const bool nvofOk = RecreateFeature(p.preset, p.inputResolutionPercent, p.scalingEnabled, err, errLen,
-                                        dimsChanged ? width : -1, dimsChanged ? height : -1,
-                                        dimsChanged ? depth : -1,
-                                        shapeChanged ? &rtx : nullptr,
-                                        shapeChanged ? (p.fgEnabled ? 1 : 0) : -1,
-                                        shapeChanged ? (fgHdrDesired ? 1 : 0) : -1);
+    RecreateRequest recreate;
+    recreate.preset = p.preset;
+    recreate.resPercent = p.inputResolutionPercent;
+    recreate.scalingEnabled = p.scalingEnabled != 0;
+    recreate.dims = dimsChanged;
+    recreate.newWidth = width;
+    recreate.newHeight = height;
+    recreate.newDepth = depth;
+    recreate.shape = shapeChanged;
+    recreate.rtx = rtx;
+    recreate.hasFg = shapeChanged;
+    recreate.fgRequested = p.fgEnabled != 0;
+    recreate.hasFgHdr = shapeChanged;
+    recreate.fgHdr = fgHdrDesired;
+    const bool nvofOk = RecreateFeature(recreate, err, errLen);
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
     // 只处理尺寸,档位变化在这里补齐。会话输入尺寸同样在此对齐(follow 开
     // 关/res% 变化)。单一裁决点见 SyncOfSession。
@@ -1845,7 +1873,7 @@ bool DlssnrContext::ProcessFrame(
     // Panel preset / internal-resolution / scaling-toggle changes require a
     // feature rebuild; consume before packing.
     if (int newPreset = -1, newRes = -1, newScaling = -1; _shared->ConsumeRebuild(newPreset, newRes, newScaling)) {
-        if (!RecreateFeature(newPreset, newRes, newScaling, err, errLen)) {
+        if (!RecreateFeature({newPreset, newRes, newScaling != 0}, err, errLen)) {
             // 面板可见:重建失败 = 本会话整体直通,具体原因进 stats。后续帧
             // 顶部 !ready 早退的发布被边缘去重,不会覆盖这条更具体的原因。
             PublishDeadState("passthrough", err);
@@ -1881,20 +1909,7 @@ bool DlssnrContext::ProcessFrame(
         af != _curAntiFlicker) {
         {
             D3D12Context::PoolHold hold(*_d3d12);
-            char afErr[160]{};
-            if (_d3d12->RebuildTemporal(af, afErr, sizeof(afErr))) {
-                _curAntiFlicker = af;
-            } else {
-                _curAntiFlicker = 0;
-                char amsg[288];
-                std::snprintf(amsg, sizeof(amsg),
-                              "DLSSNR STATUS: temporal switch failed (%s); anti-flicker off", afErr);
-                DbgLine(amsg);
-                TimingStatusLine(amsg);
-                _tPubState.store(3, std::memory_order_relaxed);
-                _tPubRoute.store(0, std::memory_order_relaxed);
-                _tPubWeight.store(0.0f, std::memory_order_relaxed);
-            }
+            RebuildTemporalOrDegrade(af, "switch");
         }
         _tValid = false;
         if (_curAntiFlicker == 0 && _tPubState.load(std::memory_order_relaxed) != 3) {
@@ -1926,7 +1941,7 @@ bool DlssnrContext::ProcessFrame(
         // RecreateFeature wait below would skew the interval).
         LARGE_INTEGER entry{};
         QueryPerformanceCounter(&entry);
-        _d3d12->NotifyFrameTick(static_cast<double>(entry.QuadPart) / static_cast<double>(qpcFreq.QuadPart));
+        _fpsMeter.Tick(static_cast<double>(entry.QuadPart) / static_cast<double>(qpcFreq.QuadPart));
     }
     // Diagnostic: VSDLSSNR_SKIP_EVAL=1 measures the pipe without NGX evaluate
     static const bool skipEval = GetEnvironmentVariableA("VSDLSSNR_SKIP_EVAL", nullptr, 0) != 0;
@@ -2072,8 +2087,10 @@ bool DlssnrContext::ProcessFrame(
                                       hasCost, hasBwd, hasBwd && hasCost,
                                       densifyInternal ? 1.0f : msX,
                                       densifyInternal ? 1.0f : msY,
-                                      densifyInternal ? 20u : 12u,
-                                      densifyInternal ? 21u : 13u);
+                                      densifyInternal ? static_cast<UINT>(HeapSlot::UavReducedMotion)
+                                                      : static_cast<UINT>(HeapSlot::UavMotion),
+                                      densifyInternal ? static_cast<UINT>(HeapSlot::UavReducedConfidence)
+                                                      : static_cast<UINT>(HeapSlot::UavConfidence));
                 D3D12_RESOURCE_BARRIER g2[2]{
                     Transition(dstMotion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                     Transition(dstConf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -2116,8 +2133,10 @@ bool DlssnrContext::ProcessFrame(
                 _d3d12->RecordFfxDensify(*cl, *slot, denseW, denseH, ofW, ofH, spW, spH,
                                          static_cast<float>(denseW) / static_cast<float>(ofW),
                                          static_cast<float>(denseH) / static_cast<float>(ofH),
-                                         densifyInternal ? 20u : 12u,
-                                         densifyInternal ? 21u : 13u);
+                                         densifyInternal ? static_cast<UINT>(HeapSlot::UavReducedMotion)
+                                                         : static_cast<UINT>(HeapSlot::UavMotion),
+                                         densifyInternal ? static_cast<UINT>(HeapSlot::UavReducedConfidence)
+                                                         : static_cast<UINT>(HeapSlot::UavConfidence));
                 D3D12_RESOURCE_BARRIER g2[2]{
                     Transition(dstMotion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
                     Transition(dstConf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
@@ -2756,8 +2775,8 @@ bool DlssnrContext::ProcessFrame(
         // 锁同线程程序序提交,FIFO 包住;失败路径 post 括号不提交 → 缺账
         // 记 0(帧已失败)。
         _d3d12->SubmitTsBracket(*slot, _vsr->Queue().Native(),
-                                slot->tsPreVsrAllocator.Get(),
-                                slot->tsPreVsrCommandList.Get(), 6,
+                                slot->ts[kTsPreVsr].alloc.Get(),
+                                slot->ts[kTsPreVsr].cl.Get(), kTsPreVsr,
                                 _d3d12->Fence(), slot->baseFenceValue);
         char rtxErr[160]{};
         uint64_t fv = 0;
@@ -2770,8 +2789,8 @@ bool DlssnrContext::ProcessFrame(
             return false;
         }
         _d3d12->SubmitTsBracket(*slot, _vsr->Queue().Native(),
-                                slot->tsPostVsrAllocator.Get(),
-                                slot->tsPostVsrCommandList.Get(), 7, nullptr, 0);
+                                slot->ts[kTsPostVsr].alloc.Get(),
+                                slot->ts[kTsPostVsr].cl.Get(), kTsPostVsr, nullptr, 0);
         vsrDoneFence = _vsr->Queue().Fence();
         vsrDoneVal = fv;
     }
@@ -2782,8 +2801,8 @@ bool DlssnrContext::ProcessFrame(
         std::lock_guard<std::mutex> rtxLock(_evaluateMutex);
         // 计时括号(8/9):TrueHDR 真实帧(生产者等待与 eval 同值)。
         _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
-                                slot->tsPreHdrAllocator.Get(),
-                                slot->tsPreHdrCommandList.Get(), 8,
+                                slot->ts[kTsPreHdr].alloc.Get(),
+                                slot->ts[kTsPreHdr].cl.Get(), kTsPreHdr,
                                 vsrRun ? _vsr->Queue().Fence() : _d3d12->Fence(),
                                 vsrRun ? vsrDoneVal : slot->baseFenceValue);
         char rtxErr[160]{};
@@ -2800,8 +2819,8 @@ bool DlssnrContext::ProcessFrame(
             return false;
         }
         _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
-                                slot->tsPostHdrAllocator.Get(),
-                                slot->tsPostHdrCommandList.Get(), 9, nullptr, 0);
+                                slot->ts[kTsPostHdr].alloc.Get(),
+                                slot->ts[kTsPostHdr].cl.Get(), kTsPostHdr, nullptr, 0);
         hdrDoneFence = _hdr->Queue().Fence();
         hdrDoneVal = fv;
         hdrChainFence = hdrDoneFence;
@@ -2994,8 +3013,8 @@ bool DlssnrContext::ProcessFrame(
             if (!fgGenOk[g]) continue;
             if (!genBracketOpen) {
                 _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
-                                        slot->tsPreGenAllocator.Get(),
-                                        slot->tsPreGenCommandList.Get(), 10,
+                                        slot->ts[kTsPreGen].alloc.Get(),
+                                        slot->ts[kTsPreGen].cl.Get(), kTsPreGen,
                                         _d3d12->Fence(), slot->fgFenceValue);
                 genBracketOpen = true;
             }
@@ -3022,8 +3041,8 @@ bool DlssnrContext::ProcessFrame(
         }
         if (genBracketOpen) {
             _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
-                                    slot->tsPostGenAllocator.Get(),
-                                    slot->tsPostGenCommandList.Get(), 11, nullptr, 0);
+                                    slot->ts[kTsPostGen].alloc.Get(),
+                                    slot->ts[kTsPostGen].cl.Get(), kTsPostGen, nullptr, 0);
         }
     }
     if (!fgBeginOk) {
@@ -3087,7 +3106,8 @@ bool DlssnrContext::ProcessFrame(
             // COMMON(fgBar 的 NSR 化随 fg CL 完成同样衰减)—— post CL 恒
             // 从 COMMON 对接,与 NR 开无 RTX 帧的 outputColor 同契约。
             _d3d12->RecordColorOutput(*postCl, *slot, pipeColor,
-                                      debugPipe ? D3D12Context::kSrvOutputColor : /* srvInput */ 0,
+                                      debugPipe ? D3D12Context::kSrvOutputColor
+                                                : static_cast<UINT>(HeapSlot::SrvInput),
                                       ColorOutKind::Sdr,
                                       width, height, matrix, range,
                                       debugPipe ? D3D12_RESOURCE_STATE_COMMON
@@ -3470,161 +3490,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             }
         }
     }
-    {
-        // concurrent frame threads: dump at most once, no interleaved writes;
-        // the mutex is only taken when a dump is actually pending (the old
-        // code locked it every frame even with dumping disabled).
-        // 颜色 dump 与 NVOF motion/flow dump 分开锁存:首帧必然是播种帧
-        // (播种清零,无真流),motion dump 要等到第一个 densify 帧。
-        static std::atomic<bool> dumped{ false };
-        static std::atomic<bool> dumpedMotion{ false };
-        if (ProbeEnabled()) {
-            char probe[96];
-            std::snprintf(probe, sizeof(probe), "PROBE: dump-site realMotion=%d ofQ=%d",
-                          ff->realMotion ? 1 : 0, _curOfQuality);
-            TimingStatusLine(probe);
-        }
-        // VSDLSSNR_DUMP_SKIP=N:跳过前 N 个真运动帧再 dump(warmup 帧
-        // 的流场未成熟,FFX/NVOF A/B 对照用)。
-        static std::atomic<int> realCount{ 0 };
-        const int myIdx = ff->realMotion ? realCount.fetch_add(1, std::memory_order_relaxed) : -1;
-        static const int dumpSkip = [] {
-            char b[16]{};
-            GetEnvironmentVariableA("VSDLSSNR_DUMP_SKIP", b, sizeof(b) - 1);
-            return b[0] ? std::atoi(b) : 0;
-        }();
-        if (ff->dumpEnabled && ff->realMotion && myIdx >= dumpSkip &&
-            !dumpedMotion.load(std::memory_order_relaxed)) {
-            static std::mutex dumpMotionMutex;
-            std::lock_guard<std::mutex> dumpLock(dumpMotionMutex);
-            if (!dumpedMotion.exchange(true)) {
-                TimingStatusLine("DLSSNR STATUS: motion latch fired");
-                wchar_t dir[MAX_PATH];
-                if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
-                    std::filesystem::path base = std::filesystem::path(dir).parent_path();
-                    const bool scaling = _d3d12->HasScaling();
-                    std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
-                    // NGX 实际消费的运动场(缩放时为降采样版,R16G16_FLOAT)+
-                    // 原始网格流(S10.5,R16G16_SINT)。
-                    bool motionDumped = _d3d12->DumpTextureToFile(
-                        scaling ? ff->slot->reducedMotion.Get() : ff->slot->motion.Get(),
-                        (base / L"dump_motion.bin").c_str());
-                    if (!motionDumped) TimingStatusLine("DLSSNR STATUS: motion dump FAILED");
-                    else TimingStatusLine("DLSSNR STATUS: motion dump OK");
-                    if (_ofBackend && _ofBackend->Kind() == kOfBackendNvof &&
-                        static_cast<NvofContext *>(_ofBackend.get())->FlowForward()) {
-                        const bool flowOk = _d3d12->DumpTextureToFile(
-                            static_cast<NvofContext *>(_ofBackend.get())->FlowForward(),
-                            (base / L"dump_flow.bin").c_str());
-                        if (!flowOk) TimingStatusLine("DLSSNR STATUS: flow dump FAILED");
-                    } else if (_ofBackend && _ofBackend->Kind() == kOfBackendFfx) {
-                        // FFX 中间场:_ffxInput(R8G8B8A8 逻辑 RGBA 直写) +
-                        // 稀疏流(R16G16_SINT,1/8 OF extent)。
-                        auto *fx = static_cast<FxofContext *>(_ofBackend.get());
-                        if (!_d3d12->DumpTextureToFile(fx->FfxInput(),
-                                                       (base / L"dump_fxof_input.bin").c_str())) {
-                            TimingStatusLine("DLSSNR STATUS: fxof input dump FAILED");
-                        }
-                        if (!_d3d12->DumpTextureToFile(fx->SparseFlow(),
-                                                       (base / L"dump_fxof_sparse.bin").c_str())) {
-                            TimingStatusLine("DLSSNR STATUS: fxof sparse dump FAILED");
-                        }
-                    }
-                }
-            }
-        }
-        if (ff->dumpEnabled && !dumped.load(std::memory_order_relaxed)) {
-            static std::mutex dumpMutex;
-            std::lock_guard<std::mutex> dumpLock(dumpMutex);
-            if (!dumped.exchange(true)) {
-                wchar_t dir[MAX_PATH];
-                if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
-                    std::filesystem::path base = std::filesystem::path(dir).parent_path();
-                    const bool scaling = _d3d12->HasScaling();
-                    std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
-                    // footprint 格式/尺寸由 DumpTextureToFile 自取资源 desc
-                    //(调用方传参版三次踩坑,见 d3d12_context.h 头注释);
-                    // 探针:dump 失败逐个留痕,"dump 文件缺失/尺寸不对"从
-                    // 这行直接定位。
-                    auto dumpOrLog = [&](ID3D12Resource *tex, const wchar_t *name) {
-                        char why[128]{};
-                        if (!_d3d12->DumpTextureToFile(tex, (base / name).c_str(),
-                                                       why, sizeof(why))) {
-                            char msg[224];
-                            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED: %.120s",
-                                          name, why);
-                            TimingStatusLine(msg);
-                        }
-                    };
-                    dumpOrLog(_d3d12->InputColor(*ff->slot), L"dump_input.bin");
-                    // YUV 输入平面(YUV→RGB 转换验收:python 参考按矩阵/范围
-                    // 重算 BGRA8 与 dump_input 对比 ≤1-2 LSB)。色度尺寸按
-                    // 真实布局(444 全分辨率等),勿自推半分辨率。
-                    {
-                        const wchar_t *names[3]{ L"dump_yuvin_y.bin", L"dump_yuvin_u.bin", L"dump_yuvin_v.bin" };
-                        for (int i = 0; i < 3; ++i) {
-                            if (!_d3d12->DumpYuvInPlane(*ff->slot, i, (base / names[i]).c_str())) {
-                                char msg[160];
-                                std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED",
-                                              names[i]);
-                                TimingStatusLine(msg);
-                            }
-                        }
-                    }
-                    // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):
-                    // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
-                    // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
-                    if (_ofBackend && ff->nvofInputIndex >= 0) {
-                        if (ID3D12Resource *ofIn =
-                                _ofBackend->InputTexture(ff->nvofInputIndex)) {
-                            dumpOrLog(ofIn, L"dump_nvof_input.bin");
-                        }
-                    }
-                    if (scaling) {
-                        dumpOrLog(_d3d12->ReducedColor(*ff->slot), L"dump_reduced_color.bin");
-                        dumpOrLog(_d3d12->ReducedDenoised(*ff->slot), L"dump_reduced_denoised.bin");
-                        dumpOrLog(_d3d12->HorizontalRes(*ff->slot), L"dump_horizontal.bin");
-                    }
-                    dumpOrLog(_d3d12->OutputColor(*ff->slot), L"dump_output.bin");
-                    // TrueHDR 输出本体(FP16 scRGB,PIPE 尺寸):黑屏排查的
-                    // "没写 vs 写了零 vs 写了错值"判据(VSDLSSNR_DUMP=1)。
-                    // 三态全留痕(2026-09-25):此前 OK/跳过都静默,
-                    // "为什么没有 hdrColor dump"无法定位。
-                    {
-                        if (ff->slot->hdrColor) {
-                            char why[128]{};
-                            const bool okHC = _d3d12->DumpTextureToFile(
-                                ff->slot->hdrColor.Get(),
-                                (base / L"dump_hdrcolor.bin").c_str(), why, sizeof(why));
-                            char msgHC[192];
-                            std::snprintf(msgHC, sizeof(msgHC), "DLSSNR STATUS: dump_hdrcolor %s%.150s",
-                                          okHC ? "OK" : "FAILED: ", okHC ? "" : why);
-                            TimingStatusLine(msgHC);
-                        } else {
-                            TimingStatusLine("DLSSNR STATUS: dump_hdrcolor SKIPPED (slot->hdrColor null)");
-                        }
-                    }
-                    // FG 插值输出(仅 eval 过的帧有内容;首帧必为播种,等
-                    // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。
-                    // 恒 SDR 域 BGRA8 @PIPE(VSR 时 = _pipeW/H,else 源尺寸)。
-                    if (ff->fgRan) {
-                        dumpOrLog(_d3d12->FgInterp(*ff->slot, 0), L"dump_fg_interp.bin");
-                    }
-                    // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
-                    // Y/U/V 与 dump 对比,≤1-2 LSB;P10 = 右对齐 word)。
-                    // 尺寸/格式随资源 desc 自取 —— RTX VSR 会话 yuvOut 在 OUT
-                    // 尺寸、HDR 会话 P10,历史上手传参数两次踩坑(2026-09-25
-                    // "dump 三连失败真因"),desc 自取后整类失配消失。
-                    {
-                        const wchar_t *names[3]{ L"dump_y_plane.bin", L"dump_u_plane.bin", L"dump_v_plane.bin" };
-                        for (int i = 0; i < 3; ++i) {
-                            dumpOrLog(_d3d12->YuvOutPlane(*ff->slot, i), names[i]);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    DumpFrameDiagnostics(*ff);
     {
         QueryPerformanceCounter(&t4);
         const auto ms = [](LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f) {
@@ -3767,16 +3633,14 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         if (perfLineDue) {
             // 门细分探针为 NvofContext 专属(其它后端无引擎等待);读法与
             // 下方 stats 块同款(仅读,锁外)。
-            NvofContext *nvProbe =
-                (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
-                    ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
+            NvofContext *nvProbe = _ofBackend ? _ofBackend->AsNvof() : nullptr;
             // Snapshot/FrameRateWindow 锁外取(各自持独立互斥,勿叠锁)。
             // res 本就是会话配置回显;NR 关(live 门)时缩放整级绕过(nrOff
             // 直连 inputColor),行内就地标注,防误读"正在按内部尺寸处理"。
             const int perfResPct = std::clamp(_shared->Snapshot().inputResolutionPercent,
                                               kResPctMin, kResPctMax);
             const bool perfNrOff = !_shared->Snapshot().nrEnabled;
-            const double perfFps = _d3d12->FrameRateWindow();
+            const double perfFps = _fpsMeter.Rate();
             snprintf(line, sizeof(line),
                      "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%%%s ofq=%d %dx%d f=%d fps=%.0f",
                      gpuLast, gpuEma, perfGpuP99, packEma, nvofEma, perfNvofLast,
@@ -3812,9 +3676,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             // perf 行同款(仅读,换会话在 PoolHold 内,帧线程读不撕裂)。
             const double slotWaitLast = ms(ff->tSlot0, ff->tSlot1, ff->qpcFreq);
             const double lockWaitLast = ms(ff->tLock0, ff->tLock1, ff->qpcFreq);
-            NvofContext *nvStats =
-                (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
-                    ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
+            NvofContext *nvStats = _ofBackend ? _ofBackend->AsNvof() : nullptr;
             StatsPayload st{}; // 未携带字段保持零/空;gpuLast 保持 -1 哨兵
             // FG 状态:on = 本帧有真插值(附当前倍数);dup = 复制真实帧
             // (复位/零光流/面板关/降级);off = 本会话未激活;unavailable =
@@ -3826,10 +3688,6 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             const char *fgState = !_fg ? "off"
                 : (!_fg->Enabled() ? "unavailable"
                                    : (ff->fgEvaluatedCount > 0 ? "on" : "dup"));
-            // fgMultMax = 运行库插值帧上限(gate 解锁结果定格值):40 系
-            // 解锁失败回落 2x 时创建/面板仍报 6,没有它面板无从知道实际
-            // 密度只有 (max+1)x。
-            const int fgMultMax = _fg ? _fg->MaxGen() : 0;
             st.gpuLast = static_cast<float>(gpuLast);
             st.packLast = static_cast<float>(packLast);
             st.evalCpuLast = static_cast<float>(evalCpuLast);
@@ -3845,20 +3703,16 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             st.width = static_cast<uint32_t>(_width);
             st.height = static_cast<uint32_t>(_height);
             st.scaling = _d3d12->HasScaling() ? 1u : 0u;
-            st.fps = static_cast<float>(_d3d12->FrameRateWindow());
-            CopyStatStr(st.gpuName, _gpuNameUtf8);
-            CopyStatStr(st.modelDll, _modelDllUtf8);
-            CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
-            CopyStatStr(st.ofMode, OfModeString());
+            st.fps = static_cast<float>(_fpsMeter.Rate());
+            // 每帧实效位(DSL9;面板直读,免镜像门控公式):eval = 本帧有
+            // NGX 调用;of = OF 消费门(SyncOfSession 的 ofNeeded);scaling
+            // = 内部缩放档真参与(NR 关直连帧整级绕过 = 0)。
+            st.evalActive = ff->evalZeroed ? 0u : 1u;
+            st.ofActive = ff->ofNeeded ? 1u : 0u;
+            st.scalingActive = (_d3d12->HasScaling() && !ff->nrOff) ? 1u : 0u;
+            FillStatsCommon(st);
             CopyStatStr(st.fgState, fgState);
             st.fgMult = static_cast<uint32_t>(ff->fgM);
-            CopyStatStr(st.fgRouteEff, _fgRouteEff);
-            st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult);
-            CopyStatStr(st.fgDetail, _fgDetail);
-            st.fgMultMax = static_cast<uint32_t>(fgMultMax);
-            CopyStatStr(st.ofDetail, _ofDetail);
-            CopyStatStr(st.rtx, _rtxStateStr);
-            CopyStatStr(st.rtxDetail, _rtxDetail);
             st.slotWait = static_cast<float>(slotWaitLast);
             st.lockWait = static_cast<float>(lockWaitLast);
             st.gateSkips = nvStats ? nvStats->GateSkips() : 0u;
@@ -3880,6 +3734,183 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         }
     }
     return rb;
+}
+
+// StatsPayload 公共体(init 发布与逐帧发布共用;原两份手抄字段清单)。
+// 帧态字段(用时/fgState/fgMult/slotWait 等)由调用方在公共体之外填充。
+void DlssnrContext::FillStatsCommon(StatsPayload &st) noexcept {
+    CopyStatStr(st.gpuName, _gpuNameUtf8);
+    CopyStatStr(st.modelDll, _modelDllUtf8);
+    CopyStatStr(st.rtx, _rtxStateStr);
+    CopyStatStr(st.rtxDetail, _rtxDetail);
+    CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
+    CopyStatStr(st.ofMode, OfModeString());
+    CopyStatStr(st.fgRouteEff, _fgRouteEff);
+    st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult);
+    CopyStatStr(st.fgDetail, _fgDetail);
+    // fgMultMax = 运行库插值帧上限(gate 解锁结果定格值):40 系解锁失败
+    // 回落 2x 时创建/面板仍报 6,没有它面板无从知道实际密度只有 (max+1)x。
+    st.fgMultMax = static_cast<uint32_t>(_fg ? _fg->MaxGen() : 0);
+    CopyStatStr(st.ofDetail, _ofDetail);
+}
+
+// 帧诊断 dump(VSDLSSNR_DUMP;原内联在 ProcessFrameFinish 中段,2026-10-03
+// 整体迁出 —— 诊断是"帧已收敛后的旁路",不该长在热路径函数里。)
+// 调用点 = Finish unpack 之后、计时段之前,语义不变。
+void DlssnrContext::DumpFrameDiagnostics(FrameFinish &ff) noexcept {
+    // concurrent frame threads: dump at most once, no interleaved writes;
+    // the mutex is only taken when a dump is actually pending (the old
+    // code locked it every frame even with dumping disabled).
+    // 颜色 dump 与 NVOF motion/flow dump 分开锁存:首帧必然是播种帧
+    // (播种清零,无真流),motion dump 要等到第一个 densify 帧。
+    static std::atomic<bool> dumped{ false };
+    static std::atomic<bool> dumpedMotion{ false };
+    if (ProbeEnabled()) {
+        char probe[96];
+        std::snprintf(probe, sizeof(probe), "PROBE: dump-site realMotion=%d ofQ=%d",
+                      ff.realMotion ? 1 : 0, _curOfQuality);
+        TimingStatusLine(probe);
+    }
+    // VSDLSSNR_DUMP_SKIP=N:跳过前 N 个真运动帧再 dump(warmup 帧
+    // 的流场未成熟,FFX/NVOF A/B 对照用)。
+    static std::atomic<int> realCount{ 0 };
+    const int myIdx = ff.realMotion ? realCount.fetch_add(1, std::memory_order_relaxed) : -1;
+    static const int dumpSkip = [] {
+        char b[16]{};
+        GetEnvironmentVariableA("VSDLSSNR_DUMP_SKIP", b, sizeof(b) - 1);
+        return b[0] ? std::atoi(b) : 0;
+    }();
+    if (ff.dumpEnabled && ff.realMotion && myIdx >= dumpSkip &&
+        !dumpedMotion.load(std::memory_order_relaxed)) {
+        static std::mutex dumpMotionMutex;
+        std::lock_guard<std::mutex> dumpLock(dumpMotionMutex);
+        if (!dumpedMotion.exchange(true)) {
+            TimingStatusLine("DLSSNR STATUS: motion latch fired");
+            wchar_t dir[MAX_PATH];
+            if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
+                std::filesystem::path base = std::filesystem::path(dir).parent_path();
+                const bool scaling = _d3d12->HasScaling();
+                std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
+                // NGX 实际消费的运动场(缩放时为降采样版,R16G16_FLOAT)+
+                // 原始网格流(S10.5,R16G16_SINT)。
+                bool motionDumped = _d3d12->DumpTextureToFile(
+                    scaling ? ff.slot->reducedMotion.Get() : ff.slot->motion.Get(),
+                    (base / L"dump_motion.bin").c_str());
+                if (!motionDumped) TimingStatusLine("DLSSNR STATUS: motion dump FAILED");
+                else TimingStatusLine("DLSSNR STATUS: motion dump OK");
+                if (NvofContext *nvDump = _ofBackend ? _ofBackend->AsNvof() : nullptr;
+                    nvDump && nvDump->FlowForward()) {
+                    const bool flowOk = _d3d12->DumpTextureToFile(
+                        nvDump->FlowForward(),
+                        (base / L"dump_flow.bin").c_str());
+                    if (!flowOk) TimingStatusLine("DLSSNR STATUS: flow dump FAILED");
+                } else if (_ofBackend && _ofBackend->Kind() == kOfBackendFfx) {
+                    // FFX 中间场:_ffxInput(R8G8B8A8 逻辑 RGBA 直写) +
+                    // 稀疏流(R16G16_SINT,1/8 OF extent)。
+                    auto *fx = static_cast<FxofContext *>(_ofBackend.get());
+                    if (!_d3d12->DumpTextureToFile(fx->FfxInput(),
+                                                   (base / L"dump_fxof_input.bin").c_str())) {
+                        TimingStatusLine("DLSSNR STATUS: fxof input dump FAILED");
+                    }
+                    if (!_d3d12->DumpTextureToFile(fx->SparseFlow(),
+                                                   (base / L"dump_fxof_sparse.bin").c_str())) {
+                        TimingStatusLine("DLSSNR STATUS: fxof sparse dump FAILED");
+                    }
+                }
+            }
+        }
+    }
+    if (ff.dumpEnabled && !dumped.load(std::memory_order_relaxed)) {
+        static std::mutex dumpMutex;
+        std::lock_guard<std::mutex> dumpLock(dumpMutex);
+        if (!dumped.exchange(true)) {
+            wchar_t dir[MAX_PATH];
+            if (GetModuleFileNameW(nullptr, dir, MAX_PATH)) {
+                std::filesystem::path base = std::filesystem::path(dir).parent_path();
+                const bool scaling = _d3d12->HasScaling();
+                std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
+                // footprint 格式/尺寸由 DumpTextureToFile 自取资源 desc
+                //(调用方传参版三次踩坑,见 d3d12_context.h 头注释);
+                // 探针:dump 失败逐个留痕,"dump 文件缺失/尺寸不对"从
+                // 这行直接定位。
+                auto dumpOrLog = [&](ID3D12Resource *tex, const wchar_t *name) {
+                    char why[128]{};
+                    if (!_d3d12->DumpTextureToFile(tex, (base / name).c_str(),
+                                                   why, sizeof(why))) {
+                        char msg[224];
+                        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED: %.120s",
+                                      name, why);
+                        TimingStatusLine(msg);
+                    }
+                };
+                dumpOrLog(_d3d12->InputColor(*ff.slot), L"dump_input.bin");
+                // YUV 输入平面(YUV→RGB 转换验收:python 参考按矩阵/范围
+                // 重算 BGRA8 与 dump_input 对比 ≤1-2 LSB)。色度尺寸按
+                // 真实布局(444 全分辨率等),勿自推半分辨率。
+                {
+                    const wchar_t *names[3]{ L"dump_yuvin_y.bin", L"dump_yuvin_u.bin", L"dump_yuvin_v.bin" };
+                    for (int i = 0; i < 3; ++i) {
+                        if (!_d3d12->DumpYuvInPlane(*ff.slot, i, (base / names[i]).c_str())) {
+                            char msg[160];
+                            std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: dump %ls FAILED",
+                                          names[i]);
+                            TimingStatusLine(msg);
+                        }
+                    }
+                }
+                // GPU 光流输入降采样结果(注册输入纹理,会话尺寸):
+                // 数值验证用 —— python 参考脚本从 dump_input.bin 重算
+                // 双线性,断言 ≤1 LSB(#46 改 GPU 的验收)。
+                if (_ofBackend && ff.nvofInputIndex >= 0) {
+                    if (ID3D12Resource *ofIn =
+                            _ofBackend->InputTexture(ff.nvofInputIndex)) {
+                        dumpOrLog(ofIn, L"dump_nvof_input.bin");
+                    }
+                }
+                if (scaling) {
+                    dumpOrLog(_d3d12->ReducedColor(*ff.slot), L"dump_reduced_color.bin");
+                    dumpOrLog(_d3d12->ReducedDenoised(*ff.slot), L"dump_reduced_denoised.bin");
+                    dumpOrLog(_d3d12->HorizontalRes(*ff.slot), L"dump_horizontal.bin");
+                }
+                dumpOrLog(_d3d12->OutputColor(*ff.slot), L"dump_output.bin");
+                // TrueHDR 输出本体(FP16 scRGB,PIPE 尺寸):黑屏排查的
+                // "没写 vs 写了零 vs 写了错值"判据(VSDLSSNR_DUMP=1)。
+                // 三态全留痕(2026-09-25):此前 OK/跳过都静默,
+                // "为什么没有 hdrColor dump"无法定位。
+                {
+                    if (ff.slot->hdrColor) {
+                        char why[128]{};
+                        const bool okHC = _d3d12->DumpTextureToFile(
+                            ff.slot->hdrColor.Get(),
+                            (base / L"dump_hdrcolor.bin").c_str(), why, sizeof(why));
+                        char msgHC[192];
+                        std::snprintf(msgHC, sizeof(msgHC), "DLSSNR STATUS: dump_hdrcolor %s%.150s",
+                                      okHC ? "OK" : "FAILED: ", okHC ? "" : why);
+                        TimingStatusLine(msgHC);
+                    } else {
+                        TimingStatusLine("DLSSNR STATUS: dump_hdrcolor SKIPPED (slot->hdrColor null)");
+                    }
+                }
+                // FG 插值输出(仅 eval 过的帧有内容;首帧必为播种,等
+                // 第一个真插值帧才有意义 —— 与 motion dump 同款锁存)。
+                // 恒 SDR 域 BGRA8 @PIPE(VSR 时 = _pipeW/H,else 源尺寸)。
+                if (ff.fgRan) {
+                    dumpOrLog(_d3d12->FgInterp(*ff.slot, 0), L"dump_fg_interp.bin");
+                }
+                // YUV 输出平面(RGB→YUV 转换验收:python 参考 script 重算
+                // Y/U/V 与 dump 对比,≤1-2 LSB;P10 = 右对齐 word)。
+                // 尺寸/格式随资源 desc 自取 —— RTX VSR 会话 yuvOut 在 OUT
+                // 尺寸、HDR 会话 P10,历史上手传参数两次踩坑(2026-09-25
+                // "dump 三连失败真因"),desc 自取后整类失配消失。
+                {
+                    const wchar_t *names[3]{ L"dump_y_plane.bin", L"dump_u_plane.bin", L"dump_v_plane.bin" };
+                    for (int i = 0; i < 3; ++i) {
+                        dumpOrLog(_d3d12->YuvOutPlane(*ff.slot, i), names[i]);
+                    }
+                }
+            }
+        }
+    }
 }
 
 void DlssnrContext::PublishDeadState(const char *state, const char *detail) noexcept {

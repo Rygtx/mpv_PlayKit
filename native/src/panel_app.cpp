@@ -147,6 +147,9 @@ struct AppState {
                              // (存储单点 = 代理 ini;面板启动回读,重启 mpv 生效)
     float slotWait = 0.0f;   // StatsPayload.slotWait: 槽池等待 last(诊断页)
     float lockWait = 0.0f;   // StatsPayload.lockWait: evaluate 互斥等待 last(诊断页)
+    int evalActive = 0;      // StatsPayload.evalActive: 本帧 NGX/NR 真评估(DSL9 实效位)
+    int ofActive = 0;        // StatsPayload.ofActive: 本帧光流消费门开
+    int scalingActive = 0;   // StatsPayload.scalingActive: 本帧内部缩放档真参与
     int gateSkips = 0;       // StatsPayload.gateSkips: 光流帧序门跳帧累计(诊断页)
     int gateExpired = 0;     // StatsPayload.gateExpired: 过期帧累计(诊断页)
     int gateResets = 0;      // StatsPayload.gateResets: 历史重置累计(诊断页)
@@ -320,6 +323,9 @@ bool CreateParamsMapping() noexcept {
     }
     // Adopt parameters from a previous panel session (last live state wins
     // over the ini) via the shared field mapping (panel_ipc.h).
+    // 直读无 seq 复验的前提(单写者不变量):面板单实例 mutex ⇒ 参数映射
+    // 恒单写者,且 adopt 时写者(上一实例)已死 —— 改互斥语义时此处是
+    // 第一个要重新审视的点。
     if (g_payload->magic == PAYLOAD_MAGIC && g_payload->seq > 0) {
         LoadLiveParams(g_app.params, *g_payload);
         LoadCreateParams(g_app.params, *g_payload);
@@ -661,8 +667,9 @@ static int ReadStatsSnapshot(StatsPayload *st, bool *badMagic) noexcept {
     }
     memcpy(st, view, copy);
     *badMagic = st->magic != 0 && st->magic != STATS_MAGIC;
-    const bool valid = st->magic == STATS_MAGIC && st->seq != 0 &&
-                       st->seq == static_cast<const volatile StatsPayload *>(view)->seq;
+    // 混部署钳制拷贝量的特例不能用 ReadWithSeq 整块模板(SeqStable = 其
+    // 复验半边,panel_ipc.h);正文稳定后 seq 复验语义一致。
+    const bool valid = st->magic == STATS_MAGIC && SeqStable(view, *st);
     return valid ? 2 : 1;
 }
 
@@ -833,6 +840,7 @@ void ClearSessionState() noexcept {
     g_app.fgMultCreate = 0;
     g_app.fgMultMax = 0;
     g_app.slotWait = g_app.lockWait = 0.0f;
+    g_app.evalActive = g_app.ofActive = g_app.scalingActive = 0;
     g_app.gateSkips = g_app.gateExpired = g_app.gateResets = 0;
     g_app.temporalState[0] = 0;
     g_app.temporalRoute = 0;
@@ -895,6 +903,10 @@ void LoadStats() noexcept {
     // 被调,曾把打标一并拖进"隐藏即休眠"的门里)。
     g_app.slotWait = st.slotWait;
     g_app.lockWait = st.lockWait;
+    // 每帧实效位(DSL9;死亡/简体 body 不带 = 清零,与 slotWait 同规则)。
+    g_app.evalActive = static_cast<int>(st.evalActive);
+    g_app.ofActive = static_cast<int>(st.ofActive);
+    g_app.scalingActive = static_cast<int>(st.scalingActive);
     g_app.gateSkips = static_cast<int>(st.gateSkips);
     g_app.gateExpired = static_cast<int>(st.gateExpired);
     g_app.gateResets = static_cast<int>(st.gateResets);
@@ -928,8 +940,9 @@ void LoadStats() noexcept {
             const int ih = static_cast<int>(st.internalH);
             const int w = static_cast<int>(st.width);
             const int h = static_cast<int>(st.height);
-            const bool scalingLive = scaling && g_app.params.nrEnabled != 0 &&
-                                     iw > 0 && ih > 0;
+            // 内部评估档真参与(DSL9 实效位直读;原按面板意图镜像"NR 参与
+            // 才为真"的推导已删 —— 插件改直连条件,面板自动跟上)。
+            const bool scalingLive = g_app.scalingActive != 0 && iw > 0 && ih > 0;
             // rtx 字段格式(dlssnr_context.cpp):"vsr WxH"/"vsr+hdr WxH"/
             // "hdr WxH"/"off" —— 跳到首个数字 sscanf WxH;off 无数字得 0。
             int rw = 0, rh = 0;
@@ -1800,25 +1813,21 @@ void DrawUi() noexcept {
                         std::snprintf(stDesc, sizeof(stDesc), "增强中,光流无运动数据");
                         stRed = true;
                     } else {
-                        // ok / 空(存活态由周期 tick 携带)。"增强中"必须真
-                        // 有增强段在跑才成立:NR 关/FG 关是 live 热生效(跳过
-                        // 评估/回落真实帧),会话壳仍在但 filter_state 恒 ok
-                        // —— 插件有意不发 passthrough(plugin.cpp nrPubState:
-                        // RTX 独立消费勿误标),面板按意图补每帧真相,与光流
-                        // 行"每帧"门控显形同理;RTX 用实际状态(create 参数,
-                        // reseek 未落地前可能仍在跑)。
-                        const bool nrOn = g_app.params.nrEnabled != 0;
-                        const bool fgOn = g_app.params.fgEnabled != 0 &&
-                                          g_app.params.fgMultiplier > 1;
+                        // ok / 空(存活态由周期 tick 携带)。"增强中"直读每帧
+                        // 实效位(DSL9):eval = 本帧 NGX 真评估;FG = fgState
+                        // "on"(真插值);RTX = 实态串(插件直发)。原按面板
+                        // 意图(nrOn/fgOn/rtxOn)推导的镜像已删 —— 插件改门控
+                        // 公式时面板静默错标的整类失配由此消灭。
+                        const bool evalOn = g_app.evalActive != 0;
+                        const bool fgOnFrame = std::strcmp(g_app.fgState, "on") == 0;
                         const bool rtxOn = g_app.rtxState[0] &&
                                            std::strcmp(g_app.rtxState, "off") != 0;
-                        if (nrOn || fgOn || rtxOn) {
+                        if (evalOn || fgOnFrame || rtxOn) {
                             std::snprintf(stDesc, sizeof(stDesc),
-                                          "增强中(NGX 推理运行)%s",
-                                          nrOn ? "" : ";NR 已关(跳过评估)");
+                                          "增强中(NGX 推理运行)");
                         } else {
                             std::snprintf(stDesc, sizeof(stDesc),
-                                          "直通(画面未增强):面板全关");
+                                          "直通(画面未增强)");
                         }
                     }
                 }
@@ -1856,19 +1865,17 @@ void DrawUi() noexcept {
                                                   : g_app.params.motionVectorQuality,
                                               0, kOfQualityMax);
                 const bool ofBroken = std::strcmp(g_app.ofMode, "zero") == 0 && ofqReq > 0;
-                // 每帧消费态(解耦门控显形):OF 的消费者只有 NR(guidance)
-                // 与 FG(插值运动),VSR/HDR 不沾 —— "实际" of_mode 是会话级
-                // 照报,NR/FG 均关时 OF 已零提交但仍显示 forward/both,不能
-                // 当"每帧在算"的证据。此处按面板意图镜像 DLL 门控
-                // (ofNeeded = quality>0 && (!nrOff || fgM>0))补出每帧真相,
-                // 与时间线 nvof(光流) 段同源可互证。
+                // 每帧消费态(DSL9 实效位直读):ofActive = 插件侧消费门
+                // (ofNeeded)本帧真值 —— of_mode 是会话级照报,门关帧零提交,
+                // 不能当"每帧在算"的证据。"算(NR/FG)"归因仍按意图(消费方
+                // 是谁只有参数知道),门开与否交给实效位。
                 const bool ofNr = g_app.params.nrEnabled != 0;
                 const bool ofFg = g_app.params.fgEnabled != 0 && g_app.params.fgMultiplier > 1;
                 const char *ofFrame = ofqReq == 0 ? "质量 0(关)"
                                       : !g_app.ofMode[0] ? "未加载"
-                                      : (ofNr || ofFg) ? (ofNr && ofFg ? "算(NR+FG)"
-                                                          : ofNr ? "算(NR)" : "算(FG)")
-                                      : "门控跳过(NR/FG 均关,零提交)";
+                                      : !g_app.ofActive ? "门控跳过(NR/FG 均关,零提交)"
+                                      : (ofNr && ofFg) ? "算(NR+FG)"
+                                      : ofNr ? "算(NR)" : "算(FG)";
                 if (ofBroken) ImGui::TextColored(kErrRed, "光流");
                 else ImGui::TextUnformatted("光流");
                 ImGui::SameLine();

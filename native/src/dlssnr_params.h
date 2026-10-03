@@ -128,11 +128,11 @@ struct DlssnrParams {
     int preset = 0;
     // NGX "DLSSNR.Style" 0-2
     int style = 0;
-    // NGX "DLSSNR.Intensity" 0-1
+    // NGX "DLSSNR.Intensity" 0-2(beta3 上限,见 kStrengthMax 注)
     float intensity = 1.0f;
-    // NGX "DLSSNR.LocalToneStrength" 0-1
+    // NGX "DLSSNR.LocalToneStrength" 0-2
     float localToneStrength = 1.0f;
-    // NGX "DLSSNR.LocalStructureStrength" 0-1
+    // NGX "DLSSNR.LocalStructureStrength" 0-2
     float localStructureStrength = 1.0f;
     // NGX "DLSSNR.SkinStructureStrength" 0-2(上游 beta3 默认 0;-1=auto 已移除)
     float skinStructureStrength = 0.0f;

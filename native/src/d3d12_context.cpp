@@ -57,30 +57,39 @@ YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept
 
 } // namespace
 
-D3D12Context::~D3D12Context() { Finalize(); }
-
-void D3D12Context::NotifyFrameTick(double qpcSeconds) noexcept {
-    std::lock_guard<std::mutex> lock(_tickMutex);
-    _tickRing[_tickHead] = qpcSeconds;
-    _tickHead = (_tickHead + 1) % kTickRingCap;
-    if (_tickCount < kTickRingCap) ++_tickCount;
-}
-
-double D3D12Context::FrameRateWindow() noexcept {
-    std::lock_guard<std::mutex> lock(_tickMutex);
-    if (_tickCount == 0) return 0.0;
-    // now 取最后写入的 tick:读路径不需要 QPC。停顿期间无人发布统计,面板
-    // 本来就冻结;恢复后第一帧的发布会以新 now 淘汰窗口外的旧条目。
-    const double now = _tickRing[(_tickHead + kTickRingCap - 1) % kTickRingCap];
-    // 4s 窗:1s 窗计数对 25fps 类源因窗沿相位对齐落在 ±1 tick(24/25/26
-    // 跳变,2026-10-02);拉宽窗把量化误差压到 ±0.25fps,显示取整稳定。
-    const double since = now - 4.0;
-    int count = 0;
-    for (int i = 0; i < _tickCount; ++i) {
-        if (_tickRing[i] >= since) ++count;
+// 槽描述符堆的句柄计算(全仓唯一实现;槽位一律传 enum HeapSlot):录制侧
+// 构造即 SetDescriptorHeaps + 取 GPU 基址,创建侧用无 CL 构造仅取基址。
+// 原"5 行 SetDescriptorHeaps/gpuBase/inc/gpu lambda"前奏 ×14 与创建侧
+// slotHandle lambda ×5 均由此收敛。
+struct HeapBinder {
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuBase{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuBase{};
+    UINT inc = 1;
+    // 录制侧:绑定堆(命令列表每 Reset 后必须重绑)并取双基址。
+    HeapBinder(ID3D12Device *dev, ID3D12GraphicsCommandList &cl, FrameSlot &slot) {
+        ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
+        cl.SetDescriptorHeaps(1, heaps);
+        cpuBase = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+        inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
-    return static_cast<double>(count) / 4.0; // 固定 4s 窗:窗口内帧数 / 4 = fps
-}
+    // 创建侧:堆刚建好,只写描述符不录命令。
+    HeapBinder(ID3D12Device *dev, FrameSlot &slot) {
+        cpuBase = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+        inc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu(UINT i) const {
+        return D3D12_CPU_DESCRIPTOR_HANDLE{ cpuBase.ptr + static_cast<SIZE_T>(i) * inc };
+    }
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu(UINT i) const {
+        return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i) * inc };
+    }
+    // 录制侧调用形态:句柄实例直接当函数用(替代原 gpu lambda)。
+    D3D12_GPU_DESCRIPTOR_HANDLE operator()(UINT i) const { return gpu(i); }
+};
+
+D3D12Context::~D3D12Context() { Finalize(); }
 
 void D3D12Context::SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept {
     if (!err || !errLen) return;
@@ -271,7 +280,10 @@ void D3D12Context::Finalize() noexcept {
             WaitForSingleObject(_ctlEvent, 2000);
         }
     }
-    // Slots first: their command lists reference the shared PSOs/heaps.
+    // Slots: only non-RAII resources get explicit teardown here (persist
+    // mappings + Win32 events); every ComPtr member dies with the slot and
+    // the authoritative resource list lives in CreateSlotResources — do not
+    // grow this enumeration.
     for (int i = 0; i < kSlotCount; ++i) {
         FrameSlot &s = _slots[i];
         if (s.fenceEvent) {
@@ -287,22 +299,16 @@ void D3D12Context::Finalize() noexcept {
             if (s.readbackYuv[p] && s.readbackYuvMapped[p]) s.readbackYuv[p]->Unmap(0, nullptr);
             s.uploadYuvMapped[p] = nullptr;
             s.readbackYuvMapped[p] = nullptr;
-            s.uploadYuv[p].Reset();
-            s.readbackYuv[p].Reset();
-            s.yuvOut[p].Reset();
         }
-        s.inputColor.Reset();
-        s.outputColor.Reset();
-        s.reducedColor.Reset();
-        s.reducedDenoised.Reset();
-        s.horizontalRes.Reset();
-        s.motion.Reset();
-        s.confidence.Reset();
-        s.reducedMotion.Reset();
-        s.reducedConfidence.Reset();
-        s.srvUavHeap.Reset();
-        s.commandList.Reset();
-        s.allocator.Reset();
+        for (int g = 0; g < kFgGenSlots; ++g) {
+            for (int p = 0; p < 3; ++p) {
+                if (s.readbackFg[g][p] && s.readbackFgMapped[g][p])
+                    s.readbackFg[g][p]->Unmap(0, nullptr);
+                s.readbackFgMapped[g][p] = nullptr;
+            }
+        }
+        if (s.tsReadback && s.tsReadbackMapped) s.tsReadback->Unmap(0, nullptr);
+        s.tsReadbackMapped = nullptr;
     }
     _freeCount = 0;
     _psoVertical.Reset();
@@ -330,17 +336,10 @@ void D3D12Context::Finalize() noexcept {
 }
 
 bool D3D12Context::BeginCtlRecording() noexcept {
-    HRESULT hr = _ctlAllocator->Reset();
-    if (FAILED(hr)) {
-        // A previous error return with the list still open makes Reset fail
-        // with E_FAIL from then on; force-close once and retry so a single
-        // SEH doesn't brick the control path for the rest of the session.
-        _ctlCommandList->Close();
-        hr = _ctlAllocator->Reset();
-        if (FAILED(hr)) return false;
-    }
-    hr = _ctlCommandList->Reset(_ctlAllocator.Get(), nullptr);
-    return SUCCEEDED(hr);
+    // A previous error return with the list still open makes Reset fail with
+    // E_FAIL from then on; ResetAllocatorHealed force-closes once and retries
+    // so a single SEH doesn't brick the control path for the rest of the session.
+    return ResetAllocatorHealed(_ctlAllocator.Get(), _ctlCommandList.Get());
 }
 
 // ctl 路径失败点统一拉取:debug layer / 运行时的报错存进 info queue,
@@ -591,21 +590,21 @@ bool D3D12Context::CreateColorTexture(
     return true;
 }
 
-bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool fg,
-                                        int pipeW, int pipeH, int outW, int outH,
-                                        bool vsr, bool hdr, bool fgHdrInterp,
-                                        int subW, int subH, bool rgb,
+bool D3D12Context::CreateFrameResources(const SessionDesc &desc,
                                         char *err, size_t errLen) noexcept {
+    const int width = desc.width, height = desc.height;
+    const int pipeW = desc.pipeW, pipeH = desc.pipeH;
+    const int outW = desc.outW, outH = desc.outH;
     _width = width;
     _height = height;
-    _bitDepth = depth;
-    _subW = subW;
-    _subH = subH;
-    _isRgb = rgb;
+    _bitDepth = desc.depth;
+    _subW = desc.subW;
+    _subH = desc.subH;
+    _isRgb = desc.rgb;
     // 输入色度平面(VS 规则:ceil)—— 444 全分辨率、422 半宽、420 半宽半高。
-    _chromaW = subW ? (width + 1) >> 1 : width;
-    _chromaH = subH ? (height + 1) >> 1 : height;
-    _fgSlots = fg;
+    _chromaW = desc.subW ? (width + 1) >> 1 : width;
+    _chromaH = desc.subH ? (height + 1) >> 1 : height;
+    _fgSlots = desc.fg;
     // 抗闪烁时域资源随尺寸失效:context 级历史/引导纹理在此释放,每槽
     // temporalOut 同步作废(temporalOut 纹理由 RebuildTemporal 创建)。调用方
     // (Initialize/RecreateFeature)在本函数成功后按当前 antiFlicker 重新
@@ -617,12 +616,12 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     _temporalMode = 0;
     // 实验性补帧 HDR 域插帧:仅 HDR 会话有意义(HDR 关时本值无论真假管线
     // 等价 —— 插值输出恒经 SDR 域直通路径)。
-    _fgHdrInterp = fgHdrInterp && hdr;
+    _fgHdrInterp = desc.fgHdrInterp && desc.hdr;
     // RTX Video 双尺寸定格。守卫:pipe/out 必须落在 [源, 合理上界] 内,
     // 越界 = 调用方换算 bug,按无 RTX 兜底(与占位视图语义一致)。
-    _vsrSlots = vsr && pipeW >= width && pipeH >= height &&
+    _vsrSlots = desc.vsr && pipeW >= width && pipeH >= height &&
                 pipeW <= width * 8 && pipeH <= height * 8;
-    _hdrPipe = hdr;
+    _hdrPipe = desc.hdr;
     if (_vsrSlots) {
         _pipeW = pipeW;
         _pipeH = pipeH;
@@ -639,8 +638,8 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     // (静默堆腐蚀 → c0000005,2026-09-22 真机实锤)。几何入口已强制
     // 偶尺寸,此处 floor 是最后一道防线(即使漏进奇尺寸也只欠拷不越界)。
     // SDR 输出 = 输入布局(420 半 / 422 半高宽全 / 444 全);HDR P10 恒 420。
-    _outChromaW = (_hdrPipe ? 1 : subW) ? _outW >> 1 : _outW;
-    _outChromaH = (_hdrPipe ? 1 : subH) ? _outH >> 1 : _outH;
+    _outChromaW = (_hdrPipe ? 1 : desc.subW) ? _outW >> 1 : _outW;
+    _outChromaH = (_hdrPipe ? 1 : desc.subH) ? _outH >> 1 : _outH;
     // HDR 输出 = 恒 P10(PQ BT.2020 limited);SDR 输出 = 源位深同格式。
     _outPlaneBytes = (_hdrPipe || _bitDepth > 8) ? 2u : 1u;
     _outFmt = _outPlaneBytes > 1 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
@@ -648,7 +647,7 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     // 10bit,消 P10→BGRA8 的 2bit 量化);VSR-only 10bit = R10G10B10A2(见
     // NrColorFormat 注释);其余 RTX 会话回落 BGRA8(TrueHDR 拒 FP16,否决制
     // 实证 2026-09-24)。CreateSlotResources 按此建缓冲(vsrColor 同格式)。
-    _inColorFmt = NrColorFormat(!hdr && !vsr, vsr && !hdr);
+    _inColorFmt = NrColorFormat(!desc.hdr && !desc.vsr, desc.vsr && !desc.hdr);
     // 新组合的留痕由 dlssnr_context 的 "color buffer" 观察行承担(格式名
     // 三态 + 回退提示),此处不再重复发行。
 
@@ -668,7 +667,7 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
     }
     // PIPE 尺寸零深度(FG + VSR 放大时:DLSSG Depth 子矩形 = backbuffer
     // 尺寸;内容与 _depth 同为全零)。
-    const bool needDepthPipe = fg && _vsrSlots && (_pipeW != width || _pipeH != height);
+    const bool needDepthPipe = desc.fg && _vsrSlots && (_pipeW != width || _pipeH != height);
     if (needDepthPipe &&
         !CreateColorTexture(_depthPipe.GetAddressOf(), _pipeW, _pipeH,
                             DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COMMON,
@@ -739,7 +738,7 @@ bool D3D12Context::CreateFrameResources(int width, int height, int depth, bool f
             snprintf(pb, sizeof(pb), "PROBE: d3d12 slot %d begin", i);
             TimingStatusLine(pb);
         }
-        if (!CreateSlotResources(_slots[i], depth, err, errLen)) return false;
+        if (!CreateSlotResources(_slots[i], desc.depth, err, errLen)) return false;
         if (ProbeEnabled()) {
             char pb[48];
             snprintf(pb, sizeof(pb), "PROBE: d3d12 slot %d done", i);
@@ -816,17 +815,15 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
     slot.fgAllocator.Reset();
     slot.postCommandList.Reset();
     slot.postAllocator.Reset();
-    // base 完成时间戳路径资源(2026-09-25):persist-mapped READBACK 先解映射。
+    // base 完成时间戳路径资源(2026-09-25):persist-mapped READBACK 先解映射;
+    // 括号 CL 对按 TsSlot 数组统一释放(含 RTX 段 —— 旧具名形态曾漏列,
+    // 靠 ComPtr 重赋值兜底;PoolHold 保证此处全部空闲)。
     if (slot.tsReadback && slot.tsReadbackMapped) slot.tsReadback->Unmap(0, nullptr);
     slot.tsReadbackMapped = nullptr;
-    slot.tsCommandList.Reset();
-    slot.tsAllocator.Reset();
-    slot.tsPreBaseCommandList.Reset();
-    slot.tsPreBaseAllocator.Reset();
-    slot.tsPreFgCommandList.Reset();
-    slot.tsPreFgAllocator.Reset();
-    slot.tsPostFgCommandList.Reset();
-    slot.tsPostFgAllocator.Reset();
+    for (int i = 0; i < kTsSlotCount; ++i) {
+        slot.ts[i].cl.Reset();
+        slot.ts[i].alloc.Reset();
+    }
     slot.tsQueryHeap.Reset();
     slot.tsReadback.Reset();
     slot.submitQpc = 0;
@@ -1057,46 +1054,41 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
         // 占位视图)+ 39-43(fgInterp 逐 gen SRV)+ 44-48(hdrFg 逐 gen SRV)。
         D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
         heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        heapDesc.NumDescriptors = 66; // 0-34 原有 + 36-38(RTX)+ 39-48(FG/HDR 逐 gen)+ 49/50(FFX OF 后端)+ 51(fgBack UAV)+ 52-65(抗闪烁时域)
+        heapDesc.NumDescriptors = kHeapSlotCount; // 布局唯一权威 = enum HeapSlot
         heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         hr = _device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(slot.srvUavHeap.GetAddressOf()));
         if (FAILED(hr)) {
             SetErr(err, errLen, hr, "CreateDescriptorHeap(SRV/UAV slot) failed");
             return false;
         }
-        const D3D12_CPU_DESCRIPTOR_HANDLE base = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, base);
-        const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        auto slotHandle = [&](UINT i) {
-            return D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(i * inc) };
-        };
-        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(7));
-        // 10-13:densify 的 motion/confidence SRV+UAV(源尺寸)。
-        _device->CreateShaderResourceView(slot.motion.Get(), nullptr, slotHandle(10));
-        _device->CreateShaderResourceView(slot.confidence.Get(), nullptr, slotHandle(11));
-        _device->CreateUnorderedAccessView(slot.motion.Get(), nullptr, nullptr, slotHandle(12));
-        _device->CreateUnorderedAccessView(slot.confidence.Get(), nullptr, nullptr, slotHandle(13));
-        // 14-17 预置为 inputColor 的占位视图(NVOF 会话建立时由
-        // BindNvofResources 覆盖为 flow/cost 视图;densify 只在会话存活时
-        // 被记录,占位视图永不被有效读取)。不要在这里建 NULL 描述符:
-        // CreateShaderResourceView(nullptr,nullptr) 在本机驱动(RTX 3080)
-        // 上触发异步 TDR(DEVICE_HUNG,2026-09-07 二分定位)。
-        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(14));
-        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(15));
-        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(16));
-        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(17));
-        // 22:outputColor 的 SRV(RGB→YUV 转换读;原 srvNvofSrc 随 nvofSrcTex
-        // 删除让位 —— 降采样直接采样槽 0 srvInput)。
-        _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(22));
-        // 23/24:NVOF 注册输入纹理的 UAV 占位(outputColor 带 UAV flag,
-        // 不 NULL);BindNvofResources 在会话建立时覆盖为真值。降采样只在
-        // 会话存活时被记录,占位永不被有效写入。
-        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(23));
-        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(24));
-        // 25-27:uploadYuv 的 typed buffer SRV(YUV→RGB 直读 upload 堆,
+        // 堆里绝不写 NULL 描述符(本机驱动 RTX 3080 上 CreateShaderResourceView
+        // (nullptr,nullptr) 曾触发异步 TDR,2026-09-07 二分定位)—— 所有
+        // 尚无真资源的槽位一律绑带 UAV flag 的 outputColor/inputColor 占位。
+        HeapBinder heap{ _device.Get(), slot };
+        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, heap.cpu(HeapSlot::SrvInput));
+        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavOutput));
+        // densify 的 motion/confidence SRV+UAV(源尺寸)。
+        _device->CreateShaderResourceView(slot.motion.Get(), nullptr, heap.cpu(HeapSlot::SrvMotion));
+        _device->CreateShaderResourceView(slot.confidence.Get(), nullptr, heap.cpu(HeapSlot::SrvConfidence));
+        _device->CreateUnorderedAccessView(slot.motion.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavMotion));
+        _device->CreateUnorderedAccessView(slot.confidence.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavConfidence));
+        // 14-17(SrvFlowF..SrvCostB)预置为 inputColor 的占位视图(NVOF 会话
+        // 建立时由 BindNvofResources 覆盖为 flow/cost 视图;densify 只在会话
+        // 存活时被记录,占位视图永不被有效读取)。
+        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, heap.cpu(HeapSlot::SrvFlowF));
+        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, heap.cpu(HeapSlot::SrvFlowB));
+        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, heap.cpu(HeapSlot::SrvCostF));
+        _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, heap.cpu(HeapSlot::SrvCostB));
+        // SrvOutputColor:outputColor 的 SRV(RGB→YUV 转换读;降采样直接采样
+        // 槽 0 srvInput)。UavNvofInput0/1:NVOF 注册输入纹理的 UAV 占位,
+        // BindNvofResources 在会话建立时覆盖为真值。
+        _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, heap.cpu(HeapSlot::SrvOutputColor));
+        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavNvofInput0));
+        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavNvofInput1));
+        // SrvYuvIn0-2:uploadYuv 的 typed buffer SRV(YUV→RGB 直读 upload 堆,
         // 2026-10-02;tsrv_probe 复核的形态,UPLOAD 堆恒 GENERIC_READ 全读态
-        // 免屏障);28-30:yuvOut 的 UAV(RGB→YUV 写出);31:inputColor 的
-        // UAV(YUV→RGB 直写)。
+        // 免屏障);UavYuvOut0-2:yuvOut 的 UAV(RGB→YUV 写出);UavInput:
+        // inputColor 的 UAV(YUV→RGB 直写)。
         for (int i = 0; i < 3; ++i) {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
             srv.Format = _bitDepth > 8 ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R8_UNORM;
@@ -1104,69 +1096,69 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srv.Buffer.NumElements = static_cast<UINT>(
                 slot.uploadYuv[i]->GetDesc().Width / (_bitDepth > 8 ? 2u : 1u));
-            _device->CreateShaderResourceView(slot.uploadYuv[i].Get(), &srv, slotHandle(25 + i));
-            _device->CreateUnorderedAccessView(slot.yuvOut[i].Get(), nullptr, nullptr, slotHandle(28 + i));
+            _device->CreateShaderResourceView(slot.uploadYuv[i].Get(), &srv,
+                                              heap.cpu(static_cast<HeapSlot>(HeapSlot::SrvYuvIn0 + i)));
+            _device->CreateUnorderedAccessView(slot.yuvOut[i].Get(), nullptr, nullptr,
+                                               heap.cpu(static_cast<HeapSlot>(HeapSlot::UavYuvOut0 + i)));
         }
-        _device->CreateUnorderedAccessView(slot.inputColor.Get(), nullptr, nullptr, slotHandle(31));
-        // 32/33:占位视图(shader 已改用逐 gen 转换视图 39-43,本座不再被
-        // 任何 pass 绑定)—— 但堆里绝不留 NULL 描述符(见描述符块前的 TDR
-        // 注释),恒绑 outputColor 占位。fgInterp 已在上面创建 —— 顺序是
-        // 硬约束。
-        _device->CreateShaderResourceView(slot.outputColor.Get(), nullptr, slotHandle(32));
-        _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(33));
-        // 34:共享差异调试纹理的 UAV(资源 = context 级 _debugDiff,已在
-        // CreateFrameResources 槽池循环前创建;每槽堆各持一份指向同一
+        _device->CreateUnorderedAccessView(slot.inputColor.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavInput));
+        // 32/33(Unused32/33):逐 gen 转换视图(39-43)接手后已无消费者,不再
+        // 建视图 —— 未绑定的堆区间从不被读,安全;编号留空不重排。
+        // UavDebugDiff:共享差异调试纹理的 UAV(资源 = context 级 _debugDiff,
+        // 已在 CreateFrameResources 槽池循环前创建;每槽堆各持一份指向同一
         // 资源的视图,dispatch 只被本槽 CL 引用)。
-        _device->CreateUnorderedAccessView(_debugDiff.Get(), nullptr, nullptr, slotHandle(34));
-        // 35:静态零运动纹理的 SRV(资源 = context 级 _motion,槽池循环前
-        // 创建,常驻 NSR)—— 光流场调试视图在无真运动帧(播种/OF 关)绑定
-        // 它:slot.motion 的内容在首 densify 前未定义,直接绑会显示假流;
-        // 零纹理保证"黑 = 无光流数据"的语义成立。
-        _device->CreateShaderResourceView(_motion.Get(), nullptr, slotHandle(35));
-        // 36/37/38:RTX Video(占位 = outputColor/motion,资源带 UAV flag,
-        // 满足"绝不写 NULL 描述符"惯例;RTX 未激活时这些槽永不被有效读取
+        _device->CreateUnorderedAccessView(_debugDiff.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavDebugDiff));
+        // SrvZeroMotion:静态零运动纹理的 SRV(资源 = context 级 _motion,
+        // 槽池循环前创建,常驻 NSR)—— 光流场调试视图在无真运动帧(播种/
+        // OF 关)绑定它:slot.motion 的内容在首 densify 前未定义,直接绑会
+        // 显示假流;零纹理保证"黑 = 无光流数据"的语义成立。
+        _device->CreateShaderResourceView(_motion.Get(), nullptr, heap.cpu(HeapSlot::SrvZeroMotion));
+        // SrvVsrColor/SrvHdrColor/UavMotionDense:RTX Video(占位 =
+        // outputColor/motion,资源带 UAV flag;RTX 未激活时永不被有效读取
         // —— 对应的 Record 调用只在 RTX 管线被记录)。
         _device->CreateShaderResourceView(slot.vsrColor ? slot.vsrColor.Get()
                                                         : slot.outputColor.Get(),
-                                          nullptr, slotHandle(36));
+                                          nullptr, heap.cpu(HeapSlot::SrvVsrColor));
         _device->CreateShaderResourceView(slot.hdrColor ? slot.hdrColor.Get()
                                                         : slot.outputColor.Get(),
-                                          nullptr, slotHandle(37));
+                                          nullptr, heap.cpu(HeapSlot::SrvHdrColor));
         _device->CreateUnorderedAccessView(slot.motionDense ? slot.motionDense.Get()
                                                             : slot.motion.Get(),
-                                           nullptr, nullptr, slotHandle(38));
-        // 39-43:fgInterp[0..4] 逐 gen SRV(转换读 / TrueHDR 输入读 —— NGX
-        // 走资源参数不需要描述符,这里只服务我们自己的转换 pass)。非 FG 槽
-        // = outputColor 占位(永不有效读取)。
+                                           nullptr, nullptr, heap.cpu(HeapSlot::UavMotionDense));
+        // SrvFgInterp0-4:fgInterp[0..4] 逐 gen SRV(转换读 / TrueHDR 输入读
+        // —— NGX 走资源参数不需要描述符,这里只服务我们自己的转换 pass)。
+        // 非 FG 槽 = outputColor 占位(永不有效读取)。
         for (int g = 0; g < kFgGenSlots; ++g) {
             _device->CreateShaderResourceView(_fgSlots ? slot.fgInterp[g].Get()
                                                        : slot.outputColor.Get(),
-                                              nullptr, slotHandle(kSrvFgInterpBase + g));
+                                              nullptr, heap.cpu(static_cast<HeapSlot>(HeapSlot::SrvFgInterp0 + g)));
         }
-        // 44-48:hdrFg[0..4] 逐 gen SRV(TrueHDR 插值帧输出,PQ 转换读)。
+        // SrvHdrFg0-4:hdrFg[0..4] 逐 gen SRV(TrueHDR 插值帧输出,PQ 转换读)。
         // 非 HDR 槽 = hdrColor/outputColor 占位。
         for (int g = 0; g < kFgGenSlots; ++g) {
             _device->CreateShaderResourceView(slot.hdrFg[g] ? slot.hdrFg[g].Get()
                                             : slot.hdrColor ? slot.hdrColor.Get()
                                                             : slot.outputColor.Get(),
-                                              nullptr, slotHandle(kSrvHdrFgBase + g));
+                                              nullptr, heap.cpu(static_cast<HeapSlot>(HeapSlot::SrvHdrFg0 + g)));
         }
-        // 51:fgBack 的 UAV(PQ 域插帧编码 pass 写,HdrToPq)。非实验槽 =
+        // UavFgBack:fgBack 的 UAV(PQ 域插帧编码 pass 写,HdrToPq)。非实验槽 =
         // outputColor 占位(永不有效读取 —— 对应 Record 调用只在实验模式被
         // 记录;资源带 UAV flag,满足"绝不写 NULL 描述符"惯例)。
         _device->CreateUnorderedAccessView(slot.fgBack ? slot.fgBack.Get()
                                                        : slot.outputColor.Get(),
-                                           nullptr, nullptr, slotHandle(kUavFgBack));
-        // 52-65:抗闪烁时域占位(RebuildTemporal 在 PoolHold 内覆盖为真值;
-        // 关闭态视图指向 inputColor/outputColor,永不有效读取 —— 时域 Record
-        // 只在 TemporalMode()>0 时被记录;占位目标均带 UAV flag,不 NULL)。
-        // 布局:52/53=out SRV/UAV,54/55=hist0 UAV/SRV,56/57=hist1,
-        // 58/59=guide0,60/61=guide1,62/63=low0 SRV/UAV,64/65=low1。
-        for (UINT d : {52u, 55u, 57u, 59u, 61u, 62u, 64u}) {
-            _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, slotHandle(d));
+                                           nullptr, nullptr, heap.cpu(HeapSlot::UavFgBack));
+        // 52-65 抗闪烁时域占位:关闭态 = inputColor(SRV 侧)/outputColor
+        // (UAV 侧),RebuildTemporal 在 PoolHold 内覆盖写真视图 —— 时域
+        // Record 只在 TemporalMode()>0 时被记录,占位永不有效读取。
+        for (HeapSlot d : {HeapSlot::SrvTemporalOut, HeapSlot::Hist0Srv, HeapSlot::Hist1Srv,
+                           HeapSlot::Guide0Srv, HeapSlot::Guide1Srv,
+                           HeapSlot::Low0Srv, HeapSlot::Low1Srv}) {
+            _device->CreateShaderResourceView(slot.inputColor.Get(), nullptr, heap.cpu(d));
         }
-        for (UINT d : {53u, 54u, 56u, 58u, 60u, 63u, 65u}) {
-            _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, slotHandle(d));
+        for (HeapSlot d : {HeapSlot::UavTemporalOut, HeapSlot::Hist0Uav, HeapSlot::Hist1Uav,
+                           HeapSlot::Guide0Uav, HeapSlot::Guide1Uav,
+                           HeapSlot::Low0Uav, HeapSlot::Low1Uav}) {
+            _device->CreateUnorderedAccessView(slot.outputColor.Get(), nullptr, nullptr, heap.cpu(d));
         }
     }
 
@@ -1182,33 +1174,24 @@ bool D3D12Context::CreateSlotResources(FrameSlot &slot, int depth, char *err, si
             SetErr(err, errLen, E_FAIL, "CreateQueryHeap(ts) failed");
             return false;
         }
-        // 10 对微型括号 CL:postBase(原有)+ preBase + preFg/postFg +
-        // RTX 段 preVsr/postVsr/preHdr/postHdr/preGen/postGen(6..11)。
-        // 同帧内全部在飞,须各自独立 allocator(在飞 Reset = UB)。
-        const auto createBracket = [&](ComPtr<ID3D12CommandAllocator> &alloc,
-                                       ComPtr<ID3D12GraphicsCommandList> &cl) -> bool {
+        // 括号 CL 对按 TsSlot 数组全量建立(Post0/Post1 = post CL 内联打点,
+        // 无独立括号,跳过)。同帧内多对在飞,须各自独立 allocator(在飞
+        // Reset = UB)。
+        const auto createBracket = [&](TsBracket &b) -> bool {
             if (FAILED(_device->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(alloc.GetAddressOf()))) ||
+                    D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(b.alloc.GetAddressOf()))) ||
                 FAILED(_device->CreateCommandList(
-                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr,
-                    IID_PPV_ARGS(cl.GetAddressOf()))) ||
-                FAILED(cl->Close())) {
+                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, b.alloc.Get(), nullptr,
+                    IID_PPV_ARGS(b.cl.GetAddressOf()))) ||
+                FAILED(b.cl->Close())) {
                 SetErr(err, errLen, E_FAIL, "create ts command path failed");
                 return false;
             }
             return true;
         };
-        if (!createBracket(slot.tsAllocator, slot.tsCommandList) ||
-            !createBracket(slot.tsPreBaseAllocator, slot.tsPreBaseCommandList) ||
-            !createBracket(slot.tsPreFgAllocator, slot.tsPreFgCommandList) ||
-            !createBracket(slot.tsPostFgAllocator, slot.tsPostFgCommandList) ||
-            !createBracket(slot.tsPreVsrAllocator, slot.tsPreVsrCommandList) ||
-            !createBracket(slot.tsPostVsrAllocator, slot.tsPostVsrCommandList) ||
-            !createBracket(slot.tsPreHdrAllocator, slot.tsPreHdrCommandList) ||
-            !createBracket(slot.tsPostHdrAllocator, slot.tsPostHdrCommandList) ||
-            !createBracket(slot.tsPreGenAllocator, slot.tsPreGenCommandList) ||
-            !createBracket(slot.tsPostGenAllocator, slot.tsPostGenCommandList)) {
-            return false;
+        for (int i = 0; i < kTsSlotCount; ++i) {
+            if (i == kTsPost0 || i == kTsPost1) continue;
+            if (!createBracket(slot.ts[i])) return false;
         }
         D3D12_HEAP_PROPERTIES rbHeap{};
         rbHeap.Type = D3D12_HEAP_TYPE_READBACK;
@@ -1375,18 +1358,9 @@ bool D3D12Context::PackInput(
 }
 
 bool D3D12Context::BeginFrameRecording(FrameSlot &slot) noexcept {
-    HRESULT hr = slot.allocator->Reset();
-    if (FAILED(hr)) {
-        // A previous frame's mid-recording error return leaves the command
-        // list open, which makes allocator/list Reset fail with E_FAIL from
-        // then on; force-close once and retry so a single SEH doesn't brick
-        // this slot for the rest of the session.
-        slot.commandList->Close();
-        hr = slot.allocator->Reset();
-        if (FAILED(hr)) return false;
-    }
-    hr = slot.commandList->Reset(slot.allocator.Get(), nullptr);
-    return SUCCEEDED(hr);
+    // 上一帧录制中途失败遗留 open CL 会让 Reset 从此 E_FAIL;自愈一次
+    // (ResetAllocatorHealed = 全仓唯一实现,见 d3d12_context.h)。
+    return ResetAllocatorHealed(slot.allocator.Get(), slot.commandList.Get());
 }
 
 // cbuffer ConvertInParams(root constants,三处同步铁律:HLSL cbuffer /
@@ -1412,11 +1386,7 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
     const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _bitDepth);
     cl->SetComputeRootSignature(_rsConvertIn.Get());
     cl->SetPipelineState(_isRgb ? _psoConvertInRgb.Get() : _psoConvertIn.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
     const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
     const float consts[8]{ cf.containerMax, cf.yLo, 1.0f / cf.ySpan, cf.cMid,
                            1.0f / cf.cSpan, cf.kr, cf.kb, 0.0f };
@@ -1435,10 +1405,10 @@ void D3D12Context::RecordConvertInput(ID3D12GraphicsCommandList &clRef, FrameSlo
         static_cast<UINT>(slot.uploadPitchYuv[1]) / texelBytes,
     };
     cl->SetComputeRoot32BitConstants(0, 2, planePitches, 14);
-    cl->SetComputeRootDescriptorTable(1, gpu(25)); // t0 PlaneY
-    cl->SetComputeRootDescriptorTable(2, gpu(26)); // t1 PlaneU
-    cl->SetComputeRootDescriptorTable(3, gpu(27)); // t2 PlaneV
-    cl->SetComputeRootDescriptorTable(4, gpu(31)); // u0 inputColor
+    cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvYuvIn0)); // t0 PlaneY
+    cl->SetComputeRootDescriptorTable(2, gpu(HeapSlot::SrvYuvIn1)); // t1 PlaneU
+    cl->SetComputeRootDescriptorTable(3, gpu(HeapSlot::SrvYuvIn2)); // t2 PlaneV
+    cl->SetComputeRootDescriptorTable(4, gpu(HeapSlot::UavInput)); // u0 inputColor
     cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
 
     // 2) inputColor → stateAfter(NSR=NGX 待读;COMMON=skipEval)。单屏障
@@ -1501,14 +1471,7 @@ bool D3D12Context::RecordReadbackCopy(ID3D12GraphicsCommandList &clRef, FrameSlo
 bool D3D12Context::BeginFgRecording(FrameSlot &slot) noexcept {
     // 与 BeginFrameRecording 同款防砖:上次录制中途失败遗留 open CL 会让
     // allocator Reset 报 E_FAIL —— force-close 一次再试。
-    HRESULT hr = slot.fgAllocator->Reset();
-    if (FAILED(hr)) {
-        slot.fgCommandList->Close();
-        hr = slot.fgAllocator->Reset();
-        if (FAILED(hr)) return false;
-    }
-    hr = slot.fgCommandList->Reset(slot.fgAllocator.Get(), nullptr);
-    return SUCCEEDED(hr);
+    return ResetAllocatorHealed(slot.fgAllocator.Get(), slot.fgCommandList.Get());
 }
 
 // 分段提交共用体:Close 目标 CL → 队列执行 → signal 全局栅栏新值。提交互斥
@@ -1544,10 +1507,10 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, char *err, size_t errLen) no
     // "0 = 本帧没盖章")。清零时槽刚从池子取出:上帧 WaitFrame 已闭合或设备
     // 丢失域,GPU 不会再写,CPU 独占安全;64 字节擦除开销可忽略。
     if (slot.tsReadbackMapped) std::memset(slot.tsReadbackMapped, 0, 128);
-    const bool preBaseOk = RecordTsBracket(slot, slot.tsPreBaseAllocator.Get(),
-                                           slot.tsPreBaseCommandList.Get(), 0);
+    const bool preBaseOk = RecordTsBracket(slot, slot.ts[kTsPreBase].alloc.Get(),
+                                           slot.ts[kTsPreBase].cl.Get(), kTsPreBase);
     if (preBaseOk) {
-        ID3D12CommandList *tsLists[]{ slot.tsPreBaseCommandList.Get() };
+        ID3D12CommandList *tsLists[]{ slot.ts[kTsPreBase].cl.Get() };
         _queue->ExecuteCommandLists(1, tsLists);
     }
     ID3D12CommandList *lists[]{ slot.commandList.Get() };
@@ -1565,9 +1528,9 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, char *err, size_t errLen) no
     // 执行 → readback 恒零 → NR 开着 gpu 段恒 0(真机实锤)。
     slot.tsValid = false;
     if (_gpuTsEnabled && preBaseOk) {
-        if (RecordTsBracket(slot, slot.tsAllocator.Get(),
-                            slot.tsCommandList.Get(), 1)) {
-            ID3D12CommandList *tsLists[]{ slot.tsCommandList.Get() };
+        if (RecordTsBracket(slot, slot.ts[kTsPostBase].alloc.Get(),
+                            slot.ts[kTsPostBase].cl.Get(), kTsPostBase)) {
+            ID3D12CommandList *tsLists[]{ slot.ts[kTsPostBase].cl.Get() };
             _queue->ExecuteCommandLists(1, tsLists);
             UINT64 gpuCal = 0, cpuCal = 0;
             if (SUCCEEDED(_queue->GetClockCalibration(&gpuCal, &cpuCal))) {
@@ -1583,15 +1546,7 @@ bool D3D12Context::SubmitBaseFrame(FrameSlot &slot, char *err, size_t errLen) no
 bool D3D12Context::RecordTsBracket(FrameSlot &slot, ID3D12CommandAllocator *alloc,
                                    ID3D12GraphicsCommandList *cl, UINT tsIdx) noexcept {
     if (!_gpuTsEnabled) return false;
-    HRESULT hr = alloc->Reset();
-    if (FAILED(hr)) {
-        // force-close 自愈(BeginFrameRecording 同款):上次录制中途失败遗留
-        // open CL 会让 allocator Reset 永久 E_FAIL。
-        cl->Close();
-        hr = alloc->Reset();
-        if (FAILED(hr)) return false;
-    }
-    if (FAILED(cl->Reset(alloc, nullptr))) return false;
+    if (!ResetAllocatorHealed(alloc, cl)) return false;
     cl->EndQuery(slot.tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, tsIdx);
     cl->ResolveQueryData(slot.tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
                          tsIdx, 1, slot.tsReadback.Get(), tsIdx * 8); // void 返回
@@ -1626,18 +1581,18 @@ bool D3D12Context::SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64
     }
     // preFg/postFg 括号(2026-09-25 账目诚实化):DLSSG 纯执行 = postFg −
     // preFg,不含冲刷点引擎等待与队列积压。失败仅放弃本段账目。
-    const bool preFgOk = RecordTsBracket(slot, slot.tsPreFgAllocator.Get(),
-                                         slot.tsPreFgCommandList.Get(), 2);
+    const bool preFgOk = RecordTsBracket(slot, slot.ts[kTsPreFg].alloc.Get(),
+                                         slot.ts[kTsPreFg].cl.Get(), kTsPreFg);
     if (preFgOk) {
-        ID3D12CommandList *tsLists[]{ slot.tsPreFgCommandList.Get() };
+        ID3D12CommandList *tsLists[]{ slot.ts[kTsPreFg].cl.Get() };
         _queue->ExecuteCommandLists(1, tsLists);
     }
     ID3D12CommandList *lists[]{ slot.fgCommandList.Get() };
     _queue->ExecuteCommandLists(1, lists);
     if (preFgOk) {
-        if (RecordTsBracket(slot, slot.tsPostFgAllocator.Get(),
-                            slot.tsPostFgCommandList.Get(), 3)) {
-            ID3D12CommandList *tsLists[]{ slot.tsPostFgCommandList.Get() };
+        if (RecordTsBracket(slot, slot.ts[kTsPostFg].alloc.Get(),
+                            slot.ts[kTsPostFg].cl.Get(), kTsPostFg)) {
+            ID3D12CommandList *tsLists[]{ slot.ts[kTsPostFg].cl.Get() };
             _queue->ExecuteCommandLists(1, tsLists);
         }
     }
@@ -1650,20 +1605,13 @@ bool D3D12Context::SubmitFgFrame(FrameSlot &slot, ID3D12Fence *waitFence, uint64
 bool D3D12Context::BeginPostRecording(FrameSlot &slot) noexcept {
     // 与 BeginFgRecording 同款防砖:上次录制中途失败遗留 open CL 会让
     // allocator Reset 报 E_FAIL —— force-close 一次再试。
-    HRESULT hr = slot.postAllocator->Reset();
-    if (FAILED(hr)) {
-        slot.postCommandList->Close();
-        hr = slot.postAllocator->Reset();
-        if (FAILED(hr)) return false;
-    }
-    hr = slot.postCommandList->Reset(slot.postAllocator.Get(), nullptr);
-    if (FAILED(hr)) return false;
+    if (!ResetAllocatorHealed(slot.postAllocator.Get(), slot.postCommandList.Get())) return false;
     // post CL 首时间戳(2026-09-25 账目诚实化):post 是自绘 shader(无
     // NGX,"同 CL 打点 SEH" 的单次观测只涉及 NGX 段),首尾同 CL 打点量出纯执行时间
     // —— 其跨队列栅栏等待(A/B)与队列积压属排队,不计入 conv。
     if (_gpuTsEnabled) {
         slot.postCommandList->EndQuery(slot.tsQueryHeap.Get(),
-                                       D3D12_QUERY_TYPE_TIMESTAMP, 4);
+                                       D3D12_QUERY_TYPE_TIMESTAMP, kTsPost0);
     }
     return true;
 }
@@ -1674,10 +1622,10 @@ bool D3D12Context::SubmitPostFrame(FrameSlot &slot,
                                    char *err, size_t errLen) noexcept {
     if (_gpuTsEnabled) {
         slot.postCommandList->EndQuery(slot.tsQueryHeap.Get(),
-                                       D3D12_QUERY_TYPE_TIMESTAMP, 5);
+                                       D3D12_QUERY_TYPE_TIMESTAMP, kTsPost1);
         slot.postCommandList->ResolveQueryData(
-            slot.tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 4, 2,
-            slot.tsReadback.Get(), 32); // void 返回;槽 4/5 = 字节偏移 32
+            slot.tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, kTsPost0, 2,
+            slot.tsReadback.Get(), kTsPost0 * 8); // void 返回;槽 4/5 = 字节偏移 32
     }
     HRESULT hr = slot.postCommandList->Close();
     if (FAILED(hr)) {
@@ -3192,34 +3140,36 @@ void ScaleMotion(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
-// AMD 光流后端通用 cs_5_0 PSO 构造:1 个 32 位常量根参数(b0,numConsts)
-// + nSrv 个独立 t 表 + nUav 个独立 u 表(与 densify/nvof downsample 同构;
-// 独立表参数,同表重叠 range 禁忌)。FFX 的两个 PSO 全走这里 ——
-// 无 WaveOps 依赖(cs_5_0),FFX 自身 7 pass 是 SM6.2 预编译 blob 不经本编译器。
-bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
-                 UINT numConsts, UINT srvCount, UINT uavCount,
-                 ID3D12RootSignature **rs, ID3D12PipelineState **pso,
-                 const char *label, char *err, size_t errLen) noexcept {
+// 通用 compute 根签名工厂:b0(numConsts)+ srvCount 张独立 SRV 表 +
+// uavCount 张独立 UAV 表。参数序 = 常量、SRV、UAV —— 全仓录制点按此绑定
+// 表索引(SetComputeRootDescriptorTable(1..N)),改序 = 全部 Record* 失配。
+// 此前该形态在 CreateComputeObjects 内手写 8 份(每份 60-90 行),唯一真
+// 差异只有个数;"同表重叠 range 非法"禁忌由工厂内独立表参数构造性规避。
+// sampler 非空 = 追加静态采样器(时域稳定器专用)。
+bool CreateComputeRs(ID3D12Device *device, UINT numConsts, UINT srvCount, UINT uavCount,
+                     ID3D12RootSignature **rs, const char *label,
+                     const D3D12_STATIC_SAMPLER_DESC *sampler,
+                     char *err, size_t errLen) noexcept {
     // err 直写(本 helper 是自由函数,SetErr 是 D3D12Context 成员)。
     auto fail = [&](const char *what) {
         if (err && errLen) std::snprintf(err, errLen, "%s: %s", label, what);
         return false;
     };
-    D3D12_DESCRIPTOR_RANGE srvRanges[2]{};
+    D3D12_DESCRIPTOR_RANGE srvRanges[8]{};
     for (UINT i = 0; i < srvCount; ++i) {
         srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
         srvRanges[i].NumDescriptors = 1;
         srvRanges[i].BaseShaderRegister = i;
         srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
     }
-    D3D12_DESCRIPTOR_RANGE uavRanges[2]{};
+    D3D12_DESCRIPTOR_RANGE uavRanges[4]{};
     for (UINT i = 0; i < uavCount; ++i) {
         uavRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
         uavRanges[i].NumDescriptors = 1;
         uavRanges[i].BaseShaderRegister = i;
         uavRanges[i].OffsetInDescriptorsFromTableStart = 0;
     }
-    D3D12_ROOT_PARAMETER params[5]{};
+    D3D12_ROOT_PARAMETER params[13]{};
     UINT n = 0;
     params[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[n].Constants.ShaderRegister = 0;
@@ -3241,6 +3191,10 @@ bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
     rsDesc.NumParameters = n;
     rsDesc.pParameters = params;
+    if (sampler) {
+        rsDesc.NumStaticSamplers = 1;
+        rsDesc.pStaticSamplers = sampler;
+    }
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
     ComPtr<ID3DBlob> rsBlob, rsErr;
     if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
@@ -3251,6 +3205,18 @@ bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
                                            rsBlob->GetBufferSize(), IID_PPV_ARGS(rs)))) {
         return fail("CreateRootSignature failed");
     }
+    return true;
+}
+
+// 对既有根签名编译一个入口并建 PSO(与 CreateComputeRs 配对;多入口共用
+// 一张根签名时循环本函数)。
+bool CreateComputePsoFor(ID3D12Device *device, const char *hlsl, const char *entry,
+                         ID3D12RootSignature *rs, ID3D12PipelineState **pso,
+                         const char *label, char *err, size_t errLen) noexcept {
+    auto fail = [&](const char *what) {
+        if (err && errLen) std::snprintf(err, errLen, "%s: %s", label, what);
+        return false;
+    };
     ComPtr<ID3DBlob> code, csErr;
     if (FAILED(D3DCompile(hlsl, strlen(hlsl), nullptr, nullptr, nullptr, entry, "cs_5_0",
                           0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
@@ -3258,12 +3224,23 @@ bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
                           : "D3DCompile failed");
     }
     D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-    psoDesc.pRootSignature = *rs;
+    psoDesc.pRootSignature = rs;
     psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
     if (FAILED(device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(pso)))) {
         return fail("CreateComputePipelineState failed");
     }
     return true;
+}
+
+// AMD 光流后端通用 cs_5_0 PSO 构造(CreateComputeRs + CreateComputePsoFor
+// 的单入口封装,FFX/motion scale 三处调用保留原签名)。
+bool CreateOfPso(ID3D12Device *device, const char *hlsl, const char *entry,
+                 UINT numConsts, UINT srvCount, UINT uavCount,
+                 ID3D12RootSignature **rs, ID3D12PipelineState **pso,
+                 const char *label, char *err, size_t errLen) noexcept {
+    return CreateComputeRs(device, numConsts, srvCount, uavCount, rs, label,
+                           nullptr, err, errLen) &&
+           CreateComputePsoFor(device, hlsl, entry, *rs, pso, label, err, errLen);
 }
 
 } // namespace
@@ -3370,290 +3347,62 @@ bool D3D12Context::DumpTextureToFile(ID3D12Resource *tex, const wchar_t *path,
 }
 
 bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
-    // root signature: b0 = 12 root constants (Magpie ResampleConstants, 48B),
-    // t0/t1 as independent SRV tables (the passes need non-adjacent descriptor
-    // pairs), (u0) UAV table
-    D3D12_DESCRIPTOR_RANGE srvRange0{};
-    srvRange0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange0.NumDescriptors = 1;
-    srvRange0.BaseShaderRegister = 0;
-    srvRange0.OffsetInDescriptorsFromTableStart = 0;
-    D3D12_DESCRIPTOR_RANGE srvRange1{};
-    srvRange1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    srvRange1.NumDescriptors = 1;
-    srvRange1.BaseShaderRegister = 1;
-    srvRange1.OffsetInDescriptorsFromTableStart = 0;
-    D3D12_DESCRIPTOR_RANGE uavRange{};
-    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    uavRange.NumDescriptors = 1;
-    uavRange.BaseShaderRegister = 0;
-    uavRange.OffsetInDescriptorsFromTableStart = 0;
+    // 全部根签名/PSO 经 CreateComputeRs + CreateComputePsoFor 表驱动建立
+    // (参数序 = b0 常量、SRV 表、UAV 表 —— 录制点按序绑表索引;此前 8 块
+    // 手写样板每块 60-90 行,唯一真差异就是个数与 HLSL)。PSOs are
+    // stateless and shared; the shader-visible descriptor heap is per-slot
+    // (each slot's textures get their own SRV/UAV descriptors).
 
-    D3D12_ROOT_PARAMETER params[4]{};
-    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[0].Constants.ShaderRegister = 0;
-    params[0].Constants.Num32BitValues = 12;
-    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[1].DescriptorTable.NumDescriptorRanges = 1;
-    params[1].DescriptorTable.pDescriptorRanges = &srvRange0;
-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[2].DescriptorTable.NumDescriptorRanges = 1;
-    params[2].DescriptorTable.pDescriptorRanges = &srvRange1;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    params[3].DescriptorTable.NumDescriptorRanges = 1;
-    params[3].DescriptorTable.pDescriptorRanges = &uavRange;
-    params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 4;
-    rsDesc.pParameters = params;
-    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-    ComPtr<ID3DBlob> rsBlob, rsErr;
-    if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-        SetErr(err, errLen, E_FAIL, "SerializeRootSignature failed");
+    // 残差五段:b0 = 12 root constants (Magpie ResampleConstants, 48B),
+    // t0/t1 独立 SRV 表(the passes need non-adjacent descriptor pairs)+ u0。
+    if (!CreateComputeRs(_device.Get(), 12, 2, 1, _rsCompute.GetAddressOf(),
+                         "compute", nullptr, err, errLen)) {
         return false;
     }
-    if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(), rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsCompute.GetAddressOf())))) {
-        SetErr(err, errLen, E_FAIL, "CreateRootSignature failed");
+    {
+        struct Cso { const char *hlsl; const char *entry; ID3D12PipelineState **pso; };
+        const Cso csos[] = {
+            { DOWNSAMPLE_HLSL, "DownsampleColorVertical", _psoDownsampleVertical.GetAddressOf() },
+            { DOWNSAMPLE_HLSL, "DownsampleColorHorizontal", _psoDownsampleHorizontal.GetAddressOf() },
+            { RESIDUAL_PREPARE_HLSL, "PrepareResidual", _psoPrepare.GetAddressOf() },
+            { RESIDUAL_HORIZONTAL_HLSL, "UpsampleResidualHorizontal", _psoHorizontal.GetAddressOf() },
+            { RESIDUAL_VERTICAL_HLSL, "CompositeResidualVertical", _psoVertical.GetAddressOf() },
+        };
+        for (const auto &cso : csos) {
+            if (!CreateComputePsoFor(_device.Get(), cso.hlsl, cso.entry, _rsCompute.Get(),
+                                     cso.pso, "compute", err, errLen)) {
+                return false;
+            }
+        }
+    }
+
+    // NVOF guidance(PORTING #6):densify = t0-t3 SRV 表 + u0/u1 独立 UAV 表
+    // + b0 10 常量(srcWH 2+flowWH 2+flags 4+MotionScale 2);guidance 降采样
+    // = t0/t1 SRV 表 + u0/u1 独立 UAV 表 + b0 12 常量(独立表参数,同表重叠
+    // range 非法 —— 禁忌由 CreateComputeRs 构造性规避)。
+    if (!CreateComputeRs(_device.Get(), 10, 4, 2, _rsDensify.GetAddressOf(),
+                         "densify", nullptr, err, errLen) ||
+        !CreateComputePsoFor(_device.Get(), DENSIFY_HLSL, "Densify", _rsDensify.Get(),
+                             _psoDensify.GetAddressOf(), "densify", err, errLen)) {
         return false;
     }
-
-    // PSOs are stateless and shared; the shader-visible descriptor heap is
-    // per-slot (each slot's textures get their own SRV/UAV descriptors).
-
-    struct Cso { const char *hlsl; const char *entry; ID3D12PipelineState **pso; };
-    const Cso csos[] = {
-        { DOWNSAMPLE_HLSL, "DownsampleColorVertical", _psoDownsampleVertical.GetAddressOf() },
-        { DOWNSAMPLE_HLSL, "DownsampleColorHorizontal", _psoDownsampleHorizontal.GetAddressOf() },
-        { RESIDUAL_PREPARE_HLSL, "PrepareResidual", _psoPrepare.GetAddressOf() },
-        { RESIDUAL_HORIZONTAL_HLSL, "UpsampleResidualHorizontal", _psoHorizontal.GetAddressOf() },
-        { RESIDUAL_VERTICAL_HLSL, "CompositeResidualVertical", _psoVertical.GetAddressOf() },
-    };
-    for (const auto &cso : csos) {
-        ComPtr<ID3DBlob> code, csErr;
-        if (FAILED(D3DCompile(cso.hlsl, strlen(cso.hlsl), nullptr, nullptr, nullptr,
-                              cso.entry, "cs_5_0", 0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile failed");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = _rsCompute.Get();
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(cso.pso)))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState failed");
-            return false;
-        }
+    if (!CreateComputeRs(_device.Get(), 12, 2, 2, _rsGuidance.GetAddressOf(),
+                         "guidance", nullptr, err, errLen) ||
+        !CreateComputePsoFor(_device.Get(), GUIDANCE_DOWNSAMPLE_HLSL, "DownsampleGuidance",
+                             _rsGuidance.Get(), _psoGuidanceDownsample.GetAddressOf(),
+                             "guidance", err, errLen)) {
+        return false;
     }
-
-    // NVOF guidance(PORTING #6):densify = t0-t3 SRV 表 + u0/u1 各自独立
-    // UAV 表 + b0 8 常量;guidance 降采样 = t0/t1 SRV 表 + u0/u1 独立 UAV 表
-    // + b0 12 常量(cbuffer 布局与残差管线共用,多出的字段是未用死重)。
-    // 注意:同一表内两个 range 的 OffsetInDescriptorsFromTableStart 若都为 0
-    // 会构成重叠范围(非法),驱动侧表现为 dispatch 挂死 —— u0/u1 必须各开
-    // 一个表参数。
-    {
-        D3D12_DESCRIPTOR_RANGE srvRanges[4]{};
-        for (UINT i = 0; i < 4; ++i) {
-            srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-            srvRanges[i].NumDescriptors = 1;
-            srvRanges[i].BaseShaderRegister = i;
-            srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
-        }
-        D3D12_DESCRIPTOR_RANGE uavRange0{};
-        uavRange0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange0.NumDescriptors = 1;
-        uavRange0.BaseShaderRegister = 0;
-        uavRange0.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_DESCRIPTOR_RANGE uavRange1{};
-        uavRange1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange1.NumDescriptors = 1;
-        uavRange1.BaseShaderRegister = 1;
-        uavRange1.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_ROOT_PARAMETER params[7]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 10; // srcWH(2)+flowWH(2)+flags(4)+MotionScale(2)
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        for (UINT i = 0; i < 4; ++i) {
-            params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
-            params[1 + i].DescriptorTable.pDescriptorRanges = &srvRanges[i];
-            params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        }
-        params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[5].DescriptorTable.NumDescriptorRanges = 1;
-        params[5].DescriptorTable.pDescriptorRanges = &uavRange0;
-        params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[6].DescriptorTable.NumDescriptorRanges = 1;
-        params[6].DescriptorTable.pDescriptorRanges = &uavRange1;
-        params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 7;
-        rsDesc.pParameters = params;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(densify) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsDensify.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(densify) failed");
-            return false;
-        }
-        ComPtr<ID3DBlob> code, csErr;
-        if (FAILED(D3DCompile(DENSIFY_HLSL, strlen(DENSIFY_HLSL), nullptr, nullptr, nullptr,
-                              "Densify", "cs_5_0", 0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(densify) failed");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = _rsDensify.Get();
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoDensify.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(densify) failed");
-            return false;
-        }
-    }
-    {
-        D3D12_DESCRIPTOR_RANGE srvRanges[2]{};
-        for (UINT i = 0; i < 2; ++i) {
-            srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-            srvRanges[i].NumDescriptors = 1;
-            srvRanges[i].BaseShaderRegister = i;
-            srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
-        }
-        D3D12_DESCRIPTOR_RANGE uavRange0{};
-        uavRange0.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange0.NumDescriptors = 1;
-        uavRange0.BaseShaderRegister = 0;
-        uavRange0.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_DESCRIPTOR_RANGE uavRange1{};
-        uavRange1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange1.NumDescriptors = 1;
-        uavRange1.BaseShaderRegister = 1;
-        uavRange1.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_ROOT_PARAMETER params[5]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 12;
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable.NumDescriptorRanges = 1;
-        params[1].DescriptorTable.pDescriptorRanges = &srvRanges[0];
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[2].DescriptorTable.NumDescriptorRanges = 1;
-        params[2].DescriptorTable.pDescriptorRanges = &srvRanges[1];
-        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        // u0/u1 各自独立表参数 + 独立 range(寄存器 0/1):同一表内两个
-        // range 的 OffsetInDescriptorsFromTableStart 都为 0 会构成重叠范围
-        // (非法),两个参数共用一个 range 也会被序列化拒绝。
-        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[3].DescriptorTable.NumDescriptorRanges = 1;
-        params[3].DescriptorTable.pDescriptorRanges = &uavRange0;
-        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[4].DescriptorTable.NumDescriptorRanges = 1;
-        params[4].DescriptorTable.pDescriptorRanges = &uavRange1;
-        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 5;
-        rsDesc.pParameters = params;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(guidance) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsGuidance.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(guidance) failed");
-            return false;
-        }
-        ComPtr<ID3DBlob> code, csErr;
-        if (FAILED(D3DCompile(GUIDANCE_DOWNSAMPLE_HLSL, strlen(GUIDANCE_DOWNSAMPLE_HLSL),
-                              nullptr, nullptr, nullptr, "DownsampleGuidance", "cs_5_0",
-                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(guidance) failed");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = _rsGuidance.Get();
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoGuidanceDownsample.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(guidance) failed");
-            return false;
-        }
-    }
-    // 光流输入 GPU 降采样(#46/#48):b0 5 常量 + t0 单表(inputColor 的
-    // Texture2D SRV,槽 0)+ u0 单表(NVOF 注册输入纹理 UAV)。t0/u0 各自
-    // 独立表参数 —— 同表重叠 range 禁忌见 densify 块注释。
+    // 光流输入 GPU 降采样(#46/#48):b0 5 常量 + t0 单表 + u0 单表。
     if (ProbeEnabled()) TimingStatusLine("PROBE: pso base ok");
-    {
-        D3D12_DESCRIPTOR_RANGE srvRange{};
-        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRange.NumDescriptors = 1;
-        srvRange.BaseShaderRegister = 0;
-        srvRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_DESCRIPTOR_RANGE uavRange{};
-        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange.NumDescriptors = 1;
-        uavRange.BaseShaderRegister = 0;
-        uavRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_ROOT_PARAMETER params[3]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 5; // srcWH(2)+dstWH(2)+pad(1)
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable.NumDescriptorRanges = 1;
-        params[1].DescriptorTable.pDescriptorRanges = &srvRange;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[2].DescriptorTable.NumDescriptorRanges = 1;
-        params[2].DescriptorTable.pDescriptorRanges = &uavRange;
-        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 3;
-        rsDesc.pParameters = params;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(nvof downsample) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsNvofDownsample.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(nvof downsample) failed");
-            return false;
-        }
-        ComPtr<ID3DBlob> code, csErr;
-        if (FAILED(D3DCompile(NVOF_DOWNSAMPLE_HLSL, strlen(NVOF_DOWNSAMPLE_HLSL),
-                              nullptr, nullptr, nullptr, "NvofDownsample", "cs_5_0",
-                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(nvof downsample) failed");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = _rsNvofDownsample.Get();
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoNvofDownsample.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(nvof downsample) failed");
-            return false;
-        }
-        if (ProbeEnabled()) TimingStatusLine("PROBE: pso nvofds done");
+    if (!CreateComputeRs(_device.Get(), 5, 1, 1, _rsNvofDownsample.GetAddressOf(),
+                         "nvof downsample", nullptr, err, errLen) ||
+        !CreateComputePsoFor(_device.Get(), NVOF_DOWNSAMPLE_HLSL, "NvofDownsample",
+                             _rsNvofDownsample.Get(), _psoNvofDownsample.GetAddressOf(),
+                             "nvof downsample", err, errLen)) {
+        return false;
     }
+    if (ProbeEnabled()) TimingStatusLine("PROBE: pso nvofds done");
     // AMD 光流后端 PSO(FFX Prepare/Densify)。仅 of_backend 选择 ffx 时才
     // 被消费;构造失败 = 初始化失败(与其它 PSO 同语义,不静默降级)。
     {
@@ -3666,162 +3415,30 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             return false;
         }
     }
-    // 差异调试视图:b0 4 常量 + t0/t1 两张 SRV 表(input/output)+ u0 一张
-    // UAV 表(共享 _debugDiff)。SRV 各自独立表参数(同表重叠 range 禁忌
-    // 见 densify 块注释)。
-    {
-        D3D12_DESCRIPTOR_RANGE srvRanges[2]{};
-        for (UINT i = 0; i < 2; ++i) {
-            srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-            srvRanges[i].NumDescriptors = 1;
-            srvRanges[i].BaseShaderRegister = i;
-            srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
-        }
-        D3D12_DESCRIPTOR_RANGE uavRange{};
-        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange.NumDescriptors = 1;
-        uavRange.BaseShaderRegister = 0;
-        uavRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_ROOT_PARAMETER params[4]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 4; // extent(2)+amp(1)+pad(1)
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        for (UINT i = 0; i < 2; ++i) {
-            params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
-            params[1 + i].DescriptorTable.pDescriptorRanges = &srvRanges[i];
-            params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        }
-        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[3].DescriptorTable.NumDescriptorRanges = 1;
-        params[3].DescriptorTable.pDescriptorRanges = &uavRange;
-        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 4;
-        rsDesc.pParameters = params;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(debug diff) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsDebugDiff.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(debug diff) failed");
-            return false;
-        }
-        ComPtr<ID3DBlob> code, csErr;
-        if (FAILED(D3DCompile(DEBUG_DIFF_HLSL, strlen(DEBUG_DIFF_HLSL),
-                              nullptr, nullptr, nullptr, "DebugDiffMain", "cs_5_0",
-                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(debug diff) failed");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = _rsDebugDiff.Get();
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoDebugDiff.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(debug diff) failed");
-            return false;
-        }
+    // 差异调试视图:b0 4 常量(extent 2+amp 1+pad 1)+ t0/t1(input/output)
+    // + u0(共享 _debugDiff)。
+    if (!CreateComputeRs(_device.Get(), 4, 2, 1, _rsDebugDiff.GetAddressOf(),
+                         "debug diff", nullptr, err, errLen) ||
+        !CreateComputePsoFor(_device.Get(), DEBUG_DIFF_HLSL, "DebugDiffMain",
+                             _rsDebugDiff.Get(), _psoDebugDiff.GetAddressOf(),
+                             "debug diff", err, errLen)) {
+        return false;
     }
-    // 光流场调试视图:b0 4 常量 + t0 一张 SRV 表(运动场,槽 10/18 按取材
-    // 二选一)+ u0 一张 UAV 表(共享 _debugDiff 中转)。
-    {
-        D3D12_DESCRIPTOR_RANGE srvRange{};
-        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRange.NumDescriptors = 1;
-        srvRange.BaseShaderRegister = 0;
-        srvRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_DESCRIPTOR_RANGE uavRange{};
-        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange.NumDescriptors = 1;
-        uavRange.BaseShaderRegister = 0;
-        uavRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_ROOT_PARAMETER params[3]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 6; // extent(2)+outExtent(2)+scale(1)+pad(1)
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable.NumDescriptorRanges = 1;
-        params[1].DescriptorTable.pDescriptorRanges = &srvRange;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[2].DescriptorTable.NumDescriptorRanges = 1;
-        params[2].DescriptorTable.pDescriptorRanges = &uavRange;
-        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 3;
-        rsDesc.pParameters = params;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(flow view) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsFlowView.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(flow view) failed");
-            return false;
-        }
-        ComPtr<ID3DBlob> code, csErr;
-        if (FAILED(D3DCompile(FLOW_VIEW_HLSL, strlen(FLOW_VIEW_HLSL),
-                              nullptr, nullptr, nullptr, "FlowViewMain", "cs_5_0",
-                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(flow view) failed");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = _rsFlowView.Get();
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoFlowView.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(flow view) failed");
-            return false;
-        }
+    // 光流场调试视图:b0 6 常量(extent 2+outExtent 2+scale 1+pad 1)+ t0
+    // (运动场,SrvMotion/SrvReducedMotion 按取材二选一)+ u0(_debugDiff 中转)。
+    if (!CreateComputeRs(_device.Get(), 6, 1, 1, _rsFlowView.GetAddressOf(),
+                         "flow view", nullptr, err, errLen) ||
+        !CreateComputePsoFor(_device.Get(), FLOW_VIEW_HLSL, "FlowViewMain",
+                             _rsFlowView.Get(), _psoFlowView.GetAddressOf(),
+                             "flow view", err, errLen)) {
+        return false;
     }
     // 抗闪烁时域稳定器:b0 14 常量(Size2/UseMotion/Route/Weight/
     // MotionExtent2/LowSize2/Pad + Region4)+ t0-t7 八张独立 SRV 表 +
-    // u0/u1/u2 三张独立 UAV 表(同表重叠 range 禁忌见 densify 块注释)。
-    // 主 shader 一份覆盖 Route 1-4,mode4 另有半分辨率 reduce —— 两个 PSO
-    // 无条件常驻(PSO 生命周期跟着"使用条件"而不是"首次搭车路径",#43-①)。
+    // u0/u1/u2 三张独立 UAV 表 + 线性静态采样器。主 shader 一份覆盖
+    // Route 1-4,mode4 另有半分辨率 reduce —— 两个 PSO 无条件常驻(PSO
+    // 生命周期跟着"使用条件"而不是"首次搭车路径",#43-①)。
     {
-        D3D12_DESCRIPTOR_RANGE srvRanges[8]{};
-        for (UINT i = 0; i < 8; ++i) {
-            srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-            srvRanges[i].NumDescriptors = 1;
-            srvRanges[i].BaseShaderRegister = i;
-            srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
-        }
-        D3D12_DESCRIPTOR_RANGE uavRanges[3]{};
-        for (UINT i = 0; i < 3; ++i) {
-            uavRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-            uavRanges[i].NumDescriptors = 1;
-            uavRanges[i].BaseShaderRegister = i;
-            uavRanges[i].OffsetInDescriptorsFromTableStart = 0;
-        }
-        D3D12_ROOT_PARAMETER params[12]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 14; // Size(2)+UseMotion+Route+Weight+MotionExtent(2)+LowSize(2)+Pad+Region(4)
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        for (UINT i = 0; i < 8; ++i) {
-            params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
-            params[1 + i].DescriptorTable.pDescriptorRanges = &srvRanges[i];
-            params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        }
-        for (UINT i = 0; i < 3; ++i) {
-            params[9 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            params[9 + i].DescriptorTable.NumDescriptorRanges = 1;
-            params[9 + i].DescriptorTable.pDescriptorRanges = &uavRanges[i];
-            params[9 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        }
         D3D12_STATIC_SAMPLER_DESC samp{};
         samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
         samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
@@ -3829,185 +3446,53 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
         samp.MaxLOD = D3D12_FLOAT32_MAX;
         samp.ShaderRegister = 0;
         samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 12;
-        rsDesc.pParameters = params;
-        rsDesc.NumStaticSamplers = 1;
-        rsDesc.pStaticSamplers = &samp;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(temporal) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsTemporal.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(temporal) failed");
+        if (!CreateComputeRs(_device.Get(), 14, 8, 3, _rsTemporal.GetAddressOf(),
+                             "temporal", &samp, err, errLen)) {
             return false;
         }
         const struct {
             const char *hlsl;
             const char *entry;
             ComPtr<ID3D12PipelineState> *pso;
-            const char *what;
         } temporalShaders[] = {
-            { TEMPORAL_MAIN_HLSL, "main", &_psoTemporalMain, "temporal main" },
-            { TEMPORAL_REDUCE_HLSL, "main", &_psoTemporalReduce, "temporal reduce" },
+            { TEMPORAL_MAIN_HLSL, "main", &_psoTemporalMain },
+            { TEMPORAL_REDUCE_HLSL, "main", &_psoTemporalReduce },
         };
         for (const auto &ts : temporalShaders) {
-            ComPtr<ID3DBlob> code, csErr;
-            if (FAILED(D3DCompile(ts.hlsl, strlen(ts.hlsl),
-                                  nullptr, nullptr, nullptr, ts.entry, "cs_5_0",
-                                  0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-                SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(temporal) failed");
-                return false;
-            }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-            psoDesc.pRootSignature = _rsTemporal.Get();
-            psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-            if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(ts.pso->GetAddressOf())))) {
-                SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(temporal) failed");
+            if (!CreateComputePsoFor(_device.Get(), ts.hlsl, ts.entry, _rsTemporal.Get(),
+                                     ts.pso->GetAddressOf(), "temporal", err, errLen)) {
                 return false;
             }
         }
     }
     // YUV↔RGB 转换(YUV 原生化):convertIn = t0/t1/t2 三张 SRV 表(Y/U/V)
-    // + u0 一张 UAV 表(inputColor)+ b0 10 常量;convertOut = t0 一张 SRV 表
-    // (outputColor)+ u0/u1 两张 UAV 表(Y/U,V)+ b0 12 常量。深度/矩阵/
-    // 范围全在常量里(R8/R16_UNORM 的 float 视图同构)—— 每 shader 单 PSO。
-    {
-        D3D12_DESCRIPTOR_RANGE srvRanges[3]{};
-        for (UINT i = 0; i < 3; ++i) {
-            srvRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-            srvRanges[i].NumDescriptors = 1;
-            srvRanges[i].BaseShaderRegister = i;
-            srvRanges[i].OffsetInDescriptorsFromTableStart = 0;
-        }
-        D3D12_DESCRIPTOR_RANGE uavRange{};
-        uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        uavRange.NumDescriptors = 1;
-        uavRange.BaseShaderRegister = 0;
-        uavRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_ROOT_PARAMETER params[5]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 16; // extent(2)+C0(4)+C1(4)+chromaExtent(2)+chromaScale(2)+pitch(2)
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        for (UINT i = 0; i < 3; ++i) {
-            params[1 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-            params[1 + i].DescriptorTable.NumDescriptorRanges = 1;
-            params[1 + i].DescriptorTable.pDescriptorRanges = &srvRanges[i];
-            params[1 + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        }
-        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[4].DescriptorTable.NumDescriptorRanges = 1;
-        params[4].DescriptorTable.pDescriptorRanges = &uavRange;
-        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 5;
-        rsDesc.pParameters = params;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(convert in) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsConvertIn.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(convert in) failed");
-            return false;
-        }
-        ComPtr<ID3DBlob> code, csErr;
-        if (FAILED(D3DCompile(YUV_TO_BGRA_HLSL, strlen(YUV_TO_BGRA_HLSL),
-                              nullptr, nullptr, nullptr, "ConvertYuvToBgra", "cs_5_0",
-                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(convert in) failed");
-            return false;
-        }
-        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-        psoDesc.pRootSignature = _rsConvertIn.Get();
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoConvertIn.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert in) failed");
-            return false;
-        }
+    // + u0 一张 UAV 表(inputColor)+ b0 16 常量(extent 2+C0 4+C1 4+
+    // chromaExtent 2+chromaScale 2+pitch 2);convertOut = t0 一张 SRV 表
+    // + u0/u1/u2 三张 UAV 表(Y;U,V)+ b0 14 常量。深度/矩阵/范围全在
+    // 常量里(R8/R16_UNORM 的 float 视图同构)。
+    if (!CreateComputeRs(_device.Get(), 16, 3, 1, _rsConvertIn.GetAddressOf(),
+                         "convert in", nullptr, err, errLen)) {
+        return false;
+    }
+    if (!CreateComputePsoFor(_device.Get(), YUV_TO_BGRA_HLSL, "ConvertYuvToBgra",
+                             _rsConvertIn.Get(), _psoConvertIn.GetAddressOf(),
+                             "convert in", err, errLen) ||
         // Phase B:VS RGBP 直读核(同 RS/cbuffer,平面序 G/B/R 在核内换位)。
-        code.Reset();
-        if (FAILED(D3DCompile(YUV_TO_BGRA_HLSL, strlen(YUV_TO_BGRA_HLSL),
-                              nullptr, nullptr, nullptr, "ConvertRgbToRgba", "cs_5_0",
-                              0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(convert in rgb) failed");
-            return false;
-        }
-        // psoDesc.CS 在首次 PSO 后指向 blob1 旧地址(code.Reset 释放),
-        // 必须重指新 blob —— 否则 PSO 读悬垂指针 E_FAIL。
-        psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-        if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(_psoConvertInRgb.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert in rgb) failed");
-            return false;
-        }
+        !CreateComputePsoFor(_device.Get(), YUV_TO_BGRA_HLSL, "ConvertRgbToRgba",
+                             _rsConvertIn.Get(), _psoConvertInRgb.GetAddressOf(),
+                             "convert in rgb", err, errLen)) {
+        return false;
+    }
+    if (!CreateComputeRs(_device.Get(), 14, 1, 3, _rsConvertOut.GetAddressOf(),
+                         "convert out", nullptr, err, errLen)) {
+        return false;
     }
     {
-        D3D12_DESCRIPTOR_RANGE srvRange{};
-        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srvRange.NumDescriptors = 1;
-        srvRange.BaseShaderRegister = 0;
-        srvRange.OffsetInDescriptorsFromTableStart = 0;
-        D3D12_DESCRIPTOR_RANGE uavRanges[3]{};
-        for (UINT i = 0; i < 3; ++i) {
-            uavRanges[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-            uavRanges[i].NumDescriptors = 1;
-            uavRanges[i].BaseShaderRegister = i;
-            uavRanges[i].OffsetInDescriptorsFromTableStart = 0;
-        }
-        D3D12_ROOT_PARAMETER params[5]{};
-        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-        params[0].Constants.ShaderRegister = 0;
-        params[0].Constants.Num32BitValues = 14; // extent(2)+srcExtent(2)+系数(4)+pad(4)+chromaStep(2)
-        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[1].DescriptorTable.NumDescriptorRanges = 1;
-        params[1].DescriptorTable.pDescriptorRanges = &srvRange;
-        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[2].DescriptorTable.NumDescriptorRanges = 1;
-        params[2].DescriptorTable.pDescriptorRanges = &uavRanges[0];
-        params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[3].DescriptorTable.NumDescriptorRanges = 1;
-        params[3].DescriptorTable.pDescriptorRanges = &uavRanges[1];
-        params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-        // u2 仅 RGB 出侧核消费(R 计划面);YUV 核不绑定此表,无害。
-        params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        params[4].DescriptorTable.NumDescriptorRanges = 1;
-        params[4].DescriptorTable.pDescriptorRanges = &uavRanges[2];
-        params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-
-        D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-        rsDesc.NumParameters = 5;
-        rsDesc.pParameters = params;
-        rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
-        ComPtr<ID3DBlob> rsBlob, rsErr;
-        if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
-                                               rsBlob.GetAddressOf(), rsErr.GetAddressOf()))) {
-            SetErr(err, errLen, E_FAIL, "SerializeRootSignature(convert out) failed");
-            return false;
-        }
-        if (FAILED(_device->CreateRootSignature(0, rsBlob->GetBufferPointer(),
-                                                rsBlob->GetBufferSize(), IID_PPV_ARGS(_rsConvertOut.GetAddressOf())))) {
-            SetErr(err, errLen, E_FAIL, "CreateRootSignature(convert out) failed");
-            return false;
-        }
         struct OutCso { const char *entry; ID3D12PipelineState **pso; };
         const OutCso outCsos[]{
             { "BgraToYuvLuma", _psoConvertOutLuma.GetAddressOf() },
             { "BgraToYuvChroma", _psoConvertOutChroma.GetAddressOf() },
-            // RTX Video 输出转换:与上面共用 _rsConvertOut(同 12 常量 +
-            // t0/u0/u1 布局),仅换 HLSL 入口。
+            // RTX Video 输出转换:与上面共用 _rsConvertOut,仅换 HLSL 入口。
             { "ScaledToYuvLuma", _psoConvertScaledLuma.GetAddressOf() },
             { "ScaledToYuvChroma", _psoConvertScaledChroma.GetAddressOf() },
             { "PqToYuvLuma", _psoPqLuma.GetAddressOf() },
@@ -4029,19 +3514,9 @@ bool D3D12Context::CreateComputeObjects(char *err, size_t errLen) noexcept {
             RGB_TO_PLANAR_HLSL, RGB_TO_PLANAR_HLSL,
         };
         for (size_t ci = 0; ci < std::size(outCsos); ++ci) {
-            const auto &cso = outCsos[ci];
-            ComPtr<ID3DBlob> code, csErr;
-            if (FAILED(D3DCompile(kOutHlslByEntry[ci], strlen(kOutHlslByEntry[ci]),
-                                  nullptr, nullptr, nullptr, cso.entry, "cs_5_0",
-                                  0, 0, code.GetAddressOf(), csErr.GetAddressOf()))) {
-                SetErr(err, errLen, E_FAIL, csErr ? static_cast<const char *>(csErr->GetBufferPointer()) : "D3DCompile(convert out) failed");
-                return false;
-            }
-            D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc{};
-            psoDesc.pRootSignature = _rsConvertOut.Get();
-            psoDesc.CS = { code->GetBufferPointer(), code->GetBufferSize() };
-            if (FAILED(_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(cso.pso)))) {
-                SetErr(err, errLen, E_FAIL, "CreateComputePipelineState(convert out) failed");
+            if (!CreateComputePsoFor(_device.Get(), kOutHlslByEntry[ci], outCsos[ci].entry,
+                                     _rsConvertOut.Get(), outCsos[ci].pso,
+                                     "convert out", err, errLen)) {
                 return false;
             }
         }
@@ -4073,16 +3548,18 @@ bool D3D12Context::RebuildTemporal(int mode, char *err, size_t errLen) noexcept 
     _temporalMode = 0;
     if (mode == 0) {
         // 视图回占位(inputColor/outputColor —— placeholder 惯例,绝不 NULL
-        // 描述符)。布局见 CreateSlotResources 的 52-65 注释。
-        const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        // 描述符)。布局 = enum HeapSlot 时域区。
         for (int i = 0; i < kSlotCount; ++i) {
-            const D3D12_CPU_DESCRIPTOR_HANDLE base = _slots[i].srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-            auto h = [&](UINT d) { return D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(d * inc) }; };
-            for (UINT d : {52u, 55u, 57u, 59u, 61u, 62u, 64u}) {
-                _device->CreateShaderResourceView(_slots[i].inputColor.Get(), nullptr, h(d));
+            HeapBinder h{ _device.Get(), _slots[i] };
+            for (HeapSlot d : {HeapSlot::SrvTemporalOut, HeapSlot::Hist0Srv, HeapSlot::Hist1Srv,
+                               HeapSlot::Guide0Srv, HeapSlot::Guide1Srv,
+                               HeapSlot::Low0Srv, HeapSlot::Low1Srv}) {
+                _device->CreateShaderResourceView(_slots[i].inputColor.Get(), nullptr, h.cpu(d));
             }
-            for (UINT d : {53u, 54u, 56u, 58u, 60u, 63u, 65u}) {
-                _device->CreateUnorderedAccessView(_slots[i].outputColor.Get(), nullptr, nullptr, h(d));
+            for (HeapSlot d : {HeapSlot::UavTemporalOut, HeapSlot::Hist0Uav, HeapSlot::Hist1Uav,
+                               HeapSlot::Guide0Uav, HeapSlot::Guide1Uav,
+                               HeapSlot::Low0Uav, HeapSlot::Low1Uav}) {
+                _device->CreateUnorderedAccessView(_slots[i].outputColor.Get(), nullptr, nullptr, h.cpu(d));
             }
         }
         return true;
@@ -4121,33 +3598,31 @@ bool D3D12Context::RebuildTemporal(int mode, char *err, size_t errLen) noexcept 
         }
     }
     // 视图写入(context 级纹理 × 每槽堆;占位全覆盖)。
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     for (int i = 0; i < kSlotCount; ++i) {
-        const D3D12_CPU_DESCRIPTOR_HANDLE base = _slots[i].srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-        auto h = [&](UINT d) { return D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(d * inc) }; };
-        _device->CreateShaderResourceView(_tempHist[0].Get(), nullptr, h(55));
-        _device->CreateShaderResourceView(_tempHist[1].Get(), nullptr, h(57));
-        _device->CreateShaderResourceView(_tempGuide[0].Get(), nullptr, h(59));
-        _device->CreateShaderResourceView(_tempGuide[1].Get(), nullptr, h(61));
-        _device->CreateUnorderedAccessView(_tempHist[0].Get(), nullptr, nullptr, h(54));
-        _device->CreateUnorderedAccessView(_tempHist[1].Get(), nullptr, nullptr, h(56));
-        _device->CreateUnorderedAccessView(_tempGuide[0].Get(), nullptr, nullptr, h(58));
-        _device->CreateUnorderedAccessView(_tempGuide[1].Get(), nullptr, nullptr, h(60));
-        _device->CreateUnorderedAccessView(_slots[i].temporalOut.Get(), nullptr, nullptr, h(kUavTemporalOut));
-        _device->CreateShaderResourceView(_slots[i].temporalOut.Get(), nullptr, h(kSrvTemporalOut));
+        HeapBinder h{ _device.Get(), _slots[i] };
+        _device->CreateShaderResourceView(_tempHist[0].Get(), nullptr, h.cpu(HeapSlot::Hist0Srv));
+        _device->CreateShaderResourceView(_tempHist[1].Get(), nullptr, h.cpu(HeapSlot::Hist1Srv));
+        _device->CreateShaderResourceView(_tempGuide[0].Get(), nullptr, h.cpu(HeapSlot::Guide0Srv));
+        _device->CreateShaderResourceView(_tempGuide[1].Get(), nullptr, h.cpu(HeapSlot::Guide1Srv));
+        _device->CreateUnorderedAccessView(_tempHist[0].Get(), nullptr, nullptr, h.cpu(HeapSlot::Hist0Uav));
+        _device->CreateUnorderedAccessView(_tempHist[1].Get(), nullptr, nullptr, h.cpu(HeapSlot::Hist1Uav));
+        _device->CreateUnorderedAccessView(_tempGuide[0].Get(), nullptr, nullptr, h.cpu(HeapSlot::Guide0Uav));
+        _device->CreateUnorderedAccessView(_tempGuide[1].Get(), nullptr, nullptr, h.cpu(HeapSlot::Guide1Uav));
+        _device->CreateUnorderedAccessView(_slots[i].temporalOut.Get(), nullptr, nullptr, h.cpu(HeapSlot::UavTemporalOut));
+        _device->CreateShaderResourceView(_slots[i].temporalOut.Get(), nullptr, h.cpu(HeapSlot::SrvTemporalOut));
         // mode 1-3 的 low 视图必须回占位(4→2/3 降档时旧视图悬空指向已
         // 释放纹理;Route!=4 不读 t6/t7 但绝不留悬空描述符);
         // mode 4 绑真纹理。mode<4 时 _tempLow 为空 —— 不可 CreateSRV(NULL)。
         if (mode == 4) {
-            _device->CreateShaderResourceView(_tempLow[0].Get(), nullptr, h(62));
-            _device->CreateShaderResourceView(_tempLow[1].Get(), nullptr, h(64));
-            _device->CreateUnorderedAccessView(_tempLow[0].Get(), nullptr, nullptr, h(63));
-            _device->CreateUnorderedAccessView(_tempLow[1].Get(), nullptr, nullptr, h(65));
+            _device->CreateShaderResourceView(_tempLow[0].Get(), nullptr, h.cpu(HeapSlot::Low0Srv));
+            _device->CreateShaderResourceView(_tempLow[1].Get(), nullptr, h.cpu(HeapSlot::Low1Srv));
+            _device->CreateUnorderedAccessView(_tempLow[0].Get(), nullptr, nullptr, h.cpu(HeapSlot::Low0Uav));
+            _device->CreateUnorderedAccessView(_tempLow[1].Get(), nullptr, nullptr, h.cpu(HeapSlot::Low1Uav));
         } else {
-            _device->CreateShaderResourceView(_slots[i].inputColor.Get(), nullptr, h(62));
-            _device->CreateShaderResourceView(_slots[i].inputColor.Get(), nullptr, h(64));
-            _device->CreateUnorderedAccessView(_slots[i].outputColor.Get(), nullptr, nullptr, h(63));
-            _device->CreateUnorderedAccessView(_slots[i].outputColor.Get(), nullptr, nullptr, h(65));
+            _device->CreateShaderResourceView(_slots[i].inputColor.Get(), nullptr, h.cpu(HeapSlot::Low0Srv));
+            _device->CreateShaderResourceView(_slots[i].inputColor.Get(), nullptr, h.cpu(HeapSlot::Low1Srv));
+            _device->CreateUnorderedAccessView(_slots[i].outputColor.Get(), nullptr, nullptr, h.cpu(HeapSlot::Low0Uav));
+            _device->CreateUnorderedAccessView(_slots[i].outputColor.Get(), nullptr, nullptr, h.cpu(HeapSlot::Low1Uav));
         }
     }
     _temporalMode = mode;
@@ -4211,11 +3686,7 @@ void D3D12Context::RecordTemporal(FrameSlot &slot, int mode, int next, bool useM
     cl->ResourceBarrier(preCount, pre);
 
     cl->SetComputeRootSignature(_rsTemporal.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     // cbuffer 布局(与 TEMPORAL_*_HLSL 同步,三处同步铁律):
     // Size@0 UseMotion@2 Route@3 Weight@4 MotionExtent@5 LowSize@7 Pad@9
@@ -4239,11 +3710,11 @@ void D3D12Context::RecordTemporal(FrameSlot &slot, int mode, int next, bool useM
     if (lowNeeded) {
         // reduce:t0 Input / t1 Base / t2 Raw(读),u0 Residual / u1 Guide(写)。
         cl->SetPipelineState(_psoTemporalReduce.Get());
-        cl->SetComputeRootDescriptorTable(1, gpu(0));
-        cl->SetComputeRootDescriptorTable(2, gpu(0));
+        cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvInput));
+        cl->SetComputeRootDescriptorTable(2, gpu(HeapSlot::SrvInput));
         cl->SetComputeRootDescriptorTable(3, gpu(kSrvOutputColor));
-        cl->SetComputeRootDescriptorTable(9, gpu(63));
-        cl->SetComputeRootDescriptorTable(10, gpu(65));
+        cl->SetComputeRootDescriptorTable(9, gpu(HeapSlot::Low0Uav));
+        cl->SetComputeRootDescriptorTable(10, gpu(HeapSlot::Low1Uav));
         cl->Dispatch((lowWH[0] + 7) / 8, (lowWH[1] + 7) / 8, 1);
         D3D12_RESOURCE_BARRIER lowReady[2]{
             Transition(_tempLow[0].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -4256,17 +3727,17 @@ void D3D12Context::RecordTemporal(FrameSlot &slot, int mode, int next, bool useM
 
     // 主 pass:u0 Output(temporalOut)/ u1 NextHistory / u2 NextGuide。
     cl->SetPipelineState(_psoTemporalMain.Get());
-    cl->SetComputeRootDescriptorTable(1, gpu(0));                     // t0 Input
-    cl->SetComputeRootDescriptorTable(2, gpu(0));                     // t1 Base(=Input)
+    cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvInput));                     // t0 Input
+    cl->SetComputeRootDescriptorTable(2, gpu(HeapSlot::SrvInput));                     // t1 Base(=Input)
     cl->SetComputeRootDescriptorTable(3, gpu(kSrvOutputColor));       // t2 Raw
-    cl->SetComputeRootDescriptorTable(4, gpu(55 + previous * 2));     // t3 History
-    cl->SetComputeRootDescriptorTable(5, gpu(59 + previous * 2));     // t4 PreviousGuide
+    cl->SetComputeRootDescriptorTable(4, gpu(kHistSrv[previous]));     // t3 History
+    cl->SetComputeRootDescriptorTable(5, gpu(kGuideSrv[previous]));     // t4 PreviousGuide
     cl->SetComputeRootDescriptorTable(6, gpu(motionSrvIndex));        // t5 Motion
-    cl->SetComputeRootDescriptorTable(7, lowNeeded ? gpu(62) : gpu(55 + previous * 2)); // t6
-    cl->SetComputeRootDescriptorTable(8, lowNeeded ? gpu(64) : gpu(59 + previous * 2)); // t7
+    cl->SetComputeRootDescriptorTable(7, lowNeeded ? gpu(HeapSlot::Low0Srv) : gpu(kHistSrv[previous])); // t6
+    cl->SetComputeRootDescriptorTable(8, lowNeeded ? gpu(HeapSlot::Low1Srv) : gpu(kGuideSrv[previous])); // t7
     cl->SetComputeRootDescriptorTable(9, gpu(kUavTemporalOut));       // u0 Output
-    cl->SetComputeRootDescriptorTable(10, gpu(54 + next * 2));        // u1 NextHistory
-    cl->SetComputeRootDescriptorTable(11, gpu(58 + next * 2));        // u2 NextGuide
+    cl->SetComputeRootDescriptorTable(10, gpu(kHistUav[next]));        // u1 NextHistory
+    cl->SetComputeRootDescriptorTable(11, gpu(kGuideUav[next]));        // u2 NextGuide
     cl->Dispatch((sizeWH[0] + 7) / 8, (sizeWH[1] + 7) / 8, 1);
 
     // 归位:input/output/历史/引导/low/temporalOut 全部回 COMMON(本 pass
@@ -4394,25 +3865,20 @@ bool D3D12Context::CreateScalingForSlot(FrameSlot &slot, int internalW, int inte
         return false;
     }
 
-    // (re)write SRV/UAV descriptors: 0=srvInput 1=srvReducedColor 2=srvReducedDenoised
-    // 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised 6=uavHorizontal 7=uavOutput
-    // 8=srvControlled 9=uavControlled 18=srvReducedMotion 19=srvReducedConfidence
-    // 20=uavReducedMotion 21=uavReducedConfidence
-    const D3D12_CPU_DESCRIPTOR_HANDLE base = slot.srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto slotHandle = [&](UINT i) { return D3D12_CPU_DESCRIPTOR_HANDLE{ base.ptr + static_cast<SIZE_T>(i * inc) }; };
-    _device->CreateShaderResourceView(slot.reducedColor.Get(), nullptr, slotHandle(1));
-    _device->CreateShaderResourceView(slot.reducedDenoised.Get(), nullptr, slotHandle(2));
-    _device->CreateShaderResourceView(slot.horizontalRes.Get(), nullptr, slotHandle(3));
-    _device->CreateUnorderedAccessView(slot.reducedColor.Get(), nullptr, nullptr, slotHandle(4));
-    _device->CreateUnorderedAccessView(slot.reducedDenoised.Get(), nullptr, nullptr, slotHandle(5));
-    _device->CreateUnorderedAccessView(slot.horizontalRes.Get(), nullptr, nullptr, slotHandle(6));
-    _device->CreateShaderResourceView(slot.controlledRes.Get(), nullptr, slotHandle(8));
-    _device->CreateUnorderedAccessView(slot.controlledRes.Get(), nullptr, nullptr, slotHandle(9));
-    _device->CreateShaderResourceView(slot.reducedMotion.Get(), nullptr, slotHandle(18));
-    _device->CreateShaderResourceView(slot.reducedConfidence.Get(), nullptr, slotHandle(19));
-    _device->CreateUnorderedAccessView(slot.reducedMotion.Get(), nullptr, nullptr, slotHandle(20));
-    _device->CreateUnorderedAccessView(slot.reducedConfidence.Get(), nullptr, nullptr, slotHandle(21));
+    // (re)write scaling SRV/UAV descriptors(槽位 = enum HeapSlot)。
+    HeapBinder heap{ _device.Get(), slot };
+    _device->CreateShaderResourceView(slot.reducedColor.Get(), nullptr, heap.cpu(HeapSlot::SrvReducedColor));
+    _device->CreateShaderResourceView(slot.reducedDenoised.Get(), nullptr, heap.cpu(HeapSlot::SrvReducedDenoised));
+    _device->CreateShaderResourceView(slot.horizontalRes.Get(), nullptr, heap.cpu(HeapSlot::SrvHorizontal));
+    _device->CreateUnorderedAccessView(slot.reducedColor.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavReducedColor));
+    _device->CreateUnorderedAccessView(slot.reducedDenoised.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavReducedDenoised));
+    _device->CreateUnorderedAccessView(slot.horizontalRes.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavHorizontal));
+    _device->CreateShaderResourceView(slot.controlledRes.Get(), nullptr, heap.cpu(HeapSlot::SrvControlled));
+    _device->CreateUnorderedAccessView(slot.controlledRes.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavControlled));
+    _device->CreateShaderResourceView(slot.reducedMotion.Get(), nullptr, heap.cpu(HeapSlot::SrvReducedMotion));
+    _device->CreateShaderResourceView(slot.reducedConfidence.Get(), nullptr, heap.cpu(HeapSlot::SrvReducedConfidence));
+    _device->CreateUnorderedAccessView(slot.reducedMotion.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavReducedMotion));
+    _device->CreateUnorderedAccessView(slot.reducedConfidence.Get(), nullptr, nullptr, heap.cpu(HeapSlot::UavReducedConfidence));
     return true;
 }
 
@@ -4432,11 +3898,7 @@ void D3D12Context::RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT sr
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     cl->SetComputeRootSignature(_rsCompute.Get());
     cl->SetPipelineState(pso);
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     const UINT srcWH[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
     const UINT dstWH[2]{ static_cast<UINT>(_internalWidth), static_cast<UINT>(_internalHeight) };
@@ -4517,22 +3979,17 @@ bool D3D12Context::BindNvofResources(ID3D12Resource *flowFwd, ID3D12Resource *fl
                               flowBwd ? flowBwd : flowFwd,
                               costFwd ? costFwd : flowFwd,
                               costBwd ? costBwd : flowFwd };
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     for (int i = 0; i < kSlotCount; ++i) {
         if (!_slots[i].srvUavHeap) return false;
-        const D3D12_CPU_DESCRIPTOR_HANDLE slotBase =
-            _slots[i].srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-        auto h = [&](UINT d) {
-            return D3D12_CPU_DESCRIPTOR_HANDLE{ slotBase.ptr + static_cast<SIZE_T>(d * inc) };
-        };
-        _device->CreateShaderResourceView(views[0], nullptr, h(14));
-        _device->CreateShaderResourceView(views[1], nullptr, h(15));
-        _device->CreateShaderResourceView(views[2], nullptr, h(16));
-        _device->CreateShaderResourceView(views[3], nullptr, h(17));
+        HeapBinder h{ _device.Get(), _slots[i] };
+        _device->CreateShaderResourceView(views[0], nullptr, h.cpu(HeapSlot::SrvFlowF));
+        _device->CreateShaderResourceView(views[1], nullptr, h.cpu(HeapSlot::SrvFlowB));
+        _device->CreateShaderResourceView(views[2], nullptr, h.cpu(HeapSlot::SrvCostF));
+        _device->CreateShaderResourceView(views[3], nullptr, h.cpu(HeapSlot::SrvCostB));
         _device->CreateUnorderedAccessView(inputFwd ? inputFwd : _slots[i].outputColor.Get(),
-                                           nullptr, nullptr, h(23));
+                                           nullptr, nullptr, h.cpu(HeapSlot::UavNvofInput0));
         _device->CreateUnorderedAccessView(inputBwd ? inputBwd : _slots[i].outputColor.Get(),
-                                           nullptr, nullptr, h(24));
+                                           nullptr, nullptr, h.cpu(HeapSlot::UavNvofInput1));
     }
     return true;
 }
@@ -4554,11 +4011,7 @@ void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
 
     cl->SetComputeRootSignature(_rsDensify.Get());
     cl->SetPipelineState(_psoDensify.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     const UINT srcWH[2]{ static_cast<UINT>(denseW), static_cast<UINT>(denseH) };
     const UINT flowWH[2]{ flowW, flowH };
@@ -4570,10 +4023,10 @@ void D3D12Context::RecordDensify(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
     const float motionScale[2]{ motionScaleX, motionScaleY };
     cl->SetComputeRoot32BitConstants(0, 2, motionScale, 7);
 
-    cl->SetComputeRootDescriptorTable(1, gpu(14)); // t0 ForwardFlow
-    cl->SetComputeRootDescriptorTable(2, gpu(15)); // t1 BackwardFlow
-    cl->SetComputeRootDescriptorTable(3, gpu(16)); // t2 ForwardCost
-    cl->SetComputeRootDescriptorTable(4, gpu(17)); // t3 BackwardCost
+    cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvFlowF)); // t0 ForwardFlow
+    cl->SetComputeRootDescriptorTable(2, gpu(HeapSlot::SrvFlowB)); // t1 BackwardFlow
+    cl->SetComputeRootDescriptorTable(3, gpu(HeapSlot::SrvCostF)); // t2 ForwardCost
+    cl->SetComputeRootDescriptorTable(4, gpu(HeapSlot::SrvCostB)); // t3 BackwardCost
     cl->SetComputeRootDescriptorTable(5, gpu(uavMotion));      // u0 DenseMotion
     cl->SetComputeRootDescriptorTable(6, gpu(uavConfidence));  // u1 DenseConfidence
     cl->Dispatch((static_cast<UINT>(denseW) + 7) / 8,
@@ -4589,11 +4042,7 @@ void D3D12Context::RecordGuidancePass(FrameSlot &slot, ID3D12PipelineState *pso,
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     cl->SetComputeRootSignature(_rsGuidance.Get());
     cl->SetPipelineState(pso);
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     const UINT srcWH[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
     const UINT dstWH[2]{ static_cast<UINT>(_internalWidth), static_cast<UINT>(_internalHeight) };
@@ -4631,11 +4080,7 @@ void D3D12Context::RecordDebugDiff(FrameSlot &slot) noexcept {
     ID3D12GraphicsCommandList *cl = slot.commandList.Get();
     cl->SetComputeRootSignature(_rsDebugDiff.Get());
     cl->SetPipelineState(_psoDebugDiff.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     // cbuffer 布局(与 DEBUG_DIFF_HLSL 同步,三处同步铁律):
     // extent@0 amp@2 pad@3。
@@ -4652,7 +4097,7 @@ void D3D12Context::RecordDebugDiff(FrameSlot &slot) noexcept {
         Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
     };
     cl->ResourceBarrier(3, pre);
-    cl->SetComputeRootDescriptorTable(1, gpu(0));               // t0 inputColor
+    cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvInput));               // t0 inputColor
     cl->SetComputeRootDescriptorTable(2, gpu(kSrvOutputColor)); // t1 outputColor
     cl->SetComputeRootDescriptorTable(3, gpu(kUavDebugDiff));   // u0 debugDiff
     cl->Dispatch((static_cast<UINT>(_width) + 7) / 8,
@@ -4686,11 +4131,7 @@ void D3D12Context::RecordFlowView(FrameSlot &slot, bool useReduced, bool realMot
     const UINT srvIndex = !realMotion ? 35u : (useReduced ? 18u : 10u);
     cl->SetComputeRootSignature(_rsFlowView.Get());
     cl->SetPipelineState(_psoFlowView.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     // cbuffer 布局(与 FLOW_VIEW_HLSL 同步,三处同步铁律):
     // extent@0 outExtent@2 scale@4 pad@5。
@@ -4742,11 +4183,7 @@ void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameS
     ID3D12GraphicsCommandList *cl = &clRef;
     cl->SetComputeRootSignature(_rsNvofDownsample.Get());
     cl->SetPipelineState(_psoNvofDownsample.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     // cbuffer 布局(与 NVOF_DOWNSAMPLE_HLSL 同步,三处同步铁律):
     // srcWH@0 dstWH@2 pad@4。
@@ -4757,8 +4194,8 @@ void D3D12Context::RecordNvofDownsample(ID3D12GraphicsCommandList &clRef, FrameS
     cl->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
     cl->SetComputeRoot32BitConstants(0, 1, pad, 4);
 
-    cl->SetComputeRootDescriptorTable(1, gpu(0));               // t0 inputColor(NSR)
-    cl->SetComputeRootDescriptorTable(2, gpu(23 + inputIndex)); // u0 NvofInput[cur]
+    cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvInput));               // t0 inputColor(NSR)
+    cl->SetComputeRootDescriptorTable(2, gpu(static_cast<HeapSlot>(HeapSlot::UavNvofInput0 + inputIndex))); // u0 NvofInput[cur]
     cl->Dispatch((static_cast<UINT>(dstW) + 7) / 8,
                  (static_cast<UINT>(dstH) + 7) / 8, 1);
 }
@@ -4771,16 +4208,11 @@ bool D3D12Context::BindOfResources(ID3D12Resource *ffxInput, ID3D12Resource *ffx
     // 每槽堆写一份;会话纹理由 context 持有、销毁走退役名单,视图内容在
     // 纹理存活期内有效。调用方保证只在会话建立时调用(PoolHold 内)。
     if (!_device) return false;
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     for (int i = 0; i < kSlotCount; ++i) {
         if (!_slots[i].srvUavHeap) return false;
-        const D3D12_CPU_DESCRIPTOR_HANDLE slotBase =
-            _slots[i].srvUavHeap->GetCPUDescriptorHandleForHeapStart();
-        auto h = [&](UINT d) {
-            return D3D12_CPU_DESCRIPTOR_HANDLE{ slotBase.ptr + static_cast<SIZE_T>(d * inc) };
-        };
-        if (ffxInput) _device->CreateUnorderedAccessView(ffxInput, nullptr, nullptr, h(49));
-        if (ffxSparse) _device->CreateShaderResourceView(ffxSparse, nullptr, h(50));
+        HeapBinder h{ _device.Get(), _slots[i] };
+        if (ffxInput) _device->CreateUnorderedAccessView(ffxInput, nullptr, nullptr, h.cpu(HeapSlot::UavFfxInput));
+        if (ffxSparse) _device->CreateShaderResourceView(ffxSparse, nullptr, h.cpu(HeapSlot::SrvFfxSparse));
     }
     return true;
 }
@@ -4793,18 +4225,14 @@ void D3D12Context::RecordFfxPrepare(ID3D12GraphicsCommandList &clRef, FrameSlot 
     ID3D12GraphicsCommandList *cl = &clRef;
     cl->SetComputeRootSignature(_rsFfxPrepare.Get());
     cl->SetPipelineState(_psoFfxPrepare.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     const UINT srcWH[2]{ srcW, srcH };
     const UINT dstWH[2]{ dstW, dstH };
     cl->SetComputeRoot32BitConstants(0, 2, srcWH, 0);
     cl->SetComputeRoot32BitConstants(0, 2, dstWH, 2);
-    cl->SetComputeRootDescriptorTable(1, gpu(0));  // t0 inputColor(NSR)
-    cl->SetComputeRootDescriptorTable(2, gpu(49)); // u0 ffxInput
+    cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvInput));  // t0 inputColor(NSR)
+    cl->SetComputeRootDescriptorTable(2, gpu(HeapSlot::UavFfxInput)); // u0 ffxInput
     cl->Dispatch((dstW + 7) / 8, (dstH + 7) / 8, 1);
 }
 
@@ -4821,11 +4249,7 @@ void D3D12Context::RecordFfxDensify(ID3D12GraphicsCommandList &clRef, FrameSlot 
     ID3D12GraphicsCommandList *cl = &clRef;
     cl->SetComputeRootSignature(_rsFfxDensify.Get());
     cl->SetPipelineState(_psoFfxDensify.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     const UINT srcWH[2]{ denseW, denseH };
     const UINT ofWH[2]{ ofW, ofH };
@@ -4835,7 +4259,7 @@ void D3D12Context::RecordFfxDensify(ID3D12GraphicsCommandList &clRef, FrameSlot 
     cl->SetComputeRoot32BitConstants(0, 2, spWH, 4);
     const float scale[2]{ scaleX, scaleY };
     cl->SetComputeRoot32BitConstants(0, 2, scale, 6);
-    cl->SetComputeRootDescriptorTable(1, gpu(50));            // t0 sparseFlow
+    cl->SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvFfxSparse));            // t0 sparseFlow
     cl->SetComputeRootDescriptorTable(2, gpu(uavMotion));     // u0 DenseMotion
     cl->SetComputeRootDescriptorTable(3, gpu(uavConfidence)); // u1 DenseConfidence
     cl->Dispatch((denseW + 7) / 8, (denseH + 7) / 8, 1);
@@ -4873,65 +4297,51 @@ void D3D12Context::RecordYuvOutput(ID3D12GraphicsCommandList &clRef, FrameSlot &
     cl->ResourceBarrier(3, toUav);
 
     cl->SetComputeRootSignature(_rsConvertOut.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
     const UINT step[2]{ static_cast<UINT>(_subW ? 2 : 1), static_cast<UINT>(_subH ? 2 : 1) };
-
-    if (_isRgb) {
-        // Phase B:RGBP 直写单 pass(零矩阵;RGB 全域直码,无 limited 整形)。
-        cl->SetPipelineState(_psoRgbOut.Get());
-        const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
-        const UINT srcExtent[2]{ extent[0], extent[1] };
-        const float consts[8]{};
+    // 单个转换 dispatch(_rsConvertOut 契约:b0 14 常量 + t0 色源 + u0/u1/u2;
+    // consts 8 槽位 = 系数 4 + pad 4,step 落在 12)。RGBP 直写走 u2 三平面变体。
+    auto recordConvertPass = [&](ID3D12PipelineState *pso, const UINT (&extent)[2],
+                                 const UINT (&srcExtent)[2], const float (&consts)[8],
+                                 UINT u0, UINT u1, UINT u2) {
+        cl->SetPipelineState(pso);
         cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
         cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
         cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
         cl->SetComputeRoot32BitConstants(0, 2, step, 12);
         cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
-        cl->SetComputeRootDescriptorTable(2, gpu(28));          // u0 G
-        cl->SetComputeRootDescriptorTable(3, gpu(29));          // u1 B
-        cl->SetComputeRootDescriptorTable(4, gpu(30));          // u2 R
-        cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
-    } else {
+        cl->SetComputeRootDescriptorTable(2, gpu(static_cast<HeapSlot>(u0)));
+        cl->SetComputeRootDescriptorTable(3, gpu(static_cast<HeapSlot>(u1)));
+        cl->SetComputeRootDescriptorTable(4, gpu(static_cast<HeapSlot>(u2)));
+        cl->Dispatch((extent[0] + 7) / 8, (extent[1] + 7) / 8, 1);
+    };
+    constexpr UINT kUnusedUav = static_cast<UINT>(HeapSlot::UavYuvOut1); // 绑定但不写的占位表
 
-    // luma:extent=W,H,Lo/Span = yLo/ySpan(÷CM 由调用侧折进常量)。
-    cl->SetPipelineState(_psoConvertOutLuma.Get());
-    {
+    if (_isRgb) {
+        // Phase B:RGBP 直写单 pass(零矩阵;RGB 全域直码,无 limited 整形)。
+        const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
+        const UINT srcExtent[2]{ extent[0], extent[1] };
+        const float consts[8]{};
+        recordConvertPass(_psoRgbOut.Get(), extent, srcExtent, consts,
+                          HeapSlot::UavYuvOut0, HeapSlot::UavYuvOut1, HeapSlot::UavYuvOut2);
+    } else {
+        // luma:extent=W,H,Lo/Span = yLo/ySpan(÷CM 由调用侧折进常量)。
         const UINT extent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
         const UINT srcExtent[2]{ extent[0], extent[1] };
         const float consts[8]{ cf.kr, cf.kb,
                                cf.yLo / cf.containerMax, cf.ySpan / cf.containerMax,
                                0.0f, 0.0f, 0.0f, 0.0f };
-        cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
-        cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
-        cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-        cl->SetComputeRoot32BitConstants(0, 2, step, 12);
-        cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
-        cl->SetComputeRootDescriptorTable(2, gpu(28)); // u0 yuvOut[0](Y)
-        cl->SetComputeRootDescriptorTable(3, gpu(29)); // u1 绑定但本 pass 不写
-        cl->Dispatch((static_cast<UINT>(_width) + 7) / 8, (static_cast<UINT>(_height) + 7) / 8, 1);
-    }
-    // chroma:extent=cw,ch,Lo/Span = cMid/cSpan;ChromaStep box 平均。
-    // u0=U,u1=V。step=(2,2) 与旧 2×2 硬编码恒等。
-    cl->SetPipelineState(_psoConvertOutChroma.Get());
-    {
-        const UINT extent[2]{ static_cast<UINT>(_chromaW), static_cast<UINT>(_chromaH) };
-        const UINT srcExtent[2]{ static_cast<UINT>(_width), static_cast<UINT>(_height) };
-        const float consts[8]{ cf.kr, cf.kb,
-                               cf.cMid / cf.containerMax, cf.cSpan / cf.containerMax,
-                               0.0f, 0.0f, 0.0f, 0.0f };
-        cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
-        cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
-        cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-        cl->SetComputeRoot32BitConstants(0, 2, step, 12);
-        cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex)); // t0 色源 SRV
-        cl->SetComputeRootDescriptorTable(2, gpu(29)); // u0 yuvOut[1](U)
-        cl->SetComputeRootDescriptorTable(3, gpu(30)); // u1 yuvOut[2](V)
-        cl->Dispatch((static_cast<UINT>(_chromaW) + 7) / 8, (static_cast<UINT>(_chromaH) + 7) / 8, 1);
-    }
+        recordConvertPass(_psoConvertOutLuma.Get(), extent, srcExtent, consts,
+                          HeapSlot::UavYuvOut0, HeapSlot::UavYuvOut1, kUnusedUav);
+        // chroma:extent=cw,ch,Lo/Span = cMid/cSpan;ChromaStep box 平均。
+        // u0=U,u1=V。step=(2,2) 与旧 2×2 硬编码恒等。
+        const UINT cExtent[2]{ static_cast<UINT>(_chromaW), static_cast<UINT>(_chromaH) };
+        const UINT cSrcExtent[2]{ extent[0], extent[1] };
+        const float cConsts[8]{ cf.kr, cf.kb,
+                                cf.cMid / cf.containerMax, cf.cSpan / cf.containerMax,
+                                0.0f, 0.0f, 0.0f, 0.0f };
+        recordConvertPass(_psoConvertOutChroma.Get(), cExtent, cSrcExtent, cConsts,
+                          HeapSlot::UavYuvOut1, HeapSlot::UavYuvOut2, kUnusedUav);
     } // !_isRgb
 
     // 色源归位 COMMON(yuvOut 留 UAV,由 RecordReadbackCopy 收尾)。
@@ -4966,11 +4376,7 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
     cl->ResourceBarrier(3, toUav);
 
     cl->SetComputeRootSignature(_rsConvertOut.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _outPlaneBytes > 1 ? 10 : 8);
     const bool fp16 = kind != ColorOutKind::Sdr; // P10 输出契约 + ChromaStep (2,2)
@@ -5000,93 +4406,65 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
         static_cast<UINT>(fp16 ? 2 : (_subW ? 2 : 1)),
         static_cast<UINT>(fp16 ? 2 : (_subH ? 2 : 1)),
     };
-    if (kind == ColorOutKind::Sdr && _isRgb) {
-        // Phase B:RGBP SDR 输出(PIPE→OUT 双线性;1:1 时坐标恒等映射,
-        // 与直写逐位同价)。RGB 全域直码,零矩阵。
-        cl->SetPipelineState(_psoRgbScaled.Get());
-        const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
-        const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
-        const float consts[8]{};
+    // 单个转换 dispatch(_rsConvertOut 契约同 RecordYuvOutput;恒绑满 u0/u1/u2
+    // 三张表 —— 未消费的表绑合法描述符,shader 不读无害)。
+    auto recordConvertPass = [&](ID3D12PipelineState *pso, const UINT (&extent)[2],
+                                 const UINT (&srcExtent)[2], const float (&consts)[8],
+                                 UINT u0, UINT u1, UINT u2) {
+        cl->SetPipelineState(pso);
         cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
         cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
         cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
         cl->SetComputeRoot32BitConstants(0, 2, step, 12);
         cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
-        cl->SetComputeRootDescriptorTable(2, gpu(28)); // u0 G
-        cl->SetComputeRootDescriptorTable(3, gpu(29)); // u1 B
-        cl->SetComputeRootDescriptorTable(4, gpu(30)); // u2 R
-        cl->Dispatch((static_cast<UINT>(_outW) + 7) / 8, (static_cast<UINT>(_outH) + 7) / 8, 1);
+        cl->SetComputeRootDescriptorTable(2, gpu(static_cast<HeapSlot>(u0)));
+        cl->SetComputeRootDescriptorTable(3, gpu(static_cast<HeapSlot>(u1)));
+        cl->SetComputeRootDescriptorTable(4, gpu(static_cast<HeapSlot>(u2)));
+        cl->Dispatch((extent[0] + 7) / 8, (extent[1] + 7) / 8, 1);
+    };
+    constexpr UINT kUnusedUav = static_cast<UINT>(HeapSlot::UavYuvOut1);
+
+    if (kind == ColorOutKind::Sdr && _isRgb) {
+        // Phase B:RGBP SDR 输出(PIPE→OUT 双线性;1:1 时坐标恒等映射,
+        // 与直写逐位同价)。RGB 全域直码,零矩阵。
+        const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
+        const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+        const float consts[8]{};
+        recordConvertPass(_psoRgbScaled.Get(), extent, srcExtent, consts,
+                          HeapSlot::UavYuvOut0, HeapSlot::UavYuvOut1, HeapSlot::UavYuvOut2);
     } else if (kind == ColorOutKind::Sdr) {
-        cl->SetPipelineState(lumaPso);
-        {
-            const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
-            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
-            const float consts[8]{ cf.kr, cf.kb,
-                                   cf.yLo / cf.containerMax, cf.ySpan / cf.containerMax,
-                                   0.0f, 0.0f, 0.0f, 0.0f };
-            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
-            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
-            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
-            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
-            cl->SetComputeRootDescriptorTable(2, gpu(28));
-            cl->SetComputeRootDescriptorTable(3, gpu(29));
-            cl->Dispatch((static_cast<UINT>(_outW) + 7) / 8, (static_cast<UINT>(_outH) + 7) / 8, 1);
-        }
-        cl->SetPipelineState(chromaPso);
-        {
-            const UINT extent[2]{ static_cast<UINT>(_outChromaW), static_cast<UINT>(_outChromaH) };
-            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
-            const float consts[8]{ cf.kr, cf.kb,
-                                   cf.cMid / cf.containerMax, cf.cSpan / cf.containerMax,
-                                   0.0f, 0.0f, 0.0f, 0.0f };
-            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
-            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
-            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
-            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
-            cl->SetComputeRootDescriptorTable(2, gpu(29));
-            cl->SetComputeRootDescriptorTable(3, gpu(30));
-            cl->Dispatch((static_cast<UINT>(_outChromaW) + 7) / 8, (static_cast<UINT>(_outChromaH) + 7) / 8, 1);
-        }
+        const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
+        const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+        const float consts[8]{ cf.kr, cf.kb,
+                               cf.yLo / cf.containerMax, cf.ySpan / cf.containerMax,
+                               0.0f, 0.0f, 0.0f, 0.0f };
+        recordConvertPass(lumaPso, extent, srcExtent, consts,
+                          HeapSlot::UavYuvOut0, HeapSlot::UavYuvOut1, kUnusedUav);
+        const UINT cExtent[2]{ static_cast<UINT>(_outChromaW), static_cast<UINT>(_outChromaH) };
+        const float cConsts[8]{ cf.kr, cf.kb,
+                                cf.cMid / cf.containerMax, cf.cSpan / cf.containerMax,
+                                0.0f, 0.0f, 0.0f, 0.0f };
+        recordConvertPass(chromaPso, cExtent, srcExtent, cConsts,
+                          HeapSlot::UavYuvOut1, HeapSlot::UavYuvOut2, kUnusedUav);
     } else {
         // HDR(HdrScRgb / HdrPqCodes):Kr/Kb = BT.2020(0.2627/0.0593);
         // limited 10bit luma 64+876y、chroma 512+896c(÷CM 折进常量,与 SDR
         // 路径同布局)。两者常量组相同,仅 PSO 对不同(码域源免 PqEncode)。
         constexpr float kKr2020 = 0.2627f;
         constexpr float kKb2020 = 0.0593f;
-        cl->SetPipelineState(lumaPso);
-        {
-            const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
-            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
-            const float consts[8]{ kKr2020, kKb2020,
-                                   64.0f / 1023.0f, 876.0f / 1023.0f,
-                                   0.0f, 0.0f, 0.0f, 0.0f };
-            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
-            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
-            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
-            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
-            cl->SetComputeRootDescriptorTable(2, gpu(28));
-            cl->SetComputeRootDescriptorTable(3, gpu(29));
-            cl->Dispatch((static_cast<UINT>(_outW) + 7) / 8, (static_cast<UINT>(_outH) + 7) / 8, 1);
-        }
-        cl->SetPipelineState(chromaPso);
-        {
-            const UINT extent[2]{ static_cast<UINT>(_outChromaW), static_cast<UINT>(_outChromaH) };
-            const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
-            const float consts[8]{ kKr2020, kKb2020,
-                                   512.0f / 1023.0f, 896.0f / 1023.0f,
-                                   0.0f, 0.0f, 0.0f, 0.0f };
-            cl->SetComputeRoot32BitConstants(0, 2, extent, 0);
-            cl->SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
-            cl->SetComputeRoot32BitConstants(0, 8, consts, 4);
-            cl->SetComputeRoot32BitConstants(0, 2, step, 12);
-            cl->SetComputeRootDescriptorTable(1, gpu(srcSrvIndex));
-            cl->SetComputeRootDescriptorTable(2, gpu(29));
-            cl->SetComputeRootDescriptorTable(3, gpu(30));
-            cl->Dispatch((static_cast<UINT>(_outChromaW) + 7) / 8, (static_cast<UINT>(_outChromaH) + 7) / 8, 1);
-        }
+        const UINT extent[2]{ static_cast<UINT>(_outW), static_cast<UINT>(_outH) };
+        const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
+        const float consts[8]{ kKr2020, kKb2020,
+                               64.0f / 1023.0f, 876.0f / 1023.0f,
+                               0.0f, 0.0f, 0.0f, 0.0f };
+        recordConvertPass(lumaPso, extent, srcExtent, consts,
+                          HeapSlot::UavYuvOut0, HeapSlot::UavYuvOut1, kUnusedUav);
+        const UINT cExtent[2]{ static_cast<UINT>(_outChromaW), static_cast<UINT>(_outChromaH) };
+        const float cConsts[8]{ kKr2020, kKb2020,
+                                512.0f / 1023.0f, 896.0f / 1023.0f,
+                                0.0f, 0.0f, 0.0f, 0.0f };
+        recordConvertPass(chromaPso, cExtent, srcExtent, cConsts,
+                          HeapSlot::UavYuvOut1, HeapSlot::UavYuvOut2, kUnusedUav);
     }
 
     D3D12_RESOURCE_BARRIER back[1]{
@@ -5119,11 +4497,7 @@ void D3D12Context::RecordHdrToPq(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
     cl->ResourceBarrier(1, toUav);
 
     cl->SetComputeRootSignature(_rsConvertOut.Get());
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl->SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), *cl, slot };
 
     cl->SetPipelineState(_psoHdrToPq.Get());
     {
@@ -5136,8 +4510,8 @@ void D3D12Context::RecordHdrToPq(ID3D12GraphicsCommandList &clRef, FrameSlot &sl
         cl->SetComputeRoot32BitConstants(0, 10, consts, 4);
         cl->SetComputeRootDescriptorTable(1, gpu(kSrvHdrColor));
         cl->SetComputeRootDescriptorTable(2, gpu(kUavFgBack));
-        cl->SetComputeRootDescriptorTable(3, gpu(28)); // 占位(未消费)
-        cl->SetComputeRootDescriptorTable(4, gpu(29)); // 占位(未消费)
+        cl->SetComputeRootDescriptorTable(3, gpu(HeapSlot::UavYuvOut0)); // 占位(未消费)
+        cl->SetComputeRootDescriptorTable(4, gpu(HeapSlot::UavYuvOut1)); // 占位(未消费)
         cl->Dispatch((static_cast<UINT>(_pipeW) + 7) / 8, (static_cast<UINT>(_pipeH) + 7) / 8, 1);
     }
     // UAV→NSR:fgBack 即 DLSSG backbuffer(eval 前 NSR 化,替代旧 fgBar)。
@@ -5154,16 +4528,12 @@ void D3D12Context::RecordMotionScale(ID3D12GraphicsCommandList &cl, FrameSlot &s
     // 调用方(帧路径)按 COMMON→UAV 屏障后调用,UAV→NSR 收尾归调用方。
     const UINT extent[2]{ static_cast<UINT>(_pipeW), static_cast<UINT>(_pipeH) };
     const UINT srcExtent[2]{ static_cast<UINT>(srcW), static_cast<UINT>(srcH) };
-    ID3D12DescriptorHeap *heaps[]{ slot.srvUavHeap.Get() };
-    cl.SetDescriptorHeaps(1, heaps);
-    const D3D12_GPU_DESCRIPTOR_HANDLE gpuBase = slot.srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-    const UINT inc = _device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    auto gpu = [&](UINT i) { return D3D12_GPU_DESCRIPTOR_HANDLE{ gpuBase.ptr + static_cast<UINT64>(i * inc) }; };
+    HeapBinder gpu{ _device.Get(), cl, slot };
     cl.SetComputeRootSignature(_rsMotionScale.Get());
     cl.SetPipelineState(_psoMotionScale.Get());
     cl.SetComputeRoot32BitConstants(0, 2, extent, 0);
     cl.SetComputeRoot32BitConstants(0, 2, srcExtent, 2);
-    cl.SetComputeRootDescriptorTable(1, gpu(10));             // t0 slot.motion SRV
+    cl.SetComputeRootDescriptorTable(1, gpu(HeapSlot::SrvMotion));             // t0 slot.motion SRV
     cl.SetComputeRootDescriptorTable(2, gpu(kUavMotionDense)); // u0 motionDense
     cl.Dispatch((extent[0] + 7) / 8, (extent[1] + 7) / 8, 1);
 }

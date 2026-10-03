@@ -35,6 +35,7 @@
 //      Release 与队列析构在 loader 锁下有死锁前科,进程退出统一回收)。
 
 #include "d3d12_context.h"
+#include "ngx_seh_gate.h" // SehCall 模板(基类内联)经此展开
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -102,17 +103,70 @@ private:
     std::atomic<uint64_t> _fenceValue{ 0 };
 };
 
-class RtxVsrContext {
+// VSR / TrueHDR 共用骨架(接入流程唯一实现;此前 Initialize/CreateFeatureOnCtl
+// /SehCall/Evaluate 壳在两类间逐字复制约 180 行,修过的 bug 必须双处同步,
+// 且已出现微漂移 —— VSR 的 Evaluate 失败补写 err 有空串守卫、HDR 版没有)。
+// 子类只填差异点:能力键、create/eval 的 EXT 调用与日志用名。
+class RtxFeatureBase {
 public:
-    RtxVsrContext() = default;
-    ~RtxVsrContext();
-    RtxVsrContext(const RtxVsrContext &) = delete;
-    RtxVsrContext &operator=(const RtxVsrContext &) = delete;
+    RtxFeatureBase() = default;
+    virtual ~RtxFeatureBase();
+    RtxFeatureBase(const RtxFeatureBase &) = delete;
+    RtxFeatureBase &operator=(const RtxFeatureBase &) = delete;
 
+    bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
+    RtxQueue &Queue() noexcept { return _queue; }
+
+protected:
+    // 通用接入序:能力预检(FeatureInitResult 精确归因)→ ctl 上
+    // CreateFeature → 专用队列初始化 → ready 发布。失败 = 清引用 + STATUS
+    // 留痕(调用方降级收口)。
+    bool InitializeCommon(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
+                          int width, int height, char *err, size_t errLen) noexcept;
+    // ctl 路径 CreateFeature(与 DLSSFG 同款:CtlMutex + ctl CL + Execute
+    // 等待)。create 与尺寸无关。
+    bool CreateFeatureOnCtl(char *err, size_t errLen) noexcept;
+    // Evaluate 通用壳:检活 → SehCall 包专用队列 Execute → 失败闩停 +
+    // STATUS 留痕(err 已有内容时不覆盖 —— 队列 Execute 的失败原因优先)。
+    bool EvaluateShell(const char *what, ID3D12Fence *waitFence, uint64_t waitValue,
+                       uint64_t *signalValueOut,
+                       const std::function<bool(ID3D12GraphicsCommandList *)> &eval,
+                       char *err, size_t errLen) noexcept;
+
+    template <typename Fn>
+    bool SehCall(Fn &&fn, const char *what, char *err, size_t errLen,
+                 void (*log)(const char *) noexcept) noexcept {
+        return NgxSehGate(_faulted, std::forward<Fn>(fn), Tag(), what,
+                          DisabledNote(), err, errLen, log);
+    }
+
+    // ---- 差异点(子类填写)----
+    virtual const char *Tag() const noexcept = 0;          // 队列/日志标签("vsr"/"hdr")
+    virtual const char *PrettyName() const noexcept = 0;   // 能力日志用名("VSR"/"TrueHDR")
+    virtual const char *DisabledNote() const noexcept = 0; // SEH 闩停后的降级说明
+    virtual const char *CapKeyAvailable() const noexcept = 0; // <Feature>.Available 键(ngx_defs 宏 = 字符串键面)
+    virtual const char *CapKeyInitResult() const noexcept = 0;
+    // ctl CL 上的 create EXT 调用(返回 = NGX Success)。
+    virtual bool CreateOnCtl(ID3D12GraphicsCommandList *cl) noexcept = 0;
+    virtual const char *CreateFailedNote() const noexcept = 0; // CreateFeature 失败日志尾
+    virtual const char *EvalFailedNote() const noexcept = 0;   // eval 失败日志尾
+
+    D3D12Context *_d3d12 = nullptr;
+    NVSDK_NGX_Parameter *_params = nullptr; // 借用;core 拥有
+    NVSDK_NGX_Handle *_feature = nullptr;
+    RtxQueue _queue;
+    std::atomic<bool> _ready{false};
+    std::atomic<bool> _faulted{false};
+};
+
+class RtxVsrContext final : public RtxFeatureBase {
+public:
     // params 为 NGX core 的 GetCapabilityParameters 块(调用方拥有并负责
     // 销毁,与 DlssfgContext 的 _fgParams 同约定)。内部自取 CtlMutex。
     bool Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
-                    int width, int height, char *err, size_t errLen) noexcept;
+                    int width, int height, char *err, size_t errLen) noexcept {
+        return InitializeCommon(d3d12, params, width, height, err, errLen);
+    }
 
     // 专用队列上执行一次 VSR eval。waitFence/waitValue = 生产者(NR 段)
     // 的完成栅栏,消费顺序由 GPU 排队保证;*signalValueOut 返回本次完成
@@ -124,32 +178,23 @@ public:
                   uint64_t *signalValueOut,
                   char *err, size_t errLen) noexcept;
 
-    bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
-    RtxQueue &Queue() noexcept { return _queue; }
-
-private:
-    bool CreateFeatureOnCtl(char *err, size_t errLen) noexcept;
-
-    template <typename Fn>
-    bool SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept;
-
-    D3D12Context *_d3d12 = nullptr;
-    NVSDK_NGX_Parameter *_params = nullptr; // 借用;core 拥有
-    NVSDK_NGX_Handle *_feature = nullptr;
-    RtxQueue _queue;
-    std::atomic<bool> _ready{false};
-    std::atomic<bool> _faulted{false};
+protected:
+    const char *Tag() const noexcept override { return "vsr"; }
+    const char *PrettyName() const noexcept override { return "VSR"; }
+    const char *DisabledNote() const noexcept override { return "VSR disabled until host restart"; }
+    const char *CapKeyAvailable() const noexcept override { return NVSDK_NGX_Parameter_VSR_Available; }
+    const char *CapKeyInitResult() const noexcept override { return NVSDK_NGX_Parameter_VSR_FeatureInitResult; }
+    bool CreateOnCtl(ID3D12GraphicsCommandList *cl) noexcept override;
+    const char *CreateFailedNote() const noexcept override { return "VSR off (SDR passthrough size)"; }
+    const char *EvalFailedNote() const noexcept override { return "VSR off (passthrough size)"; }
 };
 
-class RtxHdrContext {
+class RtxHdrContext final : public RtxFeatureBase {
 public:
-    RtxHdrContext() = default;
-    ~RtxHdrContext();
-    RtxHdrContext(const RtxHdrContext &) = delete;
-    RtxHdrContext &operator=(const RtxHdrContext &) = delete;
-
     bool Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
-                    int width, int height, char *err, size_t errLen) noexcept;
+                    int width, int height, char *err, size_t errLen) noexcept {
+        return InitializeCommon(d3d12, params, width, height, err, errLen);
+    }
 
     // TrueHDR 不缩放:inW/inH 必须等于 outW/outH(官方 eval 的 in/out rect
     // 各自独立,SDK 样例同尺寸使用;本插件恒 1:1)。
@@ -159,21 +204,15 @@ public:
                   uint64_t *signalValueOut,
                   char *err, size_t errLen) noexcept;
 
-    bool Enabled() const noexcept { return _ready.load(std::memory_order_acquire); }
-    RtxQueue &Queue() noexcept { return _queue; }
-
-private:
-    bool CreateFeatureOnCtl(char *err, size_t errLen) noexcept;
-
-    template <typename Fn>
-    bool SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept;
-
-    D3D12Context *_d3d12 = nullptr;
-    NVSDK_NGX_Parameter *_params = nullptr; // 借用;core 拥有
-    NVSDK_NGX_Handle *_feature = nullptr;
-    RtxQueue _queue;
-    std::atomic<bool> _ready{false};
-    std::atomic<bool> _faulted{false};
+protected:
+    const char *Tag() const noexcept override { return "hdr"; }
+    const char *PrettyName() const noexcept override { return "TrueHDR"; }
+    const char *DisabledNote() const noexcept override { return "HDR disabled until host restart"; }
+    const char *CapKeyAvailable() const noexcept override { return NVSDK_NGX_Parameter_TrueHDR_Available; }
+    const char *CapKeyInitResult() const noexcept override { return NVSDK_NGX_Parameter_TrueHDR_FeatureInitResult; }
+    bool CreateOnCtl(ID3D12GraphicsCommandList *cl) noexcept override;
+    const char *CreateFailedNote() const noexcept override { return "HDR off (SDR output)"; }
+    const char *EvalFailedNote() const noexcept override { return "HDR off"; }
 };
 
 } // namespace vsdlssnr

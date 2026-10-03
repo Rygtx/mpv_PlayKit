@@ -333,6 +333,24 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         const bool seed = decision == OfGateDecision::Seed || !_gate.HistoryValid();
         ID3D12CommandQueue *queue = _d3d12->Queue();
 
+        // 失败收口三连(copy submit / main acquire / dispatch 同构;此前逐字
+        // 三连仅日志文案差异 —— copy 路径缺"连败停用"留痕属漂移,现统一):
+        // 播种 + 连败闩锁(≥3 停用留痕)+ Advance + 计时 + return。
+        auto failAndAdvance = [&](const char *msg) -> OfStageResult {
+            TimingStatusLine(msg);
+            result.historyReset = true;
+            _gate.InvalidateHistory();
+            if (++_consecutiveFailures >= 3) {
+                _ready.store(false, std::memory_order_release);
+                TimingStatusLine("DLSSNR STATUS: fxof disabled after consecutive failures");
+            }
+            _gate.Advance(frameIndex);
+            QueryPerformanceCounter(&t1);
+            _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
+                           static_cast<double>(freq.QuadPart);
+            return result;
+        };
+
         // ---- copy CL ----
         // queue Wait(doneFence, 上帧 dispatch)承重:保护本帧 ffxInput 覆写
         // 不早于上帧 dispatch 读完(普通栅栏,排队可靠;FIFO 下通常已满足)。
@@ -398,17 +416,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             // inputColor 记 COMMON→UAV(from-state 错配,2026-09-25 审查)。
             result.inputIndex = 0;
         } else {
-            TimingStatusLine("DLSSNR STATUS: fxof copy submit failed");
-            result.historyReset = true;
-            _gate.InvalidateHistory();
-            if (++_consecutiveFailures >= 3) {
-                _ready.store(false, std::memory_order_release);
-            }
-            _gate.Advance(frameIndex);
-            QueryPerformanceCounter(&t1);
-            _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
-                           static_cast<double>(freq.QuadPart);
-            return result;
+            return failAndAdvance("DLSSNR STATUS: fxof copy submit failed");
         }
 
         // ---- main CL:FFX dispatch ----
@@ -420,21 +428,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         ID3D12GraphicsCommandList *mainCl = nullptr;
         bool mainOk = AcquireCl(&mainAlloc, &mainCl);
         if (!mainOk) {
-            char msg[128];
-            std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: fxof main cl acquire failed (rotator)");
-            TimingStatusLine(msg);
-            result.historyReset = true;
-            _gate.InvalidateHistory();
-            if (++_consecutiveFailures >= 3) {
-                _ready.store(false, std::memory_order_release);
-                TimingStatusLine("DLSSNR STATUS: fxof disabled after consecutive failures");
-            }
-            _gate.Advance(frameIndex);
-            QueryPerformanceCounter(&t1);
-            _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
-                           static_cast<double>(freq.QuadPart);
-            return result;
+            return failAndAdvance("DLSSNR STATUS: fxof main cl acquire failed (rotator)");
         }
         // OF GPU 跨度括号:dispatch = FFX 光流计算本体(纯 compute,无
         // NGX,同 CL 打点合法),首尾 EndQuery 量出纯执行时间。
@@ -473,18 +467,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             OutputDebugStringA("vs_dlssnr: ");
             OutputDebugStringA(msg);
             OutputDebugStringA("\n");
-            TimingStatusLine(msg);
-            result.historyReset = true;
-            _gate.InvalidateHistory();
-            if (++_consecutiveFailures >= 3) {
-                _ready.store(false, std::memory_order_release);
-                TimingStatusLine("DLSSNR STATUS: fxof disabled after consecutive failures");
-            }
-            _gate.Advance(frameIndex);
-            QueryPerformanceCounter(&t1);
-            _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
-                           static_cast<double>(freq.QuadPart);
-            return result;
+            return failAndAdvance(msg);
         }
         ID3D12CommandList *lists[]{ mainCl };
         queue->ExecuteCommandLists(1, lists);

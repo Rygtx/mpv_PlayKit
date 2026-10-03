@@ -32,6 +32,8 @@ namespace vsdlssnr {
 // 栅栏值到达等待(两光流后端共用):共享 auto-reset 事件的唤醒可能被同
 // 事件的其它等待者窃取(单次 Wait 返回不代表本等待的目标值已达成),循环
 // 复查完成值;栅栏值单调 ⇒ 有界退出。
+// CL 轮转池的 allocator Reset + force-close 自愈(ResetAllocatorHealed)
+// 已上移 d3d12_context.h(全仓唯一实现,含 d3d12 侧五处原手写份)。
 inline bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
                              HANDLE event, DWORD timeoutMs) noexcept {
     for (;;) {
@@ -39,20 +41,6 @@ inline bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
         if (FAILED(fence->SetEventOnCompletion(value, event))) return false;
         if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
     }
-}
-
-// CL 轮转池的 allocator Reset + force-close 自愈(两光流后端共用):上次
-// 录制中途失败遗留 open CL 会让 allocator Reset 永久 E_FAIL —— 先 Close
-// 一次再 Reset(d3d12 BeginCtlRecording 同款恢复模式)。含 CL->Reset。
-inline bool ResetAllocatorHealed(ID3D12CommandAllocator *alloc,
-                                 ID3D12GraphicsCommandList *cl) noexcept {
-    HRESULT hr = alloc->Reset();
-    if (FAILED(hr)) {
-        cl->Close();
-        hr = alloc->Reset();
-        if (FAILED(hr)) return false;
-    }
-    return SUCCEEDED(cl->Reset(alloc, nullptr));
 }
 
 class D3D12Context;
@@ -127,8 +115,10 @@ public:
     virtual ID3D12Resource *InputTexture(int index) const noexcept = 0;
     // StatsPayload.ofMode 能力串(backend 特有段;off/zero 前缀由 DlssnrContext 统一)。
     virtual const char *ModeString(char *buf, size_t len) noexcept = 0;
-    // 后端种类(kOfBackendNvof/Ffx;densify lambda 分支与 NVOF 专属
-    // 探针判定用 —— 免 RTTI/dynamic_cast)。
+    // NVOF 专属能力的受控下转型(门细分等待/引擎等待统计仅 NvofContext 有):
+    // 消费端不再散布 Kind()==Nvof + static_cast(原四处);FFX 恒 nullptr。
+    virtual class NvofContext *AsNvof() noexcept { return nullptr; }
+    // 后端种类(会话重建裁决/FFX 专属 dump 分支用 —— 免 RTTI/dynamic_cast)。
     virtual int Kind() const noexcept = 0;
 };
 

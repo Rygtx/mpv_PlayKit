@@ -8,6 +8,7 @@
 #include "dlssfg_gate.h"
 #include "dlssnr_context.h"
 #include "dlssnr_params.h"
+#include "nv_gpu_probe.h" // NR 模型选档的 GPU 架构探测(中立件,非 FG 门所属)
 #include "panel_ipc.h"
 #include "shared_params.h"
 
@@ -76,10 +77,10 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
 // 失效。首次 create 必然先于代理附着(代理随 FG 会话初始化加载),缓存
 // 首拍真值后恒用之;后续探测与首拍的偏差只留一行痕(可诊断"为何没换档")。
 std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
-    static const vsdlssnr::dlssfg_gate::GpuArchProbe firstProbe = [] {
-        return vsdlssnr::dlssfg_gate::ProbePrimaryGpuArch();
+    static const vsdlssnr::nv_gpu_probe::GpuArchProbe firstProbe = [] {
+        return vsdlssnr::nv_gpu_probe::ProbePrimaryGpuArch();
     }();
-    auto probe = vsdlssnr::dlssfg_gate::ProbePrimaryGpuArch();
+    auto probe = vsdlssnr::nv_gpu_probe::ProbePrimaryGpuArch();
     if (probe.arch != firstProbe.arch || probe.implementation != firstProbe.implementation) {
         static bool driftLogged = false; // 一次性:此后每拍都是同一个假值
         if (!driftLogged) {
@@ -96,7 +97,7 @@ std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
     }
     const char *tier = "stock";
     const char *candidates[2] = {SNIPPET_DLL_NAME, SNIPPET_DLL_NAME};
-    if (probe.arch == vsdlssnr::dlssfg_gate::kArchAda) {
+    if (probe.arch == vsdlssnr::nv_gpu_probe::kArchAda) {
         if (probe.implementation == kImplAd102) {
             tier = "4090";
             candidates[0] = NGX_VARIANT_DLL_4090;
@@ -104,8 +105,8 @@ std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
             tier = "40xx";
             candidates[0] = NGX_VARIANT_DLL_40XX;
         }
-    } else if (probe.arch == vsdlssnr::dlssfg_gate::kArchTuring ||
-               probe.arch == vsdlssnr::dlssfg_gate::kArchAmpere) {
+    } else if (probe.arch == vsdlssnr::nv_gpu_probe::kArchTuring ||
+               probe.arch == vsdlssnr::nv_gpu_probe::kArchAmpere) {
         tier = "20/30";
         candidates[0] = NGX_VARIANT_DLL_2030;
     }
@@ -556,6 +557,97 @@ static void ParseColorProps(const VSMap *props, const VSAPI *vsapi,
     }
 }
 
+namespace {
+// FG/非 FG 路径的公共帧执行尾(此前同一序列在 DlssnrGetFrame 两分支平行
+// 抄两遍 —— 失败策略/timing 节流/HDR props 改动需双处同步,"RTX 失败不
+// 兜底"裁定即双处落的实例):平面指针打包 → ProcessFrame → 失败插值槽
+// 释放(FG)→ 失败闩锁(RTX = 报错终止;非 RTX = 同构行拷贝兜底)→
+// HDR props → timing 节流。
+// 返回 false = 已 setFilterError(调用方直接 return nullptr);成功/兜底
+// 时 out 内容恒就绪。ffOut 非空 = defer 模式(ProcessFrame 只跑 Submit
+// 半段,续体交还调用方);genFrame/effGens/fgGenOk 仅 FG 路径提供。
+bool RunProcessFrameCommon(FilterData *d, const VSFrame *src, VSFrame *out,
+                           int frameN, int effM,
+                           VSFrame **genFrame, int effGens, bool *fgGenOk,
+                           vsdlssnr::FrameFinish **ffOut,
+                           VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
+    static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
+    const uint8_t *srcPlanes[3]{};
+    int64_t srcStrides[3]{};
+    uint8_t *dstPlanes[3]{};
+    int64_t dstStrides[3]{};
+    for (int p = 0; p < 3; ++p) {
+        srcPlanes[p] = vsapi->getReadPtr(src, p);
+        srcStrides[p] = vsapi->getStride(src, p);
+        dstPlanes[p] = vsapi->getWritePtr(out, p);
+        dstStrides[p] = vsapi->getStride(out, p);
+    }
+    uint8_t *genPlanes[kFgGenSlots * 3]{};
+    int64_t genStrides[kFgGenSlots * 3]{};
+    for (int g = 0; g < effGens; ++g) {
+        for (int p = 0; p < 3; ++p) {
+            genPlanes[g * 3 + p] = vsapi->getWritePtr(genFrame[g], p);
+            genStrides[g * 3 + p] = vsapi->getStride(genFrame[g], p);
+        }
+    }
+    char err[256]{};
+    char timing[128]{};
+    vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
+    vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
+    ParseColorProps(vsapi->getFramePropertiesRO(src), vsapi, matrix, range);
+    const bool procOk = d->ngx->ProcessFrame(
+        srcPlanes, srcStrides, dstPlanes, dstStrides,
+        effM, effGens > 0 ? genPlanes : nullptr,
+        effGens > 0 ? genStrides : nullptr, fgGenOk,
+        d->width, d->height, frameN, matrix, range, err, sizeof(err),
+        timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0,
+        ffOut);
+    // 失败/未评插值槽:释放帧(出帧时槽位回落真实帧引用)。
+    for (int g = 0; g < effGens; ++g) {
+        if (genFrame[g] && (!procOk || !fgGenOk[g])) {
+            vsapi->freeFrame(genFrame[g]);
+            genFrame[g] = nullptr;
+        }
+    }
+    if (!procOk) {
+        if (!d->failureLogged.exchange(true)) {
+            char msg[512];
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", frameN, err);
+            vsapi->logMessage(mtWarning, msg, core);
+            // 探针:首帧失败进 timing log(GUI mpv 完全看不到 logMessage)。
+            vsdlssnr::TimingStatusLine(msg);
+        }
+        // RTX 会话失败不再兜底(2026-09-26 用户裁定):最近邻缩放拷贝
+        // 产出几何错误的伪内容,宁报错终止也不静默降级。失败帧不入
+        // 缓存、不推进世代 —— 等待者无从挂在本帧世代上。
+        if (d->rtxActive) {
+            char abortMsg[320];
+            std::snprintf(abortMsg, sizeof(abortMsg),
+                          "vs_dlssnr frame %d failed: %s", frameN, err);
+            vsapi->freeFrame(out);
+            vsapi->freeFrame(src);
+            vsapi->setFilterError(abortMsg, frameCtx);
+            return false;
+        }
+        // 非 RTX:同构行拷贝兜底,输出平面不留未初始化内容。
+        CopyPlanes(src, out, vsapi, d->width, d->height);
+    } else {
+        d->failureLogged.store(false);
+        if (d->hdrOut) SetHdrFrameProps(out, vsapi);
+    }
+    if (timingEnabled && timing[0]) {
+        // Throttle: log every 30th frame (fmParallel: order irrelevant).
+        static std::atomic<int> timingFrameCount{ 0 };
+        if (timingFrameCount.fetch_add(1, std::memory_order_relaxed) % 30 == 1) {
+            char msg[192];
+            std::snprintf(msg, sizeof(msg), "vs_dlssnr timing[%d]: %s", frameN, timing);
+            vsapi->logMessage(mtInformation, msg, core);
+        }
+    }
+    return true;
+}
+} // namespace
+
 static const VSFrame *VS_CC DlssnrGetFrame(
     int n, int activationReason, void *instanceData, void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
@@ -720,30 +812,6 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             genFrame[g] = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
         }
 
-        const uint8_t *srcPlanes[3]{};
-        int64_t srcStrides[3]{};
-        uint8_t *dstPlanes[3]{};
-        int64_t dstStrides[3]{};
-        for (int p = 0; p < 3; ++p) {
-            srcPlanes[p] = vsapi->getReadPtr(src, p);
-            srcStrides[p] = vsapi->getStride(src, p);
-            dstPlanes[p] = vsapi->getWritePtr(out, p);
-            dstStrides[p] = vsapi->getStride(out, p);
-        }
-        uint8_t *genPlanes[kFgGenSlots * 3]{};
-        int64_t genStrides[kFgGenSlots * 3]{};
-        for (int g = 0; g < effGens; ++g) {
-            for (int p = 0; p < 3; ++p) {
-                genPlanes[g * 3 + p] = vsapi->getWritePtr(genFrame[g], p);
-                genStrides[g * 3 + p] = vsapi->getStride(genFrame[g], p);
-            }
-        }
-
-        char err[256]{};
-        char timing[128]{};
-        vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
-        vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
-        ParseColorProps(vsapi->getFramePropertiesRO(src), vsapi, matrix, range);
         // NGX history-reset policy (frame-gap heuristic) lives in DlssnrContext;
         // only the frame index is forwarded here. 有效密度 effM 与 genPlanes
         // 布局([gen][plane] 扁平)即 ProcessFrame 的多帧输出契约。
@@ -752,56 +820,11 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         // 下一源帧的 CPU 链与本帧 GPU 执行重叠,FG 会话恢复流水。
         bool fgGenOk[kFgGenSlots] = {};
         vsdlssnr::FrameFinish *ff = nullptr;
-        const bool procOk =
-            d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
-                                 effM, effGens > 0 ? genPlanes : nullptr,
-                                 effGens > 0 ? genStrides : nullptr, fgGenOk,
-                                 d->width, d->height, k, matrix, range, err, sizeof(err),
-                                 timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0,
-                                 &ff);
         // Submit 半段失败(含 oom)= ff 恒 null:锁内兜底 + 缓存(内容同步
-        // 就绪)+ 返回。失败/未评插值槽:释放帧(出帧时槽位回落真实帧引用)。
-        for (int g = 0; g < effGens; ++g) {
-            if (genFrame[g] && (!procOk || !fgGenOk[g])) {
-                vsapi->freeFrame(genFrame[g]);
-                genFrame[g] = nullptr;
-            }
-        }
-        if (!procOk) {
-            if (!d->failureLogged.exchange(true)) {
-                char msg[512];
-                std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", k, err);
-                vsapi->logMessage(mtWarning, msg, core);
-                // 探针:首帧失败进 timing log(GUI mpv 完全看不到 logMessage)。
-                vsdlssnr::TimingStatusLine(msg);
-            }
-            // RTX 会话失败不再兜底(2026-09-26 用户裁定):最近邻缩放拷贝
-            // 产出几何错误的伪内容,宁报错终止也不静默降级。失败帧不入
-            // 缓存、不推进世代 —— 等待者无从挂在本帧世代上。
-            if (d->rtxActive) {
-                char abortMsg[320];
-                std::snprintf(abortMsg, sizeof(abortMsg),
-                              "vs_dlssnr frame %d failed: %s", k, err);
-                vsapi->freeFrame(out);
-                vsapi->freeFrame(src);
-                vsapi->setFilterError(abortMsg, frameCtx);
-                return nullptr;
-            }
-            // 非 RTX:同构行拷贝兜底,输出平面不留未初始化内容。
-            CopyPlanes(src, out, vsapi, d->width, d->height);
-        } else {
-            d->failureLogged.store(false);
-            if (d->hdrOut) SetHdrFrameProps(out, vsapi);
-        }
-
-        if (timingEnabled && timing[0]) {
-            // Throttle: log every 30th frame (fmParallel: order irrelevant).
-            static std::atomic<int> timingFrameCount{ 0 };
-            if (timingFrameCount.fetch_add(1, std::memory_order_relaxed) % 30 == 1) {
-                char msg[192];
-                std::snprintf(msg, sizeof(msg), "vs_dlssnr timing[%d]: %s", k, timing);
-                vsapi->logMessage(mtInformation, msg, core);
-            }
+        // 就绪)+ 返回。
+        if (!RunProcessFrameCommon(d, src, out, k, effM, genFrame, effGens,
+                                   fgGenOk, &ff, frameCtx, core, vsapi)) {
+            return nullptr;
         }
 
         // 时长契约:每输出帧 = 源时长/M0(_DurationNum/_DurationDen 整数对
@@ -862,20 +885,40 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 for (int i = 0; i < n; ++i) vsapi->freeFrame(keep[i]);
             }
         } dstGuard{vsapi, dstKeep, dstKeepN};
-        if (procOk) {
+        if (ff) {
             // ---- 锁外 Finish:GPU 等待 + unpack(真实帧 + 逐 gen)----
-            // 从这里到 Ready 通知之间不持 fgMutex:其它源帧的 CPU 链
-            // (pack/OF/录制/提交)与本帧 GPU 执行/unpack 重叠。消费方在
-            // 世代门等本帧内容,不阻塞流水。
+            // (ff 非空 ⟺ Submit 半段成功打包了续体;失败/兜底路径内容已
+            // 就绪,无 Finish 半段。)从这里到 Ready 通知之间不持 fgMutex:
+            // 其它源帧的 CPU 链(pack/OF/录制/提交)与本帧 GPU 执行/unpack
+            // 重叠。消费方在世代门等本帧内容,不阻塞流水。
             fgLock.unlock();
             if (timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin pre-finish");
+            uint8_t *finDst[3]{};
+            int64_t finDstStride[3]{};
+            for (int p = 0; p < 3; ++p) {
+                finDst[p] = vsapi->getWritePtr(out, p);
+                finDstStride[p] = vsapi->getStride(out, p);
+            }
+            uint8_t *finGen[kFgGenSlots * 3]{};
+            int64_t finGenStride[kFgGenSlots * 3]{};
+            for (int g = 0; g < effGens; ++g) {
+                // 失败/未评槽已被 helper 释放置空;对应 fgGenOk[g]=false,
+                // Finish 半段不读这些平面 —— 留空即可,绝不对空帧取指针。
+                if (!genFrame[g]) continue;
+                for (int p = 0; p < 3; ++p) {
+                    finGen[g * 3 + p] = vsapi->getWritePtr(genFrame[g], p);
+                    finGenStride[g * 3 + p] = vsapi->getStride(genFrame[g], p);
+                }
+            }
+            char finErr[256]{};
+            char finTiming[128]{};
             const bool finOk =
-                d->ngx->ProcessFrameFinish(ff, dstPlanes, dstStrides,
-                                           effGens > 0 ? genPlanes : nullptr,
-                                           effGens > 0 ? genStrides : nullptr,
-                                           fgGenOk, err, sizeof(err),
-                                           timingEnabled ? timing : nullptr,
-                                           timingEnabled ? sizeof(timing) : 0);
+                d->ngx->ProcessFrameFinish(ff, finDst, finDstStride,
+                                           effGens > 0 ? finGen : nullptr,
+                                           effGens > 0 ? finGenStride : nullptr,
+                                           fgGenOk, finErr, sizeof(finErr),
+                                           timingEnabled ? finTiming : nullptr,
+                                           timingEnabled ? sizeof(finTiming) : 0);
             if (timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin post-finish");
             if (!finOk) {
                 // unpack 失败:帧已入缓存、引用可能已被消费方领走(尚未交付
@@ -883,7 +926,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 if (!d->failureLogged.exchange(true)) {
                     char msg[512];
                     std::snprintf(msg, sizeof(msg),
-                                  "vs_dlssnr frame %d failed at finish: %s", k, err);
+                                  "vs_dlssnr frame %d failed at finish: %s", k, finErr);
                     vsapi->logMessage(mtWarning, msg, core);
                     vsdlssnr::TimingStatusLine(msg);
                 }
@@ -903,7 +946,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                     d->fgReadyCv.notify_all();
                     char abortMsg[320];
                     std::snprintf(abortMsg, sizeof(abortMsg),
-                                  "vs_dlssnr frame %d failed at finish: %s", k, err);
+                                  "vs_dlssnr frame %d failed at finish: %s", k, finErr);
                     vsapi->freeFrame(ret);
                     vsapi->freeFrame(src);
                     vsapi->setFilterError(abortMsg, frameCtx);
@@ -942,54 +985,9 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     if (!d->initOk || (!nrLive && !d->rtxActive)) return src;
 
     VSFrame *out = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
-    const uint8_t *srcPlanes[3]{};
-    int64_t srcStrides[3]{};
-    uint8_t *dstPlanes[3]{};
-    int64_t dstStrides[3]{};
-    for (int p = 0; p < 3; ++p) {
-        srcPlanes[p] = vsapi->getReadPtr(src, p);
-        srcStrides[p] = vsapi->getStride(src, p);
-        dstPlanes[p] = vsapi->getWritePtr(out, p);
-        dstStrides[p] = vsapi->getStride(out, p);
-    }
-    char err[256]{};
-    char timing[128]{};
-    vsdlssnr::ColorMatrix matrix = vsdlssnr::ColorMatrix::BT709;
-    vsdlssnr::ColorRange range = vsdlssnr::ColorRange::Limited;
-    ParseColorProps(vsapi->getFramePropertiesRO(src), vsapi, matrix, range);
-    if (!d->ngx->ProcessFrame(srcPlanes, srcStrides, dstPlanes, dstStrides,
-                              0, nullptr, nullptr, nullptr,
-                              d->width, d->height, n, matrix, range, err, sizeof(err),
-                              timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0)) {
-        if (!d->failureLogged.exchange(true)) {
-            char msg[512];
-            std::snprintf(msg, sizeof(msg), "vs_dlssnr frame %d failed: %s", n, err);
-            vsapi->logMessage(mtWarning, msg, core);
-            vsdlssnr::TimingStatusLine(msg);
-        }
-        // RTX 会话失败不再兜底(2026-09-26 用户裁定):报错终止。
-        if (d->rtxActive) {
-            char abortMsg[320];
-            std::snprintf(abortMsg, sizeof(abortMsg),
-                          "vs_dlssnr frame %d failed: %s", n, err);
-            vsapi->freeFrame(out);
-            vsapi->freeFrame(src);
-            vsapi->setFilterError(abortMsg, frameCtx);
-            return nullptr;
-        }
-        // 非 RTX:同构行拷贝兜底,输出平面不留未初始化内容。
-        CopyPlanes(src, out, vsapi, d->width, d->height);
-    } else {
-        d->failureLogged.store(false);
-        if (d->hdrOut) SetHdrFrameProps(out, vsapi);
-    }
-    if (timingEnabled && timing[0]) {
-        static std::atomic<int> timingFrameCount{ 0 };
-        if (timingFrameCount.fetch_add(1, std::memory_order_relaxed) % 30 == 1) {
-            char msg[192];
-            std::snprintf(msg, sizeof(msg), "vs_dlssnr timing[%d]: %s", n, timing);
-            vsapi->logMessage(mtInformation, msg, core);
-        }
+    if (!RunProcessFrameCommon(d, src, out, n, 0, nullptr, 0, nullptr, nullptr,
+                               frameCtx, core, vsapi)) {
+        return nullptr;
     }
     // getFrameFilter handed us a reference to src; release it or every source
     // frame leaks (~24MB per 1080p frame).

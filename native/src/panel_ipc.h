@@ -88,7 +88,10 @@ constexpr uint32_t PAYLOAD_MAGIC = 0x4F4C5344u; // "DSLO" (v24, 版本位走 hex
 // —— JSON 时代的超长静默截断(v19/v25 两次扩容事故)与引号炸体
 // (SanitizeJsonDetail 的存在缘由)两事故类分别被 static_assert 与定长
 // 拷贝消灭,键名三处人肉对齐(SK_ 常量/格式串/strstr 模式)由编译器接管。
-constexpr uint32_t STATS_MAGIC = 0x384C5344u;   // "DSL8" (v27:stats JSON → struct)
+// DSL9(v28,0x394C5344):每帧实效位三元(evalActive/ofActive/scalingActive)
+// —— 面板"增强中/光流行/分辨率链"改为直读,不再镜像插件门控公式
+// (插件改门控面板静默错标的整类失配消灭)。
+constexpr uint32_t STATS_MAGIC = 0x394C5344u;   // "DSL9" (v28:每帧实效位)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -282,6 +285,11 @@ struct StatsPayload {
     uint32_t gateResets;
     uint32_t gpuHang;       // non-0 = GPU hang/device removed (body carries only removedReason)
     uint32_t temporalRoute; // anti-flicker effective level 0-4 (diag page)
+    // 每帧实效位(DSL9):面板状态行/光流行/分辨率链直读,免镜像插件门控
+    // 公式(意图参数推导在插件改门控时会静默错标)。
+    uint32_t evalActive;    // 本帧 NGX/NR 真评估(直通/播种/降级帧 = 0)
+    uint32_t ofActive;      // 本帧光流消费门开(NR/FG 在用;零提交帧 = 0)
+    uint32_t scalingActive; // 本帧内部缩放档真参与(NR 关直连 = 0)
 
     // ---- strings: fixed width; overlong copies truncate at the field edge,
     // the struct itself can never be corrupted (CopyStatStr below). Detail
@@ -344,6 +352,23 @@ inline void PublishWithSeq(volatile uint32_t *seq, uint32_t newSeq, WriteBody &&
     *seq = 0;
     writeBody();
     _InterlockedExchange(reinterpret_cast<volatile long *>(seq), static_cast<long>(newSeq));
+}
+
+// PublishWithSeq 的读侧对偶(协议读侧单点;此前 bridge adopt / bridge 轮询
+// / 面板 stats 三处各手写一份 memcpy+复验,写法各异)。拷贝正文 + seq 复验
+// (写者正文稳定后才发布;volatile 复读防编译器把拷贝前的旧值前递到比较)。
+// false = 魔法不符(成对部署被破坏)/ 写进行中(seq 0)/ 撕裂读(seq 中途
+// 移动,重试即可)。特例:ReadStatsSnapshot 因混部署映射钳制拷贝量
+// (VirtualQuery)不能用整块模板,改用 SeqStable 复验半边。
+template <typename T>
+inline bool SeqStable(const T *view, const T &snap) noexcept {
+    return view->seq != 0 && static_cast<const volatile T *>(view)->seq == snap.seq;
+}
+template <typename T, typename MagicT>
+inline bool ReadWithSeq(const T *view, T *snap, MagicT magic) noexcept {
+    if (view->magic != magic) return false;
+    memcpy(snap, view, sizeof(*snap));
+    return SeqStable(view, *snap);
 }
 
 // Plugin-side stats publisher. Mapping + writable view are created once and

@@ -13,56 +13,60 @@
 #include <windows.h>
 
 // ---------------------------------------------------------------------------
-// 保存键单一权威表(编译期):写侧(WriteDlssnrIni)与剪除表
-// (kDlssnrSectionKeys / kRtxSectionKeys)由同一组宏展开 —— 键名/值式漂移
-// 在构造上不可能(此前靠"同文件紧邻 + review 可见")。改键名/增删键只动
-// DLSSNR_FIELDS / RTX_FIELDS 两组宏表;LoadDlssnrIni 读侧手动同步(漏加
-// 无害:缺键保留当前值),但宏表漏加 = 启动剪除把刚写的键当垃圾删掉,
-// 故新增键必经宏表。注意:宏体内禁用 // 注释(会吞掉续行反斜杠),行内
-// 说明用块注释;含逗号的表达式须整体加括号。
+// 保存键单一权威表(编译期):写侧(WriteDlssnrIni)、读侧(LoadDlssnrIni)
+// 与剪除表(kDlssnrSectionKeys / kRtxSectionKeys)由同一组宏展开 —— 键名/
+// 值式漂移在构造上不可能(此前写侧漏 scaling_enabled、读侧手动同步各出过
+// 一次事故形态)。改键名/增删键只动 DLSSNR_FIELDS / RTX_FIELDS 两组宏表。
+// 注意:宏体内禁用 // 注释(会吞掉续行反斜杠),行内说明用块注释。
 // v20:fg_route 两档(0=自动/1=纯官方),保存即把存量 2/3 归一;
 // v23:fg_hdr_interp 实验性(HDR 域插帧,可能闪烁)。
 #define DLSSNR_STRW(name) L## #name
 
-// 行格式:X(键名, 写函数, 值表达式)。
+// 行格式:X(键名, DlssnrParams 成员, 类型, 下限, 上限)。类型决定三
+// 消费点(写/读/剪除)的行为:
+//   Int  = 写 clamp(int)、读 clamp(int);Bool = 写 0/1、读宽容布尔;
+//   X100 = 写 lround(v*100)、读 ÷100 后 clamp;
+//   FgRoute = Int 读法 + 越界原值捕获(legacyFgRouteRaw 升级提示用);
+//   Skip = 只写哨兵 1 的 saved 键(不读,表内占位保证剪除不误删)。
+// 宏表行内禁 // 注释;值域说明见各行尾注释(块注释形态)。
 #define DLSSNR_FIELDS(X) \
-    X(nr_enabled, writeInt, p.nrEnabled ? 1 : 0) \
-    X(preset, writeInt, (std::clamp(p.preset, kPresetMin, kPresetMax))) \
-    X(style, writeInt, p.style) \
-    X(intensity_x100, writeX100, p.intensity) \
-    X(local_tone_x100, writeX100, p.localToneStrength) \
-    X(local_structure_x100, writeX100, p.localStructureStrength) \
-    X(skin_structure_x100, writeX100, p.skinStructureStrength) \
-    X(use_auto_mask, writeInt, p.useAutoMask ? 1 : 0) \
-    X(input_resolution, writeInt, (std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax))) \
-    X(scaling_enabled, writeInt, p.scalingEnabled ? 1 : 0) \
-    X(residual_multiplier_x100, writeX100, p.residualMultiplier) \
-    X(residual_saturation_x100, writeX100, p.residualSaturation) \
-    X(residual_lightness_x100, writeX100, p.residualLightness) \
-    X(shadow_structure_x100, writeX100, p.shadowStructureMultiplier) \
-    X(reflection_glow_x100, writeX100, p.reflectionGlowMultiplier) \
-    X(motion_vector_quality, writeInt, (std::clamp(p.motionVectorQuality, kOfQualityMin, kOfQualityMax))) \
-    X(ffx_quality, writeInt, (std::clamp(p.ffxQuality, kFfxQualityMin, kFfxQualityMax))) \
-    X(nvof_follow_scaling, writeInt, p.nvofFollowScaling ? 1 : 0) \
-    X(fg_enabled, writeInt, p.fgEnabled ? 1 : 0) \
-    X(fg_multiplier, writeInt, (std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax))) \
-    X(fg_route, writeInt, (std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax))) \
-    X(fg_hdr_interp, writeInt, p.fgHdrInterp ? 1 : 0) \
-    X(of_backend, writeInt, (std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax))) \
-    X(anti_flicker, writeInt, (std::clamp(p.antiFlicker, kAntiFlickerMin, kAntiFlickerMax))) \
-    X(saved, writeInt, 1)
+    X(nr_enabled, nrEnabled, Bool, 0, 0) \
+    X(preset, preset, Int, kPresetMin, kPresetMax) \
+    X(style, style, Int, kStyleMin, kStyleMax) \
+    X(intensity_x100, intensity, X100, kStrengthMin, kStrengthMax) \
+    X(local_tone_x100, localToneStrength, X100, kStrengthMin, kStrengthMax) \
+    X(local_structure_x100, localStructureStrength, X100, kStrengthMin, kStrengthMax) \
+    X(skin_structure_x100, skinStructureStrength, X100, kSkinMin, kSkinMax) \
+    X(use_auto_mask, useAutoMask, Bool, 0, 0) \
+    X(input_resolution, inputResolutionPercent, Int, kResPctMin, kResPctMax) \
+    X(scaling_enabled, scalingEnabled, Bool, 0, 0) \
+    X(residual_multiplier_x100, residualMultiplier, X100, kResidualMultMin, kResidualMultMax) \
+    X(residual_saturation_x100, residualSaturation, X100, kResidualFineMin, kResidualFineMax) \
+    X(residual_lightness_x100, residualLightness, X100, kResidualFineMin, kResidualFineMax) \
+    X(shadow_structure_x100, shadowStructureMultiplier, X100, kResidualFineMin, kResidualFineMax) \
+    X(reflection_glow_x100, reflectionGlowMultiplier, X100, kResidualFineMin, kResidualFineMax) \
+    X(motion_vector_quality, motionVectorQuality, Int, kOfQualityMin, kOfQualityMax) \
+    X(ffx_quality, ffxQuality, Int, kFfxQualityMin, kFfxQualityMax) \
+    X(nvof_follow_scaling, nvofFollowScaling, Bool, 0, 0) \
+    X(fg_enabled, fgEnabled, Bool, 0, 0) \
+    X(fg_multiplier, fgMultiplier, Int, kFgMultMin, kFgMultMax) \
+    X(fg_route, fgRoute, FgRoute, kFgRouteMin, kFgRouteMax) \
+    X(fg_hdr_interp, fgHdrInterp, Bool, 0, 0) \
+    X(of_backend, ofBackend, Int, kOfBackendMin, kOfBackendMax) \
+    X(anti_flicker, antiFlicker, Int, kAntiFlickerMin, kAntiFlickerMax) \
+    X(saved, nrEnabled, Skip, 0, 0)
 
 // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管;
 // 面板"保存设置"与 bridge saveRequest 共用写侧)。
 #define RTX_FIELDS(X) \
-    X(vsr_mode, writeRtxInt, (std::clamp(p.rtxVsrMode, kVsrModeMin, kVsrModeMax))) \
-    X(vsr_scale_x100, writeRtxInt, (static_cast<int>(std::lround(std::clamp(p.rtxVsrScale, kVsrScaleMin, kVsrScaleMax) * 100.0f)))) \
-    X(vsr_strength, writeRtxInt, (std::clamp(p.rtxVsrStrength, kVsrStrengthMin, kVsrStrengthMax))) \
-    X(hdr_enabled, writeRtxInt, p.rtxHdrEnabled ? 1 : 0) \
-    X(hdr_contrast, writeRtxInt, (std::clamp(p.rtxHdrContrast, kHdrContrastMin, kHdrContrastMax))) \
-    X(hdr_saturation, writeRtxInt, (std::clamp(p.rtxHdrSaturation, kHdrSaturationMin, kHdrSaturationMax))) \
-    X(hdr_middle_gray, writeRtxInt, (std::clamp(p.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax))) \
-    X(hdr_peak_nits, writeRtxInt, (std::clamp(p.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax)))
+    X(vsr_mode, rtxVsrMode, Int, kVsrModeMin, kVsrModeMax) \
+    X(vsr_scale_x100, rtxVsrScale, X100, kVsrScaleMin, kVsrScaleMax) \
+    X(vsr_strength, rtxVsrStrength, Int, kVsrStrengthMin, kVsrStrengthMax) \
+    X(hdr_enabled, rtxHdrEnabled, Bool, 0, 0) \
+    X(hdr_contrast, rtxHdrContrast, Int, kHdrContrastMin, kHdrContrastMax) \
+    X(hdr_saturation, rtxHdrSaturation, Int, kHdrSaturationMin, kHdrSaturationMax) \
+    X(hdr_middle_gray, rtxHdrMiddleGray, Int, kHdrMiddleGrayMin, kHdrMiddleGrayMax) \
+    X(hdr_peak_nits, rtxHdrMaxLuminance, Int, kHdrMaxLumMin, kHdrMaxLumMax)
 
 namespace vsdlssnr {
 
@@ -86,30 +90,78 @@ inline bool ReadIniBool(const wchar_t *section, const wchar_t *key, bool def,
     return ReadIniInt(section, key, def ? 1 : 0, iniPath) != 0;
 }
 
+// 键行三消费点的类型分发器(写/读各一组重载;剪除只需键名)。全部由上方
+// 权威宏行展开 —— 新增键只加一行,漏写/漏读在构造上不可能。
+inline void WriteIniRow_Bool(int v, const wchar_t *key, int, int,
+                             const wchar_t *section, const wchar_t *path, bool &ok) noexcept {
+    wchar_t buf[8];
+    swprintf_s(buf, L"%d", v ? 1 : 0);
+    ok = WritePrivateProfileStringW(section, key, buf, path) && ok;
+}
+inline void WriteIniRow_Int(int v, const wchar_t *key, int lo, int hi,
+                            const wchar_t *section, const wchar_t *path, bool &ok) noexcept {
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d", std::clamp(v, lo, hi));
+    ok = WritePrivateProfileStringW(section, key, buf, path) && ok;
+}
+// std::lround rounds half away from zero; (int)(v*100+0.5) would eat negatives
+inline void WriteIniRow_X100(float v, const wchar_t *key, int, int,
+                             const wchar_t *section, const wchar_t *path, bool &ok) noexcept {
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d", static_cast<int>(std::lround(v * 100.0f)));
+    ok = WritePrivateProfileStringW(section, key, buf, path) && ok;
+}
+inline void WriteIniRow_FgRoute(int v, const wchar_t *key, int lo, int hi,
+                                const wchar_t *section, const wchar_t *path, bool &ok) noexcept {
+    WriteIniRow_Int(v, key, lo, hi, section, path, ok);
+}
+inline void WriteIniRow_Skip(int, const wchar_t *key, int, int,
+                             const wchar_t *section, const wchar_t *path, bool &ok) noexcept {
+    ok = WritePrivateProfileStringW(section, key, L"1", path) && ok;
+}
+
+// DlssnrParams 的布尔位存储为 int(NGX 参数块契约),读法收 int&。
+inline void ReadIniRow_Bool(int &field, const wchar_t *key, int, int,
+                            const wchar_t *section, const wchar_t *path) noexcept {
+    field = ReadIniBool(section, key, field != 0, path) ? 1 : 0;
+}
+inline void ReadIniRow_Int(int &field, const wchar_t *key, int lo, int hi,
+                           const wchar_t *section, const wchar_t *path) noexcept {
+    field = std::clamp(ReadIniInt(section, key, field, path), lo, hi);
+}
+// *_x100 values are hand-editable on disk: clamp to the documented ranges
+// (the panel and vpy paths clamp; without this an edited ini would push
+// out-of-range floats into the NGX evaluate keys every frame).
+inline void ReadIniRow_X100(float &field, const wchar_t *key, float lo, float hi,
+                            const wchar_t *section, const wchar_t *path) noexcept {
+    field = std::clamp(
+        static_cast<float>(ReadIniInt(section, key, static_cast<int>(field * 100), path)) / 100.0f,
+        lo, hi);
+}
+// FgRoute 读法 = Int(clamp);越界原值捕获在 LoadDlssnrIni 表展开前单键做
+// (legacyFgRouteRaw 语义见其注释)。
+inline void ReadIniRow_FgRoute(int &field, const wchar_t *key, int lo, int hi,
+                               const wchar_t *section, const wchar_t *path) noexcept {
+    ReadIniRow_Int(field, key, lo, hi, section, path);
+}
+inline void ReadIniRow_Skip(int &, const wchar_t *, int, int,
+                            const wchar_t *, const wchar_t *) noexcept {}
+
 // Persist the parameter profile (the [panel] log toggle is panel-local and
 // stays with the panel). Returns false when any key write failed (file
 // locked / permission) — callers log it; a silent false-save reads back as
 // "settings reset themselves" on the next load.
 inline bool WriteDlssnrIni(const DlssnrParams &p, const wchar_t *iniPath) noexcept {
-    wchar_t buf[32];
     bool ok = true;
-    auto writeInt = [&](const wchar_t *key, int v) {
-        swprintf_s(buf, L"%d", v);
-        ok = WritePrivateProfileStringW(L"dlssnr", key, buf, iniPath) && ok;
-    };
-    // std::lround rounds half away from zero; (int)(v*100+0.5) would eat negatives
-    auto writeX100 = [&](const wchar_t *key, float v) {
-        writeInt(key, static_cast<int>(std::lround(v * 100.0f)));
-    };
-    auto writeRtxInt = [&](const wchar_t *key, int v) {
-        swprintf_s(buf, L"%d", v);
-        ok = WritePrivateProfileStringW(L"rtxvideo", key, buf, iniPath) && ok;
-    };
-    // 键名与值式全部来自上方权威宏(写侧与剪除表同源,漂移在构造上不可能)。
-#define DLSSNR_WRITE_ROW(name, fn, val) fn(DLSSNR_STRW(name), val);
+    // 键名与值式全部来自上方权威宏(写/读/剪除三消费点同源)。
+#define DLSSNR_WRITE_ROW(name, member, kind, lo, hi) \
+    WriteIniRow_##kind(p.member, DLSSNR_STRW(name), lo, hi, L"dlssnr", iniPath, ok);
     DLSSNR_FIELDS(DLSSNR_WRITE_ROW)
-    RTX_FIELDS(DLSSNR_WRITE_ROW)
 #undef DLSSNR_WRITE_ROW
+#define RTX_WRITE_ROW(name, member, kind, lo, hi) \
+    WriteIniRow_##kind(p.member, DLSSNR_STRW(name), lo, hi, L"rtxvideo", iniPath, ok);
+    RTX_FIELDS(RTX_WRITE_ROW)
+#undef RTX_WRITE_ROW
     return ok;
 }
 
@@ -128,75 +180,29 @@ inline bool LoadDlssnrIni(DlssnrParams &p, const wchar_t *iniPath,
         return false; // no saved profile
     }
     if (legacyFgRouteRaw) *legacyFgRouteRaw = 0;
-    const auto readInt = [&](const wchar_t *key, int def) -> int {
-        return ReadIniInt(L"dlssnr", key, def, iniPath);
-    };
-    const auto readBool = [&](const wchar_t *key, bool def) -> bool {
-        return ReadIniBool(L"dlssnr", key, def, iniPath);
-    };
-    // *_x100 values are hand-editable on disk: clamp to the documented ranges
-    // (the panel and vpy paths clamp; without this an edited ini would push
-    // out-of-range floats into the NGX evaluate keys every frame).
-    const auto readX100 = [&](const wchar_t *key, float def, float lo, float hi) -> float {
-        return std::clamp(
-            static_cast<float>(readInt(key, static_cast<int>(def * 100))) / 100.0f, lo, hi);
-    };
-    p.nrEnabled = readBool(L"nr_enabled", p.nrEnabled != 0);
-    p.preset = std::clamp(readInt(L"preset", p.preset), kPresetMin, kPresetMax);
-    p.style = std::clamp(readInt(L"style", p.style), kStyleMin, kStyleMax);
-    p.intensity = readX100(L"intensity_x100", p.intensity, kStrengthMin, kStrengthMax);
-    p.localToneStrength = readX100(L"local_tone_x100", p.localToneStrength, kStrengthMin, kStrengthMax);
-    p.localStructureStrength = readX100(L"local_structure_x100", p.localStructureStrength, kStrengthMin, kStrengthMax);
-    p.skinStructureStrength = readX100(L"skin_structure_x100", p.skinStructureStrength, kSkinMin, kSkinMax);
-    p.useAutoMask = readBool(L"use_auto_mask", p.useAutoMask != 0);
-    p.inputResolutionPercent = std::clamp(readInt(L"input_resolution", p.inputResolutionPercent), kResPctMin, kResPctMax);
-    // != 0 归一:GetPrivateProfileInt 对非数字("true")返回 0 会静默关掉
-    // 缩放;>1 的值走整数语义(0/1),否则 CreateParamsChanged 每次热复用
-    // 会误判为变更而多付一次 feature 重建。
-    p.scalingEnabled = readBool(L"scaling_enabled", p.scalingEnabled != 0);
-    p.residualMultiplier = readX100(L"residual_multiplier_x100", p.residualMultiplier, kResidualMultMin, kResidualMultMax);
-    p.residualSaturation = readX100(L"residual_saturation_x100", p.residualSaturation, kResidualFineMin, kResidualFineMax);
-    p.residualLightness = readX100(L"residual_lightness_x100", p.residualLightness, kResidualFineMin, kResidualFineMax);
-    p.shadowStructureMultiplier = readX100(L"shadow_structure_x100", p.shadowStructureMultiplier, kResidualFineMin, kResidualFineMax);
-    p.reflectionGlowMultiplier = readX100(L"reflection_glow_x100", p.reflectionGlowMultiplier, kResidualFineMin, kResidualFineMax);
-    p.motionVectorQuality = std::clamp(readInt(L"motion_vector_quality", p.motionVectorQuality), kOfQualityMin, kOfQualityMax);
-    p.ffxQuality = std::clamp(readInt(L"ffx_quality", p.ffxQuality), kFfxQualityMin, kFfxQualityMax);
-    p.nvofFollowScaling = readBool(L"nvof_follow_scaling", p.nvofFollowScaling != 0);
-    p.fgEnabled = readBool(L"fg_enabled", p.fgEnabled != 0);
-    p.fgMultiplier = std::clamp(readInt(L"fg_multiplier", p.fgMultiplier), kFgMultMin, kFgMultMax);
-    // v20 起两档(0=自动/1=纯官方),不兼容旧值:存量 1-3 按 clamp 归 1,
-    // 升级后在面板选回自动即可。越界原值经 legacyFgRouteRaw 上报调用方
-    // (面板状态行提示),重解释不再无声。
+    // FgRoute 越界原值捕获(表展开前;其读法本体 = Int clamp,见
+    // ReadIniRow_FgRoute 注释):pre-v20 存量的重解释由此不再无声。
     if (legacyFgRouteRaw) {
-        *legacyFgRouteRaw = readInt(L"fg_route", p.fgRoute);
+        *legacyFgRouteRaw = ReadIniInt(L"dlssnr", DLSSNR_STRW(fg_route), p.fgRoute, iniPath);
     }
-    p.fgRoute = std::clamp(readInt(L"fg_route", p.fgRoute), kFgRouteMin, kFgRouteMax);
-    p.fgHdrInterp = readBool(L"fg_hdr_interp", p.fgHdrInterp != 0);
-    p.ofBackend = std::clamp(readInt(L"of_backend", p.ofBackend), kOfBackendMin, kOfBackendMax);
-    p.antiFlicker = std::clamp(readInt(L"anti_flicker", p.antiFlicker), kAntiFlickerMin, kAntiFlickerMax);
-    // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管,
-    // 与 WriteDlssnrIni 同键表)。旧部署样例的 vsr_height 键已作废(语义
-    // 换成倍率 vsr_scale_x100),不读取 —— 旧值静默失效,面板重存即归位。
-    const auto readRtxInt = [&](const wchar_t *key, int def) -> int {
-        return ReadIniInt(L"rtxvideo", key, def, iniPath);
-    };
-    p.rtxVsrMode = std::clamp(readRtxInt(L"vsr_mode", p.rtxVsrMode), kVsrModeMin, kVsrModeMax);
-    p.rtxVsrScale = std::clamp(
-        static_cast<float>(readRtxInt(L"vsr_scale_x100", static_cast<int>(p.rtxVsrScale * 100.0f))) / 100.0f,
-        kVsrScaleMin, kVsrScaleMax);
-    p.rtxVsrStrength = std::clamp(readRtxInt(L"vsr_strength", p.rtxVsrStrength), kVsrStrengthMin, kVsrStrengthMax);
-    p.rtxHdrEnabled = ReadIniBool(L"rtxvideo", L"hdr_enabled", p.rtxHdrEnabled != 0, iniPath);
-    p.rtxHdrContrast = std::clamp(readRtxInt(L"hdr_contrast", p.rtxHdrContrast), kHdrContrastMin, kHdrContrastMax);
-    p.rtxHdrSaturation = std::clamp(readRtxInt(L"hdr_saturation", p.rtxHdrSaturation), kHdrSaturationMin, kHdrSaturationMax);
-    p.rtxHdrMiddleGray = std::clamp(readRtxInt(L"hdr_middle_gray", p.rtxHdrMiddleGray), kHdrMiddleGrayMin, kHdrMiddleGrayMax);
-    p.rtxHdrMaxLuminance = std::clamp(readRtxInt(L"hdr_peak_nits", p.rtxHdrMaxLuminance), kHdrMaxLumMin, kHdrMaxLumMax);
+    // RTX Video(v22 起面板全量接管,与写侧同键表)。旧部署样例的
+    // vsr_height 键已作废(语义换成倍率 vsr_scale_x100),表内无此键 =
+    // 不读取,旧值静默失效(剪除表回收),面板重存即归位。
+#define DLSSNR_READ_ROW(name, member, kind, lo, hi) \
+    ReadIniRow_##kind(p.member, DLSSNR_STRW(name), lo, hi, L"dlssnr", iniPath);
+    DLSSNR_FIELDS(DLSSNR_READ_ROW)
+#undef DLSSNR_READ_ROW
+#define RTX_READ_ROW(name, member, kind, lo, hi) \
+    ReadIniRow_##kind(p.member, DLSSNR_STRW(name), lo, hi, L"rtxvideo", iniPath);
+    RTX_FIELDS(RTX_READ_ROW)
+#undef RTX_READ_ROW
     return true;
 }
 
 // 保存文件的自检键表:由上方权威宏直接生成 —— 写侧加键时本表自动跟上,
 // 构造上不可能漂移。读取侧本就不认未知键;文件里的表外键(例:rtxvideo
 // 的作废 vsr_height,语义已并入 vsr_scale_x100)由下方 PruneDlssnrIni 剪除。
-#define DLSSNR_NAME_ROW(name, fn, val) DLSSNR_STRW(name),
+#define DLSSNR_NAME_ROW(name, member, kind, lo, hi) DLSSNR_STRW(name),
 inline constexpr const wchar_t *kDlssnrSectionKeys[] = {
     DLSSNR_FIELDS(DLSSNR_NAME_ROW)
 };

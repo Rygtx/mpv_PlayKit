@@ -153,10 +153,9 @@ bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept {
         return false;
     }
     bool adopted = false;
-    if (view->magic == PAYLOAD_MAGIC && view->seq != 0) {
-        PanelPayload snap;
-        memcpy(&snap, view, sizeof(snap));
-        if (static_cast<const volatile PanelPayload *>(view)->seq == snap.seq) {
+    PanelPayload snap;
+    if (ReadWithSeq(view, &snap, PAYLOAD_MAGIC)) {
+        {
             LoadLiveParams(p, snap); // shared field mapping, clamps included
             LoadCreateParams(p, snap);
             adopted = true;
@@ -312,14 +311,10 @@ DWORD WINAPI BridgeThreadProc(LPVOID param) noexcept {
             continue;
         }
         if (g_paramsView->seq == 0 || g_paramsView->seq == lastSeq) continue;
-        // Snapshot under the writer: copy the payload, then confirm the seq
-        // did not move mid-copy (the panel publishes the counter only after
-        // the body is stable — a volatile re-read keeps the compiler from
-        // forwarding the pre-copy load).
+        // Snapshot under the writer(ReadWithSeq = 协议读侧单点,panel_ipc.h):
+        // 拷贝 + seq 复验,撕裂读直接丢弃本拍。
         PanelPayload snap;
-        memcpy(&snap, g_paramsView, sizeof(snap));
-        if (static_cast<const volatile PanelPayload *>(g_paramsView)->seq != snap.seq ||
-            snap.seq == lastSeq) {
+        if (!ReadWithSeq(g_paramsView, &snap, PAYLOAD_MAGIC) || snap.seq == lastSeq) {
             continue;
         }
         lastSeq = snap.seq;

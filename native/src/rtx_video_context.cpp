@@ -115,24 +115,18 @@ bool RtxQueue::Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs) n
     return true;
 }
 
-RtxVsrContext::~RtxVsrContext() {
-    // 与 DlssfgContext 同哲学:析构不重入 NGX(热上下文/进程退出统一回收);
-    // 显式 Release 只发生在未来的 feature 重建路径(当前尺寸无关,不需要)。
-}
+// ---- 公共骨架(RtxFeatureBase;接入流程唯一实现)----
+// 析构不重入 NGX:feature handle 留在 core 内随进程回收(热上下文哲学;
+// RtxQueue 同 —— loader 锁下销毁有死锁前科),默认析构即可。
+RtxFeatureBase::~RtxFeatureBase() = default;
 
-template <typename Fn>
-bool RtxVsrContext::SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept {
-    return NgxSehGate(_faulted, std::forward<Fn>(fn), "rtx vsr", what,
-                      "VSR disabled until host restart", err, errLen, TimingStatusLine);
-}
-
-bool RtxVsrContext::Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
-                               int width, int height, char *err, size_t errLen) noexcept {
+bool RtxFeatureBase::InitializeCommon(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
+                                      int width, int height, char *err, size_t errLen) noexcept {
     auto fail = [&](const char *what) {
         if (err && errLen) std::snprintf(err, errLen, "%s", what);
         char msg[224];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx vsr init failed: %.180s",
-                      what ? what : "?");
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx %s init failed: %.180s",
+                      Tag(), what ? what : "?");
         TimingStatusLine(msg);
         _d3d12 = nullptr;
         _params = nullptr;
@@ -142,27 +136,27 @@ bool RtxVsrContext::Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
     _d3d12 = &d3d12;
     _params = params;
 
-    // 能力预检(VSR.Available):snippet 缺失 / 驱动过旧(r550.58-)/ 非 RTX
-    // 卡时为 0。FeatureInitResult 读回精确归因。
-    int available = 0;
+    // 能力预检(<Feature>.Available):snippet 缺失 / 驱动过旧(r550.58-)/
+    // 非 RTX 卡时为 0。FeatureInitResult 读回精确归因。
     {
         char sehErr[160]{};
+        int available = 0;
         const bool haveCap = SehCall([&] {
-            return _params->Get(NVSDK_NGX_Parameter_VSR_Available, &available) ==
+            return _params->Get(CapKeyAvailable(), &available) ==
                    NVSDK_NGX_Result_Success;
-        }, "Get(VSR.Available)", sehErr, sizeof(sehErr));
+        }, "Get(<Feature>.Available)", sehErr, sizeof(sehErr), TimingStatusLine);
         if (!haveCap || !available) {
             unsigned int initResult = 0;
             const bool haveResult =
-                _params->Get(NVSDK_NGX_Parameter_VSR_FeatureInitResult, &initResult) ==
+                _params->Get(CapKeyInitResult(), &initResult) ==
                 NVSDK_NGX_Result_Success;
             char tag[48]{};
             if (haveResult) {
                 std::snprintf(tag, sizeof(tag), " (FeatureInitResult 0x%X)", initResult);
             }
             char msg[160];
-            std::snprintf(msg, sizeof(msg), "official NGX reports VSR unavailable%s%s",
-                          tag, haveCap ? "" : " (capability key missing)");
+            std::snprintf(msg, sizeof(msg), "official NGX reports %s unavailable%s%s",
+                          PrettyName(), tag, haveCap ? "" : " (capability key missing)");
             return fail(msg);
         }
     }
@@ -172,7 +166,7 @@ bool RtxVsrContext::Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
         return false;
     }
     char qErr[128]{};
-    if (!_queue.Initialize(_d3d12->Device(), "vsr", qErr, sizeof(qErr))) {
+    if (!_queue.Initialize(_d3d12->Device(), Tag(), qErr, sizeof(qErr))) {
         if (err && errLen) std::snprintf(err, errLen, "%.140s", qErr);
         TimingStatusLine(qErr);
         _d3d12 = nullptr;
@@ -182,48 +176,86 @@ bool RtxVsrContext::Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
     _ready.store(true, std::memory_order_release);
     {
         char msg[128];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx vsr ready (%dx%d)", width, height);
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx %s ready (%dx%d)",
+                      Tag(), width, height);
         TimingStatusLine(msg);
     }
     return true;
 }
 
-bool RtxVsrContext::CreateFeatureOnCtl(char *err, size_t errLen) noexcept {
+bool RtxFeatureBase::CreateFeatureOnCtl(char *err, size_t errLen) noexcept {
     // ctl 路径(与 DLSSFG CreateFeatureOnCtl 同款):CtlMutex + ctl 命令列表
-    // 上 CreateFeature,Execute + 栅栏等待落位。VSR create 与尺寸无关。
+    // 上 CreateFeature,Execute + 栅栏等待落位。create 与尺寸无关。
     std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
     if (!_d3d12->BeginCtlRecording()) {
-        if (err && errLen) std::snprintf(err, errLen, "rtx vsr: BeginCtlRecording failed");
+        if (err && errLen) std::snprintf(err, errLen, "rtx %s: BeginCtlRecording failed", Tag());
         return false;
     }
     _params->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
     _params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
     NVSDK_NGX_Feature_Create_Params createParams{};
     char sehErr[160]{};
-    bool ok = SehCall([&] {
-        return NGX_D3D12_CREATE_VSR_EXT(_d3d12->CtlCommandList(), 1u, 1u,
-                                        &_feature, _params, &createParams) ==
-               NVSDK_NGX_Result_Success;
-    }, "CreateFeature(VSR)", sehErr, sizeof(sehErr));
+    char what[48];
+    std::snprintf(what, sizeof(what), "CreateFeature(%s)", PrettyName());
+    bool ok = SehCall([&] { return CreateOnCtl(_d3d12->CtlCommandList()); },
+                      what, sehErr, sizeof(sehErr), TimingStatusLine);
     if (ok && !_feature) ok = false;
-    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "vsr create")) return false;
+    char where[32];
+    std::snprintf(where, sizeof(where), "%s create", Tag());
+    if (!_d3d12->ExecuteCtlAndWait(err, errLen, where)) return false;
     if (!ok) {
         unsigned int initResult = 0;
         const bool haveResult =
-            _params->Get(NVSDK_NGX_Parameter_VSR_FeatureInitResult, &initResult) ==
+            _params->Get(CapKeyInitResult(), &initResult) ==
             NVSDK_NGX_Result_Success;
         char resultTag[40]{};
         if (haveResult) {
             std::snprintf(resultTag, sizeof(resultTag), " (FeatureInitResult 0x%X)", initResult);
         }
         if (err && errLen) {
-            std::snprintf(err, errLen, "rtx vsr: CreateFeature failed%s%s%s",
-                          sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "", resultTag);
+            std::snprintf(err, errLen, "rtx %s: CreateFeature failed%s%s%s",
+                          Tag(), sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "", resultTag);
         }
-        TimingStatusLine("DLSSNR STATUS: rtx vsr CreateFeature failed; VSR off (SDR passthrough size)");
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx %s CreateFeature failed; %s",
+                      Tag(), CreateFailedNote());
+        TimingStatusLine(msg);
         return false;
     }
     return true;
+}
+
+bool RtxFeatureBase::EvaluateShell(const char *what, ID3D12Fence *waitFence, uint64_t waitValue,
+                                   uint64_t *signalValueOut,
+                                   const std::function<bool(ID3D12GraphicsCommandList *)> &eval,
+                                   char *err, size_t errLen) noexcept {
+    if (!_ready.load(std::memory_order_acquire) || _faulted.load(std::memory_order_acquire)) {
+        if (err && errLen) std::snprintf(err, errLen, "rtx %s: session dead", Tag());
+        return false;
+    }
+    char sehErr[160]{};
+    const bool ok = SehCall([&] {
+        return _queue.Execute(waitFence, waitValue, what, err, errLen, eval, signalValueOut);
+    }, what, sehErr, sizeof(sehErr), TimingStatusLine);
+    if (!ok) {
+        _ready.store(false, std::memory_order_release);
+        if (err && errLen && !err[0]) {
+            std::snprintf(err, errLen, "rtx %s: EvaluateFeature failed%s%s",
+                          Tag(), sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "");
+        }
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx %s evaluate failed; %s",
+                      Tag(), EvalFailedNote());
+        TimingStatusLine(msg);
+    }
+    return ok;
+}
+
+bool RtxVsrContext::CreateOnCtl(ID3D12GraphicsCommandList *cl) noexcept {
+    NVSDK_NGX_Feature_Create_Params createParams{};
+    return NGX_D3D12_CREATE_VSR_EXT(cl, 1u, 1u,
+                                    &_feature, _params, &createParams) ==
+           NVSDK_NGX_Result_Success;
 }
 
 bool RtxVsrContext::Evaluate(ID3D12Resource *input, int inW, int inH,
@@ -232,14 +264,8 @@ bool RtxVsrContext::Evaluate(ID3D12Resource *input, int inW, int inH,
                              ID3D12Fence *waitFence, uint64_t waitValue,
                              uint64_t *signalValueOut,
                              char *err, size_t errLen) noexcept {
-    if (!_ready.load(std::memory_order_acquire) || _faulted.load(std::memory_order_acquire)) {
-        if (err && errLen) std::snprintf(err, errLen, "rtx vsr: session dead");
-        return false;
-    }
-    char sehErr[160]{};
-    const bool ok = SehCall([&] {
-        return _queue.Execute(waitFence, waitValue, "vsr eval", err, errLen,
-                              [&](ID3D12GraphicsCommandList *cl) {
+    return EvaluateShell("vsr eval", waitFence, waitValue, signalValueOut,
+                         [&](ID3D12GraphicsCommandList *cl) {
             NVSDK_NGX_D3D12_VSR_Eval_Params eval{};
             eval.pInput = input;
             eval.pOutput = output;
@@ -255,122 +281,14 @@ bool RtxVsrContext::Evaluate(ID3D12Resource *input, int inW, int inH,
                 std::clamp(quality, kVsrStrengthMin, kVsrStrengthMax));
             return NGX_D3D12_EVALUATE_VSR_EXT(cl, _feature, _params, &eval) ==
                    NVSDK_NGX_Result_Success;
-        }, signalValueOut);
-    }, "EvaluateFeature(VSR)", sehErr, sizeof(sehErr));
-    if (!ok) {
-        _ready.store(false, std::memory_order_release);
-        if (err && errLen && !err[0]) {
-            std::snprintf(err, errLen, "rtx vsr: EvaluateFeature failed%s%s",
-                          sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "");
-        }
-        TimingStatusLine("DLSSNR STATUS: rtx vsr evaluate failed; VSR off (passthrough size)");
-    }
-    return ok;
+        }, err, errLen);
 }
 
-RtxHdrContext::~RtxHdrContext() {
-    // 同 RtxVsrContext:析构不重入 NGX。
-}
-
-template <typename Fn>
-bool RtxHdrContext::SehCall(Fn &&fn, const char *what, char *err, size_t errLen) noexcept {
-    return NgxSehGate(_faulted, std::forward<Fn>(fn), "rtx hdr", what,
-                      "HDR disabled until host restart", err, errLen, TimingStatusLine);
-}
-
-bool RtxHdrContext::Initialize(D3D12Context &d3d12, NVSDK_NGX_Parameter *params,
-                               int width, int height, char *err, size_t errLen) noexcept {
-    auto fail = [&](const char *what) {
-        if (err && errLen) std::snprintf(err, errLen, "%s", what);
-        char msg[224];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx hdr init failed: %.180s",
-                      what ? what : "?");
-        TimingStatusLine(msg);
-        _d3d12 = nullptr;
-        _params = nullptr;
-        return false;
-    };
-    if (!params) return fail("no core parameter block");
-    _d3d12 = &d3d12;
-    _params = params;
-    int available = 0;
-    {
-        char sehErr[160]{};
-        const bool haveCap = SehCall([&] {
-            return _params->Get(NVSDK_NGX_Parameter_TrueHDR_Available, &available) ==
-                   NVSDK_NGX_Result_Success;
-        }, "Get(TrueHDR.Available)", sehErr, sizeof(sehErr));
-        if (!haveCap || !available) {
-            unsigned int initResult = 0;
-            const bool haveResult =
-                _params->Get(NVSDK_NGX_Parameter_TrueHDR_FeatureInitResult, &initResult) ==
-                NVSDK_NGX_Result_Success;
-            char tag[48]{};
-            if (haveResult) {
-                std::snprintf(tag, sizeof(tag), " (FeatureInitResult 0x%X)", initResult);
-            }
-            char msg[160];
-            std::snprintf(msg, sizeof(msg), "official NGX reports TrueHDR unavailable%s%s",
-                          tag, haveCap ? "" : " (capability key missing)");
-            return fail(msg);
-        }
-    }
-    if (!CreateFeatureOnCtl(err, errLen)) {
-        _d3d12 = nullptr;
-        _params = nullptr;
-        return false;
-    }
-    char qErr[128]{};
-    if (!_queue.Initialize(_d3d12->Device(), "hdr", qErr, sizeof(qErr))) {
-        if (err && errLen) std::snprintf(err, errLen, "%.140s", qErr);
-        TimingStatusLine(qErr);
-        _d3d12 = nullptr;
-        _params = nullptr;
-        return false;
-    }
-    _ready.store(true, std::memory_order_release);
-    {
-        char msg[128];
-        std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: rtx hdr ready (%dx%d)", width, height);
-        TimingStatusLine(msg);
-    }
-    return true;
-}
-
-bool RtxHdrContext::CreateFeatureOnCtl(char *err, size_t errLen) noexcept {
-    std::lock_guard<std::mutex> ctlLock(_d3d12->CtlMutex());
-    if (!_d3d12->BeginCtlRecording()) {
-        if (err && errLen) std::snprintf(err, errLen, "rtx hdr: BeginCtlRecording failed");
-        return false;
-    }
-    _params->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
-    _params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
+bool RtxHdrContext::CreateOnCtl(ID3D12GraphicsCommandList *cl) noexcept {
     NVSDK_NGX_Feature_Create_Params createParams{};
-    char sehErr[160]{};
-    bool ok = SehCall([&] {
-        return NGX_D3D12_CREATE_TRUEHDR_EXT(_d3d12->CtlCommandList(), 1u, 1u,
-                                            &_feature, _params, &createParams) ==
-               NVSDK_NGX_Result_Success;
-    }, "CreateFeature(TrueHDR)", sehErr, sizeof(sehErr));
-    if (ok && !_feature) ok = false;
-    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "hdr create")) return false;
-    if (!ok) {
-        unsigned int initResult = 0;
-        const bool haveResult =
-            _params->Get(NVSDK_NGX_Parameter_TrueHDR_FeatureInitResult, &initResult) ==
-            NVSDK_NGX_Result_Success;
-        char resultTag[40]{};
-        if (haveResult) {
-            std::snprintf(resultTag, sizeof(resultTag), " (FeatureInitResult 0x%X)", initResult);
-        }
-        if (err && errLen) {
-            std::snprintf(err, errLen, "rtx hdr: CreateFeature failed%s%s%s",
-                          sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "", resultTag);
-        }
-        TimingStatusLine("DLSSNR STATUS: rtx hdr CreateFeature failed; HDR off (SDR output)");
-        return false;
-    }
-    return true;
+    return NGX_D3D12_CREATE_TRUEHDR_EXT(cl, 1u, 1u,
+                                        &_feature, _params, &createParams) ==
+           NVSDK_NGX_Result_Success;
 }
 
 bool RtxHdrContext::Evaluate(ID3D12Resource *input, int w, int h, ID3D12Resource *output,
@@ -378,14 +296,8 @@ bool RtxHdrContext::Evaluate(ID3D12Resource *input, int w, int h, ID3D12Resource
                              ID3D12Fence *waitFence, uint64_t waitValue,
                              uint64_t *signalValueOut,
                              char *err, size_t errLen) noexcept {
-    if (!_ready.load(std::memory_order_acquire) || _faulted.load(std::memory_order_acquire)) {
-        if (err && errLen) std::snprintf(err, errLen, "rtx hdr: session dead");
-        return false;
-    }
-    char sehErr[160]{};
-    const bool ok = SehCall([&] {
-        return _queue.Execute(waitFence, waitValue, "hdr eval", err, errLen,
-                              [&](ID3D12GraphicsCommandList *cl) {
+    return EvaluateShell("hdr eval", waitFence, waitValue, signalValueOut,
+                         [&](ID3D12GraphicsCommandList *cl) {
             NVSDK_NGX_D3D12_TRUEHDR_Eval_Params eval{};
             eval.pInput = input;
             eval.pOutput = output;
@@ -403,17 +315,6 @@ bool RtxHdrContext::Evaluate(ID3D12Resource *input, int w, int h, ID3D12Resource
             eval.MaxLuminance = static_cast<unsigned int>(std::clamp(maxLuminance, kHdrMaxLumMin, kHdrMaxLumMax));
             return NGX_D3D12_EVALUATE_TRUEHDR_EXT(cl, _feature, _params, &eval) ==
                    NVSDK_NGX_Result_Success;
-        }, signalValueOut);
-    }, "EvaluateFeature(TrueHDR)", sehErr, sizeof(sehErr));
-    if (!ok) {
-        _ready.store(false, std::memory_order_release);
-        if (err && errLen) {
-            std::snprintf(err, errLen, "rtx hdr: EvaluateFeature failed%s%s",
-                          sehErr[0] ? ": " : "", sehErr[0] ? sehErr : "");
-        }
-        TimingStatusLine("DLSSNR STATUS: rtx hdr evaluate failed; HDR off");
-    }
-    return ok;
+        }, err, errLen);
 }
-
 } // namespace vsdlssnr

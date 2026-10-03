@@ -33,6 +33,21 @@ using Microsoft::WRL::ComPtr;
 // 每源帧的最大插值帧数(倍数 M-1,M 封顶 6)—— FG 回读缓冲按此建组。
 inline constexpr int kFgGenSlots = kFgMultMax - 1;
 
+// 命令分配器 Reset + force-close 自愈:上次录制中途失败遗留 open CL 会让
+// allocator Reset 永久 E_FAIL —— 先 Close 一次再 Reset(BeginCtlRecording
+// 同款恢复模式;此前该模式在 d3d12/光流后端共手写 7 份,现单点)。
+// 含 CL->Reset。
+inline bool ResetAllocatorHealed(ID3D12CommandAllocator *alloc,
+                                 ID3D12GraphicsCommandList *cl) noexcept {
+    HRESULT hr = alloc->Reset();
+    if (FAILED(hr)) {
+        cl->Close();
+        hr = alloc->Reset();
+        if (FAILED(hr)) return false;
+    }
+    return SUCCEEDED(cl->Reset(alloc, nullptr));
+}
+
 // Full-subresource transition barrier — the one barrier builder for the whole
 // plugin (frame path, NGX context and diagnostics all used to hand-roll the
 // same struct fill).
@@ -48,6 +63,61 @@ inline D3D12_RESOURCE_BARRIER Transition(
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     return barrier;
 }
+
+// 每槽 shader 可见堆(CBV/SRV/UAV)的槽位布局 —— 唯一权威(原为 30 行注释
+// 表 + 约 30 处裸字面量并存的半具名形态)。增删槽位只改本枚举,kHeapSlotCount
+// 锚定堆容量;编号当稳定 ID,废弃位留空不重排(32/33 曾为逐 gen 转换占位)。
+enum HeapSlot : UINT {
+    SrvInput = 0,
+    SrvReducedColor = 1, SrvReducedDenoised, SrvHorizontal,
+    UavReducedColor = 4, UavReducedDenoised, UavHorizontal,
+    UavOutput = 7,
+    SrvControlled = 8, UavControlled = 9,
+    SrvMotion = 10, SrvConfidence, UavMotion, UavConfidence,
+    SrvFlowF = 14, SrvFlowB, SrvCostF, SrvCostB,          // NVOF 会话视图(BindNvofResources 填)
+    SrvReducedMotion = 18, SrvReducedConfidence,
+    UavReducedMotion = 20, UavReducedConfidence,
+    SrvOutputColor = 22,                                   // outputColor 的 SRV(RGB→YUV 转换读)
+    UavNvofInput0 = 23, UavNvofInput1,                     // NVOF 注册输入纹理 UAV(BindNvofResources 填)
+    SrvYuvIn0 = 25, SrvYuvIn1, SrvYuvIn2,                  // uploadYuv typed buffer SRV(转换直读)
+    UavYuvOut0 = 28, UavYuvOut1, UavYuvOut2,               // yuvOut UAV(RGB→YUV 写出)
+    UavInput = 31,                                         // inputColor 的 UAV(YUV→RGB 直写)
+    Unused32 = 32, Unused33,                               // 已废弃占位(无消费者,编号留空)
+    UavDebugDiff = 34,                                     // 共享差异调试纹理 UAV
+    SrvZeroMotion = 35,                                    // 静态零运动纹理 SRV(光流场视图播种)
+    SrvVsrColor = 36, SrvHdrColor, UavMotionDense,         // RTX 输出转换读 / mvec 放大写
+    SrvFgInterp0 = 39, SrvFgInterp1, SrvFgInterp2, SrvFgInterp3, SrvFgInterp4,
+    SrvHdrFg0 = 44, SrvHdrFg1, SrvHdrFg2, SrvHdrFg3, SrvHdrFg4,
+    UavFfxInput = 49, SrvFfxSparse = 50,                   // FFX 会话视图(BindOfResources 填)
+    UavFgBack = 51,                                        // fgBack UAV(HdrToPq 编码写)
+    SrvTemporalOut = 52, UavTemporalOut = 53,
+    Hist0Uav = 54, Hist0Srv, Hist1Uav, Hist1Srv,           // 时域历史 ping-pong(UAV 写 / SRV 读成对)
+    Guide0Uav = 58, Guide0Srv, Guide1Uav, Guide1Srv,       // 时域引导 ping-pong
+    Low0Srv = 62, Low0Uav, Low1Srv, Low1Uav,               // mode4 半分辨率(仅真纹理)
+    kHeapSlotCount = 66,
+};
+static_assert(kHeapSlotCount == 66);
+
+// 时域 ping-pong 取视图:[previous]/[next](0/1)直取,消掉 55+previous*2
+// 类算术编码。
+inline constexpr HeapSlot kHistSrv[2]{ HeapSlot::Hist0Srv, HeapSlot::Hist1Srv };
+inline constexpr HeapSlot kHistUav[2]{ HeapSlot::Hist0Uav, HeapSlot::Hist1Uav };
+inline constexpr HeapSlot kGuideSrv[2]{ HeapSlot::Guide0Srv, HeapSlot::Guide1Srv };
+inline constexpr HeapSlot kGuideUav[2]{ HeapSlot::Guide0Uav, HeapSlot::Guide1Uav };
+
+// 时间戳括号槽位(枚举值 = tsReadback 的 UINT64 槽索引):0..11 常驻/RTX 段;
+// Post0/Post1 是 post CL 内联 EndQuery(无独立括号 CL,数组位恒空);12/13
+// 为历史空洞。每在飞括号须独立 allocator/CL(同帧多对在飞,共享 = UB)。
+enum TsSlot {
+    kTsPreBase = 0, kTsPostBase, kTsPreFg, kTsPostFg,
+    kTsPost0, kTsPost1,
+    kTsPreVsr, kTsPostVsr, kTsPreHdr, kTsPostHdr, kTsPreGen, kTsPostGen,
+    kTsSlotCount,
+};
+struct TsBracket {
+    ComPtr<ID3D12CommandAllocator> alloc;
+    ComPtr<ID3D12GraphicsCommandList> cl;
+};
 
 // Residual fine-control set (Magpie 0.6.5 r2-fix1/2d37f8c0): applied once per
 // internal-resolution pixel in PrepareResidual, before the Catmull-Rom passes.
@@ -119,29 +189,10 @@ struct FrameSlot {
     //   提交,FIFO 包住 eval;槽复用纪律兜底 allocator —— 槽归还蕴含上一帧
     //   RTX 链完成);14/15 = TS-INLINE 探针(VSDLSSNR_TS_INLINE)
     ComPtr<ID3D12QueryHeap> tsQueryHeap;    // 6 查询(容量 8 取整)
-    ComPtr<ID3D12CommandAllocator> tsAllocator;   // postBase 括号
-    ComPtr<ID3D12GraphicsCommandList> tsCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPreBaseAllocator; // preBase 括号
-    ComPtr<ID3D12GraphicsCommandList> tsPreBaseCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPreFgAllocator;   // preFg/postFg 括号
-    ComPtr<ID3D12GraphicsCommandList> tsPreFgCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPostFgAllocator;
-    ComPtr<ID3D12GraphicsCommandList> tsPostFgCommandList;
-    // RTX 段括号 ×3 对(索引 6..11,见上方布局):VSR / TrueHDR 真实帧 /
-    // TrueHDR 插值链。未提交(段未跑)时 readback 索引保持帧首清零值,
-    // Finish 按缺账记 0。
-    ComPtr<ID3D12CommandAllocator> tsPreVsrAllocator;
-    ComPtr<ID3D12GraphicsCommandList> tsPreVsrCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPostVsrAllocator;
-    ComPtr<ID3D12GraphicsCommandList> tsPostVsrCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPreHdrAllocator;
-    ComPtr<ID3D12GraphicsCommandList> tsPreHdrCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPostHdrAllocator;
-    ComPtr<ID3D12GraphicsCommandList> tsPostHdrCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPreGenAllocator;
-    ComPtr<ID3D12GraphicsCommandList> tsPreGenCommandList;
-    ComPtr<ID3D12CommandAllocator> tsPostGenAllocator;
-    ComPtr<ID3D12GraphicsCommandList> tsPostGenCommandList;
+    // 括号 CL 对(枚举值 = readback 索引,见上方 TsSlot):创建/释放/取用全按
+    // 数组下标(Post0/Post1 无括号 CL,位恒空)。未提交(段未跑)时 readback
+    // 索引保持帧首清零值,Finish 按缺账记 0。
+    TsBracket ts[kTsSlotCount];
     ComPtr<ID3D12Resource> tsReadback;      // 128 字节 READBACK(16×UINT64,布局见上),persist-mapped
     void *tsReadbackMapped = nullptr;
     UINT64 tsGpuCal = 0;                    // 校准点 GPU tick(base 提交时)
@@ -220,37 +271,8 @@ struct FrameSlot {
     ComPtr<ID3D12Resource> readbackFg[kFgGenSlots][3];
     void *readbackFgMapped[kFgGenSlots][3] = {};
     size_t readbackPitchFg[kFgGenSlots][3] = {};
-    // slot-local shader-visible heap: 0=srvInput 1=srvReducedColor
-    // 2=srvReducedDenoised 3=srvHorizontal 4=uavReducedColor 5=uavReducedDenoised
-    // 6=uavHorizontal 7=uavOutput 8=srvControlled 9=uavControlled
-    // 10=srvMotion 11=srvConfidence 12=uavMotion 13=uavConfidence
-    // 14=srvFlowF 15=srvFlowB 16=srvCostF 17=srvCostB(NVOF 会话纹理,
-    // BindNvofResources 填充)18=srvReducedMotion 19=srvReducedConfidence
-    // 20=uavReducedMotion 21=uavReducedConfidence
-    // 22=srvOutput(outputColor 的 SRV,RGB→YUV 转换读;原 srvNvofSrc 随
-    // nvofSrcTex 删除让位——降采样直接采样槽 0 srvInput)
-    // 23=uavNvofInput0 24=uavNvofInput1(NVOF 注册输入纹理的 UAV,
-    // BindNvofResources 填充)
-    // 25=srvYuvIn0 26=srvYuvIn1 27=srvYuvIn2(YUV→RGB 转换采样)
-    // 28=uavYuvOut0 29=uavYuvOut1 30=uavYuvOut2(RGB→YUV 写出)
-    // 31=uavInput(inputColor 的 UAV,YUV→RGB 转换直写)
-    // 32/33=占位视图(shader 改用逐 gen 视图 39-43 后不再绑定;恒绑
-    // outputColor 占位 —— 绝不写 NULL 描述符,见 14-17 注释)
-    // 39-43=srvFgInterp[0..4](FG 插值输出逐 gen SRV,转换读/HDR 输入读)
-    // 34=uavDebugDiff(共享差异调试纹理的 UAV,"差异调试 ×20" 视图写入目标;
-    // 资源为 context 级单例,每槽堆各持一份视图)
-    // 35=srvZeroMotion(静态零运动纹理的 SRV,光流场视图无真运动帧绑定;
-    // 资源为 context 级单例 _motion,常驻 NSR)
-    // 44-48=srvHdrFg[0..4](TrueHDR 逐插值帧输出 FP16 SRV,PQ 转换读;
-    // 非 HDR 槽 = hdrColor/outputColor 占位)
-    // 49=uavFfxInput(FFX 会话输入,R8G8B8A8 OF extent;BindOfResources 填充)
-    // 50=srvFfxSparse(FFX 稀疏流 R16G16_SINT,densify 读)
-    // 52-65=抗闪烁时域(RebuildTemporal 覆盖写;关闭态 = inputColor/
-    // outputColor 占位,同"绝不写 NULL 描述符"惯例):
-    //   52/53=temporalOut SRV/UAV(每槽) 54/55=hist0 UAV/SRV
-    //   56/57=hist1 UAV/SRV 58/59=guide0 UAV/SRV 60/61=guide1 UAV/SRV
-    //   62/63=low0 SRV/UAV 64/65=low1 SRV/UAV(context 级 ping-pong,每槽
-    //   堆各持视图;low 仅 mode4 真纹理)
+    // slot-local shader-visible heap:槽位布局的唯一权威 = namespace 级
+    // enum HeapSlot(0-65,含废弃空位说明),此处不再维护注释副本。
     ComPtr<ID3D12DescriptorHeap> srvUavHeap;
 };
 
@@ -289,28 +311,25 @@ public:
     // should stop evaluating instead of stalling the full wait every frame.
     bool IsDeviceLost() const noexcept { return _deviceLost.load(std::memory_order_relaxed); }
 
-    // depth = YUV 位深(8/10)。同尺寸换深度必须走重建(hotMatch 侧拦截,
-    // 否则 R8 槽纹理遇 P10 打包 = 数据撕裂)。
-    // fg = 建 DLSS FG 槽资源(插值输出纹理 + 第二组回读缓冲)。create-time
-    // 语义:FG 激活与否决定帧资源形态,变化走 PoolHold 全量重建(同 Rebind
-    // 尺寸变化路径),不做逐槽懒补。
-    // RTX Video 双尺寸(创建时,无 RTX 时 pipe/out = 源尺寸):
-    //   pipeW/H — VSR 输出 / TrueHDR / FG backbuffer 所在的管线尺寸
-    //             (vsr 开 = min(目标, 源×4);关 = 源)
-    //   outW/H  — YUV 输出平面尺寸(vsr 开 = 目标;关 = 源)
-    //   vsr     — 建 vsrColor 槽纹理(PIPE≠src 时必有;=src 且 vsr 旁路时无)
-    //   hdr     — TrueHDR:输出平面切 P10(PQ)
-    //   fgHdrInterp — 实验性补帧 HDR 域插帧(PQ 域):fgInterp 切 FP16(PQ
-    //                 码域内容)、hdrFg 不建、fgBack 建立(DLSSG backbuffer;
-    //                 插值输出即 FG 的 FP16 产物,无逐帧 TrueHDR)
-    //   subW/subH — 输入色度抽取档(0=全、1=半;420=(1,1)、422=(1,0)、
-    //                 444=(0,0))。SDR 输出同布局,HDR P10 输出恒 420。
-    //   rgb       — VS RGBP 计划族直读(零矩阵;平面序 G/B/R)
-    bool CreateFrameResources(int width, int height, int depth, bool fg,
-                              int pipeW, int pipeH, int outW, int outH,
-                              bool vsr, bool hdr, bool fgHdrInterp,
-                              int subW, int subH, bool rgb,
-                              char *err, size_t errLen) noexcept;
+    // 会话资源形态(创建时定格;字段名自注释)。RTX Video 双尺寸:无 RTX
+    // 时 pipe/out = 源尺寸;vsr = 建 vsrColor 槽纹理(PIPE≠src 时必有);
+    // hdr = TrueHDR(输出平面切 P10);fgHdrInterp = 实验性 PQ 域插帧
+    // (fgInterp 切 FP16、hdrFg 不建、fgBack 建立)。subW/subH = 输入色度
+    // 抽取档(0=全、1=半;420=(1,1)、422=(1,0)、444=(0,0)),SDR 输出同
+    // 布局,HDR P10 输出恒 420。rgb = VS RGBP 计划族直读。
+    // (原 14 位置参数含 5 bool 的形态:相邻 bool 传反编译器无感,收结构。)
+    struct SessionDesc {
+        int width = 0, height = 0;
+        int depth = 0;                 // YUV 位深(8/10;同尺寸换深度必须重建)
+        bool fg = false;               // DLSS FG 槽资源(插值输出 + 第二组回读)
+        int pipeW = 0, pipeH = 0;      // VSR/TrueHDR/FG backbuffer 管线尺寸
+        int outW = 0, outH = 0;        // YUV 输出平面尺寸
+        bool vsr = false, hdr = false;
+        bool fgHdrInterp = false;
+        int subW = 1, subH = 1;
+        bool rgb = false;
+    };
+    bool CreateFrameResources(const SessionDesc &desc, char *err, size_t errLen) noexcept;
     bool FgSlots() const noexcept { return _fgSlots; }
     // RTX Video 管线几何(create-time 定格;ProcessFrame/插件侧共用)。
     int PipeWidth() const noexcept { return _pipeW; }
@@ -594,17 +613,18 @@ public:
                         float weight) noexcept;
     int TemporalMode() const noexcept { return _temporalMode; }
     ID3D12Resource *FgInterp(FrameSlot &s, int gen) const noexcept { return s.fgInterp[gen].Get(); }
-    // 描述符堆槽位(RecordYuvOutput / FG 转换共用)。
-    static constexpr UINT kSrvOutputColor = 22;  // outputColor 的 SRV
-    static constexpr UINT kSrvFgInterpBase = 39; // fgInterp[0..4] 的 SRV(FG 槽)
-    static constexpr UINT kUavDebugDiff = 34;    // 共享差异调试纹理的 UAV
-    static constexpr UINT kSrvVsrColor = 36;     // vsrColor 的 SRV(RTX 输出转换读)
-    static constexpr UINT kSrvHdrColor = 37;     // hdrColor 的 SRV(FP16 scRGB → PQ)
-    static constexpr UINT kUavMotionDense = 38;  // motionDense 的 UAV(mvec 放大写)
-    static constexpr UINT kSrvHdrFgBase = 44;    // hdrFg[0..4] 的 SRV(PQ 转换读)
-    static constexpr UINT kUavFgBack = 51;       // fgBack 的 UAV(PQ 域插帧编码 pass 写)
-    static constexpr UINT kSrvTemporalOut = 52;  // temporalOut 的 SRV(稳定帧下游消费)
-    static constexpr UINT kUavTemporalOut = 53;  // temporalOut 的 UAV(RecordTemporal 写)
+    // 描述符堆槽位(RecordYuvOutput / FG 转换共用)—— 全部为 enum HeapSlot
+    // 的具名别名(外部调用面沿用 k 前缀名;取值以枚举为唯一权威)。
+    static constexpr UINT kSrvOutputColor = static_cast<UINT>(HeapSlot::SrvOutputColor);
+    static constexpr UINT kSrvFgInterpBase = static_cast<UINT>(HeapSlot::SrvFgInterp0); // fgInterp[0..4]
+    static constexpr UINT kUavDebugDiff = static_cast<UINT>(HeapSlot::UavDebugDiff);
+    static constexpr UINT kSrvVsrColor = static_cast<UINT>(HeapSlot::SrvVsrColor);
+    static constexpr UINT kSrvHdrColor = static_cast<UINT>(HeapSlot::SrvHdrColor);
+    static constexpr UINT kUavMotionDense = static_cast<UINT>(HeapSlot::UavMotionDense);
+    static constexpr UINT kSrvHdrFgBase = static_cast<UINT>(HeapSlot::SrvHdrFg0); // hdrFg[0..4]
+    static constexpr UINT kUavFgBack = static_cast<UINT>(HeapSlot::UavFgBack);
+    static constexpr UINT kSrvTemporalOut = static_cast<UINT>(HeapSlot::SrvTemporalOut);
+    static constexpr UINT kUavTemporalOut = static_cast<UINT>(HeapSlot::UavTemporalOut);
     // YUV 原生化 dump/调试:输出平面([0]=Y [1]=U [2]=V);输入平面直落
     // upload 映射(DumpYuvInPlane,行宽挤掉 pitch 填充,GPU 已收敛后调用)。
     ID3D12Resource *YuvOutPlane(FrameSlot &s, int plane) const noexcept { return s.yuvOut[plane].Get(); }
@@ -624,13 +644,6 @@ public:
         if (!realMotion) return _motion.Get();
         return scaling ? s.reducedMotion.Get() : s.motion.Get();
     }
-    // 最近 4 秒的帧数 / 4 即帧率(计数式)。播放节奏由宿主决定:卡顿时宿主积压,
-    // 恢复后突发+并发拉帧(fmParallel 入口 Δt 可到亚毫秒),倒数式 EMA 会把
-    // 追赶吞吐当帧率冲高;计数对并发与突发免疫,停顿(窗口内无新帧)读数
-    // 自然回落。窗宽 4s(原 1s):窗沿相位对齐让固定帧率源读数跳 ±1
-    // (25fps 实测 24/25/26),拉宽窗压量化误差,显示取整才稳。
-    double FrameRateWindow() noexcept;
-    void NotifyFrameTick(double qpcSeconds) noexcept; // 帧入口计数打点
     // 零 guidance(Force Zero,等价 Magpie guidanceMode=1):
     // motion R16G16_FLOAT、depth R32_FLOAT,内容全 0,常驻 NSR 只读
     ID3D12Resource *Depth() const noexcept { return _depth.Get(); }
@@ -833,11 +846,6 @@ private:
     int _internalHeight = 0;
     bool _scalingReady = false;
     bool _fgSlots = false; // 槽池当前含 FG 资源(CreateFrameResources 的 fg 旗标)
-    std::mutex _tickMutex;
-    static constexpr int kTickRingCap = 4096; // 4s 窗的容量上限(超出按 1024fps 封顶)
-    double _tickRing[kTickRingCap] = {};
-    int _tickHead = 0;  // 下一写入位
-    int _tickCount = 0; // 有效条目数(绕环前等于已写个数)
 };
 
 } // namespace vsdlssnr

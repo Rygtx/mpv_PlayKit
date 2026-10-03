@@ -77,6 +77,7 @@ add_library(vs_dlssnr SHARED
     src/ffxof_context.cpp        # AMD FidelityFX OF 会话(of_backend=0,默认)
     src/rtx_video_context.cpp    # RTX Video(NGX VSR + TrueHDR;RTX Video SDK 1.1)
     src/iat_hook.cpp
+    src/nv_gpu_probe.cpp         # NVAPI GPU 架构探测(FG 门 / NR 选档共用中立件)
     src/d3d12_context.cpp
     src/bridge.cpp
     src/plugin.rc             # 版本信息 (build/version.h 由 CMake configure 注入)
