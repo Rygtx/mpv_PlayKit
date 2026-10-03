@@ -157,6 +157,9 @@ set_source_files_properties(src/panel.rc src/plugin.rc PROPERTIES
 
 add_executable(dlssnr_panel WIN32
     src/panel_app.cpp
+    src/panel_mpv_ipc.cpp        # mpv 管道:命令 + HDR 打标持久连接
+    src/panel_stats.cpp          # stats 共享内存消费(视图缓存/快照/直读)
+    src/panel_ui.cpp             # 全部 ImGui(DrawUi + 四页签)
     src/panel.rc              # 图标 + 版本信息 (IDI_PANEL_ICON, ico 由 tools/make_panel_icon.py 生成)
     "${IMGUI_DIR}/imgui.cpp"
     "${IMGUI_DIR}/imgui_draw.cpp"
