@@ -9,6 +9,8 @@
 #include "dlssnr_context.h"
 #include "dlssnr_params.h"
 #include "mpv_pipe_common.h" // resize watcher 的 mpv.conf 管道名解析(与面板共用)
+#include "mpv_host.h"
+#include "ngx_variant.h"
 #include "nv_gpu_probe.h" // NR 模型选档的 GPU 架构探测(中立件,非 FG 门所属)
 #include "panel_ipc.h"
 #include "shared_params.h"
@@ -33,18 +35,25 @@ static const bool g_timingEnabled =
 
 using vsdlssnr::kFgGenSlots; // FG 插值槽数上界(d3d12_context.h,kFgMultMax-1)
 
+// RTX 参数裁决:vpy args + ini + 面板 payload 已在 DlssnrParams 上合并
+// (BridgeLoadIni/AdoptPanelPayload 走共享映射),本函数只剩 mode=1 的
+// mpv 窗口显示矩形探测(窗口探测本体在 mpv_host,2026-10-04 拆出;
+// plugin.cpp 是 vsrAutoHeight 的唯一写入点)。srcW/srcH = 源分辨率。
+// 探测失败(无可见窗口)写 0:mode=1 消费侧按"目标=源"处理 = VSR 旁路,
+// 窗口出现后的链重建重新探测并启用。
+void ResolveRtxParams(DlssnrParams &p, int srcW, int srcH) noexcept {
+    if (p.rtxVsrMode == 1) {
+        const vsdlssnr::MpvDisplayPick disp = vsdlssnr::MpvDetectTargetSize(srcW, srcH);
+        p.rtxVsrAutoHeight = disp.height > 0 ? disp.height : 0;
+    }
+}
+
 namespace {
 
 constexpr char PLUGIN_IDENTIFIER[] = "dev.rygtx.vsdlssnr";
 constexpr char PLUGIN_NAMESPACE[] = "dlssnr";
 constexpr char PLUGIN_NAME[] = "NVIDIA DLSSNR filter (Magpie port)";
-constexpr char SNIPPET_DLL_NAME[] = "nvngx_dlssnr.dll";
 constexpr char FG_PROXY_DLL_NAME[] = "version.dll"; // dlssg_for_sm86 0.3.x hook 型代理
-// 社区改版模型按 GPU 系列选装(后缀即选档依据,不可改名);缺失回落原版。
-constexpr char NGX_VARIANT_DLL_4090[] = "nvngx_dlssnr.4090.dll"; // RTX 4090 ONLY(AD102)
-constexpr char NGX_VARIANT_DLL_40XX[] = "nvngx_dlssnr.40xx.dll"; // RTX 4080/70/60 ONLY(其余 Ada)
-constexpr char NGX_VARIANT_DLL_2030[] = "nvngx_dlssnr.2030.dll"; // RTX 20,30 PLAIN FP16
-constexpr uint32_t kImplAd102 = 0x2; // NVAPI implementation 是族内芯片编号(AD102=0x2,官方 NV_GPU_ARCH_IMPLEMENTATION_ID;与 GA102=0x2 跨族撞号,分档必须 arch+impl 联合判断)
 
 // vpy explicit arguments overwrite the DlssnrParams member initializers —
 // the struct defaults in dlssnr_params.h are the single authority, so a
@@ -69,125 +78,6 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
     int err = 0;
     const long long v = vsapi->mapGetInt(in, key, 0, &err);
     if (!err) field = v != 0;
-}
-
-// 默认模型路径选档:按 GPU 系列在 ngx\ 下挑社区改版,原版无条件兜底
-// (探测失败/50 系/未选装 = 纯原版,行为与现状一致)。选档是 (arch, impl,
-// 文件存在性) 的纯函数,会话内确定 —— 热重绑定按 ngxDllPath 比较不受影响。
-// 变体与原版同目录,NGX core 的 app dir 取 dll.parent_path() 不受选择影响。
-//
-// 首拍可信度自检:枚举进程模块找"外来 version.dll"(FG 代理宿主名;
-// 系统正品在 System32 下,代理在 mpv 根目录/插件目录)。
-bool ForeignVersionDllResident() noexcept {
-    using EnumFx = BOOL(WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD);
-    using NameFx = DWORD(WINAPI *)(HANDLE, HMODULE, LPWSTR, DWORD);
-    const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
-    if (!k32) return false;
-    const auto enumMods = reinterpret_cast<EnumFx>(reinterpret_cast<void *>(
-        GetProcAddress(k32, "K32EnumProcessModules")));
-    const auto modName = reinterpret_cast<NameFx>(reinterpret_cast<void *>(
-        GetProcAddress(k32, "K32GetModuleFileNameExW")));
-    if (!enumMods || !modName) return false;
-    HMODULE mods[512];
-    DWORD needed = 0;
-    if (!enumMods(GetCurrentProcess(), mods, sizeof(mods), &needed)) return false;
-    const int n = static_cast<int>(
-        (std::min<DWORD>)(needed / sizeof(HMODULE), 512));
-    wchar_t sysDir[MAX_PATH];
-    const UINT sysLen = GetSystemDirectoryW(sysDir, MAX_PATH);
-    for (int i = 0; i < n; ++i) {
-        wchar_t path[MAX_PATH]{};
-        if (!modName(GetCurrentProcess(), mods[i], path, MAX_PATH)) continue;
-        const wchar_t *base = path;
-        for (const wchar_t *p = path; *p; ++p)
-            if (*p == L'\\' || *p == L'/') base = p + 1;
-        if (lstrcmpiW(base, L"version.dll") != 0) continue;
-        if (sysLen && sysLen < MAX_PATH &&
-            CompareStringOrdinal(path, static_cast<int>(sysLen),
-                                 sysDir, static_cast<int>(sysLen), TRUE) == CSTR_EQUAL &&
-            path[sysLen] == L'\\') {
-            continue; // System32 正品
-        }
-        return true;
-    }
-    return false;
-}
-
-// 探针必须"首拍定格":FG 代理(version.dll,dlssg_for_sm86)为给官方
-// DLSSG 放行,会把进程内 NVAPI GetArchInfo 钩成伪装 Blackwell(0x1B0)
-// —— 2026-10-03 实锤:3080 会话开 FG 后下一次 create 探到 0x1B0 →
-// tier=stock → 原版 snippet 在伪装态下 Feature 18 恒 0xbad00001,NR 整体
-// 失效。首次 create 必然先于代理附着(代理随 FG 会话初始化加载),缓存
-// 首拍真值后恒用之;后续探测与首拍的偏差只留一行痕(可诊断"为何没换档")。
-// 首拍自身的可信度自检(2026-10-04):若代理被 PE 加载器提前拉入并先挂了
-// NVAPI(非设计形态),首拍锁进 0x1B0 且 drift 行永不触发(后续探针恒等
-// 首拍)= 零诊断 NR 失效。识别:dlssg_for_sm86 只部署在 Turing/Ampere,
-// 探到 Blackwell 却有外来 version.dll 常驻 = 自相矛盾 —— 按 20/30 系救援
-// 选档并大声留痕,而非静默 tier=stock。
-std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
-    static const vsdlssnr::nv_gpu_probe::GpuArchProbe firstProbe = [] {
-        auto p = vsdlssnr::nv_gpu_probe::ProbePrimaryGpuArch();
-        if (p.arch == vsdlssnr::nv_gpu_probe::kArchBlackwell &&
-            ForeignVersionDllResident()) {
-            char msg[200];
-            std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: ngx first-shot probe = Blackwell (0x%X) with "
-                          "foreign version.dll resident — NVAPI spoof suspected (dlssg "
-                          "proxy only targets Turing/Ampere); forcing 20/30 tier",
-                          p.arch);
-            vsdlssnr::TimingStatusLine(msg);
-            p.arch = vsdlssnr::nv_gpu_probe::kArchAmpere; // → 20/30 档
-            p.implementation = 0;
-        }
-        return p;
-    }();
-    auto probe = vsdlssnr::nv_gpu_probe::ProbePrimaryGpuArch();
-    if (probe.arch != firstProbe.arch || probe.implementation != firstProbe.implementation) {
-        static bool driftLogged = false; // 一次性:此后每拍都是同一个假值
-        if (!driftLogged) {
-            driftLogged = true;
-            char msg[160];
-            std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: ngx variant probe drifted (0x%X/0x%X -> 0x%X/0x%X, "
-                          "FG proxy NVAPI spoof?); keeping first-read tier",
-                          firstProbe.arch, firstProbe.implementation,
-                          probe.arch, probe.implementation);
-            vsdlssnr::TimingStatusLine(msg);
-        }
-        probe = firstProbe;
-    }
-    const char *tier = "stock";
-    const char *candidates[2] = {SNIPPET_DLL_NAME, SNIPPET_DLL_NAME};
-    if (probe.arch == vsdlssnr::nv_gpu_probe::kArchAda) {
-        if (probe.implementation == kImplAd102) {
-            tier = "4090";
-            candidates[0] = NGX_VARIANT_DLL_4090;
-        } else {
-            tier = "40xx";
-            candidates[0] = NGX_VARIANT_DLL_40XX;
-        }
-    } else if (probe.arch == vsdlssnr::nv_gpu_probe::kArchTuring ||
-               probe.arch == vsdlssnr::nv_gpu_probe::kArchAmpere) {
-        tier = "20/30";
-        candidates[0] = NGX_VARIANT_DLL_2030;
-    }
-    std::filesystem::path chosen;
-    for (const char *name : candidates) {
-        std::error_code ec;
-        if (const auto p = ngxDir / name; std::filesystem::exists(p, ec)) {
-            chosen = p;
-            break;
-        }
-    }
-    if (chosen.empty()) chosen = ngxDir / SNIPPET_DLL_NAME; // 全缺也走原版:下游 LoadLibrary 失败 → 既有 passthrough
-    const auto chosenUtf8 = chosen.u8string();
-    char msg[512];
-    std::snprintf(msg, sizeof(msg),
-                  "DLSSNR STATUS: ngx model tier=%s arch=0x%X impl=0x%X -> %s", tier,
-                  probe.arch, probe.implementation,
-                  reinterpret_cast<const char *>(chosenUtf8.c_str()));
-    vsdlssnr::TimingStatusLine(msg);
-    return chosen.wstring();
 }
 
 struct FilterData {
@@ -375,212 +265,6 @@ static void CopyPlanes(const VSFrame *src, VSFrame *dst, const VSAPI *vsapi,
                     static_cast<size_t>(pw) * bpp, static_cast<size_t>(ph));
     }
 }
-
-// ---- RTX Video:目标尺寸的"跟随播放器"落点 ----
-// 探测本进程 mpv vo 窗口:**客户区尺寸 = mpv 的 osd-dimensions 等价**
-// (插件 DLL 活在 mpv 进程内,直读窗口零桥接),显示器原生分辨率仅作
-// 上限 clamp(窗口理论上不会大于所在屏)。链创建粒度:mpv 在 seek/换片
-// 时重建整条 VS 链 → 重新探测;窗口换屏/改尺寸后的生效点是下一次链重建
-// (VS constant-format 契约,每帧跟随在 mpv 架构下不存在落点)。
-// 探测失败(无窗口/枚举失败)回落主显示器。
-struct DisplayPick {
-    int width = 0;
-    int height = 0;
-};
-
-static DisplayPick DetectTargetSize(int srcW, int srcH) noexcept {
-    struct Ctx {
-        DWORD pid;
-        HWND hwnd;
-        LONG area;
-    } ctx{ GetCurrentProcessId(), nullptr, 0 };
-    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
-        auto *c = reinterpret_cast<Ctx *>(lp);
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hwnd, &pid);
-        if (pid != c->pid || !IsWindowVisible(hwnd)) return TRUE;
-        // mpv vo 窗口 = 本进程可见的主窗口;排除工具窗/无边框辅助窗
-        //(面板另有进程)。
-        const LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
-        if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
-        RECT rc{};
-        if (!GetWindowRect(hwnd, &rc)) return TRUE;
-        const LONG area = (rc.right - rc.left) * (rc.bottom - rc.top);
-        if (area > c->area) {
-            c->area = area;
-            c->hwnd = hwnd;
-        }
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&ctx));
-    // 找不到可见窗口(无窗音频/全屏独占被排除等)= 探测失败,返回 {0,0}
-    // 由调用方按 VSR 旁路处理;窗口出现后的链重建会重新探到并启用。
-    // 与显示器无关:有窗口时客户区即实际显示大小(宿主 per-monitor DPI
-    // aware,物理像素),无窗口时无目标 —— 不存在"拿显示器凑"的场景。
-    if (!ctx.hwnd) return { 0, 0 };
-    int w = 0, h = 0;
-    // 最小化窗口的 GetClientRect 是任务栏代表尺寸(~152x20,低于源)——
-    // 不做特例:探测目标低于源 = 旁路,正是"低于源分辨率直通"的设计语义;
-    // 还原时 resize watcher 探到高度变化,自动 seek 重建回全尺寸目标。
-    RECT rc{};
-    if (GetClientRect(ctx.hwnd, &rc)) {
-        w = rc.right - rc.left;
-        h = rc.bottom - rc.top;
-    }
-    if (w <= 0 || h <= 0) return { 0, 0 };
-    // 视频实际显示矩形 = 源宽高比在客户区内 min-fit(mpv letterbox 语义;
-    // panscan/zoom 覆盖不追,近似足够)—— 黑边不计入目标,避免"宽窗放
-    // 窄视频"时目标虚大。
-    if (srcW > 0 && srcH > 0) {
-        const double s = (std::min)(static_cast<double>(w) / srcW,
-                                    static_cast<double>(h) / srcH);
-        w = (std::max)(1, static_cast<int>(std::lround(srcW * s)));
-        h = (std::max)(1, static_cast<int>(std::lround(srcH * s)));
-    }
-    return { w, h };
-}
-
-// RTX 参数裁决:vpy args + ini + 面板 payload 已在 DlssnrParams 上合并
-// (BridgeLoadIni/AdoptPanelPayload 走共享映射),本函数只剩 mode=1 的
-// mpv 窗口显示矩形探测(plugin.cpp 是 vsrAutoHeight 的唯一写入点)。
-// srcW/srcH = 源分辨率,用于把客户区换算成视频实际显示矩形。
-// 探测失败(无可见窗口)写 0:mode=1 消费侧按"目标=源"处理 = VSR 旁路,
-// 窗口出现后的链重建重新探测并启用。
-static void ResolveRtxParams(DlssnrParams &p, int srcW, int srcH) noexcept {
-    if (p.rtxVsrMode == 1) {
-        const DisplayPick disp = DetectTargetSize(srcW, srcH);
-        p.rtxVsrAutoHeight = disp.height > 0 ? disp.height : 0;
-    }
-}
-
-// ---- 窗口 resize 跟随(mode=1)----
-// 窗口尺寸变化不触发 mpv 的 video-reconfig(纯 VO 事件),链不重建、
-// 探测不重跑 —— VSR 目标停留在创建时尺寸,必须 seek 才跟随。轻量
-// watcher:每 400ms 复用 DetectTargetSize 探一次,高度连续两拍稳定偏离
-// 创建值(迟滞 max(8px, 2%))后经 mpv IPC 发一次 1ms seek 触发链重建;
-// 重建出的新实例带新探测值与新 watcher,本线程随即退出(存活事件关闭
-// = 滤镜释放,同样退出)。IPC 缺失则优雅降级为旧行为(需手动 seek)。
-namespace {
-
-struct ResizeWatchCtx {
-    int srcW, srcH, refH;
-    HANDLE stop; // 匿名停事件(FilterData 持句柄,Free 时 SetEvent+Close)
-};
-
-std::atomic<int> g_resizeWatchers{ 0 };
-
-bool ResizeWatchSendSeek() noexcept {
-    // 管道名发现 = mpv.conf input-ipc-server 优先(与面板同源解析,
-    // mpv_pipe_common;2026-10-04 补齐 —— 此前只试三个默认名,自定义管道
-    // 名部署下面板 reseek 正常而本线程静默失效,双实现分叉的实害)。
-    // conf 按 mpv.exe 目录(宿主进程可执行文件)定位。解析结果进程级缓存
-    // (conf 中途改动需重启 mpv,与面板侧同语义)。
-    // 写/读 overlapped + 500ms 有界(2026-09-25):原同步 ReadFile 无超时,
-    // mpv 挂起时本线程永久滞留 —— watcher 名额上限 2,滞留 = 自动跟随静默
-    // 失效到进程退出。
-    const wchar_t *candidates[4] = { nullptr, L"mpvpipe", L"mpvsocket", L"umpv" };
-    static wchar_t *g_confPipe = nullptr; // 进程级缓存(nullptr = 解析过且无)
-    static bool g_confProbed = false;
-    if (!g_confProbed) {
-        g_confProbed = true;
-        wchar_t exe[MAX_PATH];
-        if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-            wchar_t *slash = nullptr;
-            for (wchar_t *p = exe; *p; ++p)
-                if (*p == L'\\' || *p == L'/') slash = p;
-            if (slash) {
-                wchar_t confPath[MAX_PATH];
-                swprintf_s(confPath, L"%.*s\\portable_config\\mpv.conf",
-                           static_cast<int>(slash - exe), exe);
-                g_confPipe = vsdlssnr::MpvParseIpcServerName(confPath);
-            }
-        }
-    }
-    candidates[0] = g_confPipe;
-    for (const wchar_t *name : candidates) {
-        wchar_t path[MAX_PATH];
-        swprintf_s(path, L"\\\\.\\pipe\\%s", name);
-        HANDLE pipe = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-                                  0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED,
-                                  nullptr);
-        if (pipe == INVALID_HANDLE_VALUE) continue;
-        HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!ev) {
-            CloseHandle(pipe);
-            continue;
-        }
-        OVERLAPPED ov{};
-        ov.hEvent = ev;
-        const char *cmd = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
-        const DWORD cmdLen = static_cast<DWORD>(strlen(cmd));
-        DWORD written = 0;
-        bool ok =
-            WriteFile(pipe, cmd, cmdLen, &written, &ov) ||
-            (GetLastError() == ERROR_IO_PENDING &&
-             WaitForSingleObject(ev, 500) == WAIT_OBJECT_0 &&
-             GetOverlappedResult(pipe, &ov, &written, FALSE));
-        ok = ok && written == cmdLen;
-        if (ok) {
-            ResetEvent(ev);
-            char ack[128]{};
-            DWORD got = 0;
-            if (!ReadFile(pipe, ack, sizeof(ack) - 1, &got, &ov) &&
-                GetLastError() == ERROR_IO_PENDING &&
-                WaitForSingleObject(ev, 500) != WAIT_OBJECT_0) {
-                CancelIoEx(pipe, &ov);
-                GetOverlappedResult(pipe, &ov, &got, TRUE);
-            }
-        } else {
-            CancelIoEx(pipe, &ov);
-            DWORD got = 0;
-            GetOverlappedResult(pipe, &ov, &got, TRUE);
-        }
-        CloseHandle(ev);
-        CloseHandle(pipe);
-        if (ok) {
-            char msg[128];
-            std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: resize reload seek via IPC pipe %ls", name);
-            vsdlssnr::TimingStatusLine(msg);
-            return true;
-        }
-    }
-    return false;
-}
-
-DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
-    std::unique_ptr<ResizeWatchCtx> ctx(static_cast<ResizeWatchCtx *>(param));
-    int drift = 0;
-    // 停靠匿名事件(2026-09-25):此前等 ALIVE_EVENT 的 WAIT_OBJECT_0 分支
-    // 是死代码(该事件 manual-reset 初始非信号、全仓无 SetEvent),watcher
-    // 只能靠自己触发 seek 或进程退出结束,期间 2.5Hz 全量 EnumWindows 空转,
-    // 且线程生命周期不受实例释放约束。现在 FilterData 持停事件句柄,Free
-    // 时 SetEvent —— 实例与线程生命周期对齐。
-    for (;;) {
-        const DWORD w = WaitForSingleObject(ctx->stop, 400);
-        // 非 WAIT_TIMEOUT 一律停:SetEvent 是正常停旗;WAIT_FAILED = Free 的
-        // CloseHandle 撞上扫描窗口(不在 wait 中),句柄已关,继续循环会
-        // 全速空转(每圈全量 EnumWindows)。
-        if (w != WAIT_TIMEOUT) break; // 滤镜已释放(重建/热停泊/关停)
-        const DisplayPick d = DetectTargetSize(ctx->srcW, ctx->srcH);
-        if (d.height <= 0) { drift = 0; continue; } // 窗口暂不可见,不积累
-        const int thresh = (std::max)(8, ctx->refH / 50);
-        if (std::abs(d.height - ctx->refH) <= thresh) { drift = 0; continue; }
-        if (++drift < 2) continue; // 连续两拍稳定偏离才触发(拖动防抖)
-        char msg[128];
-        std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: window target %d -> %d, triggering reload",
-                      ctx->refH, d.height);
-        vsdlssnr::TimingStatusLine(msg);
-        if (!ResizeWatchSendSeek()) {
-            vsdlssnr::TimingStatusLine("DLSSNR STATUS: resize watch: mpv IPC unavailable, auto-follow off");
-        }
-        break; // 重建带来新探测值与新 watcher
-    }
-    g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
-    return 0;
-}
-
-} // namespace
 
 // ctx 载荷(创建时定格):DlssnrParams 合并值 → RtxVideoParams(纯创建时
 // 几何/形态;per-eval live 值运行中由 Snapshot 逐帧取,不进卡片)。
@@ -1090,8 +774,7 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
     // 停掉本实例的 resize watcher(实例与线程生命周期对齐;watcher 线程
     // 检测到事件即自行退出,无需等待)。
     if (d->resizeWatchStop) {
-        SetEvent(d->resizeWatchStop);
-        CloseHandle(d->resizeWatchStop);
+        vsdlssnr::MpvResizeWatchStop(d->resizeWatchStop);
         d->resizeWatchStop = nullptr;
     }
     vsdlssnr::BridgeStop(d->params);
@@ -1267,7 +950,7 @@ static void VS_CC DlssnrCreate(
                 // getPluginPath is UTF-8 as well (see above)
                 const std::filesystem::path dir =
                     std::filesystem::path(reinterpret_cast<const char8_t *>(selfPath)).parent_path() / "ngx";
-                d->ngxDllPath = SelectNgxDllVariant(dir);
+                d->ngxDllPath = vsdlssnr::SelectNgxDllVariant(dir);
             } catch (...) {
                 d->ngxDllPath.clear();
             }
@@ -1470,26 +1153,11 @@ static void VS_CC DlssnrCreate(
                       d->outW, d->outH, d->outFi.bitsPerSample, d->hdrOut ? 1 : 0,
                       d->rtxActive ? 1 : 0, d->width, d->height, d->depth);
         vsdlssnr::TimingStatusLine(msg);
-        // 窗口 resize 跟随(mode=1):见 ResizeWatchProc。refH = 本次创建
-        // 的探测值。
-        if (initial.rtxVsrMode == 1 &&
-            g_resizeWatchers.load(std::memory_order_relaxed) < 2) {
-            HANDLE stop = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset 停旗
-            if (stop) {
-                g_resizeWatchers.fetch_add(1, std::memory_order_relaxed);
-                auto *wctx = new ResizeWatchCtx{ d->width, d->height,
-                                                 initial.rtxVsrAutoHeight, stop };
-                HANDLE th = CreateThread(nullptr, 0, ResizeWatchProc, wctx, 0, nullptr);
-                if (th) {
-                    CloseHandle(th);
-                    d->resizeWatchStop = stop; // 句柄归 FilterData,Free 时 SetEvent+Close
-                } else {
-                    delete wctx;
-                    CloseHandle(stop);
-                    g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
-                }
-            }
-        }
+        // 窗口 resize 跟随(mode=1):watcher 全套在 mpv_host(2026-10-04 拆出)。
+        // refH = 本次创建的探测值;stop 句柄归 FilterData,Free 时 MpvResizeWatchStop。
+        d->resizeWatchStop =
+            vsdlssnr::MpvResizeWatchStart(d->width, d->height, initial.rtxVsrAutoHeight,
+                                          initial.rtxVsrMode == 1);
     }
     VSVideoInfo viOut = *vi;
     viOut.width = d->outW;

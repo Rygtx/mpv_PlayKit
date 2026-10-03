@@ -708,6 +708,12 @@ private:
     // vsrOnly = vsr && !hdr)。
     DXGI_FORMAT NrColorFormat(bool allowFp16, bool vsrOnly) const noexcept;
     bool CreateComputeObjects(char *err, size_t errLen) noexcept;
+    // ---- 子系统 Pass 组(实现分居各 d3d12_<子系统>.cpp;由上方 CreateComputeObjects 按序调用)----
+    bool CreateResidualObjects(char *err, size_t errLen) noexcept;
+    bool CreateOfObjects(char *err, size_t errLen) noexcept;
+    bool CreateDebugObjects(char *err, size_t errLen) noexcept;
+    bool CreateTemporalObjects(char *err, size_t errLen) noexcept;
+    bool CreateConvertObjects(char *err, size_t errLen) noexcept;
     void SetErr(char *err, size_t errLen, HRESULT hr, const char *what) const noexcept;
 
     ComPtr<ID3D12Device> _device;

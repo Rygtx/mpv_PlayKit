@@ -79,7 +79,13 @@ add_library(vs_dlssnr SHARED
     src/iat_hook.cpp
     src/mpv_pipe_common.cpp      # mpv.conf input-ipc-server 解析(resize watcher 用,与面板共用)
     src/nv_gpu_probe.cpp         # NVAPI GPU 架构探测(FG 门 / NR 选档共用中立件)
+    src/ngx_variant.cpp          # NGX NR 模型选档(首拍定格 + 伪装自检)
+    src/mpv_host.cpp             # mpv 宿主探测 + resize 跟随 watcher
     src/d3d12_context.cpp
+    src/d3d12_residual.cpp       # 残差降采样 Pass 组(RecordPass 族 + RebuildScaling)
+    src/d3d12_of.cpp             # 光流 guidance Pass 组(NVOF densify/FFX/mvec)
+    src/d3d12_temporal.cpp       # 抗闪烁时域 + 调试视图 Pass 组
+    src/d3d12_convert.cpp        # 色域转换 Pass 组(YUV↔RGB/RTX 输出)
     src/bridge.cpp
     src/plugin.rc             # 版本信息 (build/version.h 由 CMake configure 注入)
     # --- FidelityFX Optical Flow(AMD 光流后端的 SDK 闭包;编译集 =
