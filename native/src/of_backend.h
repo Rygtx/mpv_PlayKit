@@ -26,6 +26,7 @@
 #include <mutex>
 
 #include "dlssnr_params.h" // kOfBackend* 常量(Kind() 返回值;params 为唯一权威)
+#include "d3d12_context.h" // OfClRotator:IsDeviceLost / ResetAllocatorHealed(自身不含本件,无环)
 
 namespace vsdlssnr {
 
@@ -42,6 +43,91 @@ inline bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
         if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
     }
 }
+
+// 栅栏 + 等待事件配对(轮转位背压等待的事件选择;NVOF 单栅栏恒同事件,
+// FFX copy/done 双栅栏按身份选事件 —— 事件分家防唤醒窃取,见两会话注释)。
+struct OfFenceEvent {
+    ID3D12Fence *fence;
+    HANDLE event;
+};
+
+// CL 轮转池(NvofContext/FxofContext 共用脚手架;此前 AcquireCl 在两会话
+// 各写一份,2026-09-25 轮转池改造被迫双处同步落盘):idx = seq % 4,Reset
+// 前 CPU 等同位上一段提交 —— 4 段之前常态"等待即刻返回",GPU 落后超 4 段
+// = 背压。等待期间设备丢失 = 永不满足,快速失败。Reset 含 force-close 自愈
+// (d3d12_context.h)。门内串行(OfFrameGate),会话级簿记无并发等待者。
+class OfClRotator {
+public:
+    // 建 4 深 allocator/CL 对(DIRECT;建后即 Close 待录)。失败返回 false
+    // (会话建失败路径收口,报错由调用方 fail() 统一落)。
+    bool Create(D3D12Context &d3d12, ID3D12Device *device) noexcept {
+        _d3d12 = &d3d12;
+        for (int i = 0; i < kDepth; ++i) {
+            if (FAILED(device->CreateCommandAllocator(
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(_alloc[i].GetAddressOf()))) ||
+                FAILED(device->CreateCommandList(
+                    0, D3D12_COMMAND_LIST_TYPE_DIRECT, _alloc[i].Get(), nullptr,
+                    IID_PPV_ARGS(_cl[i].GetAddressOf()))) ||
+                FAILED(_cl[i]->Close())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    enum class AcquireResult { Ok, Timeout, ResetFailed };
+    // 取轮转位:背压等待(fe 表按栅栏身份选事件,无匹配 = fe[0].event)+
+    // 自愈 Reset。Timeout = 背压 10s 未达(调用方留痕 + 退役);ResetFailed
+    // = 自愈后仍失败(设备级故障,调用方直接失败)。
+    AcquireResult Acquire(ID3D12CommandAllocator **allocator,
+                          ID3D12GraphicsCommandList **cl,
+                          const OfFenceEvent *fe, size_t feCount) noexcept {
+        const int idx = static_cast<int>(_seq % kDepth);
+        if (_lastFence[idx] && _lastValue[idx] && !_d3d12->IsDeviceLost()) {
+            HANDLE ev = fe[0].event;
+            for (size_t i = 0; i < feCount; ++i) {
+                if (fe[i].fence == _lastFence[idx]) { ev = fe[i].event; break; }
+            }
+            if (!WaitFenceReached(_lastFence[idx], _lastValue[idx], ev, 10000)) {
+                return AcquireResult::Timeout;
+            }
+        }
+        if (!ResetAllocatorHealed(_alloc[idx].Get(), _cl[idx].Get())) {
+            return AcquireResult::ResetFailed;
+        }
+        *allocator = _alloc[idx].Get();
+        *cl = _cl[idx].Get();
+        return AcquireResult::Ok;
+    }
+
+    // 提交记账:idx 位的在飞栅栏值(调用方在 Signal 后调用;每段恰一次)。
+    void RecordUse(ID3D12Fence *fence, uint64_t value) noexcept {
+        const int idx = static_cast<int>(_seq % kDepth);
+        _lastFence[idx] = fence;
+        _lastValue[idx] = value;
+        ++_seq;
+    }
+
+    // 会话销毁:栅栏指针随会话失效,簿记清零(退役会话不再 Acquire,
+    // 清零防悬垂比较)。
+    void ResetBookkeeping() noexcept {
+        for (int i = 0; i < kDepth; ++i) {
+            _lastFence[i] = nullptr;
+            _lastValue[i] = 0;
+        }
+        _seq = 0;
+    }
+
+private:
+    D3D12Context *_d3d12 = nullptr;
+    static constexpr int kDepth = 4;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> _alloc[kDepth];
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> _cl[kDepth];
+    ID3D12Fence *_lastFence[kDepth] = {}; // 轮转位最近提交的栅栏
+    uint64_t _lastValue[kDepth] = {};     // 轮转位最近提交的栅栏值
+    uint64_t _seq = 0;                    // 轮转指针(每段提交 +1)
+};
 
 class D3D12Context;
 

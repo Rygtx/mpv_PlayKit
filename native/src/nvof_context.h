@@ -203,18 +203,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> _cost[2];
     NvOFGPUBufferHandle _registered[6]{};
 
-    // 拷贝命令路径:4 深轮转池(2026-09-25,对齐 FfxofContext::AcquireCl)。
-    // 此前单 allocator:每帧 copy/densify 复用同一对,Reset 前 CPU 等上一帧
-    // 完成(_lastCopyFence 等待,探针 c%)—— GPU 落后时该等待在门内串行。
-    // 池化后常态零等待,背压(落后 >4 段)才等待。copy 与 densify 各占一个
+    // 拷贝命令路径:4 深轮转池(2026-09-25;2026-10-03 实体收拢到
+    // of_backend.h OfClRotator,NVOF/FFX 共用)。copy 与 densify 各占一个
     // 轮转位(每帧 2 段,4 深 = 2 帧跑道;execute 输出的 CPU 等待天然把
     // 帧间距离拉开,跑道远大于消耗)。
-    static constexpr int kClDepth = 4;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> _alloc[kClDepth];
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> _cl[kClDepth];
-    ID3D12Fence *_lastUseFence[kClDepth]{};   // 轮转位最近提交的栅栏(恒 _copyFence)
-    uint64_t _lastUseValue[kClDepth]{};       // 轮转位最近提交的栅栏值
-    uint64_t _submitSeq = 0;                  // 轮转指针(每段提交 +1)
+    OfClRotator _rotator;
     Microsoft::WRL::ComPtr<ID3D12Fence> _copyFence;  // 我方拷贝完成(app → NVOF)
     Microsoft::WRL::ComPtr<ID3D12Fence> _doneFence;  // NVOF 输出完成(NVOF → 我方)
     // 两个自动重置事件按栅栏分家:auto-reset 事件被多等待者共享时会发生

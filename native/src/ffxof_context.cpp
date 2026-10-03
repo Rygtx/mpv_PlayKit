@@ -65,12 +65,9 @@ void FxofContext::DestroySession() noexcept {
     _ffxInput.Reset();
     _sparseFlow.Reset();
     _scd.Reset();
-    for (int i = 0; i < kFfxClDepth; ++i) {
-        _cl[i].Reset();
-        _alloc[i].Reset();
-        _lastUseFence[i] = nullptr;
-        _lastUseValue[i] = 0;
-    }
+    // 轮转池 CL 随会话析构(OfClRotator 成员 ComPtr 自释);簿记清零防
+    // 退役会话的悬垂栅栏指针比较(下方 copy/done 栅栏对象本体会 Reset)。
+    _rotator.ResetBookkeeping();
     _copyFence.Reset();
     _doneFence.Reset();
     if (_copyFenceEvent) {
@@ -85,7 +82,6 @@ void FxofContext::DestroySession() noexcept {
     _lastCopyFence = 0;
     _doneSeq = 0;
     _lastDone = 0;
-    _submitSeq = 0;
     // OF GPU 跨度括号资源(READBACK 先解映射)。
     if (_tsReadback && _tsMapped) _tsReadback->Unmap(0, nullptr);
     _tsMapped = nullptr;
@@ -184,15 +180,8 @@ bool FxofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         return fail("fxof: create session textures failed");
     }
 
-    for (int i = 0; i < kFfxClDepth; ++i) {
-        if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                  IID_PPV_ARGS(_alloc[i].GetAddressOf()))) ||
-            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                             _alloc[i].Get(), nullptr,
-                                             IID_PPV_ARGS(_cl[i].GetAddressOf()))) ||
-            FAILED(_cl[i]->Close())) {
-            return fail("fxof: create command path failed");
-        }
+    if (!_rotator.Create(d3d12, device)) {
+        return fail("fxof: create command path failed");
     }
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
                                    IID_PPV_ARGS(_copyFence.GetAddressOf()))) ||
@@ -407,9 +396,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             queue->ExecuteCommandLists(1, lists);
             _lastCopyFence = ++_copySeq;
             queue->Signal(_copyFence.Get(), _lastCopyFence);
-            _lastUseFence[_submitSeq % kFfxClDepth] = _copyFence.Get();
-            _lastUseValue[_submitSeq % kFfxClDepth] = _lastCopyFence;
-            ++_submitSeq;
+            _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
             // 转换 + Prepare 已落在成功提交的 copy CL 上(of_backend.h 契约):
             // 回填 inputIndex,调用方跳过槽 CL 的重复转换 —— 此前恒 -1,FFX
             // 每帧多付一次全量 YUV→RGB dispatch,且槽 CL 对已 NSR 的
@@ -473,9 +460,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         queue->ExecuteCommandLists(1, lists);
         _lastDone = ++_doneSeq;
         queue->Signal(_doneFence.Get(), _lastDone);
-        _lastUseFence[_submitSeq % kFfxClDepth] = _doneFence.Get();
-        _lastUseValue[_submitSeq % kFfxClDepth] = _lastDone;
-        ++_submitSeq;
+        _rotator.RecordUse(_doneFence.Get(), _lastDone);
         if (_tsMapped) {
             _spanPending = true;
             _spanFence = _lastDone;
@@ -508,9 +493,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             queue->ExecuteCommandLists(1, lists);
             _lastCopyFence = ++_copySeq;
             queue->Signal(_copyFence.Get(), _lastCopyFence);
-            _lastUseFence[_submitSeq % kFfxClDepth] = _copyFence.Get();
-            _lastUseValue[_submitSeq % kFfxClDepth] = _lastCopyFence;
-            ++_submitSeq;
+            _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
             result.waitFenceValue = _lastDone; // 非 0 = realMotion
         } else {
             TimingStatusLine("DLSSNR STATUS: fxof densify submit failed");
@@ -541,25 +524,17 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
 
 bool FxofContext::AcquireCl(ID3D12CommandAllocator **allocator,
                             ID3D12GraphicsCommandList **cl) noexcept {
-    // CL 池轮转(RtxQueue 同款纪律):idx = _submitSeq % depth,Reset 前
-    // CPU 等同 idx 上次使用的栅栏 —— 4 段之前,常态"等待即刻返回";GPU
-    // 落后超 4 段 = 背压。等待期间设备丢失 = 永不满足,快速失败。门内串行
-    // (OfFrameGate),会话级事件无并发等待者。
-    const int idx = static_cast<int>(_submitSeq % kFfxClDepth);
-    if (_lastUseFence[idx] && _lastUseValue[idx] &&
-        !_d3d12->IsDeviceLost()) {
-        HANDLE ev = _lastUseFence[idx] == _doneFence.Get() ? _doneFenceEvent
-                                                           : _copyFenceEvent;
-        if (!WaitFenceReached(_lastUseFence[idx], _lastUseValue[idx], ev, 10000)) {
-            TimingStatusLine("DLSSNR STATUS: fxof cl rotator wait timeout; session retired");
-            _ready.store(false, std::memory_order_release);
-            return false;
-        }
+    // CL 池轮转(OfClRotator 共用实体):背压等待按栅栏身份选事件(事件
+    // 分家防唤醒窃取),自愈 Reset,门内串行(OfFrameGate),会话级簿记无
+    // 并发等待者。
+    const OfFenceEvent fe[2]{{_copyFence.Get(), _copyFenceEvent},
+                             {_doneFence.Get(), _doneFenceEvent}};
+    const auto r = _rotator.Acquire(allocator, cl, fe, 2);
+    if (r == OfClRotator::AcquireResult::Timeout) {
+        TimingStatusLine("DLSSNR STATUS: fxof cl rotator wait timeout; session retired");
+        _ready.store(false, std::memory_order_release);
     }
-    if (!ResetAllocatorHealed(_alloc[idx].Get(), _cl[idx].Get())) return false;
-    *allocator = _alloc[idx].Get();
-    *cl = _cl[idx].Get();
-    return true;
+    return r == OfClRotator::AcquireResult::Ok;
 }
 
 void FxofContext::WaitCopyIdle() noexcept {

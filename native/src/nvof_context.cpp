@@ -110,36 +110,26 @@ static NvofFences &GetNvofFences(ID3D12Device *device) noexcept {
 
 bool NvofContext::AcquireCl(ID3D12CommandAllocator **allocator,
                             ID3D12GraphicsCommandList **cl, LARGE_INTEGER freq) noexcept {
-    // 轮转池取 CL(RtxQueue/FfxofContext 同款纪律):idx = _submitSeq % 深度,
-    // Reset 前 CPU 等同位上一段提交 —— 4 段之前常态"等待即刻返回";GPU 落后
-    // 超 4 段 = 背压。等待期间设备丢失 = 永不满足,快速失败。全部段都 signal
-    // copyFence(单栅栏值空间单调),共享 _copyFenceEvent 无跨栅栏窃取
-    // (等待者只有门内串行线程与 WaitCopyIdle,后者在门外,事件分家见
-    // _copyFenceEvent/_doneFenceEvent 注释 —— copyFence 侧等待共用同一事件
-    // 是安全的:值空间单调,窃取后循环复查兜底)。
-    const int idx = static_cast<int>(_submitSeq % kClDepth);
-    if (_lastUseFence[idx] && _lastUseValue[idx] &&
-        !_d3d12->IsDeviceLost()) {
-        // 常驻诊断:轮转位等待(>0 = GPU 落后背压)。
-        LARGE_INTEGER tc0{}, tc1{};
-        QueryPerformanceCounter(&tc0);
-        const bool reached = WaitFenceReached(_lastUseFence[idx], _lastUseValue[idx],
-                                              _copyFenceEvent, 10000);
-        QueryPerformanceCounter(&tc1);
-        _lastCpyWaitMs = static_cast<double>(tc1.QuadPart - tc0.QuadPart) * 1000.0 /
-                         static_cast<double>(freq.QuadPart);
-        if (!reached) {
-            TimingStatusLine("DLSSNR STATUS: nvof cl rotator wait timeout; session retired");
-            _ready.store(false, std::memory_order_release);
-            return false;
-        }
-    } else {
-        _lastCpyWaitMs = 0.0;
+    // 轮转池取 CL(OfClRotator;背压/自愈/轮转簿记全部在共享实体内)。全部
+    // 段都 signal copyFence(单栅栏值空间单调),共享 _copyFenceEvent 无跨
+    // 栅栏窃取(等待者只有门内串行线程与 WaitCopyIdle,后者在门外,事件
+    // 分家见 _copyFenceEvent/_doneFenceEvent 注释 —— copyFence 侧等待共用
+    // 同一事件是安全的:值空间单调,窃取后循环复查兜底)。
+    // 常驻诊断:轮转位等待耗时(>0 = GPU 落后背压)。
+    const OfFenceEvent fe{_copyFence.Get(), _copyFenceEvent};
+    LARGE_INTEGER tc0{}, tc1{};
+    QueryPerformanceCounter(&tc0);
+    const auto r = _rotator.Acquire(allocator, cl, &fe, 1);
+    QueryPerformanceCounter(&tc1);
+    _lastCpyWaitMs = r == OfClRotator::AcquireResult::Ok
+                         ? static_cast<double>(tc1.QuadPart - tc0.QuadPart) * 1000.0 /
+                               static_cast<double>(freq.QuadPart)
+                         : 0.0;
+    if (r == OfClRotator::AcquireResult::Timeout) {
+        TimingStatusLine("DLSSNR STATUS: nvof cl rotator wait timeout; session retired");
+        _ready.store(false, std::memory_order_release);
     }
-    if (!ResetAllocatorHealed(_alloc[idx].Get(), _cl[idx].Get())) return false;
-    *allocator = _alloc[idx].Get();
-    *cl = _cl[idx].Get();
-    return true;
+    return r == OfClRotator::AcquireResult::Ok;
 }
 
 NvofContext::~NvofContext() { Finalize(); }
@@ -170,13 +160,9 @@ void NvofContext::DestroySession() noexcept {
     _api = {};
     // 模块进程级缓存,永不 FreeLibrary(见 GetNvofModule 注释)。
     _module = nullptr;
-    for (int i = 0; i < kClDepth; ++i) {
-        _cl[i].Reset();
-        _alloc[i].Reset();
-        _lastUseFence[i] = nullptr;
-        _lastUseValue[i] = 0;
-    }
-    _submitSeq = 0;
+    // 轮转池 CL 随会话析构(OfClRotator 成员 ComPtr 自释);簿记清零防
+    // 退役会话的悬垂栅栏指针比较。
+    _rotator.ResetBookkeeping();
     // 栅栏/事件是进程级单例(GetNvofFences):不释放,只解除本会话引用。
     _copyFence.Reset();
     _doneFence.Reset();
@@ -398,16 +384,8 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         _copySeq = _lastCopyFence = _copyFence->GetCompletedValue();
         _doneSeq = _lastDone = _doneFence->GetCompletedValue();
     }
-    for (int i = 0; i < kClDepth; ++i) {
-        if (FAILED(device->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                IID_PPV_ARGS(_alloc[i].GetAddressOf()))) ||
-            FAILED(device->CreateCommandList(
-                0, D3D12_COMMAND_LIST_TYPE_DIRECT, _alloc[i].Get(), nullptr,
-                IID_PPV_ARGS(_cl[i].GetAddressOf()))) ||
-            FAILED(_cl[i]->Close())) {
-            return fail("nvof: create copy command list failed");
-        }
+    if (!_rotator.Create(*_d3d12, device)) {
+        return fail("nvof: create copy command list failed");
     }
 
     for (int i = 0; i < 6; ++i) {
@@ -608,9 +586,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             _lastCopyFence = ++_copySeq;
             queue->Signal(_copyFence.Get(), _lastCopyFence);
             // 轮转位记账(FfxofContext 同款:先记后 ++,acquire 侧同式回读)。
-            _lastUseFence[_submitSeq % kClDepth] = _copyFence.Get();
-            _lastUseValue[_submitSeq % kClDepth] = _lastCopyFence;
-            ++_submitSeq;
+            _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
         } else {
             // 拷贝失败:清零 + 重置(下帧重新播种)。失败必须进 timing log。
             char msg[128];
@@ -812,9 +788,7 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
     _d3d12->Queue()->ExecuteCommandLists(1, lists);
     _lastCopyFence = ++_copySeq;
     _d3d12->Queue()->Signal(_copyFence.Get(), _lastCopyFence);
-    _lastUseFence[_submitSeq % kClDepth] = _copyFence.Get();
-    _lastUseValue[_submitSeq % kClDepth] = _lastCopyFence;
-    ++_submitSeq;
+    _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
 }
 
 void NvofContext::WaitCopyIdle() noexcept {

@@ -102,9 +102,8 @@ private:
     void DestroySession() noexcept;
     bool CreateSession(D3D12Context &d3d12, int width, int height, int quality,
                        char *err, size_t errLen) noexcept;
-    // CL 池轮转:idx = _submitSeq % depth,CPU 等同 idx 上次使用的栅栏
-    // (4 段之前,常态即刻返回),Reset allocator + CL(含 force-close 自愈,
-    // of_backend.h ResetAllocatorHealed)。提交后由调用方记 _lastUse。
+    // CL 池轮转(OfClRotator 共用实体):背压等待/自愈 Reset/簿记内聚。
+    // 提交后由调用方 RecordUse 记在飞栅栏值。
     bool AcquireCl(ID3D12CommandAllocator **allocator,
                    ID3D12GraphicsCommandList **cl) noexcept;
 
@@ -134,12 +133,10 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> _sparseFlow; // R16G16_SINT sparse
     Microsoft::WRL::ComPtr<ID3D12Resource> _scd;
 
-    // 持久命令路径:copy/main/densify 三段统一 4 深轮转池。idx = 提交序 % 4,
-    // Reset 前 CPU 等同 idx 上次使用的栅栏(4 段之前;GPU 落后超 4 段 =
-    // 背压,RtxQueue 同款)。门内 CPU 等 dispatch 已删(见头注释时序模型)。
-    static constexpr int kFfxClDepth = 4;
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> _alloc[kFfxClDepth];
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> _cl[kFfxClDepth];
+    // 持久命令路径:copy/main/densify 三段统一 4 深轮转池(OfClRotator
+    // 共用实体;每帧 copy+main 2 段,HDR 链 densify 追加)。门内 CPU 等
+    // dispatch 已删(见头注释时序模型)。
+    OfClRotator _rotator;
     Microsoft::WRL::ComPtr<ID3D12Fence> _copyFence;  // copy/densify 完成(app 侧)
     Microsoft::WRL::ComPtr<ID3D12Fence> _doneFence;  // FFX dispatch 完成
     HANDLE _copyFenceEvent = nullptr;
@@ -148,9 +145,6 @@ private:
     uint64_t _lastCopyFence = 0;
     uint64_t _doneSeq = 0;      // doneFence 计数(main CL 提交)
     uint64_t _lastDone = 0;
-    uint64_t _submitSeq = 0;                    // CL 池轮转计数(三段统一)
-    ID3D12Fence *_lastUseFence[kFfxClDepth] = {}; // 每槽最后一次使用的栅栏
-    uint64_t _lastUseValue[kFfxClDepth] = {};     // 及其 signal 值
 
     OfFrameGate _gate;
     uint32_t _consecutiveFailures = 0;
