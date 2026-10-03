@@ -1383,30 +1383,9 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     }
     nrMs = segMs();
     } // end nrKeysChanged
-    if (!_d3d12->BeginCtlRecording()) {
-        if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: BeginCtlRecording failed");
-        _ready.store(false, std::memory_order_release);
-        return false;
-    }
-    {
-        DWORD sehCode = 0;
-        if (!SetCreateParametersSafely(&sehCode)) {
-            if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: parameter setup raised SEH");
-            _ready.store(false, std::memory_order_release);
-            return false;
-        }
-        const NVSDK_NGX_Result r = SnippetCreateFeatureSafely(_d3d12->CtlCommandList(), _parameters, &sehCode);
-        if (sehCode || !NVSDK_NGX_SUCCEED(r) || !_feature) {
-            if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: CreateFeature failed (0x%x)",
-                static_cast<unsigned>(sehCode ? 0xFFFFFFFFu : r));
-            _ready.store(false, std::memory_order_release);
-            return false;
-        }
-    }
-    if (!_d3d12->ExecuteCtlAndWait(err, errLen, "nr recreate")) {
-        _ready.store(false, std::memory_order_release);
-        return false;
-    }
+    // c9b5d9e 曾在此残留一份无守卫的 CreateFeature 拷贝:每次重建多建一个
+    // 特征覆盖 _feature 句柄(旧特征泄漏,显存只涨不降)—— 已删,创建仅
+    // 存在于上方 nrKeysChanged 段。
     const int totalMs = static_cast<int>((tSeg.QuadPart - tTotal.QuadPart) * 1000 / qpf.QuadPart);
     char msg[224];
     snprintf(msg, sizeof(msg),
