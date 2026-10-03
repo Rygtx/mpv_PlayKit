@@ -3763,7 +3763,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                     (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
                         ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
                 snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%% ofq=%d %dx%d f=%d fps=%.0f",
+                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%%%s ofq=%d %dx%d f=%d fps=%.0f",
                          gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
                          nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
                          nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
@@ -3775,7 +3775,14 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                          slotEma, g_timing.slotW[lastIdx],
                          lockEma, g_timing.lockW[lastIdx],
                          queueWaitMs,
-                         std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax),
+                         // res 本就是会话配置回显;NR 关(live 门)时缩放整级
+                         // 绕过(nrOff 直连 inputColor),行内就地标注,防误读
+                         // "正在按内部尺寸处理"。
+                         [&] {
+                             const DlssnrParams p = _shared->Snapshot();
+                             return std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax);
+                         }(),
+                         !_shared->Snapshot().nrEnabled ? "(nrOff)" : "",
                          _curOfQuality,
                          _width, _height,
                          _lastFrameN.load(std::memory_order_relaxed),

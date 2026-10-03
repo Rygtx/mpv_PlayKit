@@ -919,11 +919,17 @@ void LoadStats() noexcept {
             // 分辨率展示:VSR 生效(rtx 字段携带 "vsr WxH"/"vsr+hdr WxH")
             // -> 源 → VSR 输出;未开启缩放 -> 原生分辨率;开启 -> 处理分辨率
             // → 回源分辨率。width/height 恒为源尺寸,不含 VSR 输出。
+            // 内部评估档只在 NR 参与时为真:NR 关(live 门)时下游直连全尺寸
+            // inputColor,缩放纹理整级绕过(dlssnr_context nrOff 直连)——
+            // 链条按面板意图折叠(不另加标注,折叠本身即真相;reseek 窗口内
+            // 意图与实际短暂错位,与下方会话行同哲学)。
             const int scaling = static_cast<int>(st.scaling);
             const int iw = static_cast<int>(st.internalW);
             const int ih = static_cast<int>(st.internalH);
             const int w = static_cast<int>(st.width);
             const int h = static_cast<int>(st.height);
+            const bool scalingLive = scaling && g_app.params.nrEnabled != 0 &&
+                                     iw > 0 && ih > 0;
             // rtx 字段格式(dlssnr_context.cpp):"vsr WxH"/"vsr+hdr WxH"/
             // "hdr WxH"/"off" —— 跳到首个数字 sscanf WxH;off 无数字得 0。
             int rw = 0, rh = 0;
@@ -934,7 +940,7 @@ void LoadStats() noexcept {
             }
             if (rw > 0 && rh > 0 && (rw != w || rh != h)) {
                 // VSR 生效:内部评估 → 回源 → VSR 输出,箭头链
-                if (scaling && iw > 0 && ih > 0) {
+                if (scalingLive) {
                     snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                              "分辨率 %dx%d → %dx%d → %dx%d",
                              iw, ih, w, h, rw, rh);
@@ -942,7 +948,7 @@ void LoadStats() noexcept {
                     snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                              "分辨率 %dx%d → %dx%d", w, h, rw, rh);
                 }
-            } else if (scaling && iw > 0 && ih > 0) {
+            } else if (scalingLive) {
                 snprintf(g_app.statsRes, sizeof(g_app.statsRes),
                          "分辨率 %dx%d → %dx%d", iw, ih, w, h);
             } else {
