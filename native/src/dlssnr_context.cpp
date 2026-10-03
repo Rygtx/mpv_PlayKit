@@ -140,6 +140,11 @@ void TimingLog(const char *line) noexcept {
     // the lazy path/handle init below lives inside the lock (it used to race
     // a partially-written path between the first concurrent threads).
     std::lock_guard<std::mutex> lock(g_timingMutex);
+    // 关闭竞态收口(2026-10-04):enabled 检查在锁外(上方),而
+    // SetTimingLogEnabled(false) 是翻标志后才进锁 fclose —— 已过检查的
+    // 日志线程会在锁内看到空句柄,把刚关的文件重新打开(违背"关闭以便
+    // 删/移文件"的设计目的)。重开路径补一次锁内复查。
+    if (!g_timingLogEnabled.load(std::memory_order_relaxed)) return;
     if (!g_timingLogPath[0]) {
         wchar_t dir[MAX_PATH];
         if (!GetModuleFileNameW(nullptr, dir, MAX_PATH)) return;
@@ -625,6 +630,15 @@ bool DlssnrContext::Initialize(
     };
 
     _d3d12 = &d3d12;
+    // GPU 挂起上报接线(设备层 → 面板 stats 通道;传输归宿主层,设备层
+    // 不 include panel_ipc —— 2026-10-04 解耦)。
+    d3d12.SetHangNotify([](const char *reasonUtf8) noexcept {
+        StatsPayload st{};
+        st.gpuHang = 1;
+        std::snprintf(st.removedReason, sizeof(st.removedReason), "%s",
+                      reasonUtf8 ? reasonUtf8 : "");
+        PublishStats(st);
+    });
     _width = width;
     _height = height;
     _depth = depth;
@@ -759,17 +773,18 @@ bool DlssnrContext::Initialize(
             _hdrParams = cap;
             return have && available;
         };
-        if (!vsrCapOk()) {
-            if (_vsrRequested) {
-                TimingStatusLine("DLSSNR STATUS: rtx vsr unavailable (capability); passthrough size");
-                std::snprintf(_rtxDetail, sizeof(_rtxDetail),
-                              "VSR 不可用(capability;驱动/RTX 显卡/nvngx_vsr.dll)");
-            }
+        // 仅 VSR 已请求时才回收几何:vsrCapOk 对 !_vsrRequested 恒 false,
+        // 无条件覆盖会把 DecideRtxGeometry 尾部的取偶结果(本文件 558-590 的
+        // 堆腐蚀级不变量)打回原始奇尺寸 —— 每条普通 NR 会话都会踩。
+        if (_vsrRequested && !vsrCapOk()) {
+            TimingStatusLine("DLSSNR STATUS: rtx vsr unavailable (capability); passthrough size");
+            std::snprintf(_rtxDetail, sizeof(_rtxDetail),
+                          "VSR 不可用(capability;驱动/RTX 显卡/nvngx_vsr.dll)");
             _vsrRequested = false;
-            _pipeW = width;
-            _pipeH = height;
-            _outW = width;
-            _outH = height;
+            _pipeW = width & ~1;
+            _pipeH = height & ~1;
+            _outW = width & ~1;
+            _outH = height & ~1;
         }
         if (!hdrCapOk()) {
             if (_hdrActive) {
@@ -897,9 +912,10 @@ bool DlssnrContext::Initialize(
     _fgHdrInterp = (pInit.fgHdrInterp != 0) && _hdrActive;
     // FG 会话级事实初值:请求了 = 暂记 copy(初始化成功会被下文改写成
     // 实际路由);没请求 = off。失败原因串在此段内逐路径覆写。
-    _fgCreateMult = _fgRequested
-                        ? std::clamp(pInit.fgMultiplier, kFgMultMin, kFgMultMax)
-                        : 0;
+    // M0 不在此暂记:会话边界(SetupFgSession)单点落账,真实值在 4a 段
+    // 就位 —— 此前此处按请求预写,初始化若在会话建立前失败,死态 body
+    // 会谎报 FG 契约倍数。
+    _fgCreateMult = 0;
     std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s", _fgRequested ? "copy" : "off");
     _fgDetail[0] = '\0';
     // 预载失败归因并入(appendProxyNote)与 FG 会话建立一起迁入
@@ -951,7 +967,7 @@ bool DlssnrContext::Initialize(
     // 建立流程 = SetupFgSession(冷初始化与 Rebind 形态重建共用同一条链,
     // 路由/能力块/失败记因不漂移)。
     if (_fgRequested) {
-        SetupFgSession();
+        SetupFgSession(pInit);
     }
 
     // 4b) 光流会话(of_backend 单一后端,默认 FFX):quality > 0 时建立;
@@ -973,13 +989,13 @@ bool DlssnrContext::Initialize(
         }
         if (ofq > 0) {
             char ofErr[160]{};
-            _ofBackend = CreateOfBackend(ofq, _width, _height, ofErr, sizeof(ofErr));
+            _ofBackend = CreateOfBackend(ofq, backendReq, _width, _height, ofErr, sizeof(ofErr));
             if (_ofBackend) {
                 _curOfBackend = backendReq;
                 _ofDetail[0] = '\0';
                 char msg[160];
                 std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: of session created backend=%d quality=%d %dx%d",
-                              _curOfBackend, ofq, _width, _height);
+                              _curOfBackend.load(std::memory_order_relaxed), ofq, _width, _height);
                 DbgLine(msg);
                 TimingLog(msg);
             } else {
@@ -1046,9 +1062,6 @@ bool DlssnrContext::Initialize(
 
     _ready = true;
     {
-        _curPreset = pInit.preset;
-        _curRes = pInit.inputResolutionPercent;
-        _curScaling = pInit.scalingEnabled != 0;
         _appliedCreate = pInit; // 完整建参数存档(Rebind 比对真身,见成员注释)
         char msg[384];
         std::snprintf(msg, sizeof(msg),
@@ -1075,8 +1088,8 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
     const int newHeight = req.dims ? req.newHeight : -1;
     const int newDepth = req.dims ? req.newDepth : -1;
     const RtxVideoParams *const newRtx = req.shape ? &req.rtx : nullptr;
-    const int fgReq = req.shape ? (req.hasFg ? (req.fgRequested ? 1 : 0) : -1) : -1;
-    const int fgHdrReq = req.shape ? (req.hasFgHdr ? (req.fgHdr ? 1 : 0) : -1) : -1;
+    const int fgReq = req.shape ? (req.fgRequested ? 1 : 0) : -1;
+    const int fgHdrReq = req.shape ? (req.fgHdr ? 1 : 0) : -1;
     if (!_ready.load(std::memory_order_acquire) || !_snippetReleaseFeature) {
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
         return false;
@@ -1228,15 +1241,13 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
         if (fgHdrReq >= 0) {
             _fgHdrInterp = (fgHdrReq != 0) && _hdrActive;
         }
-        // FG 会话级事实重算(路由/倍数;stats tick 复用成员即面板可见)。
+        // FG 会话级事实重算(路由;M0 归 SetupFgSession 会话边界单点,
+        // stats tick 复用成员即面板可见)。
         std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
                       !_fgRequested ? "off"
                       : (_fg && _fg->Enabled())
                           ? (DlssfgContext::CachedProxyIsHookStyle() ? "official-hook" : "official")
                           : "copy");
-        _fgCreateMult = (_fgRequested && _fg && _fg->Enabled())
-                            ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
-                            : 0;
         RefreshRtxStateString();
         char msg[160];
         std::snprintf(msg, sizeof(msg),
@@ -1271,12 +1282,18 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
     // 纯 RTX/FG 形态变化(vsrMode/fg 档位)时跳过 ~0.7s 的模型重建
     // (实测日志 nr=617/775ms,是 VSR 切档重建的大头)。
     const DXGI_FORMAT nrFmtAfter = _d3d12->ColorFormat();
-    // res 项带 scalingEnabled 前提 = 唯一权威 CreateParamsChanged 同款
+    // res 项带 scalingEnabled 前提 = 唯一权威 CreateParamsChanged 本尊
     // (dlssnr_params.h):scaling 关时 res 不进管线,不得单独触发重建 ——
     // 否则"关缩放拖 res 滑块 + 任意形态热化"会白付 ~0.7s 模型重建。
-    const bool nrKeysChanged = dimsChange || preset != _curPreset ||
-                               (scalingEnabled != 0 && resPercent != _curRes) ||
-                               (scalingEnabled != 0) != _curScaling ||
+    // 比较走 _appliedCreate 真身(_cur* 三成员已删,三元组规则只在
+    // dlssnr_params.h 一处;请求侧仅填 create 键,新增 create 键时默认值
+    // 与存档必不等 = 朝重建方向误报,安全侧)。
+    DlssnrParams reqCreate{};
+    reqCreate.preset = preset;
+    reqCreate.scalingEnabled = scalingEnabled ? 1 : 0;
+    reqCreate.inputResolutionPercent = resPercent;
+    const bool nrKeysChanged = dimsChange ||
+                               CreateParamsChanged(reqCreate, _appliedCreate) ||
                                nrFmtBefore != nrFmtAfter;
     if (resize && _fgRequested) {
         if (_fg && _fg->Enabled()) {
@@ -1303,8 +1320,7 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
             // SetupFgSession 降级 FG off(_fgProxyNote 归因并入),无重试
             // 风暴(seek 边界一次性)。
             if (!DlssfgContext::CachedProxyIsHookStyle()) {
-                const DlssnrParams &sp = p;
-                if (std::clamp(sp.fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
+                if (std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
                     _fgProxyPath[0] &&
                     dlssfg_gate::GpuFamilyPrefersProxy()) {
                     char proxyErr[96]{};
@@ -1316,7 +1332,7 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
                     }
                 }
             }
-            SetupFgSession();
+            SetupFgSession(p);
         }
     } else if (resize && !_fgRequested && _fg) {
         // on→off:会话保留(热复用免费,重开无缝;FgActive() 请求感知 →
@@ -1330,17 +1346,19 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
     // FG 激活变化改写 follow 语义,由 Rebind 尾部 SyncOfSession 的 stale
     // 检查收口(档位/尺寸失配才重建,无风暴)。
     if (dimsChange && _ofBackend && _curOfQuality > 0 && !_nvofFailed) {
-        const DlssnrParams &sp = p;
         // FG 激活时 MVecs 契约要求源尺寸稠密运动 —— follow 被忽略。
-        const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled && !(_fg && _fg->Enabled());
+        // (谓词 = SyncOfSession 单点;scaling 传请求态,纹理尚未重建。)
+        const bool foll = OfFollowDesired(p, scalingEnabled);
         int iw = _width, ih = _height;
         if (foll) InternalSize(_width, _height, resPercent, iw, ih);
         char ofErr[160]{};
-        auto next = CreateOfBackend(_curOfQuality, iw, ih, ofErr, sizeof(ofErr));
+        auto next = CreateOfBackend(_curOfQuality,
+                                    std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax),
+                                    iw, ih, ofErr, sizeof(ofErr));
         if (next) {
             _retiredOf.push_back(std::move(_ofBackend));
             _ofBackend = std::move(next);
-            _curOfBackend = std::clamp(sp.ofBackend, kOfBackendMin, kOfBackendMax);
+            _curOfBackend = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
         } else {
             _nvofFailed = true;
             // 尺寸重建失败:旧会话尺寸必然已失配(触发本次重建的原因),
@@ -1434,24 +1452,25 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
              drainMs, shapeMs, resMs, postMs, nrMs, totalMs);
     DbgLine(msg);
     TimingLog(msg);
-    _curPreset = preset;
-    _curRes = resPercent;
-    _curScaling = scalingEnabled != 0;
-    // 完整建参数存档(覆盖冷初始化值;三个调用点共享本收口点)。本函数
-    // 入口快照 p 的 create 键恒 == 本次入参(current 侧在消费与传参之间
-    // 只被 ConsumeRebuild 改写,而那正是入参的来源)。
+    // 完整建参数存档(覆盖冷初始化值;三个调用点共享本收口点)。create 键
+    // 以本次入参显式覆写落账 —— 此前依赖"入口快照 p 的 create 键恒 ==
+    // 入参"的跨函数时序论证(只靠注释成立),存档即所建,不再需要该前提。
     _appliedCreate = p;
+    _appliedCreate.preset = preset;
+    _appliedCreate.scalingEnabled = scalingEnabled ? 1 : 0;
+    _appliedCreate.inputResolutionPercent = resPercent;
     return true;
 }
 
 std::unique_ptr<IOpticalFlowBackend> DlssnrContext::CreateOfBackend(
-    int q, int dstW, int dstH, char *err, size_t errLen) noexcept {
+    int q, int backendReq, int dstW, int dstH, char *err, size_t errLen) noexcept {
     // of_backend = 单一后端(用户裁定 2026-09-21:默认 FFX,跨厂商通用;
     // 上游 Magpie 同款 RTX 5070 Ti 上 AMD OF 实测有流)。仅 1 = nvof 时
     // 走 NVOF(NVOF 引擎本身 NVIDIA 专属,内部厂商门会拦截)。失败 =
     // 零 guidance,不跨后端回落(对齐 fg_route 先例:行为可预测)。
-    const int backendReq =
-        std::clamp(_shared->Snapshot().ofBackend, kOfBackendMin, kOfBackendMax);
+    // backendReq 由调用方从其快照传入(2026-10-04:此处曾自取 Snapshot,
+    // 与调用方 stale 裁决用的快照可差一次面板推送,建出"档位旧 + 后端新"
+    // 的缝合会话)。
     if (backendReq == kOfBackendNvof) {
         auto b = std::make_unique<NvofContext>();
         if (!b->Initialize(*_d3d12, dstW, dstH, q, err, errLen)) return nullptr;
@@ -1462,12 +1481,13 @@ std::unique_ptr<IOpticalFlowBackend> DlssnrContext::CreateOfBackend(
     return b;
 }
 
-bool DlssnrContext::SetupFgSession() noexcept {
+bool DlssnrContext::SetupFgSession(const DlssnrParams &p) noexcept {
     // FG 路由选择(0=自动:预载 0.3.x hook 代理后走官方链;1=纯官方:
     // 不预载代理直连官方运行时)。钉档失败不回落(选错档 = FG 关,
-    // 输出 1:1)。
+    // 输出 1:1)。参数 = 调用方快照(单一快照纪律:此处曾自取 Snapshot,
+    // 与调用方裁决所用的快照可差一次面板推送)。
     const int fgRoute =
-        std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax);
+        std::clamp(p.fgRoute, kFgRouteMin, kFgRouteMax);
     // 官方 NGX 链(PORTING #8):官方签名 nvngx_dlssg.dll 与模型 DLL
     // 同目录(ngx\)部署,经共享 NGX core 走官方签名链 —— 免自签
     // proxy 与杀软误报面。参数块 = GetCapability(官方 DLSSG 的 Magpie
@@ -1525,6 +1545,10 @@ bool DlssnrContext::SetupFgSession() noexcept {
                 // 预载后,本会话纯官方在 30/20 系实际仍是 hook 在托)。
                 std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s",
                               DlssfgContext::CachedProxyIsHookStyle() ? "official-hook" : "official");
+                // 成功清因(头文件契约本就如此写,2026-10-04 起兑现):
+                // 瞬时失败自愈后不留过期原因串(面板会同时看到存活的
+                // of/fgMode 和过期的 detail)。
+                _fgDetail[0] = '\0';
             } else {
                 char msg[352];
                 std::snprintf(msg, sizeof(msg),
@@ -1554,9 +1578,22 @@ bool DlssnrContext::SetupFgSession() noexcept {
             appendProxyNote();
         }
         _fgRequested = false; // 槽资源已带 FG 纹理,无害留用
-        _fgCreateMult = 0;    // 未激活:面板倍数 mismatch 判定归零
     }
+    // M0 落账单点(2026-10-04 收拢):会话边界一处同步建活/失败与簿记。
+    // 此前四写点散布(Initialize 暂记/形态段/Rebind/本函数失败路径),
+    // 真正建活的这一处反而不写 —— off→on 热重建(Rebind 簿记时 _fg 尚空)
+    // 后面板 M0 恒 0,"需重建"红显判定被自己的簿记骗了。Rebind 的写点
+    // 保留(新实例契约锚:hot-reuse 路径不进本函数,倍数非 create 键也
+    // 随 seek 换实例刷新)。
+    _fgCreateMult = (fgUp && _fgRequested)
+                        ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
+                        : 0;
     return fgUp;
+}
+
+bool DlssnrContext::OfFollowDesired(const DlssnrParams &p, bool scalingActive) const noexcept {
+    const bool fgLive = _fg && _fg->Enabled() && p.fgEnabled != 0;
+    return p.nvofFollowScaling != 0 && scalingActive && !fgLive;
 }
 
 bool DlssnrContext::SyncOfSession(const DlssnrParams &p, int srcW, int srcH,
@@ -1564,8 +1601,7 @@ bool DlssnrContext::SyncOfSession(const DlssnrParams &p, int srcW, int srcH,
     // 光流会话同步的单一裁决点:此前三份拷贝(Rebind 热路径/RecreateFeature
     // 补齐/ProcessFrame)已互相漂移 —— 前两份含 _nvofFailed 重试项,帧路径
     // 不含。统一在此,帧路径经 allowRetry=false 保持防风暴不对称。
-    const bool fgLive = _fg && _fg->Enabled() && p.fgEnabled != 0;
-    const bool follow = p.nvofFollowScaling != 0 && _d3d12->HasScaling() && !fgLive;
+    const bool follow = OfFollowDesired(p, _d3d12->HasScaling());
     const int nvW = follow ? _d3d12->InternalWidth() : srcW;
     const int nvH = follow ? _d3d12->InternalHeight() : srcH;
     const int backendReq = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
@@ -1650,7 +1686,8 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
             // 先建新会话再弃旧(旧会话仅弃引用,不销毁 —— 见 _retiredOf 注释)。
             // 弃旧的 GPU 资源随 PoolHold 排空后不再被引用,纹理显存由驱动
             // 按引用回收(对象随进程生存)。
-            auto next = revived ? std::move(revived) : CreateOfBackend(q, dstW, dstH, err, errLen);
+            auto next = revived ? std::move(revived)
+                                : CreateOfBackend(q, backendReq, dstW, dstH, err, errLen);
             if (next) {
                 if (_ofBackend) _retiredOf.push_back(std::move(_ofBackend)); // 退役,不销毁
                 _ofBackend = std::move(next);
@@ -1693,9 +1730,13 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
     if (_ofBackend && _ofBackend->Enabled()) {
         char msg[160];
         std::snprintf(msg, sizeof(msg), "DLSSNR STATUS: of rebuilt backend=%d quality=%d %dx%d",
-                      _curOfBackend, _curOfQuality, dstW, dstH);
+                      _curOfBackend.load(std::memory_order_relaxed),
+                      _curOfQuality.load(std::memory_order_relaxed), dstW, dstH);
         DbgLine(msg);
         TimingLog(msg);
+        // 成功清因(与 _fgDetail 同契约,2026-10-04 兑现):瞬时失败自愈后
+        // 不留过期原因串,面板不再同时看到存活会话与过期 detail。
+        _ofDetail[0] = '\0';
     }
     return _ofBackend && _ofBackend->Enabled();
 }
@@ -1761,7 +1802,9 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         char msg[160];
         std::snprintf(msg, sizeof(msg),
                       "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%dd%d internal=%dx%d)",
-                      _curPreset, _curScaling ? _curRes : 100, _curScaling, _curOfQuality,
+                      _appliedCreate.preset,
+                      _appliedCreate.scalingEnabled ? _appliedCreate.inputResolutionPercent : 100,
+                      _appliedCreate.scalingEnabled != 0, _curOfQuality.load(std::memory_order_relaxed),
                       _width, _height, _depth, _d3d12->InternalWidth(), _d3d12->InternalHeight());
         DbgLine(msg);
         TimingLog(msg);
@@ -1777,9 +1820,7 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     recreate.newDepth = depth;
     recreate.shape = shapeChanged;
     recreate.rtx = rtx;
-    recreate.hasFg = shapeChanged;
     recreate.fgRequested = p.fgEnabled != 0;
-    recreate.hasFgHdr = shapeChanged;
     recreate.fgHdr = fgHdrDesired;
     const bool nvofOk = RecreateFeature(recreate, err, errLen);
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
@@ -1823,10 +1864,6 @@ struct FrameFinish {
     int fgM = 0;
     int fgEvaluatedCount = 0;
     int nvofInputIndex = -1;
-    int width = 0;
-    int height = 0;
-    int pipeW = 0;
-    int pipeH = 0;
     double nvofMs = 0.0;    // OF 提交成本(eval_cpu 窗口内扣减用)
     double nvofSpanMs = 0.0; // OF 全跨度(提交+引擎+暴露等待,nvof 段上报值)
     double ofEngineMs = 0.0; // 冲刷点引擎等待(逐帧携带 —— 共享探针会被
@@ -1956,7 +1993,6 @@ bool DlssnrContext::ProcessFrame(
     };
     // Telemetry is always on (QPC reads cost ~ns); timingOut additionally
     // receives a per-frame segment string for the VS-log channel.
-    const bool vsTiming = timingOut && timingLen > 0;
     LARGE_INTEGER qpcFreq{}, t0{}, t1{}, t2{}, t3a{}, t3b{}, t3c{}, t4{};
     LARGE_INTEGER tSlot0{}, tSlot1{}; // AcquireSlot 等待(perf 行 slot=)
     LARGE_INTEGER tLock0{}, tLock1{}; // evaluate 互斥等待(perf 行 lock=)
@@ -2415,7 +2451,7 @@ bool DlssnrContext::ProcessFrame(
         if (tsInline) {
             cl->EndQuery(slot->tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 15);
             cl->ResolveQueryData(slot->tsQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
-                                 14, 2, slot->tsReadback.Get(), 112);
+                                 14, 2, slot->tsReadback.res.Get(), 112);
         }
         QueryPerformanceCounter(&t2);
         if (sehCode) {
@@ -2823,6 +2859,10 @@ bool DlssnrContext::ProcessFrame(
                                 slot->ts[kTsPostVsr].cl.Get(), kTsPostVsr, nullptr, 0);
         vsrDoneFence = _vsr->Queue().Fence();
         vsrDoneVal = fv;
+        // fv 只覆盖 eval,不覆盖其后入队的 post 括号;队尾补一记 Signal 作
+        // 完成锚点,帧槽回收等 vsrDone 才真正蕴含括号完成(0 = Signal 失败,
+        // 设备域故障,回落 eval 值由帧失败路径收尾)。
+        if (const uint64_t sealed = _vsr->Queue().SignalNow()) vsrDoneVal = sealed;
         _pipeLedger.Set(slot->vsrColor.Get(), D3D12_RESOURCE_STATE_COMMON); // NGX 写后衰减
     }
     // 真实帧 TrueHDR(输入 = vsrColor(vsrRun)或 outputColor —— 恒 SDR 域;
@@ -2856,6 +2896,11 @@ bool DlssnrContext::ProcessFrame(
         hdrDoneVal = fv;
         hdrChainFence = hdrDoneFence;
         hdrChainVal = fv;
+        // 同 postVsr:fv 不覆盖 post 括号,队尾补 Signal 收口。
+        if (const uint64_t sealed = _hdr->Queue().SignalNow()) {
+            hdrDoneVal = sealed;
+            hdrChainVal = sealed;
+        }
         _pipeLedger.Set(slot->hdrColor.Get(), D3D12_RESOURCE_STATE_COMMON); // NGX 写后衰减
     }
 
@@ -2910,8 +2955,7 @@ bool DlssnrContext::ProcessFrame(
             // 本段在 fg CL 上、SubmitFgFrame 等 TrueHDR 链尾栅栏之后执行,
             // hdrColor 就绪闭合(修复:旧形态 fg CL 直读 hdrColor 只等 vsr/
             // base 栅栏,与 RTX 队列的 TrueHDR eval 存在跨队列竞态)。
-            _d3d12->RecordHdrToPq(*fgCl, *slot, pipe.w, pipe.h,
-                                  D3D12_RESOURCE_STATE_COMMON);
+            _d3d12->RecordHdrToPq(*fgCl, *slot, D3D12_RESOURCE_STATE_COMMON);
         }
         // MVecs = PIPE 尺寸稠密运动场(FG 契约 = backbuffer 同尺寸、像素
         // 单位):PIPE≠src 时源尺寸 motion 双线性放大进 motionDense。
@@ -3078,6 +3122,11 @@ bool DlssnrContext::ProcessFrame(
             _d3d12->SubmitTsBracket(*slot, _hdr->Queue().Native(),
                                     slot->ts[kTsPostGen].alloc.Get(),
                                     slot->ts[kTsPostGen].cl.Get(), kTsPostGen, nullptr, 0);
+            // 同 postVsr:链尾 fv 不覆盖 postGen 括号,队尾补 Signal 收口。
+            if (const uint64_t sealed = _hdr->Queue().SignalNow()) {
+                hdrDoneVal = sealed;
+                hdrChainVal = sealed;
+            }
         }
     }
     if (!fgBeginOk) {
@@ -3202,14 +3251,16 @@ bool DlssnrContext::ProcessFrame(
                                            : (fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
                                                        : D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
                                "post C2 no-rtx");
-            _d3d12->RecordYuvOutput(*postCl, *slot, matrix, range,
-                                    temporalRan ? (fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                                                            : D3D12_RESOURCE_STATE_COMMON)
-                                                : (fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
-                                                            : D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-                                    temporalRan ? _d3d12->TemporalOut(*slot) : nullptr,
-                                    temporalRan ? D3D12Context::kSrvTemporalOut
-                                                : D3D12Context::kSrvOutputColor);
+            _d3d12->RecordColorOutput(*postCl, *slot,
+                                      temporalRan ? _d3d12->TemporalOut(*slot)
+                                                  : _d3d12->OutputColor(*slot),
+                                      temporalRan ? D3D12Context::kSrvTemporalOut
+                                                  : D3D12Context::kSrvOutputColor,
+                                      ColorOutKind::Sdr, _width, _height, matrix, range,
+                                      temporalRan ? (fgOnFgCl ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                                              : D3D12_RESOURCE_STATE_COMMON)
+                                                  : (fgOnFgCl ? D3D12_RESOURCE_STATE_COMMON
+                                                              : D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
             _pipeLedger.Set(temporalRan ? _d3d12->TemporalOut(*slot)
                                         : _d3d12->OutputColor(*slot),
                             D3D12_RESOURCE_STATE_COMMON);
@@ -3243,19 +3294,15 @@ bool DlssnrContext::ProcessFrame(
                     };
                     postCl->ResourceBarrier(1, fiBack);
                 } else {
-                    if (_rtxActive) {
-                        _d3d12->RecordColorOutput(*postCl, *slot, slot->fgInterp[g].Get(),
-                                                  D3D12Context::kSrvFgInterpBase + g,
-                                                  hdrLegacyInterp ? ColorOutKind::HdrPqCodes
-                                                                  : ColorOutKind::Sdr,
-                                                  pipe.w, pipe.h, matrix, range,
-                                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                    } else {
-                        _d3d12->RecordYuvOutput(*postCl, *slot, matrix, range,
-                                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                                                slot->fgInterp[g].Get(),
-                                                D3D12Context::kSrvFgInterpBase + g);
-                    }
+                    // 统一走 RecordColorOutput(2026-10-04,RecordYuvOutput 已
+                    // 并入):!_rtxActive 时 pipe.w/h == 源尺寸,1:1 判据自动
+                    // 选直写 PSO,与旧 Yuv 直写路径逐位同价。
+                    _d3d12->RecordColorOutput(*postCl, *slot, slot->fgInterp[g].Get(),
+                                              D3D12Context::kSrvFgInterpBase + g,
+                                              hdrLegacyInterp ? ColorOutKind::HdrPqCodes
+                                                              : ColorOutKind::Sdr,
+                                              pipe.w, pipe.h, matrix, range,
+                                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                     if (!_d3d12->RecordReadbackCopy(*postCl, *slot, err, errLen, g)) {
                         return false;
                     }
@@ -3267,7 +3314,7 @@ bool DlssnrContext::ProcessFrame(
         //    hdr-only 拆分形态的 outputColor|inputColor —— post 不消费它们;
         //  - NR 关直连的 inputColor(= rtxColorIn,TrueHDR 消费过):hdr-only
         //    拆分形态它就是管线色(上一分支已归位),不重复。
-        // 其余形态的管线色由 C2 消费,RecordColorOutput/RecordYuvOutput 自带
+        // 其余形态的管线色由 C2 消费,RecordColorOutput 自带
         // 收尾归位。post 等 TrueHDR 链尾栅栏 —— 这些归位与 RTX 队列并发读
         // 的竞态窗口在此闭合(原 fg CL 尾归位的既有竞态顺带修复)。
         if (fgOnFgCl) {
@@ -3372,8 +3419,6 @@ bool DlssnrContext::ProcessFrame(
         ff->ofNeeded = ofNeeded; ff->fgRan = fgRan;
         ff->fgM = fgM; ff->fgEvaluatedCount = fgEvaluatedCount;
         ff->nvofInputIndex = nvofInputIndex;
-        ff->width = width; ff->height = height;
-        ff->pipeW = pipe.w; ff->pipeH = pipe.h;
         // nvof 段上报值 = 光流阶段全跨度(2026-09-25 语义修正):门入口 →
         // 冲刷完成 = 提交 + 引擎计算 + 暴露等待,即真实光流处理用时。此处
         // 读取时冲刷已落位(点 A/B/C 均在 packFinish 前),fgMutex 下无跨帧
@@ -3477,7 +3522,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
     if (ff->slot->tsValid) {
         ff->t3a = ff->t2;
         // postBase 括号 = 索引 1(索引 0 已被 preBase 占用,见 d3d12_context.h 布局)
-        const UINT64 tsEnd = static_cast<const UINT64 *>(ff->slot->tsReadbackMapped)[1];
+        const UINT64 tsEnd = static_cast<const UINT64 *>(ff->slot->tsReadback.mapped)[1];
         if (tsEnd > ff->slot->tsGpuCal) {
             const double deltaQpc =
                 static_cast<double>(tsEnd - ff->slot->tsGpuCal) / _d3d12->GpuTsFreq() *
@@ -3494,8 +3539,8 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
     double baseGpuMs = 0.0, queueWaitMs = 0.0, fgGpuMs = 0.0, convGpuMs = 0.0;
     double rtxVsrGpuMs = 0.0, rtxHdrRealMs = 0.0, rtxHdrGenMs = 0.0;
     const bool tsAcc = ff->slot->tsValid;
-    const UINT64 *tsq = ff->slot->tsReadbackMapped
-                            ? static_cast<const UINT64 *>(ff->slot->tsReadbackMapped)
+    const UINT64 *tsq = ff->slot->tsReadback.mapped
+                            ? static_cast<const UINT64 *>(ff->slot->tsReadback.mapped)
                             : nullptr;
     const double tickMs = 1000.0 / _d3d12->GpuTsFreq();
     // 括号差分防线(2026-10-02):readback 帧首已清零(SubmitBaseFrame),
@@ -3531,8 +3576,8 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
     // 随整本清零),等待已由 WaitFrame 蕴含。每帧一行 —— 计数证据:ok 行数
     // = 内联组合存活帧数;NO-TS = 本帧没走 eval(播种/直通);SEH/设备移除
     // 在别处留痕(帧路径 eval 域与 WaitFrame 失败路径)。
-    if (TsInlineProbeEnabled() && ff->slot->tsReadbackMapped) {
-        const UINT64 *tsqP = static_cast<const UINT64 *>(ff->slot->tsReadbackMapped);
+    if (TsInlineProbeEnabled() && ff->slot->tsReadback.mapped) {
+        const UINT64 *tsqP = static_cast<const UINT64 *>(ff->slot->tsReadback.mapped);
         char pbuf[128];
         if (tsqP[14] && tsqP[15] && tsqP[15] > tsqP[14]) {
             std::snprintf(pbuf, sizeof(pbuf), "TS-INLINE: f=%d ok delta=%.3fms",
@@ -3716,12 +3761,11 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             const bool perfNrOff = !_shared->Snapshot().nrEnabled;
             const double perfFps = _fpsMeter.Rate();
             snprintf(line, sizeof(line),
-                     "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%%%s ofq=%d %dx%d f=%d fps=%.0f",
+                     "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%%%s ofq=%d %dx%d f=%d fps=%.0f",
                      gpuLast, gpuEma, perfGpuP99, packEma, nvofEma, perfNvofLast,
                      nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
                      nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
                      ff->ofEngineMs,
-                     nvProbe ? nvProbe->GateSkips() : 0u,
                      nvProbe ? nvProbe->GateExpired() : 0u,
                      nvProbe ? nvProbe->ResetCount() : 0u,
                      evalCpuEma, fgLast, rtxVsrLast, rtxHdrLast, convLast, unpackEma, subWaitMs,
@@ -3730,13 +3774,14 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      queueWaitMs,
                      perfResPct,
                      perfNrOff ? "(nrOff)" : "",
-                     _curOfQuality,
+                     _curOfQuality.load(std::memory_order_relaxed),
                      _width, _height,
                      _lastFrameN.load(std::memory_order_relaxed),
                      perfFps);
             // nvof=ema/last;后缀 g/c/e = 门等待/前帧拷贝等待/引擎输出等待,
-            // s/x/r = 门跳帧/过期帧/历史重置累计(探针保留:时序类问题的
-            // 第一手证据)。ff->slot/lock = 槽池等待 / evaluate 互斥等待
+            // x/r = 过期帧/历史重置累计(探针保留:时序类问题的第一手证据;
+            // 2026-10-04 撤恒 0 的 s=GateSkips,死指标,原 cv 超时门已删)。
+            // ff->slot/lock = 槽池等待 / evaluate 互斥等待
             // (ema/last);f = 本行前一帧的帧号(与 STATUS 行对齐用);
             // fps = 4s 窗口帧入口计数均值,处理帧率 < 源帧率 = 宿主侧没来帧。
         }
@@ -3784,12 +3829,18 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             st.evalActive = ff->evalZeroed ? 0u : 1u;
             st.ofActive = ff->ofNeeded ? 1u : 0u;
             st.scalingActive = (_d3d12->HasScaling() && !ff->nrOff) ? 1u : 0u;
+            // rtx 实效位/数值尺寸(DSLA):面板 HDR 打标与分辨率链直读,rtx
+            // 显示串回归纯显示(免 strstr/sscanf 人读串 parse)。位 = 本帧
+            // RTX 段真跑(完成栅栏已挂);尺寸 = 输出几何成员(会话稳定)。
+            st.rtxVsrActive = ff->vsrDoneFence ? 1u : 0u;
+            st.rtxHdrActive = ff->hdrDoneFence ? 1u : 0u;
+            st.rtxOutW = static_cast<uint32_t>(_outW);
+            st.rtxOutH = static_cast<uint32_t>(_outH);
             FillStatsCommon(st);
             CopyStatStr(st.fgState, fgState);
             st.fgMult = static_cast<uint32_t>(ff->fgM);
             st.slotWait = static_cast<float>(slotWaitLast);
             st.lockWait = static_cast<float>(lockWaitLast);
-            st.gateSkips = nvStats ? nvStats->GateSkips() : 0u;
             st.gateExpired = nvStats ? nvStats->GateExpired() : 0u;
             st.gateResets = nvStats ? nvStats->ResetCount() : 0u;
             CopyStatStr(st.temporal,
@@ -3842,7 +3893,7 @@ void DlssnrContext::DumpFrameDiagnostics(FrameFinish &ff) noexcept {
     if (ProbeEnabled()) {
         char probe[96];
         std::snprintf(probe, sizeof(probe), "PROBE: dump-site realMotion=%d ofQ=%d",
-                      ff.realMotion ? 1 : 0, _curOfQuality);
+                      ff.realMotion ? 1 : 0, _curOfQuality.load(std::memory_order_relaxed));
         TimingStatusLine(probe);
     }
     // VSDLSSNR_DUMP_SKIP=N:跳过前 N 个真运动帧再 dump(warmup 帧

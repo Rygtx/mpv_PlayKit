@@ -11,15 +11,21 @@
 #include "panel_ipc.h"
 
 #include <windows.h>
+#include <atomic>
 
 using namespace vsdlssnr;
 
 struct ImFont;
 
 // 进程退出旗标:主循环(WM_QUIT)、看门狗与 HDR 打标线程轮询同一位。
-extern bool g_quit;
+extern std::atomic<bool> g_quit;
 struct AppState {
     DlssnrParams params{};
+    // stats 通道整快照(2026-10-04 快照化:此前 25+ 字段逐个镜像 StatsPayload
+    // 并配三份手抄清单(直读/Clear/snap==0 判定),v28 加字段时清单已失序
+    // 一次 —— 整拷 = "body 未携带即发布侧零值"语义天然成立,新字段零接线)。
+    // UI/闭环兜底直读本快照;字段语义见 panel_ipc.h StatsPayload 注释。
+    StatsPayload snap{};
     int lastVsrMode = 1; // 最近一次非零 VSR 模式(1=自动 2=手动):取消勾选
                          // 后重新勾选恢复它,而不是恒落回自动 —— 恒落回曾把
                          // "手动倍率"选择静默丢弃,勾回后 VSR 在 4K 窗口旁路
@@ -31,7 +37,8 @@ struct AppState {
                               // flush 时 WritePayload 后自动触发 mpv 原地 seek
     bool timingLog = true;
     bool advancedOpen = false; // 残差精调折叠区(ini [panel] advanced 记忆)
-    int page = 0;              // 功能页签:0=神经渲染,1=帧生成(ini [panel] page 记忆)
+    int page = 0;              // 功能页签:0=神经渲染 1=帧生成 2=RTX 超分/HDR
+                               // 3=诊断(ini [panel] page 记忆)
     bool pageRestore = true;   // 页签启动恢复锁:恢复期内每帧重喂 SetSelected 并
                                // 强制重绘,直到期望页真正可见(或预算烧完)才解除。
                                // 只喂首帧不够 —— SetSelected 排队到下一帧布局才
@@ -45,41 +52,10 @@ struct AppState {
     char status[160]{};
     char statsBig[64]{};
     char statsRes[96]{};
-    char gpuName[128]{};
-    char modelDll[64]{};     // StatsPayload.modelDll: 加载的模型 dll 文件名(诊断页)
-    char filterState[16]{};  // StatsPayload.filterState: ok / nvof_zero / passthrough / ngx_faulted
-    char stateDetail[208]{}; // StatsPayload.stateDetail: 死亡状态的原因串
-                             // (生产端 %.200s 封顶,缓冲须容 200+NUL,见 plugin.cpp)
-    char ofMode[40]{};       // StatsPayload.ofMode: off / zero / 后端能力串(最长
-                             // "fxof q5 qual 1920x1080" = 23+1;与插件 _ofModeBuf 同尺寸)
-    char fgState[16]{};      // StatsPayload.fgState: on / dup / off / unavailable
-    int fgMult = 0;          // StatsPayload.fgMult: 当前插帧倍数(未激活 = 0)
-    char fgRouteEff[16]{};   // StatsPayload.fgRouteEff: off/official-hook/official/copy
-    int fgMultCreate = 0;    // StatsPayload.fgMultCreate: 会话创建倍数(FG 未激活 = 0)
-    char fgDetail[128]{};    // StatsPayload.fgDetail: FG 最近一次初始化失败原因(成功 = 空)
-    int fgMultMax = 0;       // StatsPayload.fgMultMax: 运行库插值帧上限(FG 未激活 = 0)。
-                             // gate 解锁失败回落 2x 的唯一面板侧信号源
-    char ofDetail[96]{};     // StatsPayload.ofDetail: 光流会话创建失败原因(成功 = 空)
-    char rtxState[32]{};     // StatsPayload.rtx: off / vsr / hdr / vsr+hdr + 实际输出分辨率
-                             // ("vsr+hdr 15360x8640" = 18+NUL;原 16 字节把分辨率
-                             // 截成 "7680x43" —— 诊断页"实际"显示不全的根因)
-    char rtxDetail[96]{};    // StatsPayload.rtxDetail: VSR/TrueHDR 最近失败原因(成功 = 空)
     int connState = 0;       // stats 通道连接态:0=未检测到插件 1=已连接
                              // 2=magic 不匹配(面板/插件版本未成对更新)
     int fgOptimized = 1;     // dlssg_for_sm86 [FrameGeneration] Optimized 0-3
                              // (存储单点 = 代理 ini;面板启动回读,重启 mpv 生效)
-    float slotWait = 0.0f;   // StatsPayload.slotWait: 槽池等待 last(诊断页)
-    float lockWait = 0.0f;   // StatsPayload.lockWait: evaluate 互斥等待 last(诊断页)
-    int evalActive = 0;      // StatsPayload.evalActive: 本帧 NGX/NR 真评估(DSL9 实效位)
-    int ofActive = 0;        // StatsPayload.ofActive: 本帧光流消费门开
-    int scalingActive = 0;   // StatsPayload.scalingActive: 本帧内部缩放档真参与
-    int gateSkips = 0;       // StatsPayload.gateSkips: 光流帧序门跳帧累计(诊断页)
-    int gateExpired = 0;     // StatsPayload.gateExpired: 过期帧累计(诊断页)
-    int gateResets = 0;      // StatsPayload.gateResets: 历史重置累计(诊断页)
-    char temporalState[10]{}; // StatsPayload.temporal: off / seed / steady / failed(诊断页)
-    int temporalRoute = 0;   // StatsPayload.temporalRoute: 实际生效档 0-4(诊断页)
-    float temporalW = 0.0f;  // StatsPayload.temporalW: 最近一帧混合权重(诊断页)
-    double fps = 0.0;
     // 分段显示值(EMA 平滑,用户裁定"显示平滑、真实数据不平滑"):每拍从
     // 插件上报的裸 last 值就地喂 EMA;时间线/列表/tooltip 用平滑值,避免
     // CPU 唤醒竞争造成的瞬时 0 让段忽隐忽现。
@@ -110,10 +86,9 @@ bool BasePath(wchar_t *path, size_t len) noexcept;
 void PanelLog(const char *fmt, ...) noexcept;
 bool WriteIniNow() noexcept;
 bool WriteFgOptimizedIni(int v) noexcept;
-void WritePayload(bool saveRequest = false) noexcept;
+void WritePayload() noexcept;
 
 // ---- panel_mpv_ipc.cpp ----
-bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept;
 bool TriggerMpvReseek() noexcept;
 DWORD WINAPI HdrTagProc(LPVOID) noexcept; // HDR 打标线程入口(wWinMain 拉起)
 

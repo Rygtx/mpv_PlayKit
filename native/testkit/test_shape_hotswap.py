@@ -166,14 +166,17 @@ def main():
 
         # ---- VSR off + FG on:会话落定(激活 ×2 或优雅降级记因)----
         # DLSSG 有最小分辨率约束(640x360 上官方链 0xBAD0000B,640x480 可
-        # 用):本机/媒体组合下激活与降级都合法,共同点 = shape 段热运行 +
-        # 无冷回落 + 结果有迹可查。
+        # 用):本机/媒体组合下激活与降级都合法。FG 首开路径自 2026-10-03
+        # fgProxyCold(d1735b0)起恒走冷启:代理必须先于 NGX core 附着(进程
+        # 级单例约束),热 shape 段只在其后已附着的进程里出现 —— 两态皆
+        # 合法,共同点 = 会话落定有迹可查 + 无"rebind 失败回落"。
         off = testenv.log_size(TIMING_LOG)
         testenv.set_ini("rtxvideo", "vsr_mode", "0")
         testenv.set_ini("dlssnr", "fg_enabled", "1")
         seek()
         hit, lines = window(off,
-                            lambda ls: any("hot rebind shape" in l for l in ls)
+                            lambda ls: any(("hot rebind shape" in l)
+                                           or ("dlssfg ready" in l) for l in ls)
                             and any(("fg active, output fps x2" in l)
                                     or ("dlssfg official init failed" in l)
                                     or ("dlssfg nvngx_dlssg.dll missing" in l)
@@ -185,7 +188,10 @@ def main():
         else:
             check("fg on: degraded with reason (shape fg=0)",
                   any("hot rebind shape" in l and "fg=0" in l for l in lines))
-        assert_warm(lines, "fg on")
+        check("fg on: hot shape or designed cold (proxy attach)",
+              any(("hot rebind shape" in l) or ("dlssfg ready" in l) for l in lines))
+        check("fg on: no rebind-failure fallback",
+              not any("hot rebind failed" in l or "re-initializing" in l for l in lines))
 
         # ---- FG on→off:输出 1:1(FgActive 请求感知),无 fg active 新行 ----
         # FG 激活成功时本步是 shape 段(请求翻转);上一步降级已把 _fgRequested

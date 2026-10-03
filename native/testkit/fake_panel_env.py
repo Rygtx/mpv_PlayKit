@@ -65,7 +65,9 @@ STATS_BASE = {
     "fg_detail": "",
     "rtx": "off", "rtx_detail": "",
     "slot_wait": 1.23, "lock_wait": 0.45,
-    "gate_skips": 3, "gate_expired": 1, "gate_resets": 2,
+    "gate_expired": 1, "gate_resets": 2,
+    "eval_active": 1, "of_active": 1, "scaling_active": 1,
+    "rtx_vsr_active": 0, "rtx_hdr_active": 0, "rtx_out_w": 0, "rtx_out_h": 0,
     "temporal": "off", "temporal_route": 0, "temporal_w": 0.0,
 }
 

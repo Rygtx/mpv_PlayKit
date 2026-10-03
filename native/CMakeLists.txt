@@ -77,6 +77,7 @@ add_library(vs_dlssnr SHARED
     src/ffxof_context.cpp        # AMD FidelityFX OF 会话(of_backend=0,默认)
     src/rtx_video_context.cpp    # RTX Video(NGX VSR + TrueHDR;RTX Video SDK 1.1)
     src/iat_hook.cpp
+    src/mpv_pipe_common.cpp      # mpv.conf input-ipc-server 解析(resize watcher 用,与面板共用)
     src/nv_gpu_probe.cpp         # NVAPI GPU 架构探测(FG 门 / NR 选档共用中立件)
     src/d3d12_context.cpp
     src/bridge.cpp
@@ -158,6 +159,7 @@ set_source_files_properties(src/panel.rc src/plugin.rc PROPERTIES
 add_executable(dlssnr_panel WIN32
     src/panel_app.cpp
     src/panel_mpv_ipc.cpp        # mpv 管道:命令 + HDR 打标持久连接
+    src/mpv_pipe_common.cpp      # mpv.conf input-ipc-server 解析(与插件共用)
     src/panel_stats.cpp          # stats 共享内存消费(视图缓存/快照/直读)
     src/panel_ui.cpp             # 全部 ImGui(DrawUi + 四页签)
     src/panel.rc              # 图标 + 版本信息 (IDI_PANEL_ICON, ico 由 tools/make_panel_icon.py 生成)

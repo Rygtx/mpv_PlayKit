@@ -139,6 +139,20 @@ enum class ColorRange : int { Full = 0, Limited = 1 };
 // PqEncode);HdrPqCodes = FP16 PQ 码域(PQ 域插帧产物,码直读免 pow)。
 enum class ColorOutKind : int { Sdr = 0, HdrScRgb = 1, HdrPqCodes = 2 };
 
+// persist 常驻映射对(2026-10-04 RAII 化):资源 + 创建时 Map 的常驻指针,
+// 释放单点(此前 Create/Finalize 两处手抄同一份枚举清单,漏一处 = 悬空映射
+// 或句柄泄漏 —— 2026-09-26 use-after-free 闪退族的邻近区域)。新增 persist
+// 缓冲只改成员与本结构,释放路径自动归一。
+struct PersistMapped {
+    ComPtr<ID3D12Resource> res;
+    void *mapped = nullptr;
+    void Unmap() noexcept {
+        if (res && mapped) res->Unmap(0, nullptr);
+        mapped = nullptr;
+        res.Reset();
+    }
+};
+
 // Per-frame-in-flight resources; acquired from the slot pool for the duration
 // of one getFrame call.
 struct FrameSlot {
@@ -166,8 +180,9 @@ struct FrameSlot {
     // postB 栅栏等待统一走 WaitFenceValuePublic + 事件入参。
     uint64_t postFenceValue = 0;      // postB 段提交的栅栏值
     uint64_t fgFenceValue = 0;        // postA(fg CL)提交的栅栏值(计时锚)
-    // base 段 GPU 完成时间戳路径(2026-09-25:WaitBaseFrame CPU 阻塞删除,
-    // RTX/fg/post 提交链与 base GPU 执行重叠)。timestamp 打点不与 NGX 同 CL
+    // base 段 GPU 完成时间戳路径(RTX/fg/post 提交链与 base GPU 执行重叠;
+    // WaitBaseFrame CPU 阻塞的常态路径已由时间戳括号替代,仅 ts 失败回退
+    // 仍有一处有界阻塞,见 WaitBaseFrame 实现处注释)。timestamp 打点不与 NGX 同 CL
     // 内联(2026-09-05 单次观测 SEH;2026-10-02 复核未复现,见
     // dlssnr_context.cpp NOTE)—— 独立微型 CL 括号对夹住各段(同一
     // _submitMutex 保证队列序),EndQuery + ResolveQueryData 写 READBACK 缓冲;
@@ -186,15 +201,16 @@ struct FrameSlot {
     //   0=preBase 1=postBase 2=preFg 3=postFg 4=post0 5=post1(readback 布局)
     //   6=preVsr 7=postVsr 8=preHdr 9=postHdr 10=preGen 11=postGen(RTX 段,
     //   2026-10-02 括号化;VSR/HDR 专用队列,括号与 eval 同锁同线程程序序
-    //   提交,FIFO 包住 eval;槽复用纪律兜底 allocator —— 槽归还蕴含上一帧
-    //   RTX 链完成);14/15 = TS-INLINE 探针(VSDLSSNR_TS_INLINE)
-    ComPtr<ID3D12QueryHeap> tsQueryHeap;    // 6 查询(容量 8 取整)
+    //   提交,FIFO 包住 eval;槽归还蕴含上一帧 RTX 链完成 = eval + 括号:
+    //   post 括号入队在 eval Signal 之后,由调用方在括号尾 RtxQueue::
+    //   SignalNow 补队尾锚点(2026-10-04),消费方等锚点值);14/15 = TS-
+    //   INLINE 探针(VSDLSSNR_TS_INLINE)
+    ComPtr<ID3D12QueryHeap> tsQueryHeap;    // 12 槽 + 2 探针(容量 16 取整)
     // 括号 CL 对(枚举值 = readback 索引,见上方 TsSlot):创建/释放/取用全按
     // 数组下标(Post0/Post1 无括号 CL,位恒空)。未提交(段未跑)时 readback
     // 索引保持帧首清零值,Finish 按缺账记 0。
     TsBracket ts[kTsSlotCount];
-    ComPtr<ID3D12Resource> tsReadback;      // 128 字节 READBACK(16×UINT64,布局见上),persist-mapped
-    void *tsReadbackMapped = nullptr;
+    PersistMapped tsReadback;               // 128 字节 READBACK(16×UINT64,布局见上)
     UINT64 tsGpuCal = 0;                    // 校准点 GPU tick(base 提交时)
     UINT64 tsCpuCal = 0;                    // 校准点 QPC
     UINT64 submitQpc = 0;                   // SubmitBaseFrame 入口 QPC(排队段锚)
@@ -212,11 +228,9 @@ struct FrameSlot {
     // 版本本身。2026-10-02 用户裁定:输入侧启用直读(typed buffer SRV,
     // 3×upload→yuvIn 拷贝与 yuvIn 纹理已撤);输出侧仍绕道 —— READBACK 堆
     // 不允许 UAV,shader 无法直写 CPU 可见内存,一趟拷贝是 D3D12 地板。
-    ComPtr<ID3D12Resource> uploadYuv[3];
-    void *uploadYuvMapped[3] = {};
+    PersistMapped uploadYuv[3];
     size_t uploadPitchYuv[3] = {};
-    ComPtr<ID3D12Resource> readbackYuv[3];
-    void *readbackYuvMapped[3] = {};
+    PersistMapped readbackYuv[3];
     size_t readbackPitchYuv[3] = {};
     // GPU 侧 YUV 纹理:Out = RGB→YUV dispatch 写出供 readback。格式
     // R8_UNORM(8bit)/R16_UNORM(10bit),10bit 存储字 = VS P10 采样值
@@ -268,8 +282,7 @@ struct FrameSlot {
     // 先后多次转换+回读,真实帧回读不能被插值帧覆写)。按插值槽分组
     // [gen 0..kFgGenSlots-1][plane] —— 倍数 M 时 M-1 个插值帧各自落一组,
     // 每组转换+回读后 yuvOut 归位供下一槽复用。
-    ComPtr<ID3D12Resource> readbackFg[kFgGenSlots][3];
-    void *readbackFgMapped[kFgGenSlots][3] = {};
+    PersistMapped readbackFg[kFgGenSlots][3];
     size_t readbackPitchFg[kFgGenSlots][3] = {};
     // slot-local shader-visible heap:槽位布局的唯一权威 = namespace 级
     // enum HeapSlot(0-65,含废弃空位说明),此处不再维护注释副本。
@@ -285,6 +298,10 @@ public:
 
     bool Initialize(char *err, size_t errLen) noexcept;
     void Finalize() noexcept;
+    // GPU 挂起上报回调(宿主层接线;2026-10-04 解耦:设备层不再直连面板
+    // IPC —— 传输渠道归宿主定,单测/复用不被 stats 通道牵连)。挂起时以
+    // 移除原因串("0x%08lX")调用;未设 = 只走 timing log/Debug 通道。
+    void SetHangNotify(void (*fn)(const char *reasonUtf8)) noexcept { _hangNotify = fn; }
 
     ID3D12Device *Device() const noexcept { return _device.Get(); }
     IDXGIAdapter1 *Adapter() const noexcept { return _adapter.Get(); }
@@ -418,20 +435,17 @@ public:
     void RecordConvertInput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                             ColorMatrix matrix, ColorRange range,
                             D3D12_RESOURCE_STATES stateAfter) noexcept;
-    void RecordYuvOutput(ID3D12GraphicsCommandList &cl, FrameSlot &slot, ColorMatrix matrix,
-                         ColorRange range, D3D12_RESOURCE_STATES outputStateBefore,
-                         ID3D12Resource *srcColor = nullptr,
-                         UINT srcSrvIndex = kSrvOutputColor) noexcept;
-    // RTX Video 管线的颜色输出(PIPE 尺寸源 → OUT 尺寸 YUV 平面):
-    //   Sdr       → BGRA8 源,归一化 uv 双线性缩放采样(SDR;矩阵/范围
-    //                同 RecordYuvOutput);1:1 时与旧路径逐位同价。
+    // 颜色输出统一出口(2026-10-04:RecordYuvOutput 已并入 —— 原 SDR 直写
+    // 双胞胎只在读哪组尺寸成员上有差别,且已单边漂移:直写优化分支只在
+    // Color 侧有。非 RTX 调用点传源尺寸,1:1 判据自动选直写 PSO,逐位同价):
+    //   Sdr       → BGRA8 源,归一化 uv 双线性缩放采样(SDR);1:1 直写。
     //   HdrScRgb  → FP16 scRGB 线性源(HDR):709→2020 线性域转换 →
     //                PQ(ST 2084)编码 → BT.2020 limited → P10 平面。
     //                scRGB 语义:1.0 = 80 nits(SDR 参考白)。
     //   HdrPqCodes → FP16 PQ 码域源(真HDR 插帧的 fgInterp[g]):码直读,
     //                免逐像素 PqEncode;BT.2020 limited → P10 平面。
-    // 源状态契约与 RecordYuvOutput 相同:stateBefore(UAV/NSR)→ NSR 转换 →
-    // 收尾归 COMMON;yuvOut 留 UAV 交 RecordReadbackCopy。dstW/H = OUT 尺寸。
+    // 源状态契约:stateBefore(UAV/NSR)→ NSR 转换 → 收尾归 COMMON;
+    // yuvOut 留 UAV 交 RecordReadbackCopy。
     void RecordColorOutput(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
                            ID3D12Resource *srcColor, UINT srcSrvIndex,
                            ColorOutKind kind, int srcW, int srcH,
@@ -445,7 +459,6 @@ public:
     // 仅 fgHdrInterp 且 fg 段开启时被记录(fg CL 上、eval 前 —— SubmitFgFrame
     // 等 TrueHDR 链尾栅栏,跨队列就绪已闭合)。
     void RecordHdrToPq(ID3D12GraphicsCommandList &cl, FrameSlot &slot,
-                       int w, int h,
                        D3D12_RESOURCE_STATES stateBefore) noexcept;
     // 源尺寸稠密运动场 → PIPE 尺寸双线性放大(FG MVecs 契约 = backbuffer
     // 同尺寸,像素单位向量;双线性对 R16G16F 向量场 = 线性插值,语义保真)。
@@ -506,7 +519,7 @@ public:
     // FG 分段 CL 的录制起点(防砖 retry 与 base 同款)。仅 FG 插帧链录在
     // fgCommandList 上;门关帧不 Begin/不提交,slot.fenceValue 停在 base 值。
     bool BeginFgRecording(FrameSlot &slot) noexcept;
-    // 记录:yuvOut ×3 UAV→COPY_SOURCE→拷贝→COMMON(在 RecordYuvOutput 之后,
+    // 记录:yuvOut ×3 UAV→COPY_SOURCE→拷贝→COMMON(在 RecordColorOutput 之后,
     // yuvOut 处于 UAV 态)。fgGen >= 0 = 拷入 FG 插值帧第 fgGen 组回读缓冲;
     // 同一条 CL 上真实帧 + 各插值槽的转换+回读共用 yuvOut,目标缓冲必须
     // 两两不同。cl 由调用方显式给定(真实帧 = base CL,插值 = fg CL)。
@@ -576,7 +589,7 @@ public:
     // |outputColor − inputColor| 逐通道最大差 ×20 的灰度图替换输出。
     // 调用契约(dlssnr_context 帧路径):outputColor 处于 UAV 态(eval/残差/
     // 直通三路帧末一致),inputColor 处于 COMMON;调用后 outputColor 保持
-    // UAV(RecordYuvOutput 的 stateBefore 契约不变),inputColor 归 COMMON。
+    // UAV(RecordColorOutput 的 stateBefore 契约不变),inputColor 归 COMMON。
     // _debugDiff 为 context 级共享单纹理:dispatch+copyback 在同一条槽 CL
     // 上原子成对,队列按提交序串行,并发帧的记录对不交错。
     void RecordDebugDiff(FrameSlot &slot) noexcept;
@@ -613,7 +626,7 @@ public:
                         float weight) noexcept;
     int TemporalMode() const noexcept { return _temporalMode; }
     ID3D12Resource *FgInterp(FrameSlot &s, int gen) const noexcept { return s.fgInterp[gen].Get(); }
-    // 描述符堆槽位(RecordYuvOutput / FG 转换共用)—— 全部为 enum HeapSlot
+    // 描述符堆槽位(RecordColorOutput / FG 转换共用)—— 全部为 enum HeapSlot
     // 的具名别名(外部调用面沿用 k 前缀名;取值以枚举为唯一权威)。
     static constexpr UINT kSrvOutputColor = static_cast<UINT>(HeapSlot::SrvOutputColor);
     static constexpr UINT kSrvFgInterpBase = static_cast<UINT>(HeapSlot::SrvFgInterp0); // fgInterp[0..4]
@@ -678,7 +691,8 @@ private:
     // ResidualMultiplier@7, ResidualSaturation@8, ResidualLightness@9,
     // ShadowStructureMultiplier@10, ReflectionGlowMultiplier@11 — mirrors the
     // four HLSL cbuffer blocks (Magpie ResampleConstants, 48 bytes).
-    void RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, UINT srv0, UINT srv1, UINT uav,
+    void RecordPass(FrameSlot &slot, ID3D12PipelineState *pso, HeapSlot srv0, HeapSlot srv1,
+                    HeapSlot uav,
                     UINT dispatchX, UINT dispatchY, const ResidualControls &rc) noexcept;
     // guidance 降采样专用:同 12 常量 cbuffer,但 SRV/UAV 各两个
     // (t0/t1 = motion/confidence,u0/u1 = reducedMotion/reducedConfidence)。
@@ -708,6 +722,7 @@ private:
     bool _gpuTsEnabled = false;
     std::atomic<uint64_t> _fenceValue{0};
     std::atomic<bool> _deviceLost{false};
+    void (*_hangNotify)(const char *) = nullptr; // 宿主层接线,见 SetHangNotify
     // serializes fetch_add + Signal so the fence value order matches the
     // queue's ExecuteCommandLists order (a fence value must never regress)
     std::mutex _submitMutex;

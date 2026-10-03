@@ -1,8 +1,8 @@
 #pragma once
 // Panel parameter channel: the tray panel (dlssnr_panel.exe) pushes the full
 // parameter set into a named shared-memory mapping (panel_ipc.h); the bridge
-// polls it and applies changes onto SharedParams. "save" requests persist
-// SharedParams to dlssnr_ui.ini which later loads use as defaults.
+// polls it and applies changes onto SharedParams. ini 落盘 = 面板独占
+// ("保存设置"按钮;2026-10-03 单写者裁定,本侧无任何写路径)。
 
 #include "shared_params.h"
 

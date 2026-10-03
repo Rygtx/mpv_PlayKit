@@ -94,6 +94,12 @@ bool RtxQueue::Execute(ID3D12Fence *waitFence, uint64_t waitValue,
     return true;
 }
 
+uint64_t RtxQueue::SignalNow() noexcept {
+    const uint64_t v = _fenceValue.fetch_add(1) + 1;
+    if (FAILED(_queue->Signal(_fence.Get(), v))) return 0;
+    return v;
+}
+
 bool RtxQueue::Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs) noexcept {
     // 共享 auto-reset 事件:多帧线程可并发等待不同栅栏值(fmParallel 锁外
     // 等待窗口),fence 值跳变时唤醒可被合并 —— 单次 Wait 返回不代表本等待
@@ -193,7 +199,6 @@ bool RtxFeatureBase::CreateFeatureOnCtl(char *err, size_t errLen) noexcept {
     }
     _params->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
     _params->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
-    NVSDK_NGX_Feature_Create_Params createParams{};
     char sehErr[160]{};
     char what[48];
     std::snprintf(what, sizeof(what), "CreateFeature(%s)", PrettyName());

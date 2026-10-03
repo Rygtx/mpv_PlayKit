@@ -36,6 +36,14 @@ public:
         _RecordFault(ERROR_INVALID_STATE);
     }
 
+    // feature 级 SEH 的上抛入口(2026-10-04):NgxSehGate 捕获的 VSR/HDR/FG
+    // 异常同样可能击穿 SDK 内部临界区(core 三方共享),持死后续 Invoke 的
+    // 入口 —— SEH 侧必须同样置进程闩锁,宁可全降级不可挂死。
+    static void MarkExternalFault(DWORD code) noexcept {
+        std::lock_guard lock(_callMutex);
+        _RecordFault(code);
+    }
+
 private:
     template <typename Function, typename Result>
     static Result _InvokeSafely(Function &function, Result failure, DWORD *sehCode) noexcept {

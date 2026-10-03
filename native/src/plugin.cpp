@@ -8,6 +8,7 @@
 #include "dlssfg_gate.h"
 #include "dlssnr_context.h"
 #include "dlssnr_params.h"
+#include "mpv_pipe_common.h" // resize watcher 的 mpv.conf 管道名解析(与面板共用)
 #include "nv_gpu_probe.h" // NR 模型选档的 GPU 架构探测(中立件,非 FG 门所属)
 #include "panel_ipc.h"
 #include "shared_params.h"
@@ -24,6 +25,11 @@
 #include <mutex>
 #include <string>
 #include <windows.h>
+
+// VSDLSSNR_TIMING=1 启用 per-frame 分段计时串(Pack/Unpack 与 getFrame 两处
+// 消费;2026-10-04 收拢 —— 原两处各自 static 同义双账)。
+static const bool g_timingEnabled =
+    GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
 
 using vsdlssnr::kFgGenSlots; // FG 插值槽数上界(d3d12_context.h,kFgMultMax-1)
 
@@ -70,15 +76,70 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
 // 文件存在性) 的纯函数,会话内确定 —— 热重绑定按 ngxDllPath 比较不受影响。
 // 变体与原版同目录,NGX core 的 app dir 取 dll.parent_path() 不受选择影响。
 //
+// 首拍可信度自检:枚举进程模块找"外来 version.dll"(FG 代理宿主名;
+// 系统正品在 System32 下,代理在 mpv 根目录/插件目录)。
+bool ForeignVersionDllResident() noexcept {
+    using EnumFx = BOOL(WINAPI *)(HANDLE, HMODULE *, DWORD, LPDWORD);
+    using NameFx = DWORD(WINAPI *)(HANDLE, HMODULE, LPWSTR, DWORD);
+    const HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return false;
+    const auto enumMods = reinterpret_cast<EnumFx>(reinterpret_cast<void *>(
+        GetProcAddress(k32, "K32EnumProcessModules")));
+    const auto modName = reinterpret_cast<NameFx>(reinterpret_cast<void *>(
+        GetProcAddress(k32, "K32GetModuleFileNameExW")));
+    if (!enumMods || !modName) return false;
+    HMODULE mods[512];
+    DWORD needed = 0;
+    if (!enumMods(GetCurrentProcess(), mods, sizeof(mods), &needed)) return false;
+    const int n = static_cast<int>(
+        (std::min<DWORD>)(needed / sizeof(HMODULE), 512));
+    wchar_t sysDir[MAX_PATH];
+    const UINT sysLen = GetSystemDirectoryW(sysDir, MAX_PATH);
+    for (int i = 0; i < n; ++i) {
+        wchar_t path[MAX_PATH]{};
+        if (!modName(GetCurrentProcess(), mods[i], path, MAX_PATH)) continue;
+        const wchar_t *base = path;
+        for (const wchar_t *p = path; *p; ++p)
+            if (*p == L'\\' || *p == L'/') base = p + 1;
+        if (lstrcmpiW(base, L"version.dll") != 0) continue;
+        if (sysLen && sysLen < MAX_PATH &&
+            CompareStringOrdinal(path, static_cast<int>(sysLen),
+                                 sysDir, static_cast<int>(sysLen), TRUE) == CSTR_EQUAL &&
+            path[sysLen] == L'\\') {
+            continue; // System32 正品
+        }
+        return true;
+    }
+    return false;
+}
+
 // 探针必须"首拍定格":FG 代理(version.dll,dlssg_for_sm86)为给官方
 // DLSSG 放行,会把进程内 NVAPI GetArchInfo 钩成伪装 Blackwell(0x1B0)
 // —— 2026-10-03 实锤:3080 会话开 FG 后下一次 create 探到 0x1B0 →
 // tier=stock → 原版 snippet 在伪装态下 Feature 18 恒 0xbad00001,NR 整体
 // 失效。首次 create 必然先于代理附着(代理随 FG 会话初始化加载),缓存
 // 首拍真值后恒用之;后续探测与首拍的偏差只留一行痕(可诊断"为何没换档")。
+// 首拍自身的可信度自检(2026-10-04):若代理被 PE 加载器提前拉入并先挂了
+// NVAPI(非设计形态),首拍锁进 0x1B0 且 drift 行永不触发(后续探针恒等
+// 首拍)= 零诊断 NR 失效。识别:dlssg_for_sm86 只部署在 Turing/Ampere,
+// 探到 Blackwell 却有外来 version.dll 常驻 = 自相矛盾 —— 按 20/30 系救援
+// 选档并大声留痕,而非静默 tier=stock。
 std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
     static const vsdlssnr::nv_gpu_probe::GpuArchProbe firstProbe = [] {
-        return vsdlssnr::nv_gpu_probe::ProbePrimaryGpuArch();
+        auto p = vsdlssnr::nv_gpu_probe::ProbePrimaryGpuArch();
+        if (p.arch == vsdlssnr::nv_gpu_probe::kArchBlackwell &&
+            ForeignVersionDllResident()) {
+            char msg[200];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: ngx first-shot probe = Blackwell (0x%X) with "
+                          "foreign version.dll resident — NVAPI spoof suspected (dlssg "
+                          "proxy only targets Turing/Ampere); forcing 20/30 tier",
+                          p.arch);
+            vsdlssnr::TimingStatusLine(msg);
+            p.arch = vsdlssnr::nv_gpu_probe::kArchAmpere; // → 20/30 档
+            p.implementation = 0;
+        }
+        return p;
     }();
     auto probe = vsdlssnr::nv_gpu_probe::ProbePrimaryGpuArch();
     if (probe.arch != firstProbe.arch || probe.implementation != firstProbe.implementation) {
@@ -408,12 +469,34 @@ struct ResizeWatchCtx {
 std::atomic<int> g_resizeWatchers{ 0 };
 
 bool ResizeWatchSendSeek() noexcept {
-    // mpv.conf 自定义管道名不追(自动跟随随 IPC 缺失优雅降级);三个
-    // 默认名覆盖 mpvpipe/mpvsocket/umpv 全部常规部署。
+    // 管道名发现 = mpv.conf input-ipc-server 优先(与面板同源解析,
+    // mpv_pipe_common;2026-10-04 补齐 —— 此前只试三个默认名,自定义管道
+    // 名部署下面板 reseek 正常而本线程静默失效,双实现分叉的实害)。
+    // conf 按 mpv.exe 目录(宿主进程可执行文件)定位。解析结果进程级缓存
+    // (conf 中途改动需重启 mpv,与面板侧同语义)。
     // 写/读 overlapped + 500ms 有界(2026-09-25):原同步 ReadFile 无超时,
     // mpv 挂起时本线程永久滞留 —— watcher 名额上限 2,滞留 = 自动跟随静默
     // 失效到进程退出。
-    for (const wchar_t *name : { L"mpvpipe", L"mpvsocket", L"umpv" }) {
+    const wchar_t *candidates[4] = { nullptr, L"mpvpipe", L"mpvsocket", L"umpv" };
+    static wchar_t *g_confPipe = nullptr; // 进程级缓存(nullptr = 解析过且无)
+    static bool g_confProbed = false;
+    if (!g_confProbed) {
+        g_confProbed = true;
+        wchar_t exe[MAX_PATH];
+        if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
+            wchar_t *slash = nullptr;
+            for (wchar_t *p = exe; *p; ++p)
+                if (*p == L'\\' || *p == L'/') slash = p;
+            if (slash) {
+                wchar_t confPath[MAX_PATH];
+                swprintf_s(confPath, L"%.*s\\portable_config\\mpv.conf",
+                           static_cast<int>(slash - exe), exe);
+                g_confPipe = vsdlssnr::MpvParseIpcServerName(confPath);
+            }
+        }
+    }
+    candidates[0] = g_confPipe;
+    for (const wchar_t *name : candidates) {
         wchar_t path[MAX_PATH];
         swprintf_s(path, L"\\\\.\\pipe\\%s", name);
         HANDLE pipe = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
@@ -571,7 +654,6 @@ bool RunProcessFrameCommon(FilterData *d, const VSFrame *src, VSFrame *out,
                            VSFrame **genFrame, int effGens, bool *fgGenOk,
                            vsdlssnr::FrameFinish **ffOut,
                            VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) noexcept {
-    static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
     const uint8_t *srcPlanes[3]{};
     int64_t srcStrides[3]{};
     uint8_t *dstPlanes[3]{};
@@ -600,7 +682,7 @@ bool RunProcessFrameCommon(FilterData *d, const VSFrame *src, VSFrame *out,
         effM, effGens > 0 ? genPlanes : nullptr,
         effGens > 0 ? genStrides : nullptr, fgGenOk,
         d->width, d->height, frameN, matrix, range, err, sizeof(err),
-        timingEnabled ? timing : nullptr, timingEnabled ? sizeof(timing) : 0,
+        g_timingEnabled ? timing : nullptr, g_timingEnabled ? sizeof(timing) : 0,
         ffOut);
     // 失败/未评插值槽:释放帧(出帧时槽位回落真实帧引用)。
     for (int g = 0; g < effGens; ++g) {
@@ -635,7 +717,7 @@ bool RunProcessFrameCommon(FilterData *d, const VSFrame *src, VSFrame *out,
         d->failureLogged.store(false);
         if (d->hdrOut) SetHdrFrameProps(out, vsapi);
     }
-    if (timingEnabled && timing[0]) {
+    if (g_timingEnabled && timing[0]) {
         // Throttle: log every 30th frame (fmParallel: order irrelevant).
         static std::atomic<int> timingFrameCount{ 0 };
         if (timingFrameCount.fetch_add(1, std::memory_order_relaxed) % 30 == 1) {
@@ -685,7 +767,6 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     }
     if (activationReason != arAllFramesReady) return nullptr;
 
-    static const bool timingEnabled = GetEnvironmentVariableA("VSDLSSNR_TIMING", nullptr, 0) != 0;
 
     // NR 总开关 live 门(shared_lock 快照,fmParallel 并发安全)。FG 激活
     // 的会话:NR 关由 ProcessFrame 内部门控(跳过NR 评估,补帧/光流照常
@@ -892,7 +973,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             // 其它源帧的 CPU 链(pack/OF/录制/提交)与本帧 GPU 执行/unpack
             // 重叠。消费方在世代门等本帧内容,不阻塞流水。
             fgLock.unlock();
-            if (timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin pre-finish");
+            if (g_timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin pre-finish");
             uint8_t *finDst[3]{};
             int64_t finDstStride[3]{};
             for (int p = 0; p < 3; ++p) {
@@ -917,9 +998,9 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                                            effGens > 0 ? finGen : nullptr,
                                            effGens > 0 ? finGenStride : nullptr,
                                            fgGenOk, finErr, sizeof(finErr),
-                                           timingEnabled ? finTiming : nullptr,
-                                           timingEnabled ? sizeof(finTiming) : 0);
-            if (timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin post-finish");
+                                           g_timingEnabled ? finTiming : nullptr,
+                                           g_timingEnabled ? sizeof(finTiming) : 0);
+            if (g_timingEnabled) vsdlssnr::TimingStatusLine("PROBE: plugin post-finish");
             if (!finOk) {
                 // unpack 失败:帧已入缓存、引用可能已被消费方领走(尚未交付
                 // —— 世代门拦着)。日志闩锁与 Submit 失败同惯例。
@@ -1391,7 +1472,7 @@ static void VS_CC DlssnrCreate(
         vsdlssnr::TimingStatusLine(msg);
         // 窗口 resize 跟随(mode=1):见 ResizeWatchProc。refH = 本次创建
         // 的探测值。
-        if (d->params->Snapshot().rtxVsrMode == 1 &&
+        if (initial.rtxVsrMode == 1 &&
             g_resizeWatchers.load(std::memory_order_relaxed) < 2) {
             HANDLE stop = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset 停旗
             if (stop) {
@@ -1415,7 +1496,10 @@ static void VS_CC DlssnrCreate(
     viOut.height = d->outH;
     viOut.format = d->outFi; // VS4:VSVideoInfo.format 为内嵌值
     if (d->fgActive) {
-        d->fgCreateMult = std::clamp(d->params->Snapshot().fgMultiplier, kFgMultMin, kFgMultMax);
+        // 创建契约读合并终值 initial(而非 live 快照):BridgeStart 已在上方
+        // 启动,面板 payload 可在其后改 live 字段(fgMultiplier 是 live 参)
+        // —— vi.fps ×M 的创建契约在竞态窗口内曾非确定(2026-10-04)。
+        d->fgCreateMult = std::clamp(initial.fgMultiplier, kFgMultMin, kFgMultMax);
         viOut.fpsNum *= d->fgCreateMult;
         // 帧数同步 ×M:VS4 里 n >= numFrames 的请求会被核心拒为越界 ——
         // mpv 顺序拉流到尾帧时会提前 EOF(尾段丢插值帧)。

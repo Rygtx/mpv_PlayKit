@@ -13,8 +13,11 @@
 //   CreateFeature —— 本类仍按官方链驱动,链路形态不变。0.2.4 直驱 proxy
 //   契约(Init_Ext + 专用参数块)已删除,不再兼容。
 // 与 NR snippet 同款集成形态;区别于 NR 的两点:
-//   1. 故障隔离 —— FG 的 SEH 走本类本地闩锁(_faulted),不上抛全局
-//      NgxRuntimeGuard:FG 崩溃只降级本功能(复制真实帧),绝不连带杀 NR。
+//   1. 故障隔离 —— FG 的 SEH 走本类本地闩锁(_faulted):FG 崩溃后本功能
+//      降级为复制真实帧。隔离是策略而非结构保证:FG feature 与 NR 同跑在
+//      NR 建立的共享 NGX core 上,SEH 仍会经 NgxSehGate 上抛进程闩锁
+//      (2026-10-04)—— core 疑似被 SEH 击穿时 NR/VSR/HDR 一并降级,宁可
+//      全停不可挂死。
 //   2. 参数契约 —— 设官方 eval 契约全量(Magpie optionalParams:五矩阵恒等/
 //      相机单位基座/jitter 0/可选资源 null)。
 // 时序契约(README:输入 NSR / 输出 UAV,提交与同步归调用方):插值输出的

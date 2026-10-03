@@ -2,13 +2,16 @@
 // NGX feature 级 SEH 闩锁门(RTX VSR / TrueHDR / DLSS FG 三处共用;原三类
 // 各持一份逐字拷贝)。与 NgxRuntimeGuard(进程级,ngx_runtime_guard.h)
 // 互补:本闩锁随 feature 实例生命周期 —— SEH 后该 feature 拒绝再进入直至
-// 宿主重启;进程级 SDK core 闩锁仍由 NgxRuntimeGuard 独立把守。SEH 绝不
-// 上抛全局闩锁(降级边界:哪个 feature 崩,只停哪个)。
+// 宿主重启。SEH 同时上抛进程闩锁(MarkExternalFault,2026-10-04):core
+// 为 NR/VSR/HDR/FG 三方共享,SDK 内部临界区可能被 SEH 击穿持死,后续
+// 他家 evaluate 若照常进入只会挂在闩锁保护之外 —— 宁可全降级,不可挂死。
 #include <windows.h>
 #include <atomic>
 #include <cstdio>
 
 #include <nvsdk_ngx.h>
+
+#include "ngx_runtime_guard.h"
 
 namespace vsdlssnr {
 
@@ -56,6 +59,7 @@ bool NgxSehGate(std::atomic<bool> &faulted, Fn &&fn, const char *tag,
     const bool ok = NgxSehRun(fn, &sehCode);
     if (!ok && sehCode) {
         faulted.store(true, std::memory_order_release);
+        NgxRuntimeGuard::MarkExternalFault(sehCode); // 共享 core 一损俱损,见头注
         char msg[160];
         std::snprintf(msg, sizeof(msg),
                       "DLSSNR STATUS: %s %s raised SEH 0x%lX; %s",

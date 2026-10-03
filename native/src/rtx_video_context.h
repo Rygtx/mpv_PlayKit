@@ -70,6 +70,12 @@ public:
     // 交由 WaitFrame 的既有失败路径收尾 —— 含 allocator 复用的背压等待,
     // 此前"背压保持 INFINITE"的语义已随 5e239eb 修复废弃)。
     bool Wait(uint64_t value, char *err, size_t errLen, DWORD timeoutMs) noexcept;
+    // 括号段完成锚点(2026-10-04):post 计时括号在 Execute 的 Signal 之后
+    // 入队,eval 栅栏值不覆盖括号执行 —— 帧槽回收若只等 eval 值,可对在飞
+    // 括号 allocator Reset(UB)。调用方在本队列该帧全部提交收尾后调用,
+    // 补一记 Signal 并返回新值;消费方等此值才真正蕴含括号完成。返回 0 =
+    // Signal 失败(设备域故障),调用方回落 eval 值(帧照常走失败路径)。
+    uint64_t SignalNow() noexcept;
     ID3D12Fence *Fence() const noexcept { return _fence.Get(); }
     // 原生队列句柄(时间戳括号夹提交用,2026-10-02):帧路径在本线程、
     // Evaluate 前后紧邻提交括号 CL —— 与 Execute 的提交是同线程程序序,
@@ -78,7 +84,7 @@ public:
 
 private:
     ComPtr<ID3D12CommandQueue> _queue;
-    // **六组 allocator/CL 轮转(0-5)**:单 allocator 下 back-to-back eval
+    // **十二组 allocator/CL 轮转**:单 allocator 下 back-to-back eval
     //(HDR 链逐插值帧)的 allocator Reset 必须等上一笔 GPU 完成(lookback
     // wait)→ CPU 提交链被 GPU 执行串行吸收(实测 sub=17ms,2026-09-24),
     // vsr/fg 分段观测被填满塌 0。双组(0/1)在 mult=4 HDR 链(每源帧 4 笔

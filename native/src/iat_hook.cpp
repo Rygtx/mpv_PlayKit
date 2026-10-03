@@ -10,6 +10,10 @@ namespace vsdlssnr {
 namespace {
 
 std::atomic<void *> g_hookOwner{ nullptr };
+// RestoreSnippetCallerHook 失败后 owner 被永久持有(有意的:槽位仍指向
+// hook,此刻放行新安装会把"hook 当 original"读走,异模块调用无限递归)。
+// 粘性旗标让后续安装失败时报出真因,而非笼统的 "another live context"。
+std::atomic<bool> g_restoreStuck{ false };
 std::atomic<HMODULE> g_snippetCallerModule{ nullptr };
 
 using GetModuleFileNameWFn = DWORD(WINAPI *)(HMODULE, LPWSTR, DWORD);
@@ -105,6 +109,10 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook,
     void *expectedOwner = nullptr;
     if (!g_hookOwner.compare_exchange_strong(
             expectedOwner, &hook, std::memory_order_acq_rel)) {
+        if (g_restoreStuck.load(std::memory_order_acquire)) {
+            return fail("hook restore previously failed (VirtualProtect); "
+                        "owner held for process lifetime");
+        }
         return fail("another live context owns the hook");
     }
 
@@ -126,12 +134,17 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook,
         return fail(why);
     }
 
-    g_snippetCallerModule.store(callerModule, std::memory_order_release);
-    void *original = InterlockedExchangePointer(
-        reinterpret_cast<void *volatile *>(hook.iatSlot), hookAddress);
+    // original 先落账再换槽:换槽后、落账前进入 hook 的异模块调用会读到
+    // original == null 而吃 ERROR_INVALID_FUNCTION(撞上 snippet 自 caller
+    // 校验窗口 = NR init 莫名失败)。单 owner 保证读到的就是 xchg 将返回的
+    // 同一值。callerModule 同理先于换槽可见。
+    void *original = *reinterpret_cast<void *volatile *>(hook.iatSlot);
     GetModuleFileNameWFn originalFunction = nullptr;
     std::memcpy(&originalFunction, &original, sizeof(original));
     g_originalGetModuleFileNameW.store(originalFunction, std::memory_order_release);
+    g_snippetCallerModule.store(callerModule, std::memory_order_release);
+    InterlockedExchangePointer(
+        reinterpret_cast<void *volatile *>(hook.iatSlot), hookAddress);
     hook.installed = true;
 
     DWORD ignoredProtection = 0;
@@ -169,6 +182,10 @@ bool RestoreSnippetCallerHook(SnippetCallerHook &hook) noexcept {
         // 探针:恢复失败 = IAT 槽位永远指向 hook(会话内无实际危害,但
         // "hook 为什么没还原"这类问题需要留痕)。OutputDebugString 层级,
         // 不引入对 dlssnr_context 的反向依赖。
+        // 恢复失败 = IAT 槽位永远指向 hook:owner 必须持有(见 g_restoreStuck
+        // 注,此刻放行新安装会把 hook 当 original 读走 = 异模块调用无限递归),
+        // 后续安装经 CAS 失败路径报出真因。
+        g_restoreStuck.store(true, std::memory_order_release);
         OutputDebugStringA("vs_dlssnr: IAT hook restore FAILED (VirtualProtect); slot left hooked\n");
         return false;
     }

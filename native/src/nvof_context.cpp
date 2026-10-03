@@ -384,7 +384,7 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         _copySeq = _lastCopyFence = _copyFence->GetCompletedValue();
         _doneSeq = _lastDone = _doneFence->GetCompletedValue();
     }
-    if (!_rotator.Create(*_d3d12, device)) {
+    if (!_rotator.Create(*_d3d12)) {
         return fail("nvof: create copy command list failed");
     }
 
@@ -474,7 +474,13 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         std::unique_lock<std::mutex> lock(_gate.Mutex);
         // 入门即清:上一帧失败路径(ProcessFrame 提前返回且守卫冲刷未跑,
         // 理论上守卫恒跑,此为双保险)残留的待冲刷作废 —— 其帧已失败,
-        // densify 不再有意义。
+        // densify 不再有意义。残留非零 = "恰一次冲刷"契约被破坏(调用方
+        // 既没在首个 motion 消费者前冲刷、守卫兜底也没跑)—— 静默作废改
+        // 为大声留痕,协议失守不再不可见(2026-10-04)。
+        if (_pendingDensifyValue) {
+            TimingStatusLine("DLSSNR STATUS: nvof stale pending densify at gate "
+                             "entry (flush-once contract violated)");
+        }
         _pendingDensifyValue = 0;
 
         // ---- 帧序门:迟到/缺口一律播种,连续才 execute(OfFrameGate::Arrive;
@@ -581,14 +587,13 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             copyOk = SUCCEEDED(copyCl->Close());
         }
         if (copyOk) {
-            ID3D12CommandList *lists[]{ copyCl };
-            queue->ExecuteCommandLists(1, lists);
-            _lastCopyFence = ++_copySeq;
-            queue->Signal(_copyFence.Get(), _lastCopyFence);
-            // 轮转位记账(FfxofContext 同款:先记后 ++,acquire 侧同式回读)。
-            _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
+            // 提交 + 记账单点(OfClRotator::Submit;此前 ECL/Signal/RecordUse
+            // 三步手工簿记散布五处)。
+            _lastCopyFence = _rotator.Submit(queue, _copyFence.Get(), copyCl, ++_copySeq);
         } else {
             // 拷贝失败:清零 + 重置(下帧重新播种)。失败必须进 timing log。
+            // 链断(InvalidateHistory)= 连败闩锁语义内,计入(2026-10-04:
+            // 此前只有 execute 失败计数,拷贝风暴永不自停)。
             char msg[128];
             std::snprintf(msg, sizeof(msg),
                           "DLSSNR STATUS: nvof copy submit failed frame=%d", frameIndex);
@@ -596,6 +601,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             TimingStatusLine(msg);
             result.historyReset = true;
             _gate.InvalidateHistory(); // 参考帧未更新,历史链断
+            LatchFailure(_consecutiveFailures, _ready, "nvof");
             execute = false;
         }
 
@@ -675,16 +681,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                 TimingStatusLine(msg);
                 result.historyReset = true;
                 _gate.InvalidateHistory();
-                if (++_consecutiveFailures >= 3) {
-                    _ready.store(false, std::memory_order_release);
-                    char msg2[96];
-                    std::snprintf(msg2, sizeof(msg2),
-                                  "DLSSNR STATUS: nvof disabled after consecutive failures");
-                    OutputDebugStringA("vs_dlssnr: ");
-                    OutputDebugStringA(msg2);
-                    OutputDebugStringA("\n");
-                    TimingStatusLine(msg2);
-                }
+                LatchFailure(_consecutiveFailures, _ready, "nvof");
             }
 
             // densify 二次提交已迁往 FlushPendingDensify:execute 的 flow 输
@@ -784,11 +781,8 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
         TimingStatusLine("DLSSNR STATUS: nvof densify close failed at flush");
         return;
     }
-    ID3D12CommandList *lists[]{ densCl };
-    _d3d12->Queue()->ExecuteCommandLists(1, lists);
-    _lastCopyFence = ++_copySeq;
-    _d3d12->Queue()->Signal(_copyFence.Get(), _lastCopyFence);
-    _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
+    // 提交 + 记账单点(OfClRotator::Submit)。
+    _lastCopyFence = _rotator.Submit(_d3d12->Queue(), _copyFence.Get(), densCl, ++_copySeq);
 }
 
 void NvofContext::WaitCopyIdle() noexcept {

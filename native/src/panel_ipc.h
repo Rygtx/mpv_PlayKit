@@ -19,7 +19,7 @@ namespace vsdlssnr {
 constexpr wchar_t PARAMS_MAPPING[] = L"vs_dlssnr_panel_params";
 constexpr wchar_t STATS_MAPPING[] = L"vs_dlssnr_stats";
 constexpr wchar_t PARAMS_EVENT[] = L"vs_dlssnr_panel_params_event"; // auto-reset; panel signals after each payload write
-constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";             // saved profile (written/read by both sides)
+constexpr wchar_t INI_FILE[] = L"dlssnr_ui.ini";             // saved profile (写侧 = 面板独占;插件只读,2026-10-03 单写者裁定)
 constexpr wchar_t ALIVE_EVENT[] = L"vs_dlssnr_bridge_alive"; // filter-lifetime marker (bridge + panel watchdog)
 // v25 起 2048:v25 时账目诚实化新增 queue/of_engine 两键,1024 的 json 已无
 // 余量(v19 同族截断风险)。混跑安全:小视图映射大对象合法,旧面板只看前
@@ -39,7 +39,7 @@ constexpr uint32_t PAYLOAD_SIZE = 2048;
 // NGX,进程级,重启 mpv 生效 —— 后端由硬件决定,自动档总能选对,单控件足够);
 // v13 adds debugView(差异调试 ×20 视图 0/1,live,不持久化 —— 输出被替换为
 // |NR改动|×20 灰度图)并退役 uiCorrection(视频管线无 UI 图层,模型端结构性
-// no-op —— 字段保留占位防布局漂移,写入恒 1,面板不再暴露);
+// no-op —— 字段已随 v25 删除,magic 拒读下占位无意义);
 // v14/v15/v17 曾引入 antiFlicker/ofBackend/ffxQuality;v18 撤销抗闪烁时域
 // 稳定器全链移植(上游 antiFlicker 2026-09-21 裁定移除 —— NR 输出收敛稳定,
 // 机制维护成本 > 感知收益),ofBackend/ffxQuality 保留(FFX 后端);结构体
@@ -70,7 +70,8 @@ constexpr uint32_t PAYLOAD_SIZE = 2048;
 // —— v14 首引入、v18 随"维护成本 > 感知收益"裁定移除;NR 参数调强后
 // 闪烁复现,机制原样回植(d3d12 侧 TEMPORAL_* HLSL + dlssnr 侧时间线),
 // 结构体尾部追加,新旧混跑按 magic 拒 —— 成对部署。
-constexpr uint32_t PAYLOAD_MAGIC = 0x4F4C5344u; // "DSLO" (v24, 版本位走 hex:9 之后是 A/B/C/D/E/F)
+constexpr uint32_t PAYLOAD_MAGIC = 0x504C5344u; // "DSLP" (v25:saveRequest/uiCorrection
+                                                //  死字段删除 —— 版本位走 hex)
 // v23(stats "DSL4",hex 实际末字节 '4'):stats JSON 新增 rtxvsr_last/
 // rtxhdr_last(RTX Video VSR/TrueHDR 专用队列 eval 分段拆账 —— 此前 RTX
 // 时间无账目:CPU 录制混进 gpu 段窗口,GPU 执行经 post CL 的队列 Wait 全落
@@ -91,7 +92,9 @@ constexpr uint32_t PAYLOAD_MAGIC = 0x4F4C5344u; // "DSLO" (v24, 版本位走 hex
 // DSL9(v28,0x394C5344):每帧实效位三元(evalActive/ofActive/scalingActive)
 // —— 面板"增强中/光流行/分辨率链"改为直读,不再镜像插件门控公式
 // (插件改门控面板静默错标的整类失配消灭)。
-constexpr uint32_t STATS_MAGIC = 0x394C5344u;   // "DSL9" (v28:每帧实效位)
+constexpr uint32_t STATS_MAGIC = 0x414C5344u;   // "DSLA" (v29:gateSkips 死指标删除;
+                                                //  rtx 实效位/数值输出尺寸加入 ——
+                                                //  hdr 打标与分辨率链不再 parse 人读串)
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -105,7 +108,6 @@ struct PanelPayload {
     float localStructure;        // 0-1
     float skinStructure;         // 0-2 (上游 beta3 起 -1=auto 移除,默认 0)
     int32_t useAutoMask;         // 0/1
-    int32_t uiCorrection;        // 保留字段(v13 退役:视频管线无 UI 图层,恒写 1)
     int32_t inputResolution;     // 25-100
     float residualMultiplier;    // 1-2
     float residualSaturation;    // 0-2 (relative to DLSSNR's own change)
@@ -113,8 +115,10 @@ struct PanelPayload {
     float shadowStructure;       // 0-2
     float reflectionGlow;        // 0-2
     int32_t scalingEnabled;      // 0 = ignore inputResolution (treat as 100)
-    int32_t saveRequest;         // panel "保存设置" press (applied once per seq)
     int32_t logEnabled;          // perf log toggle state
+                                 // (v25 删 saveRequest/uiCorrection:前者无消费者
+                                 //  —— ini 单写者归面板;后者 v13 已退役恒 1。
+                                 //  "防布局漂移"在 magic 拒读世界无意义。)
     int32_t motionVectorQuality; // 0-5 NVOF 档位(0 = 无光流;live)
     int32_t ffxQuality;          // 0-2 FFX 档位(0 = 无;1 性能,2 质量;live)
     int32_t nvofFollowScaling;   // 0/1 光流输入跟随内部降采样
@@ -147,6 +151,9 @@ static_assert(sizeof(PanelPayload) <= PAYLOAD_SIZE, "payload must fit the mappin
 // params (preset / input_resolution / scaling_enabled) ride
 // Request*/ConsumeRebuild — the plugin's _cur side for them is owned by
 // ConsumeRebuild alone, never write them behind its back.
+// 例外(nrEnabled/fgEnabled 两函数都写,有意):两键既是 live 门(逐帧
+// 评估/插帧门)又是 create 形态(槽资源/FG 会话),两路都必须落到位 ——
+// 单边权威承诺不含这两键,删任一边 = 死态 body/闭环兜底失明。
 // ---------------------------------------------------------------------------
 inline void LoadLiveParams(DlssnrParams &p, const PanelPayload &pl) noexcept {
     p.nrEnabled = pl.nrEnabled != 0;
@@ -207,7 +214,6 @@ inline PanelPayload PayloadFromParams(const DlssnrParams &p) noexcept {
     pl.localStructure = p.localStructureStrength;
     pl.skinStructure = p.skinStructureStrength;
     pl.useAutoMask = p.useAutoMask ? 1 : 0;
-    pl.uiCorrection = 1; // 退役保留字段(v13):视频管线无 UI 图层,恒写模型默认
     pl.inputResolution = p.inputResolutionPercent;
     pl.scalingEnabled = p.scalingEnabled ? 1 : 0;
     pl.residualMultiplier = p.residualMultiplier;
@@ -280,16 +286,20 @@ struct StatsPayload {
     uint32_t fgMultMax;     // runtime generated-frame cap (0-5). Sole signal when a
                             // 40-series gate unlock falls back to 2x; panel red-rule:
                             // fgMultMax + 1 < fgMultCreate
-    uint32_t gateSkips;     // OF frame-gate counters (diag page)
-    uint32_t gateExpired;
+    uint32_t gateExpired;   // OF frame-gate expired counter (diag page)
     uint32_t gateResets;
     uint32_t gpuHang;       // non-0 = GPU hang/device removed (body carries only removedReason)
     uint32_t temporalRoute; // anti-flicker effective level 0-4 (diag page)
-    // 每帧实效位(DSL9):面板状态行/光流行/分辨率链直读,免镜像插件门控
-    // 公式(意图参数推导在插件改门控时会静默错标)。
+    // 每帧实效位(DSL9 起,DSLA 扩):面板状态行/光流行/分辨率链/HDR 打标
+    // 直读,免镜像插件门控公式与人读串 parse(意图参数推导在插件改门控时
+    // 会静默错标;rtx 串回归纯显示)。
     uint32_t evalActive;    // 本帧 NGX/NR 真评估(直通/播种/降级帧 = 0)
     uint32_t ofActive;      // 本帧光流消费门开(NR/FG 在用;零提交帧 = 0)
     uint32_t scalingActive; // 本帧内部缩放档真参与(NR 关直连 = 0)
+    uint32_t rtxVsrActive;  // 本帧 VSR 真参与(NR 关旁路直连 = 0)
+    uint32_t rtxHdrActive;  // 本帧 TrueHDR 真参与(HDR 打标直读位)
+    uint32_t rtxOutW;       // RTX 输出尺寸(vsr 关 = 源尺寸;分辨率链直读)
+    uint32_t rtxOutH;
 
     // ---- strings: fixed width; overlong copies truncate at the field edge,
     // the struct itself can never be corrupted (CopyStatStr below). Detail

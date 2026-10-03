@@ -57,7 +57,7 @@
     X(saved, nrEnabled, Skip, 0, 0)
 
 // RTX Video(VSR/TrueHDR):[rtxvideo] 独立节(v22 起面板全量接管;
-// 面板"保存设置"与 bridge saveRequest 共用写侧)。
+// 写侧 = 面板独占,插件只读 —— 2026-10-03 单写者裁定)。
 #define RTX_FIELDS(X) \
     X(vsr_mode, rtxVsrMode, Int, kVsrModeMin, kVsrModeMax) \
     X(vsr_scale_x100, rtxVsrScale, X100, kVsrScaleMin, kVsrScaleMax) \

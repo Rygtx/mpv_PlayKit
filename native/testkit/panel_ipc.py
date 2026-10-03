@@ -16,8 +16,8 @@ import re
 import struct
 
 PAYLOAD_SIZE = 2048
-PAYLOAD_MAGIC = 0x4E4C5344  # "DSLN" (v23, 版本位走 hex: 9 之后是 A/B/C/D/E/F)
-STATS_MAGIC = 0x384C5344  # "DSL8" (v27: stats body JSON → 定长 struct)
+PAYLOAD_MAGIC = 0x504C5344  # "DSLP" (v25: saveRequest/uiCorrection 死字段删除)
+STATS_MAGIC = 0x414C5344  # "DSLA" (v29: gateSkips 删除 + rtx 实效位/数值尺寸)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
@@ -43,6 +43,7 @@ SK = {
     "scaling": "scaling",
     "fps": "fps",
     "gpu_name": "gpu_name",
+    "model_dll": "model_dll",
     "gpu_hang": "gpu_hang",
     "removed_reason": "removed_reason",
     "filter_state": "filter_state",
@@ -59,9 +60,15 @@ SK = {
     "rtx_detail": "rtx_detail",
     "slot_wait": "slot_wait",
     "lock_wait": "lock_wait",
-    "gate_skips": "gate_skips",
     "gate_expired": "gate_expired",
     "gate_resets": "gate_resets",
+    "eval_active": "eval_active",
+    "of_active": "of_active",
+    "scaling_active": "scaling_active",
+    "rtx_vsr_active": "rtx_vsr_active",
+    "rtx_hdr_active": "rtx_hdr_active",
+    "rtx_out_w": "rtx_out_w",
+    "rtx_out_h": "rtx_out_h",
     "temporal": "temporal",
     "temporal_route": "temporal_route",
     "temporal_w": "temporal_w",
@@ -70,10 +77,12 @@ assert len(set(SK.values())) == len(SK), "SK 键名表内有重复值"
 
 # mirror of StatsPayload (panel_ipc.h #pragma pack push,8;v27 起定长 struct,
 # 旧 JSON 键名保留为 dict 键)。布局:2I magic,seq | 14f 计时/权重 |
-# 13I 尺寸/倍数/门累计 | 12 段定长字符串。错位 = 读出乱码,断言即炸 ——
-# 尺寸断言是同步防线(与 _STRUCT 同一教训)。
-_STATS_STRUCT = struct.Struct("<II14f13I160s200s16s40s16s16s128s96s96s96s10s16s")
-assert _STATS_STRUCT.size == 1006, "StatsPayload 布局与 panel_ipc.h 不一致"
+# 19I 尺寸/倍数/门累计/实效位(DSL9 三位 + DSLA rtx 四项;gate_skips 已删)|
+# 13 段定长字符串(v28 起含 model_dll)。错位 = 读出乱码,断言即炸 ——
+# 尺寸断言是同步防线(与 _STRUCT 同一教训)。1096 = C++ sizeof(pack(8),
+# 尾部对齐到 4)。
+_STATS_STRUCT = struct.Struct("<II14f19I160s64s200s16s40s16s16s128s96s96s96s10s16s")
+assert _STATS_STRUCT.size == 1094, "StatsPayload 布局与 panel_ipc.h 不一致(C++ sizeof=1096)"
 _STATS_FIELDS = (
     "magic", "seq",
     "gpu_last", "pack_last", "eval_cpu_last", "unpack_last",
@@ -81,15 +90,18 @@ _STATS_FIELDS = (
     "conv_last", "queue_last", "slot_wait", "lock_wait", "fps", "temporal_w",
     "internal_w", "internal_h", "width", "height", "scaling",
     "fg_mult", "fg_mult_create", "fg_mult_max",
-    "gate_skips", "gate_expired", "gate_resets", "gpu_hang", "temporal_route",
-    "gpu_name", "state_detail", "filter_state", "of_mode", "fg", "fg_route_eff",
-    "fg_detail", "of_detail", "rtx", "rtx_detail", "temporal", "removed_reason",
+    "gate_expired", "gate_resets", "gpu_hang", "temporal_route",
+    "eval_active", "of_active", "scaling_active",
+    "rtx_vsr_active", "rtx_hdr_active", "rtx_out_w", "rtx_out_h",
+    "gpu_name", "model_dll", "state_detail", "filter_state", "of_mode", "fg",
+    "fg_route_eff", "fg_detail", "of_detail", "rtx", "rtx_detail", "temporal",
+    "removed_reason",
 )
-assert len(_STATS_FIELDS) == 2 + 14 + 13 + 12 == len(set(_STATS_FIELDS))
-_STATS_STR_START = 2 + 14 + 13  # 首个字符串字段在字段元组中的下标
+assert len(_STATS_FIELDS) == 2 + 14 + 19 + 13 == len(set(_STATS_FIELDS))
+_STATS_STR_START = 2 + 14 + 19  # 首个字符串字段在字段元组中的下标
 _STATS_STR_WIDTHS = [int(w) for w in re.findall(r"(\d+)s", _STATS_STRUCT.format)]
-assert len(_STATS_STR_WIDTHS) == 12
-assert sum(_STATS_STR_WIDTHS) == _STATS_STRUCT.size - 8 - 14 * 4 - 13 * 4
+assert len(_STATS_STR_WIDTHS) == 13
+assert sum(_STATS_STR_WIDTHS) == _STATS_STRUCT.size - 8 - 14 * 4 - 19 * 4
 
 
 def pack_stats(stats, seq=1):
@@ -114,23 +126,23 @@ def pack_stats(stats, seq=1):
 
 # mirror of PanelPayload (#pragma pack push, 全 4 字节字段无对齐缝隙):
 # 3I magic,seq,generation | 2i preset,style | 4f intensity,localTone,
-# localStructure,skinStructure | 3i useAutoMask,uiCorrection(保留,恒 1),
-# inputResolution | 5f residualMultiplier,residualSaturation,residualLightness,
-# shadowStructure,reflectionGlow | 12i scalingEnabled,saveRequest,logEnabled,
-# motionVectorQuality,ffxQuality,nvofFollowScaling,fgEnabled,fgMultiplier,
-# fgRoute,nrEnabled,debugView,ofBackend | i f(vsrMode,vsrScale)| 7i
-# vsrStrength,hdrEnabled,hdrContrast,hdrSaturation,hdrMiddleGray,
-# hdrMaxLuminance,fgHdrInterp(v23 实验性补帧 HDR 域插值)
-_STRUCT = struct.Struct("<3I2i4f3i5f12iif7i")
-assert _STRUCT.size == 152, "PanelPayload 布局与 panel_ipc.h 不一致"
+# localStructure,skinStructure | 2i useAutoMask,inputResolution | 5f
+# residualMultiplier,residualSaturation,residualLightness,shadowStructure,
+# reflectionGlow | 11i scalingEnabled,logEnabled,motionVectorQuality,
+# ffxQuality,nvofFollowScaling,fgEnabled,fgMultiplier,fgRoute,nrEnabled,
+# debugView,ofBackend | i f(vsrMode,vsrScale)| 7i vsrStrength,hdrEnabled,
+# hdrContrast,hdrSaturation,hdrMiddleGray,hdrMaxLuminance,fgHdrInterp
+# (v25 删 uiCorrection/saveRequest。)
+_STRUCT = struct.Struct("<3I2i4f2i5f11iif7i")
+assert _STRUCT.size == 144, "PanelPayload 布局与 panel_ipc.h 不一致"
 
 DEFAULTS = dict(
     preset=0, style=0,
     intensity=1.0, localTone=1.0, localStructure=1.0, skinStructure=-1.0,
-    useAutoMask=1, uiCorrection=1, inputResolution=100,
+    useAutoMask=1, inputResolution=100,
     residualMultiplier=1.0, residualSaturation=1.0, residualLightness=1.0,
     shadowStructure=1.0, reflectionGlow=1.0,
-    scalingEnabled=1, saveRequest=0, logEnabled=1,
+    scalingEnabled=1, logEnabled=1,
     motionVectorQuality=0, ffxQuality=2, nvofFollowScaling=0,
     fgEnabled=0, fgMultiplier=2, fgRoute=0, nrEnabled=1,
     debugView=0, ofBackend=0,
@@ -142,10 +154,10 @@ DEFAULTS = dict(
 
 _FIELDS = ("magic", "seq", "generation", "preset", "style",
            "intensity", "localTone", "localStructure", "skinStructure",
-           "useAutoMask", "uiCorrection", "inputResolution",
+           "useAutoMask", "inputResolution",
            "residualMultiplier", "residualSaturation", "residualLightness",
            "shadowStructure", "reflectionGlow",
-           "scalingEnabled", "saveRequest", "logEnabled",
+           "scalingEnabled", "logEnabled",
            "motionVectorQuality", "ffxQuality", "nvofFollowScaling",
            "fgEnabled", "fgMultiplier", "fgRoute", "nrEnabled", "debugView",
            "ofBackend",
@@ -180,10 +192,10 @@ class ParamsChannel:
             PAYLOAD_MAGIC, seq, generation,
             vals["preset"], vals["style"],
             vals["intensity"], vals["localTone"], vals["localStructure"], vals["skinStructure"],
-            vals["useAutoMask"], vals["uiCorrection"], vals["inputResolution"],
+            vals["useAutoMask"], vals["inputResolution"],
             vals["residualMultiplier"], vals["residualSaturation"],
             vals["residualLightness"], vals["shadowStructure"], vals["reflectionGlow"],
-            vals["scalingEnabled"], vals["saveRequest"], vals["logEnabled"],
+            vals["scalingEnabled"], vals["logEnabled"],
             vals["motionVectorQuality"], vals["ffxQuality"], vals["nvofFollowScaling"],
             vals["fgEnabled"], vals["fgMultiplier"], vals["fgRoute"],
             vals["nrEnabled"], vals["debugView"], vals["ofBackend"],

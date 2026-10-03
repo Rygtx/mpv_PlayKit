@@ -171,9 +171,11 @@ public:
     double LastGateWaitMs() const noexcept { return _lastGateWaitMs; } // 门互斥+cv 等待
     double LastCpyWaitMs() const noexcept { return _lastCpyWaitMs; }   // 前帧拷贝完成 CPU 等待
     double LastExeWaitMs() const noexcept { return _lastExeWaitMs; }   // execute 输出栅栏 CPU 等待
-    uint32_t GateSkips() const noexcept { return _gateSkips; }         // cv 超时跳帧累计
     uint32_t GateExpired() const noexcept { return _gateExpired; }     // 过期帧累计
     uint32_t ResetCount() const noexcept { return _resetCount; }       // ResetHistory 累计
+    // (GateSkips 已删 2026-10-04:恒 0 死指标,读数会让人误判"从未跳帧"而非
+    //  "此指标已死" —— 原 cv 超时门随零等待门改造消失,过期帧语义由
+    //  GateExpired 承担。)
 
 private:
     void DestroySession() noexcept;
@@ -217,10 +219,12 @@ private:
     HANDLE _copyFenceEvent = nullptr;
     HANDLE _doneFenceEvent = nullptr;
     uint64_t _copySeq = 0;        // copyFence 单调计数
-    uint64_t _lastCopyFence = 0;  // 最近一次拷贝提交的值
+    // 尾随完成值:门内写,WaitCopyIdle 门外读(fmParallel 并发,atomic
+    // 对齐惯例;2026-10-04 —— 陈旧读语义安全:少等自己不拥有的提交)。
+    std::atomic<uint64_t> _lastCopyFence{ 0 };  // 最近一次拷贝提交的值
     uint64_t _doneSeq = 0;        // doneFence 单调计数(注册 + execute 共用)
-    uint64_t _lastDone = 0;       // 最近一次 execute 的 done 值(copy(n+1) 等它)
-    uint64_t _doneByParity[2]{};  // 每个输入槽位最近一次被 execute 写入的 done 值
+    std::atomic<uint64_t> _lastDone{ 0 };       // 最近一次 execute 的 done 值(copy(n+1) 等它)
+    std::atomic<uint64_t> _doneByParity[2]{};   // 每个输入槽位最近一次被 execute 写入的 done 值
     // 队列级 Wait 复核探针(VSDLSSNR_NVOF_QWAIT)已删:2026-10-02 复核
     // 30/30 未复现,"队列 Wait 无过错"结论归档(git 史 docs(reverify))。
     // 延迟 densify(2026-09-25):待冲刷帧的 execute done 值 + 输入槽位。
@@ -244,7 +248,6 @@ private:
     double _lastGateWaitMs = 0.0; // 常驻诊断(面板/testkit 消费)
     double _lastCpyWaitMs = 0.0;  // 常驻诊断(面板/testkit 消费)
     double _lastExeWaitMs = 0.0;  // 常驻诊断(面板/testkit 消费)
-    uint32_t _gateSkips = 0;      // 常驻诊断(面板/testkit 消费)
     uint32_t _gateExpired = 0;    // 常驻诊断(面板/testkit 消费)
     uint32_t _resetCount = 0;     // 常驻诊断(面板/testkit 消费)
 };

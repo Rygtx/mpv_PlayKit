@@ -3,6 +3,7 @@
 // 收口(OpenMpvPipe)。
 
 #include "panel_shared.h"
+#include "mpv_pipe_common.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -55,51 +56,12 @@ wchar_t *ResolveMpvPipeCandidates(const wchar_t **candidates) noexcept {
     wchar_t base[MAX_PATH];
     if (!BasePath(base, MAX_PATH)) return nullptr;
 
-    wchar_t *parsedName = nullptr; // _wcsdup;末尾 free(nullptr) 恒安全
-    {
-        wchar_t confPath[MAX_PATH];
-        swprintf_s(confPath, L"%s\\..\\portable_config\\mpv.conf", base);
-        FILE *f = nullptr;
-        if (_wfopen_s(&f, confPath, L"rb") == 0 && f) {
-            char buf[16384]{};
-            const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-            fclose(f);
-            // 逐行找未注释的 input-ipc-server = <名>(值可带引号)
-            size_t pos = 0;
-            while (pos < n) {
-                const size_t eol = pos + strcspn(buf + pos, "\r\n");
-                size_t s = pos;
-                while (s < eol && (buf[s] == ' ' || buf[s] == '\t')) ++s;
-                if (s + 16 <= eol && _strnicmp(buf + s, "input-ipc-server", 16) == 0) {
-                    size_t eq = s + 16;
-                    while (eq < eol && (buf[eq] == ' ' || buf[eq] == '\t')) ++eq;
-                    if (eq < eol && buf[eq] == '=') {
-                        ++eq;
-                        while (eq < eol && (buf[eq] == ' ' || buf[eq] == '\t')) ++eq;
-                        size_t e = eol;
-                        for (size_t h = eq; h < e; ++h) {
-                            if (buf[h] == '#') { e = h; break; }
-                        }
-                        while (e > eq && (buf[e - 1] == ' ' || buf[e - 1] == '\t' ||
-                                          buf[e - 1] == '"' || buf[e - 1] == '\'')) --e;
-                        if (e > eq && e - eq < 64) {
-                            wchar_t parsed[64]{};
-                            const int cw = MultiByteToWideChar(
-                                CP_UTF8, 0, buf + eq, static_cast<int>(e - eq),
-                                parsed, 63);
-                            if (cw > 0) {
-                                parsed[cw] = L'\0';
-                                parsedName = _wcsdup(parsed);
-                                candidates[0] = parsedName;
-                            }
-                        }
-                        break;
-                    }
-                }
-                pos = eol + 1;
-            }
-        }
-    }
+    // conf 解析收口到 mpv_pipe_common(与插件 resize watcher 共用,2026-10-04
+    // —— 此前两份手写解析,插件侧压根没有,自定义管道名下静默分叉)。
+    wchar_t confPath[MAX_PATH];
+    swprintf_s(confPath, L"%s\\..\\portable_config\\mpv.conf", base);
+    wchar_t *parsedName = MpvParseIpcServerName(confPath);
+    if (parsedName) candidates[0] = parsedName;
 
     if (parsedName) {
         g_pipeResolved = _wcsdup(parsedName); // 命中缓存(进程期有效)
@@ -132,12 +94,18 @@ static HANDLE OpenMpvPipe(const wchar_t *const *candidates, bool overlapped,
 }
 } // namespace
 
-// 面板→mpv IPC 单条命令:候选管道逐个尝试,写命令 + 读回执。cmd 须自带
-// 行尾 \n。命中管道名经 hitOut 带回。
+// 面板→mpv 原地重载请求(唯一消费者 = reseek;原"通用 MpvIpcSendCmd"单
+// 调用者壳已内联,2026-10-04)。候选管道逐个尝试,写命令 + 排空回执。
 // 写/读均为 overlapped + 500ms 有界等待(2026-09-25):原实现同步无超时,
-// mpv 活着但不回包(渲染挂起)时 ReadFile 永久阻塞 —— 主线程 reseek 路径
-// 与打标线程共用本函数,主线程被拖死 = 面板 UI 整体冻结。
-bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
+// mpv 活着但不回包(渲染挂起)时 ReadFile 永久阻塞 —— 主线程被拖死 =
+// 面板 UI 整体冻结。
+bool TriggerMpvReseek() noexcept {
+    // 原地微 seek(1ms 向前,exact)触发 vf_vapoursynth 整脚本重建,
+    // 新实例在 create 时采纳刚发布的 payload create-time 三元组
+    // (vsrMode/scale/hdr)。实测播放/暂停两态均稳定重建(2026-09-23
+    // 4/4);曾误判"seek 不重建"(23:02 风暴零新实例)—— 对照测试
+    // 推翻,该次异常归因于管道归属的环境性歧义,机制本身有效。
+    static const char kSeekCmd[] = "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
     const wchar_t *candidates[4];
     wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
 
@@ -154,11 +122,11 @@ bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
         }
         OVERLAPPED ov{};
         ov.hEvent = ev;
-        const DWORD cmdLen = static_cast<DWORD>(strlen(cmd));
+        const DWORD cmdLen = static_cast<DWORD>(sizeof(kSeekCmd) - 1);
         DWORD written = 0;
         // 写入有界等待:ERROR_IO_PENDING 后等事件,超时视为该候选失败。
         const bool wrote =
-            WriteFile(pipe, cmd, cmdLen, &written, &ov) ||
+            WriteFile(pipe, kSeekCmd, cmdLen, &written, &ov) ||
             (GetLastError() == ERROR_IO_PENDING &&
              WaitForSingleObject(ev, 500) == WAIT_OBJECT_0 &&
              GetOverlappedResult(pipe, &ov, &written, FALSE));
@@ -181,28 +149,15 @@ bool MpvIpcSendCmd(const char *cmd, wchar_t *hitOut, size_t hitLen) noexcept {
         }
         CloseHandle(ev);
         CloseHandle(pipe);
-        if (ok && hitOut && hitLen) {
-            swprintf_s(hitOut, hitLen, L"%ls", candidates[i]);
+        if (ok) {
+            PanelLog("panel: mpv reseek via IPC pipe %ls", candidates[i]);
         }
     }
     free(parsedName);
-    return ok;
-}
-
-bool TriggerMpvReseek() noexcept {
-    // 原地微 seek(1ms 向前,exact)触发 vf_vapoursynth 整脚本重建,
-    // 新实例在 create 时采纳刚发布的 payload create-time 三元组
-    // (vsrMode/scale/hdr)。实测播放/暂停两态均稳定重建(2026-09-23
-    // 4/4);曾误判"seek 不重建"(23:02 风暴零新实例)—— 对照测试
-    // 推翻,该次异常归因于管道归属的环境性歧义,机制本身有效。
-    wchar_t hit[64];
-    if (MpvIpcSendCmd("{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n",
-                      hit, 64)) {
-        PanelLog("panel: mpv reseek via IPC pipe %ls", hit);
-        return true;
+    if (!ok) {
+        PanelLog("panel: mpv IPC reseek unavailable (input-ipc-server off? mpv closed?); falling back to in-session live");
     }
-    PanelLog("panel: mpv IPC reseek unavailable (input-ipc-server off? mpv closed?); falling back to in-session live");
-    return false;
+    return ok;
 }
 
 // ---- HDR 输出打标同步(独立后台线程)-------------------------------------
@@ -342,10 +297,10 @@ DWORD WINAPI HdrTagProc(LPVOID) noexcept {
         StatsPayload st{};
         bool badMagic = false;
         if (ReadStatsSnapshot(&st, &badMagic) != 2) continue; // 插件未跑/快照未稳
-        // rtx 字段为空 ≠ 死 body:NR+FG+RTX 皆关时插件发布 passthrough 简体,
-        // 本身不带 rtx(2026-09-24 实锤:关 HDR 后标签残留)—— 空即 SDR
-        // 实态,发 remove 摘标。
-        HdrTagTick(conn, strstr(st.rtx, "hdr") ? 1 : 0);
+        // HDR 打标直读实效位(DSLA;原 strstr 人读串 parse 在插件改显示
+        // 格式时会静默错)。rtxHdrActive 缺省 0(passthrough 简体 body 不带)
+        // = SDR 实态,发 remove 摘标 —— 与旧"rtx 字段为空"判据同语义。
+        HdrTagTick(conn, st.rtxHdrActive ? 1 : 0);
     }
     if (conn.pipe) CloseHandle(conn.pipe);
     return 0;

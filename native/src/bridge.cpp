@@ -123,15 +123,9 @@ bool GetSelfIniPath(wchar_t *path, size_t pathLen) noexcept {
 bool BridgeLoadIni(DlssnrParams &p) noexcept {
     wchar_t iniPath[MAX_PATH];
     if (!GetSelfIniPath(iniPath, MAX_PATH)) return false;
-    // 启动自检:剪除表外键(跨版本回滚残留/手编历史键,见 PruneDlssnrIni)。
-    wchar_t pruned[256] = L"";
-    const int prunedN = PruneDlssnrIni(iniPath, pruned, sizeof(pruned) / sizeof(pruned[0]));
-    if (prunedN > 0) {
-        char msg[160];
-        std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: pruned %d stale ini key(s)", prunedN);
-        TimingStatusLine(msg);
-    }
+    // 只读:prune 归面板启动自检单点(2026-10-04)。本侧 PruneDlssnrIni 是
+    // WritePrivateProfileStringW 整文件改写 = 与面板写路径跨进程并发丢更新,
+    // 且表外键本就被键表忽略,插件侧 prune 无正确性收益。
     return LoadDlssnrIni(p, iniPath); // shared key list + clamps (dlssnr_ini.h)
 }
 
@@ -202,11 +196,11 @@ void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
     {
         char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: bridge apply seq=%u gen=%u preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d save=%d log=%d",
+                      "DLSSNR STATUS: bridge apply seq=%u gen=%u preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d log=%d",
                       static_cast<unsigned>(pl.seq), static_cast<unsigned>(pl.generation),
                       pl.preset, pl.inputResolution, pl.scalingEnabled,
                       pl.motionVectorQuality, pl.ffxQuality, pl.nvofFollowScaling,
-                      pl.saveRequest, pl.logEnabled);
+                      pl.logEnabled);
         TimingStatusLine(msg);
     }
     DlssnrParams p = state->params->Snapshot();
@@ -224,13 +218,8 @@ void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
     state->params->RequestScalingEnabled(create.scalingEnabled);
     state->params->Update(p);
 
-    // saveRequest 无消费者(2026-10-03):ini 落盘单写者 = 面板"保存设置"
-    // (WriteIniNow 直写 g_app.params)。本侧写块(2026-09-23 引入)与其
-    // 等价 —— SaveTime* 两行被随后的 LoadCreateParams(s, pl) 整体覆盖 =
-    // 死代码,而 pl 的 create 字段本就源自面板同一份 g_app.params;双写者
-    // 反而让面板"已保存"提示与最终落盘内容脱节,且磁盘写卡在轮询线程上
-    // (BridgeStopLocked 5s wedge 泄漏场景的直接成因)。旗标保留在协议里,
-    // 仅作上方探针行的对齐锚点。
+    // saveRequest 已随 v25 协议删除(无消费者 —— ini 落盘单写者 = 面板
+    // "保存设置",2026-10-03 裁定;本侧写块当时已撤)。
     SetTimingLogEnabled(pl.logEnabled != 0);
 }
 

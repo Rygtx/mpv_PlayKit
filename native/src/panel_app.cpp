@@ -39,7 +39,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 
 // 进程退出旗标:主循环(WM_QUIT)、看门狗与 HDR 打标线程轮询同一位。
 // 定义在匿名 namespace 之前 —— HdrTagProc 在文件前部,须能看到它。
-bool g_quit = false;
+// atomic(2026-10-04:裸 bool 跨线程轮询是数据竞争;bridge 侧同场景用 volatile)。
+std::atomic<bool> g_quit{ false };
 
 constexpr wchar_t WINDOW_CLASS[] = L"vs_dlssnr_panel_app";
 constexpr wchar_t WINDOW_TITLE[] = L"DLSSNR 控制面板";
@@ -214,13 +215,12 @@ bool CreateParamsMapping() noexcept {
     return true;
 }
 
-void WritePayload(bool saveRequest) noexcept {
+void WritePayload() noexcept {
     if (!g_payload) return;
     static uint32_t seq = 0;
     const uint32_t newSeq = ++seq;
     PanelPayload pl = PayloadFromParams(g_app.params); // shared field mapping; seq stays 0
     pl.generation = g_generation;
-    pl.saveRequest = saveRequest ? 1 : 0;
     pl.logEnabled = g_app.timingLog ? 1 : 0;
     // Publish protocol shared with the plugin's stats channel (panel_ipc.h):
     // body lands with seq 0, the counter moves alone after it is stable.
@@ -622,12 +622,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
         if (g_quit) break;
 
-        // Hidden-to-tray: stop rendering, wake on messages only
-        if (!IsWindowVisible(g_hwnd)) {
-            WaitMessage();
-            continue;
-        }
-
         LARGE_INTEGER now{};
         QueryPerformanceCounter(&now);
         // Absolute QPC time (a per-frame delta would always be < the 100ms
@@ -679,8 +673,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         // 由此补触发重建;2.5s 去抖防重建窗口内对旧 body 重复 seek。
         // 要求面板自身意图 nrEnabled:用户中途又关掉时旧 body 不得再触发。
         if (g_app.params.nrEnabled &&
-            std::strcmp(g_app.filterState, "passthrough") == 0 &&
-            std::strcmp(g_app.stateDetail, vsdlssnr::kStateNrSeekInit) == 0 &&
+            std::strcmp(g_app.snap.filterState, "passthrough") == 0 &&
+            std::strcmp(g_app.snap.stateDetail, vsdlssnr::kStateNrSeekInit) == 0 &&
             nowSec - g_app.lastSeekInitReseek > 2.5) {
             g_app.lastSeekInitReseek = nowSec;
             if (TriggerMpvReseek()) {
@@ -694,7 +688,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         // times a second for content that moves at most twice a second.
         // 页签恢复期例外:恢复需要连续渲染帧推进 ImGui 的布局状态,空闲门
         // 会把窗口冻在恢复完成前的旧帧上(启动页签显示错误的根因之一)。
-        if (activity || g_app.liveDirty || g_app.statsDirty || g_app.pageRestore) {
+        // Hidden-to-tray:仅跳过渲染,上方节流工作(参数推送/reseek/闭环兜底)
+        // 照常运转 —— 托盘常驻进程的核心副作用不能只在前景发生;等待走下方
+        // 带超时的 MsgWait,隐藏态的闭环检查由 stats 节拍驱动,不依赖消息。
+        if (IsWindowVisible(g_hwnd) &&
+            (activity || g_app.liveDirty || g_app.statsDirty || g_app.pageRestore)) {
             g_app.statsDirty = false;
             if (g_rtv) { // WM_SIZE failure (device removal) leaves no RTV to bind
                 ImGui_ImplDX11_NewFrame();

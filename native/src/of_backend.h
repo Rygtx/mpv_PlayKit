@@ -20,8 +20,10 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 
@@ -29,6 +31,10 @@
 #include "d3d12_context.h" // OfClRotator:IsDeviceLost / ResetAllocatorHealed(自身不含本件,无环)
 
 namespace vsdlssnr {
+
+// 闩锁留痕出口(本体内 TimingStatusLine 在 dlssnr_context;避免反向 include,
+// 重复声明合法)。
+void TimingStatusLine(const char *line) noexcept;
 
 // 栅栏值到达等待(两光流后端共用):共享 auto-reset 事件的唤醒可能被同
 // 事件的其它等待者窃取(单次 Wait 返回不代表本等待的目标值已达成),循环
@@ -59,9 +65,11 @@ struct OfFenceEvent {
 class OfClRotator {
 public:
     // 建 4 深 allocator/CL 对(DIRECT;建后即 Close 待录)。失败返回 false
-    // (会话建失败路径收口,报错由调用方 fail() 统一落)。
-    bool Create(D3D12Context &d3d12, ID3D12Device *device) noexcept {
+    // (会话建失败路径收口,报错由调用方 fail() 统一落)。设备取自 d3d12
+    // (2026-10-04:撤双参数形态 —— 同一设备两种真相来源,可传不一致)。
+    bool Create(D3D12Context &d3d12) noexcept {
         _d3d12 = &d3d12;
+        ID3D12Device *device = d3d12.Device();
         for (int i = 0; i < kDepth; ++i) {
             if (FAILED(device->CreateCommandAllocator(
                     D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -101,12 +109,18 @@ public:
         return AcquireResult::Ok;
     }
 
-    // 提交记账:idx 位的在飞栅栏值(调用方在 Signal 后调用;每段恰一次)。
-    void RecordUse(ID3D12Fence *fence, uint64_t value) noexcept {
-        const int idx = static_cast<int>(_seq % kDepth);
-        _lastFence[idx] = fence;
-        _lastValue[idx] = value;
-        ++_seq;
+    // 提交 + 记账单点(2026-10-04 收拢):ECL → Signal → RecordUse 三步
+    // 此前散布 NVOF/FFX 五处提交点,靠"每段恰一次"的注释纪律维持 —— 漏记
+    // RecordUse 不会报错,错误在 4 段后才以背压假超时现形(极难归因)。
+    // value = 调用方每栅栏的单调计数(copySeq/doneSeq 各自独立,外部读
+    // _lastDone/_lastCopyFence 的语义不变)。返回 value(便于链式落账)。
+    uint64_t Submit(ID3D12CommandQueue *queue, ID3D12Fence *fence,
+                    ID3D12GraphicsCommandList *cl, uint64_t value) noexcept {
+        ID3D12CommandList *lists[]{ cl };
+        queue->ExecuteCommandLists(1, lists);
+        queue->Signal(fence, value);
+        RecordUse(fence, value);
+        return value;
     }
 
     // 会话销毁:栅栏指针随会话失效,簿记清零(退役会话不再 Acquire,
@@ -120,6 +134,15 @@ public:
     }
 
 private:
+    // 提交记账:idx 位的在飞栅栏值(经 Submit 调用;不再单独暴露 ——
+    // 配对关系从纪律变结构)。
+    void RecordUse(ID3D12Fence *fence, uint64_t value) noexcept {
+        const int idx = static_cast<int>(_seq % kDepth);
+        _lastFence[idx] = fence;
+        _lastValue[idx] = value;
+        ++_seq;
+    }
+
     D3D12Context *_d3d12 = nullptr;
     static constexpr int kDepth = 4;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> _alloc[kDepth];
@@ -206,6 +229,23 @@ public:
     virtual class NvofContext *AsNvof() noexcept { return nullptr; }
     // 后端种类(会话重建裁决/FFX 专属 dump 分支用 —— 免 RTTI/dynamic_cast)。
     virtual int Kind() const noexcept = 0;
+
+protected:
+    // 连败停用闩锁单点(2026-10-04 收拢):链断类失败(拷贝提交/execute/
+    // FFX densify —— 历史链断或会话能力存疑)统一计数,≥3 停用留痕,重试
+    // 经 Rebind/换档。此前两后端四处失败路径两种口径(FFX densify 失败
+    // 恰漏在自己注释宣称"已统一"的网外;NVOF 拷贝提交失败不计)。NVOF 的
+    // 冲刷 densify 失败链完好,不计(语义见其注释)。
+    void LatchFailure(uint32_t &consecutive, std::atomic<bool> &ready,
+                      const char *tag) noexcept {
+        if (++consecutive >= 3) {
+            ready.store(false, std::memory_order_release);
+            char msg[96];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: %s disabled after consecutive failures", tag);
+            TimingStatusLine(msg);
+        }
+    }
 };
 
 } // namespace vsdlssnr

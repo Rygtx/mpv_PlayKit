@@ -180,7 +180,7 @@ bool FxofContext::CreateSession(D3D12Context &d3d12, int width, int height,
         return fail("fxof: create session textures failed");
     }
 
-    if (!_rotator.Create(d3d12, device)) {
+    if (!_rotator.Create(d3d12)) {
         return fail("fxof: create command path failed");
     }
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
@@ -192,8 +192,9 @@ bool FxofContext::CreateSession(D3D12Context &d3d12, int width, int height,
     _copyFenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
     _doneFenceEvent = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
     if (!_copyFenceEvent || !_doneFenceEvent) return fail("fxof: CreateEvent failed");
-    _copySeq = _lastCopyFence = _copyFence->GetCompletedValue();
-    _doneSeq = _lastDone = _doneFence->GetCompletedValue();
+    // 计数器不再从完成值播种(2026-10-04 撤 NVOF 同构仪式):栅栏是本会话
+    // 新建(CreateFence 初值 0),播种恒得 0 —— 该写法只在 NVOF 的进程级
+    // 单例栅栏上承重(其 91ea1d1 历史 bug 背书),此处纯属误导性留痕。
 
     // 视图写入每槽堆(49/50;失败 = 初始化失败)。
     if (!d3d12.BindOfResources(_ffxInput.Get(), _sparseFlow.Get())) {
@@ -324,15 +325,12 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
 
         // 失败收口三连(copy submit / main acquire / dispatch 同构;此前逐字
         // 三连仅日志文案差异 —— copy 路径缺"连败停用"留痕属漂移,现统一):
-        // 播种 + 连败闩锁(≥3 停用留痕)+ Advance + 计时 + return。
+        // 播种 + 连败闩锁(LatchFailure 单点)+ Advance + 计时 + return。
         auto failAndAdvance = [&](const char *msg) -> OfStageResult {
             TimingStatusLine(msg);
             result.historyReset = true;
             _gate.InvalidateHistory();
-            if (++_consecutiveFailures >= 3) {
-                _ready.store(false, std::memory_order_release);
-                TimingStatusLine("DLSSNR STATUS: fxof disabled after consecutive failures");
-            }
+            LatchFailure(_consecutiveFailures, _ready, "fxof");
             _gate.Advance(frameIndex);
             QueryPerformanceCounter(&t1);
             _lastStageMs = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
@@ -341,9 +339,10 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         };
 
         // ---- copy CL ----
-        // queue Wait(doneFence, 上帧 dispatch)承重:保护本帧 ffxInput 覆写
-        // 不早于上帧 dispatch 读完(普通栅栏,排队可靠;FIFO 下通常已满足)。
-        if (_lastDone) queue->Wait(_doneFence.Get(), _lastDone);
+        // (2026-10-04 撤 NVOF 同构仪式的 queue Wait:copy 与上帧 dispatch
+        // 在同一队列 FIFO 上,copy(n) 天然后于 dispatch(n-1) 完成 —— 自家
+        // 队列的自等是零收益的队列依赖,还向读者暗示存在跨引擎同步需求。
+        // NVOF 的同名等待是跨引擎时序,承重,不在此列。)
         ID3D12CommandAllocator *copyAlloc = nullptr;
         ID3D12GraphicsCommandList *copyCl = nullptr;
         bool copyOk = AcquireCl(&copyAlloc, &copyCl);
@@ -392,11 +391,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             }
         }
         if (copyOk) {
-            ID3D12CommandList *lists[]{ copyCl };
-            queue->ExecuteCommandLists(1, lists);
-            _lastCopyFence = ++_copySeq;
-            queue->Signal(_copyFence.Get(), _lastCopyFence);
-            _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
+            _lastCopyFence = _rotator.Submit(queue, _copyFence.Get(), copyCl, ++_copySeq);
             // 转换 + Prepare 已落在成功提交的 copy CL 上(of_backend.h 契约):
             // 回填 inputIndex,调用方跳过槽 CL 的重复转换 —— 此前恒 -1,FFX
             // 每帧多付一次全量 YUV→RGB dispatch,且槽 CL 对已 NSR 的
@@ -456,14 +451,10 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             OutputDebugStringA("\n");
             return failAndAdvance(msg);
         }
-        ID3D12CommandList *lists[]{ mainCl };
-        queue->ExecuteCommandLists(1, lists);
-        _lastDone = ++_doneSeq;
-        queue->Signal(_doneFence.Get(), _lastDone);
-        _rotator.RecordUse(_doneFence.Get(), _lastDone);
+        _lastDone = _rotator.Submit(queue, _doneFence.Get(), mainCl, ++_doneSeq);
         if (_tsMapped) {
             _spanPending = true;
-            _spanFence = _lastDone;
+            _spanFence = _lastDone.load(std::memory_order_relaxed);
         }
         _consecutiveFailures = 0;
         if (_executesLogged < 5) {
@@ -477,29 +468,28 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
 
         // ---- densify CL:稀疏流 → 稠密运动 ----
         // sparseFlow 经 main CL 的 UAV 写,FFX backend 收尾归 COMMON(声明
-        // 契约);densify SRV 读走隐式提升 —— debug layer 校验点。提交前
-        // queue Wait(doneFence, 本帧 main)承重:读序等本帧 dispatch 完成
-        // (普通栅栏,排队可靠)。
+        // 契约);densify SRV 读走隐式提升 —— debug layer 校验点。读序 =
+        // 同队列 FIFO(densify 后于 dispatch 入队,自然后完成;原 queue
+        // Wait 同为 NVOF 同构仪式,2026-10-04 撤)。
         ID3D12CommandAllocator *densAlloc = nullptr;
         ID3D12GraphicsCommandList *densCl = nullptr;
         bool densifyOk = AcquireCl(&densAlloc, &densCl);
         if (densifyOk) {
-            if (_lastDone) queue->Wait(_doneFence.Get(), _lastDone);
             postExecute(densCl, 0); // motion/conf 屏障 + RecordFfxDensify
             densifyOk = SUCCEEDED(densCl->Close());
         }
         if (densifyOk) {
-            ID3D12CommandList *lists[]{ densCl };
-            queue->ExecuteCommandLists(1, lists);
-            _lastCopyFence = ++_copySeq;
-            queue->Signal(_copyFence.Get(), _lastCopyFence);
-            _rotator.RecordUse(_copyFence.Get(), _lastCopyFence);
+            _lastCopyFence = _rotator.Submit(queue, _copyFence.Get(), densCl, ++_copySeq);
             result.waitFenceValue = _lastDone; // 非 0 = realMotion
         } else {
+            // densify 失败与 copy/main 同类(链断:InvalidateHistory 已落),
+            // 计入连败闩锁 —— 此前恰漏在"失败收口三连已统一"的网外,持续
+            // 失败风暴时本后端永不自停(2026-10-04 补齐)。
             TimingStatusLine("DLSSNR STATUS: fxof densify submit failed");
             result.historyReset = true;
             result.waitFenceValue = 0;
             _gate.InvalidateHistory();
+            LatchFailure(_consecutiveFailures, _ready, "fxof");
         }
 
         // 播种帧对齐 NVOF 播种语义(of_backend.h 契约):发布零运动 + 携带

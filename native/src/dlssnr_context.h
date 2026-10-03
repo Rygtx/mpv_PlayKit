@@ -103,9 +103,10 @@ public:
         int newWidth = 0, newHeight = 0, newDepth = 0;
         bool shape = false;             // 提供时 = 形态段(RTX/FG 会话热重建)
         RtxVideoParams rtx{};           // shape 段的新 RTX 几何(DecideRtxGeometry 入参)
-        bool hasFg = false;             // shape 段内:提供 FG 请求态(否则维持现状)
+        // shape 段内的 FG 请求态(2026-10-04:hasFg/hasFgHdr 旗标已删 ——
+        // 全部调用点恒等于 shape,"提供才参与"零兑现,纯双账)。bridge 的
+        // preset 重建路径 shape=false,两键整体跳过。
         bool fgRequested = false;
-        bool hasFgHdr = false;          // shape 段内:提供 fgHdrInterp 请求态
         bool fgHdr = false;
     };
     // Preset / internal-resolution / scaling-toggle are create-time NGX keys:
@@ -129,6 +130,13 @@ public:
     // RebuildOf 封池风暴(该不对称是防风暴关键,不是漂移)。
     bool SyncOfSession(const DlssnrParams &p, int srcW, int srcH, bool allowRetry,
                        char *err, size_t errLen) noexcept;
+    // follow 判定单一谓词(SyncOfSession 裁决点与 RecreateFeature 形态段
+    // 共用;此前形态段内联版漏 fgEnabled 项 —— FG on→off seek + follow 开
+    // 时按"FG 占用"在源尺寸建会话,Rebind 尾 SyncOfSession 按"FG 已关"
+    // 判 stale 再建一次,刚建的会话直接退役,显存白付一份,2026-10-04
+    // 收拢)。scalingActive 由调用方给语义:裁决点 = 实态 HasScaling();
+    // 形态段 = 本次重建的请求态(scaling 纹理尚未重建)。
+    bool OfFollowDesired(const DlssnrParams &p, bool scalingActive) const noexcept;
     // 光流历史失效(seek = 新时间线)。热 Rebind 上调用;下一帧重新播种。
     void ResetNvofHistory() noexcept;
 
@@ -267,11 +275,14 @@ private:
     // (_fgDetail + 预载归因并入)一条龙。成功置 _fgRouteEff=
     // official-hook|official;失败清 _fgRequested(槽资源已带 FG 纹理时
     // 无害留用)。返回会话是否可用。
-    bool SetupFgSession() noexcept;
+    bool SetupFgSession(const DlssnrParams &p) noexcept;
     // 光流后端构造(of_backend 单一后端,默认 FFX;失败不跨后端回落 ——
     // 对齐 fg_route 先例:行为可预测)。
     // q > 0;err 带最后一个失败原因(冷初始化 4b 与 RebuildOf 共用)。
-    std::unique_ptr<IOpticalFlowBackend> CreateOfBackend(int q, int dstW, int dstH,
+    // backendReq = 调用方快照的请求后端(单一快照纪律,2026-10-04 起
+    // 不再函数内自取)。
+    std::unique_ptr<IOpticalFlowBackend> CreateOfBackend(int q, int backendReq,
+                                                         int dstW, int dstH,
                                                          char *err, size_t errLen) noexcept;
     // OF 实际模式串(StatsPayload.ofMode):档位关闭 = "off",会话死亡 = "zero",
     // 存活 = backend 能力段(NvofContext "both+cost q2 grid4" /
@@ -358,17 +369,13 @@ private:
     // Cross-thread: written by one frame thread (device-lost latch /
     // failed rebuild) while others read it under fmParallel.
     std::atomic<bool> _ready{false};
-    // create-time parameters currently baked into the NGX feature (Rebind
-    // compares against these to skip a no-op RecreateFeature)
-    int _curPreset = -1;
-    int _curRes = -1;
-    bool _curScaling = false;
     // 最近一次成功建(重)模时的完整参数快照:Initialize 落账、
     // RecreateFeature 尾部覆盖(三个调用点共享该收口点)。Rebind 的
-    // "要不要重建"比对(CreateParamsChanged)用真身对真身 —— 不再伪造
-    // 三字段 cur(半成品在未来新增 create 键时会静默读默认值 0 误判,
-    // 编译器无法兜底)。CreateParamsChanged 只比较 create 键;其余字段
-    // 顺带存档,不参与裁决。
+    // "要不要重建"比对(CreateParamsChanged)与 RecreateFeature 的
+    // nrKeysChanged 都对真身比较 —— create 三元组规则只在
+    // dlssnr_params.h 一处(2026-10-04:三字段 _cur* 副本已删,双账
+    // 必漂移)。CreateParamsChanged 只比较 create 键;其余字段顺带存档,
+    // 不参与裁决。
     DlssnrParams _appliedCreate{};
     // 光流会话(of_backend 选择后端:kOfBackendNvof/Ffx)。
     // _curOfQuality = 当前生效档位(0 = 零 guidance;语义随后端 —— NVOF
@@ -382,9 +389,13 @@ private:
     // 存活到进程退出(热上下文哲学;每会话约 2×W×H×4B 显存,FFX 另含内部
     // 金字塔资源)。
     std::vector<std::unique_ptr<IOpticalFlowBackend>> _retiredOf;
-    int _curOfQuality = 0;
-    int _curOfBackend = 0; // 当前会话按 of_backend 参数构造时的请求值
-    bool _nvofFailed = false;
+    // 跨帧线程读写的会话事实(fmParallel):写侧恒在 PoolHold/_nvofMutex
+    // 封池窗口,读侧(SyncOfSession 每帧 stale 检查、ProcessFrame、stats
+    // 发布)在窗口外无锁 —— atomic 化对齐 _tPubState 惯例(2026-10-04,
+    // 此前普通成员按设计就数据竞争)。
+    std::atomic<int> _curOfQuality{ 0 };
+    std::atomic<int> _curOfBackend{ 0 }; // 最近已处理的请求后端(请求级,见 RebuildOf 注)
+    std::atomic<bool> _nvofFailed{ false };
     std::mutex _nvofMutex;
     // DLSS FG(挂 NR 之后):创建时 fgEnabled → 建 proxy 会话 + FG 槽资源
     // (_fgRequested 参与 CreateFrameResources 旗标,sticky);初始化失败 =
@@ -442,7 +453,9 @@ private:
     // ProcessFrame 的 evaluate 串行域内推进,与 NGX 单例同一把
     // _evaluateMutex 保护(记录序 ≠ 提交序的风险面与 NGX 时域历史一致:
     // 乱序帧 weight 0 拒混,双缓冲容忍一帧偏斜)。
-    int _curAntiFlicker = 0;
+    // 帧路径 live 切换写(无全局锁),他帧线程读 —— 与上方 OF 会话事实
+    // 同理 atomic 化(2026-10-04)。
+    std::atomic<int> _curAntiFlicker{ 0 };
     long long _tLastFrame = -1;
     double _tLastQpc = 0.0;
     int _tNext = 0;

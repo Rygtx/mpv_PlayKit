@@ -184,7 +184,7 @@ void DrawNrPage(UiCtx &ui) noexcept {
             // live 会话(含 NR 已关)恒 filterState="ok"("NR off (panel)"
             // 边沿体已随解耦删除),走 live 门即时生效。
             const bool needsReseek =
-                v && strcmp(g_app.filterState, "passthrough") == 0;
+                v && strcmp(g_app.snap.filterState, "passthrough") == 0;
             g_app.params.nrEnabled = v ? 1 : 0;
             g_app.liveDirty = true;
             if (needsReseek) g_app.reseekDirty = true;
@@ -632,22 +632,22 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                 // 224 = "直通(画面未增强)" 前缀 + stateDetail 全长(207)+NUL
                 char stDesc[224] = "未加载滤镜";
                 bool stRed = false;
-                if (g_app.gpuName[0]) {
-                    if (std::strcmp(g_app.filterState, "passthrough") == 0) {
+                if (g_app.snap.gpuName[0]) {
+                    if (std::strcmp(g_app.snap.filterState, "passthrough") == 0) {
                         // deliberate = 用户主动全关("NR+FG+RTX disabled");
                         // "NR off (panel)" 边沿体已删。原 "NR+FG disabled" 14
                         // 字符前缀是加 RTX 前的老串,与现串第 5 字节起错位恒
                         // 不命中 —— 全关实例曾被误标红色错误态。
                         const bool deliberate =
-                            std::strncmp(g_app.stateDetail, "NR+FG+RTX disabled", 18) == 0;
+                            std::strncmp(g_app.snap.stateDetail, "NR+FG+RTX disabled", 18) == 0;
                         std::snprintf(stDesc, sizeof(stDesc), "直通(画面未增强)%s%s",
-                                      g_app.stateDetail[0] ? ": " : "", g_app.stateDetail);
+                                      g_app.snap.stateDetail[0] ? ": " : "", g_app.snap.stateDetail);
                         stRed = !deliberate;
-                    } else if (std::strcmp(g_app.filterState, "ngx_faulted") == 0) {
+                    } else if (std::strcmp(g_app.snap.filterState, "ngx_faulted") == 0) {
                         std::snprintf(stDesc, sizeof(stDesc), "NGX 故障已停用%s%s",
-                                      g_app.stateDetail[0] ? ": " : "", g_app.stateDetail);
+                                      g_app.snap.stateDetail[0] ? ": " : "", g_app.snap.stateDetail);
                         stRed = true;
-                    } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
+                    } else if (std::strcmp(g_app.snap.filterState, "nvof_zero") == 0) {
                         std::snprintf(stDesc, sizeof(stDesc), "增强中,光流无运动数据");
                         stRed = true;
                     } else {
@@ -656,10 +656,10 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                         // "on"(真插值);RTX = 实态串(插件直发)。原按面板
                         // 意图(nrOn/fgOn/rtxOn)推导的镜像已删 —— 插件改门控
                         // 公式时面板静默错标的整类失配由此消灭。
-                        const bool evalOn = g_app.evalActive != 0;
-                        const bool fgOnFrame = std::strcmp(g_app.fgState, "on") == 0;
-                        const bool rtxOn = g_app.rtxState[0] &&
-                                           std::strcmp(g_app.rtxState, "off") != 0;
+                        const bool evalOn = g_app.snap.evalActive != 0;
+                        const bool fgOnFrame = std::strcmp(g_app.snap.fgState, "on") == 0;
+                        const bool rtxOn = g_app.snap.rtx[0] &&
+                                           std::strcmp(g_app.snap.rtx, "off") != 0;
                         if (evalOn || fgOnFrame || rtxOn) {
                             std::snprintf(stDesc, sizeof(stDesc),
                                           "增强中(NGX 推理运行)");
@@ -673,7 +673,7 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                 // 实际加载的模型 dll(原版/哪档变体,一眼核对;等价 timing log
                 // 的 "ngx model tier=" 行 + "snippet dll" 指纹)。
                 ImGui::TextDisabled("模型: %s",
-                                    g_app.modelDll[0] ? g_app.modelDll : "(未知)");
+                                    g_app.snap.modelDll[0] ? g_app.snap.modelDll : "(未知)");
 
                 // 请求 vs 实际三列手动网格(参数页 SameLine 网格同款,不用
                 // BeginTable:其列宽在此自绘 DPI 体系下不可预期):项目列
@@ -702,7 +702,7 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                                                   ? g_app.params.ffxQuality
                                                   : g_app.params.motionVectorQuality,
                                               0, kOfQualityMax);
-                const bool ofBroken = std::strcmp(g_app.ofMode, "zero") == 0 && ofqReq > 0;
+                const bool ofBroken = std::strcmp(g_app.snap.ofMode, "zero") == 0 && ofqReq > 0;
                 // 每帧消费态(DSL9 实效位直读):ofActive = 插件侧消费门
                 // (ofNeeded)本帧真值 —— of_mode 是会话级照报,门关帧零提交,
                 // 不能当"每帧在算"的证据。"算(NR/FG)"归因仍按意图(消费方
@@ -710,8 +710,8 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                 const bool ofNr = g_app.params.nrEnabled != 0;
                 const bool ofFg = g_app.params.fgEnabled != 0 && g_app.params.fgMultiplier > 1;
                 const char *ofFrame = ofqReq == 0 ? "质量 0(关)"
-                                      : !g_app.ofMode[0] ? "未加载"
-                                      : !g_app.ofActive ? "门控跳过(NR/FG 均关,零提交)"
+                                      : !g_app.snap.ofMode[0] ? "未加载"
+                                      : !g_app.snap.ofActive ? "门控跳过(NR/FG 均关,零提交)"
                                       : (ofNr && ofFg) ? "算(NR+FG)"
                                       : ofNr ? "算(NR)" : "算(FG)";
                 if (ofBroken) ImGui::TextColored(kErrRed, "光流");
@@ -722,18 +722,18 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                 ImGui::SameLine();
                 ImGui::SetCursorPosX(actX);
                 TextColoredWrapped(ofBroken ? kErrRed : kDimTxt, "%s · 每帧:%s%s%s",
-                                   g_app.ofMode[0] ? g_app.ofMode : "(未加载)",
+                                   g_app.snap.ofMode[0] ? g_app.snap.ofMode : "(未加载)",
                                    ofFrame,
-                                   g_app.ofDetail[0] ? " —— " : "", g_app.ofDetail);
+                                   g_app.snap.ofDetail[0] ? " —— " : "", g_app.snap.ofDetail);
 
                 // 抗闪烁请求 vs 实际:实际档 + 时间线状态 + 最近混合权重。
                 // 红显 = 请求开但插件降级(failed),或状态活跃而实档掉 0。
                 {
                     const bool afReqOn = g_app.params.antiFlicker > 0;
-                    const bool afFailed = std::strcmp(g_app.temporalState, "failed") == 0;
-                    const bool afDegraded = afReqOn && g_app.temporalState[0] &&
-                                            std::strcmp(g_app.temporalState, "off") != 0 &&
-                                            g_app.temporalRoute == 0;
+                    const bool afFailed = std::strcmp(g_app.snap.temporal, "failed") == 0;
+                    const bool afDegraded = afReqOn && g_app.snap.temporal[0] &&
+                                            std::strcmp(g_app.snap.temporal, "off") != 0 &&
+                                            g_app.snap.temporalRoute == 0;
                     const bool afBroken = afFailed || afDegraded;
                     char afReq[32];
                     std::snprintf(afReq, sizeof(afReq), "%s",
@@ -742,18 +742,18 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                                                 kAntiFlickerMin, kAntiFlickerMax)]
                                           : "关");
                     char afEff[112];
-                    if (!g_app.temporalState[0]) {
+                    if (!g_app.snap.temporal[0]) {
                         std::snprintf(afEff, sizeof(afEff), "(未加载)");
                     } else if (afFailed) {
                         std::snprintf(afEff, sizeof(afEff), "重建失败(已降级关闭)");
-                    } else if (!afReqOn || std::strcmp(g_app.temporalState, "off") == 0) {
+                    } else if (!afReqOn || std::strcmp(g_app.snap.temporal, "off") == 0) {
                         std::snprintf(afEff, sizeof(afEff), "未开启");
                     } else {
                         std::snprintf(afEff, sizeof(afEff), "档位 %d · %s · w=%.2f",
-                                      g_app.temporalRoute,
-                                      std::strcmp(g_app.temporalState, "steady") == 0 ? "稳态"
+                                      g_app.snap.temporalRoute,
+                                      std::strcmp(g_app.snap.temporal, "steady") == 0 ? "稳态"
                                                                                       : "播种",
-                                      g_app.temporalW);
+                                      g_app.snap.temporalW);
                     }
                     if (afBroken) ImGui::TextColored(kErrRed, "抗闪烁");
                     else ImGui::TextUnformatted("抗闪烁");
@@ -776,17 +776,17 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                                   kRouteNames[std::clamp(g_app.params.fgRoute, kFgRouteMin, kFgRouteMax)]);
                 }
                 const bool fgBroken = g_app.params.fgEnabled != 0 &&
-                                      (std::strcmp(g_app.fgState, "unavailable") == 0 ||
-                                       std::strcmp(g_app.fgRouteEff, "copy") == 0);
+                                      (std::strcmp(g_app.snap.fgState, "unavailable") == 0 ||
+                                       std::strcmp(g_app.snap.fgRouteEff, "copy") == 0);
                 char fgEff[192]; // 路由标签(≤34)+ " —— " + fgDetail(127)+NUL
-                if (!g_app.fgRouteEff[0]) {
+                if (!g_app.snap.fgRouteEff[0]) {
                     std::snprintf(fgEff, sizeof(fgEff), "(未加载)");
-                } else if (std::strcmp(g_app.fgRouteEff, "off") == 0) {
+                } else if (std::strcmp(g_app.snap.fgRouteEff, "off") == 0) {
                     std::snprintf(fgEff, sizeof(fgEff), "未开启");
                 } else {
-                    const char *rl = FgRouteLabel(g_app.fgRouteEff);
-                    std::snprintf(fgEff, sizeof(fgEff), "%s%s%s", rl[0] ? rl : g_app.fgRouteEff,
-                                  g_app.fgDetail[0] ? " —— " : "", g_app.fgDetail);
+                    const char *rl = FgRouteLabel(g_app.snap.fgRouteEff);
+                    std::snprintf(fgEff, sizeof(fgEff), "%s%s%s", rl[0] ? rl : g_app.snap.fgRouteEff,
+                                  g_app.snap.fgDetail[0] ? " —— " : "", g_app.snap.fgDetail);
                 }
                 if (fgBroken) ImGui::TextColored(kErrRed, "帧生成");
                 else ImGui::TextUnformatted("帧生成");
@@ -800,22 +800,22 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                 // 创建倍数 vs live 倍数 vs 运行库上限:上限 < 创建值 = gate
                 // 解锁失败回落(输出按高倍率节拍,超出槽位全是复制真实帧)
                 // —— 此前这一事实无任何 stats 键,面板全绿,用户毫无感知。
-                if (g_app.params.fgEnabled && g_app.fgMultCreate > 0) {
-                    const bool multClipped = g_app.params.fgMultiplier > g_app.fgMultCreate;
+                if (g_app.params.fgEnabled && g_app.snap.fgMultCreate > 0) {
+                    const bool multClipped = g_app.params.fgMultiplier > g_app.snap.fgMultCreate;
                     // fg_mult_max 是插值帧数口径(M 倍 = M-1 插值):实效倍数
                     // = 上限+1。直接拿它跟倍数比会把健康的 6x(上限 5 插值)
                     // 误判成被压档红显 —— 曾致"5x 能开 6x 开不了"的假警。
-                    const bool capped = g_app.fgMultMax >= 1 &&
-                                        g_app.fgMultMax + 1 < g_app.fgMultCreate;
+                    const bool capped = g_app.snap.fgMultMax >= 1 &&
+                                        g_app.snap.fgMultMax + 1 < g_app.snap.fgMultCreate;
                     char fgAct[224];
                     if (capped) {
                         std::snprintf(fgAct, sizeof(fgAct),
                                       "会话创建 %dx | 运行库上限 %dx"
                                       "(超出槽位为复制帧 —— gate 解锁失败?驱动更新后重试)",
-                                      g_app.fgMultCreate, g_app.fgMultMax + 1);
+                                      g_app.snap.fgMultCreate, g_app.snap.fgMultMax + 1);
                     } else {
                         std::snprintf(fgAct, sizeof(fgAct), "会话创建 %dx%s",
-                                      g_app.fgMultCreate,
+                                      g_app.snap.fgMultCreate,
                                       multClipped ? "(超出部分需重载生效)" : "");
                     }
                     if (capped || multClipped) ImGui::TextColored(kErrRed, "FG 倍数");
@@ -842,7 +842,7 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                         std::snprintf(rtxReq, sizeof(rtxReq), "%s", vsrReq ? "VSR" : "HDR");
                     }
                     const bool rtxDown = (vsrReq || hdrReq) &&
-                                         std::strcmp(g_app.rtxState, "off") == 0;
+                                         std::strcmp(g_app.snap.rtx, "off") == 0;
                     if (rtxDown) ImGui::TextColored(kErrRed, "RTX Video");
                     else ImGui::TextUnformatted("RTX Video");
                     ImGui::SameLine();
@@ -851,8 +851,8 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                     ImGui::SameLine();
                     ImGui::SetCursorPosX(actX);
                     TextColoredWrapped(rtxDown ? kErrRed : kDimTxt, "%s%s%s",
-                                       g_app.rtxState[0] ? g_app.rtxState : "(未加载)",
-                                       g_app.rtxDetail[0] ? " —— " : "", g_app.rtxDetail);
+                                       g_app.snap.rtx[0] ? g_app.snap.rtx : "(未加载)",
+                                       g_app.snap.rtxDetail[0] ? " —— " : "", g_app.snap.rtxDetail);
                 }
             }
 
@@ -863,21 +863,21 @@ void DrawDiagPage(UiCtx &ui) noexcept {
             ImGui::TextUnformatted("槽池等待");
             ImGui::SameLine();
             ImGui::SetCursorPosX(qValX);
-            ImGui::Text("%.2f ms", g_app.slotWait);
+            ImGui::Text("%.2f ms", g_app.snap.slotWait);
             if (ImGui::IsItemHovered())
                 ShowTip("槽池全占时等槽的时长:大 = GPU 超载;与 NGX 等待都小而帧率低 = 上游没来帧。");
             ImGui::TextUnformatted("NGX 串行等待");
             ImGui::SameLine();
             ImGui::SetCursorPosX(qValX);
-            ImGui::Text("%.2f ms", g_app.lockWait);
+            ImGui::Text("%.2f ms", g_app.snap.lockWait);
             if (ImGui::IsItemHovered())
                 ShowTip("并发槽等 NGX 互斥的时长(与 perf 行 lock= 同源)。");
             ImGui::TextUnformatted("光流门");
             ImGui::SameLine();
             ImGui::SetCursorPosX(qValX);
-            ImGui::Text("跳帧 %d / 过期 %d / 重置 %d", g_app.gateSkips, g_app.gateExpired, g_app.gateResets);
+            ImGui::Text("过期 %d / 重置 %d", g_app.snap.gateExpired, g_app.snap.gateResets);
             if (ImGui::IsItemHovered())
-                ShowTip("跳帧 = 缺口超时,过期 = 帧迟到,重置 = seek(其后增加属正常);\n持续增长 = 时序异常。FFX 后端恒 0。");
+                ShowTip("过期 = 帧迟到(乱序播种),重置 = seek(其后增加属正常);\n持续增长 = 时序异常。");
 
             ImGui::Spacing();
             ImGui::TextDisabled("全页无红 = 插件正常工作。红色 = 与面板请求不一致。");
@@ -952,14 +952,14 @@ void DrawUi() noexcept {
     // Magpie Profiler 头部:GPU 名称 + 帧率(全程显示,无滤镜时占位)。
     // 首行必须手动定位到 marginX:后续行自动回流到 WindowPadding.x,历史
     // 上这里写死 16*s,而 WindowPadding 不缩放,高 DPI 下首行比后续行更靠右。
-    ImGui::Text("GPU: %s", g_app.gpuName[0] ? g_app.gpuName : "(等待滤镜加载)");
+    ImGui::Text("GPU: %s", g_app.snap.gpuName[0] ? g_app.snap.gpuName : "(等待滤镜加载)");
     // fps 打点在源帧入口(不含插帧):fg 状态非 off 即按 ×M 节奏出帧
     // (on=真插值;dup/unavailable=复制帧,节拍不变),输出 = 源 × fg_mult。
     // 计数本身就是整数,按整数显示(%.1f 是假精度)。
     {
-        const bool fgCadence = g_app.fgState[0] && std::strcmp(g_app.fgState, "off") != 0 && g_app.fgMult > 0;
-        const int mult = fgCadence ? g_app.fgMult : 1;
-        const int src = static_cast<int>(g_app.fps + 0.5);
+        const bool fgCadence = g_app.snap.fgState[0] && std::strcmp(g_app.snap.fgState, "off") != 0 && g_app.snap.fgMult > 0;
+        const int mult = fgCadence ? g_app.snap.fgMult : 1;
+        const int src = static_cast<int>(g_app.snap.fps + 0.5);
         if (mult > 1) {
             // 箭头链与分辨率行同款:源 → 插帧输出
             ImGui::Text("帧率: %d → %d FPS", src, src * mult);
@@ -998,39 +998,39 @@ void DrawUi() noexcept {
     {
         const ImVec4 warnCol(1.0f, 0.62f, 0.20f, 1.0f);
         const ImVec4 errCol(1.0f, 0.45f, 0.45f, 1.0f);
-        if (std::strcmp(g_app.filterState, "passthrough") == 0) {
+        if (std::strcmp(g_app.snap.filterState, "passthrough") == 0) {
             ImGui::TextColored(warnCol, "滤镜已回退直通(画面未增强)");
-            if (g_app.stateDetail[0]) TextDisabledWrapped(g_app.stateDetail);
-        } else if (std::strcmp(g_app.filterState, "ngx_faulted") == 0) {
+            if (g_app.snap.stateDetail[0]) TextDisabledWrapped(g_app.snap.stateDetail);
+        } else if (std::strcmp(g_app.snap.filterState, "ngx_faulted") == 0) {
             ImGui::TextColored(errCol, "NGX 故障,滤镜已停用 —— 重启 mpv 恢复");
-            if (g_app.stateDetail[0]) TextDisabledWrapped(g_app.stateDetail);
-        } else if (std::strcmp(g_app.filterState, "nvof_zero") == 0) {
+            if (g_app.snap.stateDetail[0]) TextDisabledWrapped(g_app.snap.stateDetail);
+        } else if (std::strcmp(g_app.snap.filterState, "nvof_zero") == 0) {
             ImGui::TextColored(warnCol, "光流无运动数据,已降级(增强继续)");
             // 原因直达(of_detail):此前"为什么降级"只活在 timing log。
-            if (g_app.ofDetail[0]) TextDisabledWrapped(g_app.ofDetail);
+            if (g_app.snap.ofDetail[0]) TextDisabledWrapped(g_app.snap.ofDetail);
         }
         // 实际光流模式:请求档位 ≠ 实际能力(Turing 无 cost / 驱动拒双向)
         // 时在这里暴露;档位关闭(off)不显示。
-        if (g_app.ofMode[0] && std::strcmp(g_app.ofMode, "off") != 0) {
-            ImGui::TextDisabled("光流模式: %s", g_app.ofMode);
+        if (g_app.snap.ofMode[0] && std::strcmp(g_app.snap.ofMode, "off") != 0) {
+            ImGui::TextDisabled("光流模式: %s", g_app.snap.ofMode);
         }
         // DLSS FG 状态:on=插值中;dup=复制帧(复位/零光流/开关暂关/降级);
         // off=本会话未激活;unavailable=代理初始化失败回退 1:1。
-        if (g_app.fgState[0] && std::strcmp(g_app.fgState, "off") != 0) {
-            const char *desc = std::strcmp(g_app.fgState, "on") == 0 ? "插值中"
-                             : std::strcmp(g_app.fgState, "dup") == 0 ? "复制帧"
-                             : std::strcmp(g_app.fgState, "unavailable") == 0 ? "不可用(1:1)"
-                             : g_app.fgState;
-            if (g_app.fgMult >= 2 && (std::strcmp(g_app.fgState, "on") == 0 ||
-                                      std::strcmp(g_app.fgState, "dup") == 0)) {
+        if (g_app.snap.fgState[0] && std::strcmp(g_app.snap.fgState, "off") != 0) {
+            const char *desc = std::strcmp(g_app.snap.fgState, "on") == 0 ? "插值中"
+                             : std::strcmp(g_app.snap.fgState, "dup") == 0 ? "复制帧"
+                             : std::strcmp(g_app.snap.fgState, "unavailable") == 0 ? "不可用(1:1)"
+                             : g_app.snap.fgState;
+            if (g_app.snap.fgMult >= 2 && (std::strcmp(g_app.snap.fgState, "on") == 0 ||
+                                      std::strcmp(g_app.snap.fgState, "dup") == 0)) {
                 // 库上限 < 面板倍数(40 系 gate 解锁失败回落 2x):输出按
                 // 面板倍数节拍走但实际密度只有 (上限+1)x —— 必须在此可见,
                 // 否则"选了 6x 全绿"而实际每 6 帧里 4 帧是复制帧。
-                if (g_app.fgMultMax >= 1 && g_app.fgMultMax + 1 < g_app.fgMult) {
+                if (g_app.snap.fgMultMax >= 1 && g_app.snap.fgMultMax + 1 < g_app.snap.fgMult) {
                     ImGui::TextDisabled("帧生成: %s (%dx, 实效 %dx —— 运行库上限)",
-                                        desc, g_app.fgMult, g_app.fgMultMax + 1);
+                                        desc, g_app.snap.fgMult, g_app.snap.fgMultMax + 1);
                 } else {
-                    ImGui::TextDisabled("帧生成: %s (%dx)", desc, g_app.fgMult);
+                    ImGui::TextDisabled("帧生成: %s (%dx)", desc, g_app.snap.fgMult);
                 }
             } else {
                 ImGui::TextDisabled("帧生成: %s", desc);
@@ -1159,7 +1159,7 @@ void DrawUi() noexcept {
         // 只读时状态栏红字说明,否则用户看到"已保存",重启全部回旧值
         // (dlssnr_ini.h 注释预言的场景)。
         if (WriteIniNow()) {
-            WritePayload(true); // saveRequest 旗标已无消费者,仅留 bridge 日志对齐锚点
+            WritePayload(); // logEnabled 等开关态随载荷同步
             snprintf(g_app.status, sizeof(g_app.status), "已保存");
         } else {
             snprintf(g_app.status, sizeof(g_app.status), "保存失败(文件被占用或不可写)");
