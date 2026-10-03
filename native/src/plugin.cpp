@@ -68,8 +68,32 @@ void ApplyFlagArg(const VSMap *in, const VSAPI *vsapi, const char *key, int &fie
 // (探测失败/50 系/未选装 = 纯原版,行为与现状一致)。选档是 (arch, impl,
 // 文件存在性) 的纯函数,会话内确定 —— 热重绑定按 ngxDllPath 比较不受影响。
 // 变体与原版同目录,NGX core 的 app dir 取 dll.parent_path() 不受选择影响。
+//
+// 探针必须"首拍定格":FG 代理(version.dll,dlssg_for_sm86)为给官方
+// DLSSG 放行,会把进程内 NVAPI GetArchInfo 钩成伪装 Blackwell(0x1B0)
+// —— 2026-10-03 实锤:3080 会话开 FG 后下一次 create 探到 0x1B0 →
+// tier=stock → 原版 snippet 在伪装态下 Feature 18 恒 0xbad00001,NR 整体
+// 失效。首次 create 必然先于代理附着(代理随 FG 会话初始化加载),缓存
+// 首拍真值后恒用之;后续探测与首拍的偏差只留一行痕(可诊断"为何没换档")。
 std::wstring SelectNgxDllVariant(const std::filesystem::path &ngxDir) {
-    const auto probe = vsdlssnr::dlssfg_gate::ProbePrimaryGpuArch();
+    static const vsdlssnr::dlssfg_gate::GpuArchProbe firstProbe = [] {
+        return vsdlssnr::dlssfg_gate::ProbePrimaryGpuArch();
+    }();
+    auto probe = vsdlssnr::dlssfg_gate::ProbePrimaryGpuArch();
+    if (probe.arch != firstProbe.arch || probe.implementation != firstProbe.implementation) {
+        static bool driftLogged = false; // 一次性:此后每拍都是同一个假值
+        if (!driftLogged) {
+            driftLogged = true;
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: ngx variant probe drifted (0x%X/0x%X -> 0x%X/0x%X, "
+                          "FG proxy NVAPI spoof?); keeping first-read tier",
+                          firstProbe.arch, firstProbe.implementation,
+                          probe.arch, probe.implementation);
+            vsdlssnr::TimingStatusLine(msg);
+        }
+        probe = firstProbe;
+    }
     const char *tier = "stock";
     const char *candidates[2] = {SNIPPET_DLL_NAME, SNIPPET_DLL_NAME};
     if (probe.arch == vsdlssnr::dlssfg_gate::kArchAda) {
@@ -1226,7 +1250,23 @@ static void VS_CC DlssnrCreate(
     // 处注释)。冷初始化 ~1s 在锁内 —— 并发的 Free 最多等一个冷启动周期。
     std::lock_guard<std::mutex> lifecycleLock(g_lifecycleMutex);
     const bool rtxRequested = rtx.vsrMode > 0 || rtx.hdrEnabled != 0;
+    // FG 代理时序门:hook 代理必须先于 NGX 核心加载才能挂上钩(依赖核心的
+    // 加载事件);热上下文的核心早已在,FG off→on 原地 rebind 补预载 =
+    // 钩子恒挂不上,官方 DLSSG 拒 0xBAD0000B(2026-10-03 实锤:面板中途
+    // 开 FG 恒"未生效(复制帧)",后续 seek 走热复用也救不回)。代理未加载
+    // 时强制冷初始化 —— Initialize 的预载先于核心,设计路径。每进程只强
+    // 制一次:预载成功后 ProxyLoaded 恒真自然回归热复用;version.dll 缺失
+    // 时防每个 seek 都付一遍冷启动(FG 降级复制帧,与旧语义一致)。
+    const bool fgProxyNeedsCold = initial.fgEnabled &&
+        std::clamp(initial.fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
+        !d->fgDllPath.empty() &&
+        !vsdlssnr::DlssfgContext::ProxyLoaded() &&
+        vsdlssnr::dlssfg_gate::GpuFamilyPrefersProxy();
+    static bool fgProxyColdForced = false; // 每进程一次(见上)
+    const bool fgProxyCold = fgProxyNeedsCold && !fgProxyColdForced;
+    fgProxyColdForced |= fgProxyCold;
     const bool hotMatch = (initial.nrEnabled || initial.fgEnabled || rtxRequested) &&
+                          !fgProxyCold &&
                           Hot().valid &&
                           Hot().ngxDllPath == d->ngxDllPath &&
                           Hot().width == d->width && Hot().height == d->height &&

@@ -57,6 +57,12 @@ public:
     // (official-hook/official)—— 钩子进程级不可拆,与本次是否预载解耦。
     static bool CachedProxyIsHookStyle() noexcept;
 
+    // 代理模块是否已在本进程加载(无论 hook 型与否)。FG off→on 的热复用
+    // 判定用:未加载 = 钩子不可能已附着(钩子依赖先于 NGX 核心的加载事件),
+    // 原地补预载必 0xBAD0000B —— 调用方应改走冷初始化(预载先于核心,
+    // 设计路径)。见 plugin.cpp 创建热复用判定。
+    static bool ProxyLoaded() noexcept;
+
     // 尺寸变化重建 feature(旧 handle 经 ReleaseFeature 退役;Release 失败
     // 即整体停用 —— 与 NR 的"Release 后不安全重试"同语义)。PoolHold 内调用。
     bool Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,

@@ -82,6 +82,10 @@ bool DlssfgContext::CachedProxyIsHookStyle() noexcept {
     return mod && GetProcAddress(mod, "DlssgProxy_Role") != nullptr;
 }
 
+bool DlssfgContext::ProxyLoaded() noexcept {
+    return FgModule().module != nullptr;
+}
+
 DlssfgContext::~DlssfgContext() {
     // 故障后绝不重入 NGX FG feature(闩锁语义;feature 泄漏给 OS 回收,与
     // 热上下文同哲学)。健康路径也只弃引用:ReleaseFeature 在 Rebuild 尺寸

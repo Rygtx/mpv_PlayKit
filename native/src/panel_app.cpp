@@ -995,10 +995,14 @@ void LoadStats() noexcept {
             CopyStatStr(g_app.modelDll, st.modelDll);
         } else {
             // 死亡 body(passthrough / ngx_faulted):清掉冻结的旧统计与
-            // 分段,让状态行成为唯一内容。
+            // 分段,让状态行成为唯一内容。不得调 ClearSessionState():
+            // 上方字段直读已把会话字段同步成本 body 的实值(passthrough
+            // body 携带 filterState/stateDetail)—— 此处再清空会把
+            // "passthrough" 抹成 "",面板勾 NR 的 needsReseek 判据与
+            // kStateNrSeekInit 闭环双双失明,全关实例勾 NR 永不自动重建
+            // (2026-10-03 实锤:直通会话勾选瞬间 g_app.filterState=='')。
             g_app.statsBig[0] = 0;
             g_app.statsRes[0] = 0;
-            ClearSessionState();
             g_app.segDispPack = g_app.segDispEval = g_app.segDispGpu = g_app.segDispUnpack =
             g_app.segDispNvof = g_app.segDispFg = g_app.segDispRtxVsr = g_app.segDispRtxHdr =
             g_app.segDispConv = g_app.segDispQueue = 0.0f;
