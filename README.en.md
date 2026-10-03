@@ -166,6 +166,7 @@ The two AI features have different GPU requirements:
 | RTX 30 | Ampere (SM86) | ✅ **Verified** (RTX 3080) | ✅ **Verified** (RTX 3080, 0.3.x proxy takeover of the official chain) |
 | RTX 20 | Turing (SM75) | 🟡 Theoretical (official range, untested) | 🟡 Theoretical (0.3.x proxy kernel family auto-picked per physical architecture; upstream 2080 Ti verified, not tested with this plugin) |
 | GTX / non-RTX | — | ❌ Unavailable (no Tensor Core) | ❌ Unavailable |
+| AMD, all series (RX 9000 / 7000 / older) | RDNA4/3/2 | ❌ **Not adapted for now** (the maintainer has no AMD GPU to verify against; community open-source implementations already run on RDNA4 — see the [AMD-DLSSNR survey](docs/AMD-DLSSNR-RESEARCH.md) for the survey and future implementation reference) | ❌ Not adapted for now (same; no official counterpart feature either) |
 
 Legend: ✅ verified · 🟡 theoretical (untested) · ❌ unavailable
 
