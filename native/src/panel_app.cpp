@@ -2061,10 +2061,12 @@ void DrawUi() noexcept {
     y += 8 * s;
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX, wpos.y + y));
     if (ImGui::Button("保存设置", ImVec2(120 * s, 30 * s))) {
-        // 失败不再假报成功:ini 被占用/只读时状态栏红字说明,否则用户
-        // 看到"已保存",重启全部回旧值(dlssnr_ini.h 注释预言的场景)。
+        // ini 单写者 = 本面板(bridge 侧写块已撤,2026-10-03):成败提示
+        // 即最终落盘结果,无第二进程覆写。失败不再假报成功:ini 被占用/
+        // 只读时状态栏红字说明,否则用户看到"已保存",重启全部回旧值
+        // (dlssnr_ini.h 注释预言的场景)。
         if (WriteIniNow()) {
-            WritePayload(true); // persist-through-bridge flag included
+            WritePayload(true); // saveRequest 旗标已无消费者,仅留 bridge 日志对齐锚点
             snprintf(g_app.status, sizeof(g_app.status), "已保存");
         } else {
             snprintf(g_app.status, sizeof(g_app.status), "保存失败(文件被占用或不可写)");
@@ -2607,7 +2609,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             // 会重启,但重启面板在启动时采纳最后一份 payload(CreateParams
             // Mapping 的 adopt 路径,含 rtx 三元组,后于 ini 生效)—— 切换
             // 值不落盘也能跨面板重启保持;ini 仍只由"保存设置"显式写入
-            // (插件侧 saveRequest 落盘带 LoadCreateParams 叠加,见 bridge)。
+            // (单写者 = 面板,bridge 侧写块已撤,2026-10-03)。
             WritePayload();
             g_app.liveDirty = false;
             g_app.lastLiveWrite = nowSec;

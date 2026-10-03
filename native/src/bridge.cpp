@@ -225,26 +225,13 @@ void ApplyPanelPayload(BridgeState *state, const PanelPayload &pl) noexcept {
     state->params->RequestScalingEnabled(create.scalingEnabled);
     state->params->Update(p);
 
-    if (pl.saveRequest) {
-        wchar_t iniPath[MAX_PATH];
-        if (GetSelfIniPath(iniPath, MAX_PATH)) {
-            DlssnrParams s = state->params->Snapshot();
-            s.preset = state->params->SaveTimePreset();
-            s.inputResolutionPercent = state->params->SaveTimeResolution();
-            // create-time 字段以 payload 为准:Snapshot 的 _cur 侧不含
-            // rtxVsrMode/Scale/HdrEnabled(LoadLiveParams 不带它们,只在
-            // create 时定格)—— 自动落盘把会话创建时的旧值写回 ini,面板
-            // 重启后读到的就是"点了自动还是手动"(2026-09-23 实锤)。payload
-            // 是面板当前态的单一事实,连同 NR 三元组的 pending 语义一起
-            // 叠加后才落盘。
-            LoadCreateParams(s, pl);
-            // 探针:"保存设置"失败(文件被占/权限)此前完全静默,用户以为
-            // 存上了,下次加载却又回到旧值。
-            if (!WriteDlssnrIni(s, iniPath)) {
-                TimingStatusLine("DLSSNR STATUS: save ini FAILED (bridge saveRequest)");
-            }
-        }
-    }
+    // saveRequest 无消费者(2026-10-03):ini 落盘单写者 = 面板"保存设置"
+    // (WriteIniNow 直写 g_app.params)。本侧写块(2026-09-23 引入)与其
+    // 等价 —— SaveTime* 两行被随后的 LoadCreateParams(s, pl) 整体覆盖 =
+    // 死代码,而 pl 的 create 字段本就源自面板同一份 g_app.params;双写者
+    // 反而让面板"已保存"提示与最终落盘内容脱节,且磁盘写卡在轮询线程上
+    // (BridgeStopLocked 5s wedge 泄漏场景的直接成因)。旗标保留在协议里,
+    // 仅作上方探针行的对齐锚点。
     SetTimingLogEnabled(pl.logEnabled != 0);
 }
 
