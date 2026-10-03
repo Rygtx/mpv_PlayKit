@@ -573,6 +573,10 @@ bool DlssnrContext::Initialize(
     _isRgb = rgb;
     _shared = shared;
     _rtx = rtx;
+    // 全程单一快照(与帧路径 frameParams 同纪律):初始化是数百毫秒的
+    // 多步决策链,散点 Snapshot 会在面板中途推送时建出"半新半旧"的缝合
+    // 形态,且组合随时机漂移不可复现。入口取一次,全文只读这一份。
+    const DlssnrParams pInit = _shared->Snapshot();
 
     // RTX Video 几何换算(单一裁决 helper;capability 预检在资源创建之前 ——
     // 不过/建不起 = 由 DegradeRtxFeature 收口,资源按降级形态建,直通尺寸
@@ -606,8 +610,8 @@ bool DlssnrContext::Initialize(
     // GPU 族分流:SM86 代理只适用 Turing/Ampere;Ada 及更新走官方链,由
     // dlssfg_context 的 mfg gate 解锁拿多帧(RTX 40 6x)。探测失败 fail-open
     // 维持预载(30 系无损)。
-    if (_shared->Snapshot().fgEnabled &&
-        std::clamp(_shared->Snapshot().fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
+    if (pInit.fgEnabled &&
+        std::clamp(pInit.fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
         fgDllPath && fgDllPath[0] &&
         dlssfg_gate::GpuFamilyPrefersProxy()) {
         // 预载失败曾经裸 return false 零痕迹:下游只会报 "official NGX
@@ -825,16 +829,16 @@ bool DlssnrContext::Initialize(
     // FG 请求 = 创建时参数快照的 fgEnabled(桥接 ini/payload 采纳已在此前
     // 完成);sticky —— 尺寸重建(RecreateFeature)沿用本旗标,面板运行中
     // 改变只影响逐帧 eval 门,不重建槽资源。
-    _fgRequested = _shared->Snapshot().fgEnabled != 0;
+    _fgRequested = pInit.fgEnabled != 0;
     // 实验性补帧 HDR 域插帧(创建时定格;仅 HDR 会话有意义 —— HDR 关时
     // 强制 0,FG create 格式与槽资源恒 SDR 形态,管线等价)。判据用
     // _hdrActive 实际态而非 rtxHdrEnabled 请求:TrueHDR 在 2b/3b 降级后
     // (capability 不过 / CreateFeature 失败)FG 不再携带 PQ 域形态。
-    _fgHdrInterp = (_shared->Snapshot().fgHdrInterp != 0) && _hdrActive;
+    _fgHdrInterp = (pInit.fgHdrInterp != 0) && _hdrActive;
     // FG 会话级事实初值:请求了 = 暂记 copy(初始化成功会被下文改写成
     // 实际路由);没请求 = off。失败原因串在此段内逐路径覆写。
     _fgCreateMult = _fgRequested
-                        ? std::clamp(_shared->Snapshot().fgMultiplier, kFgMultMin, kFgMultMax)
+                        ? std::clamp(pInit.fgMultiplier, kFgMultMin, kFgMultMax)
                         : 0;
     std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s", _fgRequested ? "copy" : "off");
     _fgDetail[0] = '\0';
@@ -862,8 +866,8 @@ bool DlssnrContext::Initialize(
                           ? " [revert: VSDLSSNR_NR_FORMAT=bgra8]" : "");
         TimingStatusLine(msg);
     }
-    if (_shared->Snapshot().scalingEnabled) {
-        const int pct = std::clamp(_shared->Snapshot().inputResolutionPercent, kResPctMin, kResPctMax);
+    if (pInit.scalingEnabled) {
+        const int pct = std::clamp(pInit.inputResolutionPercent, kResPctMin, kResPctMax);
         int iw = _width, ih = _height;
         InternalSize(_width, _height, pct, iw, ih);
         if (!_d3d12->RebuildScaling(iw, ih, err, errLen)) return failWithExistingErr();
@@ -873,7 +877,7 @@ bool DlssnrContext::Initialize(
     // 约束天然满足);失败降级 antiFlicker=0(模式还能 live 再切)。历史状态
     // 随纹理作废。
     {
-        const int af = std::clamp(_shared->Snapshot().antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
+        const int af = std::clamp(pInit.antiFlicker, kAntiFlickerMin, kAntiFlickerMax);
         if (af > 0) {
             char afErr[160]{};
             if (_d3d12->RebuildTemporal(af, afErr, sizeof(afErr))) {
@@ -908,7 +912,7 @@ bool DlssnrContext::Initialize(
     // 单线程、槽池空闲,满足会话的 PoolHold 约束。档位按后端取对应字段
     // (NVOF→motionVectorQuality,FFX→ffxQuality)。
     {
-        const DlssnrParams snap = _shared->Snapshot();
+        const DlssnrParams &snap = pInit;
         const int backendReq =
             std::clamp(snap.ofBackend, kOfBackendMin, kOfBackendMax);
         const int ofq = ResolveOfQuality(snap); // clamp 在 helper 内(按后端值域)
@@ -1005,10 +1009,10 @@ bool DlssnrContext::Initialize(
 
     _ready = true;
     {
-        const DlssnrParams p = _shared->Snapshot();
-        _curPreset = p.preset;
-        _curRes = p.inputResolutionPercent;
-        _curScaling = p.scalingEnabled;
+        _curPreset = pInit.preset;
+        _curRes = pInit.inputResolutionPercent;
+        _curScaling = pInit.scalingEnabled != 0;
+        _appliedCreate = pInit; // 完整建参数存档(Rebind 比对真身,见成员注释)
         char msg[384];
         std::snprintf(msg, sizeof(msg),
                       "DLSSNR STATUS: Feature=18 created=true path=signed-snippet %dx%dd%d disabled=false gpu=%.60s rtx=%s pipe=%dx%d out=%dx%d hdr=%d fg=%d",
@@ -1032,6 +1036,12 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
         if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: context not ready");
         return false;
     }
+    // 全程单一快照(同 Initialize pInit / 帧路径 frameParams 纪律):重建
+    // 链数百毫秒,散点 Snapshot 会让形态段各取不同时刻的值。create 键以
+    // 入参为准(调用方定格传入),本快照服务形态段其余字段 —— 其 create
+    // 键与入参恒等(current 侧在消费与传参之间只被 ConsumeRebuild 改写,
+    // 而那正是入参的来源)。
+    const DlssnrParams p = _shared->Snapshot();
     // 重建耗时分解打点(2026-10-02):VSR 切档"复制帧好几秒"的定位数据 ——
     // 各段耗时随 STATUS 行落 timing log,一次复现即可定位大头(排空/RTX
     // 模型加载/槽纹理/NR 特征)。
@@ -1192,7 +1202,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
                           ? (DlssfgContext::CachedProxyIsHookStyle() ? "official-hook" : "official")
                           : "copy");
         _fgCreateMult = (_fgRequested && _fg && _fg->Enabled())
-                            ? std::clamp(_shared->Snapshot().fgMultiplier, kFgMultMin, kFgMultMax)
+                            ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
                             : 0;
         RefreshRtxStateString();
         char msg[160];
@@ -1238,8 +1248,11 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // 纯 RTX/FG 形态变化(vsrMode/fg 档位)时跳过 ~0.7s 的模型重建
     // (实测日志 nr=617/775ms,是 VSR 切档重建的大头)。
     const DXGI_FORMAT nrFmtAfter = _d3d12->ColorFormat();
+    // res 项带 scalingEnabled 前提 = 唯一权威 CreateParamsChanged 同款
+    // (dlssnr_params.h):scaling 关时 res 不进管线,不得单独触发重建 ——
+    // 否则"关缩放拖 res 滑块 + 任意形态热化"会白付 ~0.7s 模型重建。
     const bool nrKeysChanged = dimsChange || preset != _curPreset ||
-                               resPercent != _curRes ||
+                               (scalingEnabled != 0 && resPercent != _curRes) ||
                                (scalingEnabled != 0) != _curScaling ||
                                nrFmtBefore != nrFmtAfter;
     if (resize && _fgRequested) {
@@ -1267,7 +1280,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
             // SetupFgSession 降级 FG off(_fgProxyNote 归因并入),无重试
             // 风暴(seek 边界一次性)。
             if (!DlssfgContext::CachedProxyIsHookStyle()) {
-                const DlssnrParams sp = _shared->Snapshot();
+                const DlssnrParams &sp = p;
                 if (std::clamp(sp.fgRoute, kFgRouteMin, kFgRouteMax) == kFgRouteAuto &&
                     _fgProxyPath[0] &&
                     dlssfg_gate::GpuFamilyPrefersProxy()) {
@@ -1294,7 +1307,7 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     // FG 激活变化改写 follow 语义,由 Rebind 尾部 SyncOfSession 的 stale
     // 检查收口(档位/尺寸失配才重建,无风暴)。
     if (dimsChange && _ofBackend && _curOfQuality > 0 && !_nvofFailed) {
-        const DlssnrParams sp = _shared->Snapshot();
+        const DlssnrParams &sp = p;
         // FG 激活时 MVecs 契约要求源尺寸稠密运动 —— follow 被忽略。
         const bool foll = sp.nvofFollowScaling != 0 && scalingEnabled && !(_fg && _fg->Enabled());
         int iw = _width, ih = _height;
@@ -1401,6 +1414,10 @@ bool DlssnrContext::RecreateFeature(int preset, int resPercent, int scalingEnabl
     _curPreset = preset;
     _curRes = resPercent;
     _curScaling = scalingEnabled != 0;
+    // 完整建参数存档(覆盖冷初始化值;三个调用点共享本收口点)。本函数
+    // 入口快照 p 的 create 键恒 == 本次入参(current 侧在消费与传参之间
+    // 只被 ConsumeRebuild 改写,而那正是入参的来源)。
+    _appliedCreate = p;
     return true;
 }
 
@@ -1675,11 +1692,8 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     // completely warm across mpv's seek-triggered script re-initialization.
     // A different video size rebuilds frame resources + feature inside the
     // same pool-sealed RecreateFeature pass, so the ~1s bring-up survives
-    // resolution changes too.
-    DlssnrParams cur{};
-    cur.preset = _curPreset;
-    cur.inputResolutionPercent = _curRes;
-    cur.scalingEnabled = _curScaling;
+    // resolution changes too. 比对用 _appliedCreate 真身(上次成功建/重
+    // 模时的完整参数快照),不再伪造三字段 cur。
     const bool dimsChanged = width != _width || height != _height || depth != _depth;
     // 形态变化(RTX 参数 / FG 请求 / FG HDR 折叠态):热复用 + 会话形态
     // 重建(RecreateFeature 形态段),NR NGX feature 不额外重建 —— 冷启动
@@ -1690,7 +1704,7 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     const bool shapeChanged = rtx != _rtx ||
                               (p.fgEnabled != 0) != (_fgRequested != 0) ||
                               fgHdrDesired != (_fgHdrInterp != 0);
-    if (!dimsChanged && !shapeChanged && !CreateParamsChanged(p, cur)) {
+    if (!dimsChanged && !shapeChanged && !CreateParamsChanged(p, _appliedCreate)) {
         // 热复用:NGX feature 保持,但 seek 是新时间线 —— 光流历史必须
         // 作废(下一帧播种),光流档位同步到新实例的参数快照;此前建立
         // 失败的会话在热复用时重试一次。FG 同理(下一帧 eval 带 Reset,
@@ -3710,6 +3724,13 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                      evalCpuLast = evalOnlyMs, unpackLast = unpackMs,
                      fgLast = fgMs, rtxVsrLast = rtxVsrMs, rtxHdrLast = rtxHdrMs,
                      convLast = convMs;
+        // perf 行数据两段式:g_timing 相关在锁内备齐,外部量(Snapshot/
+        // FrameRateWindow,各自持独立互斥)在锁外取 —— 不在 g_timingMutex
+        // 内叠锁(块尾注释纪律;曾塞进 snprintf 参数与该纪律相反,acc2e69
+        // 引入)。perfLineDue = 锁内时间门判定,供锁外拼行。
+        bool perfLineDue = false;
+        double perfGpuP99 = 0.0, perfSlotEma = 0.0, perfLockEma = 0.0;
+        double perfNvofLast = 0.0, perfSlotLast = 0.0, perfLockLast = 0.0;
         {
             std::lock_guard<std::mutex> timingLock(g_timingMutex);
             const double slotWaitMs = ms(ff->tSlot0, ff->tSlot1, ff->qpcFreq);
@@ -3734,44 +3755,52 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
                 nvofEma = TimingWindow::Ema(g_timing.nvof, g_timing.count);
                 evalCpuEma = TimingWindow::Ema(g_timing.evalCpu, g_timing.count);
                 unpackEma = TimingWindow::Ema(g_timing.unpack, g_timing.count);
-                const double gpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
-                const double slotEma = TimingWindow::Ema(g_timing.slotW, g_timing.count);
-                const double lockEma = TimingWindow::Ema(g_timing.lockW, g_timing.count);
-                // 门细分探针为 NvofContext 专属(其它后端无引擎等待)。
-                NvofContext *nvProbe =
-                    (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
-                        ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
-                snprintf(line, sizeof(line),
-                         "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%%%s ofq=%d %dx%d f=%d fps=%.0f",
-                         gpuLast, gpuEma, gpuP99, packEma, nvofEma, g_timing.nvof[lastIdx],
-                         nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
-                         nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
-                         ff->ofEngineMs,
-                         nvProbe ? nvProbe->GateSkips() : 0u,
-                         nvProbe ? nvProbe->GateExpired() : 0u,
-                         nvProbe ? nvProbe->ResetCount() : 0u,
-                         evalCpuEma, fgLast, rtxVsrLast, rtxHdrLast, convLast, unpackEma, subWaitMs,
-                         slotEma, g_timing.slotW[lastIdx],
-                         lockEma, g_timing.lockW[lastIdx],
-                         queueWaitMs,
-                         // res 本就是会话配置回显;NR 关(live 门)时缩放整级
-                         // 绕过(nrOff 直连 inputColor),行内就地标注,防误读
-                         // "正在按内部尺寸处理"。
-                         [&] {
-                             const DlssnrParams p = _shared->Snapshot();
-                             return std::clamp(p.inputResolutionPercent, kResPctMin, kResPctMax);
-                         }(),
-                         !_shared->Snapshot().nrEnabled ? "(nrOff)" : "",
-                         _curOfQuality,
-                         _width, _height,
-                         _lastFrameN.load(std::memory_order_relaxed),
-                         _d3d12->FrameRateWindow());
-                // nvof=ema/last;后缀 g/c/e = 门等待/前帧拷贝等待/引擎输出等待,
-                // s/x/r = 门跳帧/过期帧/历史重置累计(探针保留:时序类问题的
-                // 第一手证据)。ff->slot/lock = 槽池等待 / evaluate 互斥等待
-                // (ema/last);f = 本行前一帧的帧号(与 STATUS 行对齐用);
-                // fps = 4s 窗口帧入口计数均值,处理帧率 < 源帧率 = 宿主侧没来帧。
+                perfGpuP99 = TimingWindow::P99(g_timing.gpu, g_timing.count);
+                perfSlotEma = TimingWindow::Ema(g_timing.slotW, g_timing.count);
+                perfLockEma = TimingWindow::Ema(g_timing.lockW, g_timing.count);
+                perfNvofLast = g_timing.nvof[lastIdx];
+                perfSlotLast = g_timing.slotW[lastIdx];
+                perfLockLast = g_timing.lockW[lastIdx];
+                perfLineDue = true;
             }
+        }
+        if (perfLineDue) {
+            // 门细分探针为 NvofContext 专属(其它后端无引擎等待);读法与
+            // 下方 stats 块同款(仅读,锁外)。
+            NvofContext *nvProbe =
+                (_ofBackend && _ofBackend->Kind() == kOfBackendNvof)
+                    ? static_cast<NvofContext *>(_ofBackend.get()) : nullptr;
+            // Snapshot/FrameRateWindow 锁外取(各自持独立互斥,勿叠锁)。
+            // res 本就是会话配置回显;NR 关(live 门)时缩放整级绕过(nrOff
+            // 直连 inputColor),行内就地标注,防误读"正在按内部尺寸处理"。
+            const int perfResPct = std::clamp(_shared->Snapshot().inputResolutionPercent,
+                                              kResPctMin, kResPctMax);
+            const bool perfNrOff = !_shared->Snapshot().nrEnabled;
+            const double perfFps = _d3d12->FrameRateWindow();
+            snprintf(line, sizeof(line),
+                     "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f s%u x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%%%s ofq=%d %dx%d f=%d fps=%.0f",
+                     gpuLast, gpuEma, perfGpuP99, packEma, nvofEma, perfNvofLast,
+                     nvProbe ? nvProbe->LastGateWaitMs() : 0.0,
+                     nvProbe ? nvProbe->LastCpyWaitMs() : 0.0,
+                     ff->ofEngineMs,
+                     nvProbe ? nvProbe->GateSkips() : 0u,
+                     nvProbe ? nvProbe->GateExpired() : 0u,
+                     nvProbe ? nvProbe->ResetCount() : 0u,
+                     evalCpuEma, fgLast, rtxVsrLast, rtxHdrLast, convLast, unpackEma, subWaitMs,
+                     perfSlotEma, perfSlotLast,
+                     perfLockEma, perfLockLast,
+                     queueWaitMs,
+                     perfResPct,
+                     perfNrOff ? "(nrOff)" : "",
+                     _curOfQuality,
+                     _width, _height,
+                     _lastFrameN.load(std::memory_order_relaxed),
+                     perfFps);
+            // nvof=ema/last;后缀 g/c/e = 门等待/前帧拷贝等待/引擎输出等待,
+            // s/x/r = 门跳帧/过期帧/历史重置累计(探针保留:时序类问题的
+            // 第一手证据)。ff->slot/lock = 槽池等待 / evaluate 互斥等待
+            // (ema/last);f = 本行前一帧的帧号(与 STATUS 行对齐用);
+            // fps = 4s 窗口帧入口计数均值,处理帧率 < 源帧率 = 宿主侧没来帧。
         }
         // stats 每帧发布(九段 last + 共享内存写,开销可忽略):面板
         // "处理用时"随帧呼吸,不再按日志节流跳变。perf 行(磁盘 IO)按时间

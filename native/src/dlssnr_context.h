@@ -300,6 +300,13 @@ private:
     int _curPreset = -1;
     int _curRes = -1;
     bool _curScaling = false;
+    // 最近一次成功建(重)模时的完整参数快照:Initialize 落账、
+    // RecreateFeature 尾部覆盖(三个调用点共享该收口点)。Rebind 的
+    // "要不要重建"比对(CreateParamsChanged)用真身对真身 —— 不再伪造
+    // 三字段 cur(半成品在未来新增 create 键时会静默读默认值 0 误判,
+    // 编译器无法兜底)。CreateParamsChanged 只比较 create 键;其余字段
+    // 顺带存档,不参与裁决。
+    DlssnrParams _appliedCreate{};
     // 光流会话(of_backend 选择后端:kOfBackendNvof/Ffx)。
     // _curOfQuality = 当前生效档位(0 = 零 guidance;语义随后端 —— NVOF
     // 1-5 / FFX 1=性能 2=质量,取自已激活后端对应字段);_nvofFailed =
