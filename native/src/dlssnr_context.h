@@ -24,6 +24,33 @@
 
 namespace vsdlssnr {
 
+// 管线色状态账本(调试观测;零 GPU 行为变更):帧路径对管线色家族
+// (outputColor/inputColor/temporalOut/vsrColor/fgBack/hdrColor/hdrFg[])的
+// stateBefore 全靠手工簿记 —— 生产/消费/归位三处各自心算,历次 from-state
+// 事故的根源(2026-09-25 审查类)。账本在 NGX 衰减点与消费点登记事实;
+// Expect 不符仅留痕(VSDLSSNR_PROBE=1 时 TimingStatusLine),不参与任何
+// 屏障决策 —— 错配当场暴露,不再等画面撕裂或 debug layer 抱怨。
+// 条目 = {资源指针, 最近状态}。并发帧安全性:只登记槽资源,槽池排他下
+// 并发帧的指针集互斥,数组无竞争;context 级共享资源不入账。
+class PipeLedger {
+public:
+    void Set(ID3D12Resource *res, D3D12_RESOURCE_STATES st) noexcept {
+        for (int i = 0; i < count_; ++i) {
+            if (entries_[i].res == res) { entries_[i].state = st; return; }
+        }
+        if (count_ < kCap) entries_[count_++] = {res, st};
+    }
+    // 消费点断言:不符仅留痕(首见资源以期望值起账)。
+    void Expect(ID3D12Resource *res, D3D12_RESOURCE_STATES expected,
+                const char *where) noexcept;
+private:
+    struct Entry { ID3D12Resource *res; D3D12_RESOURCE_STATES state; };
+    static constexpr int kCap = 24;
+    Entry entries_[kCap]{};
+    int count_ = 0;
+};
+
+
 // ProcessFrame 拆分执行的续体(实现在 cpp;FG 持锁窗口缩小用):Submit 半段
 // 把等待/unpack/stats 所需的全部状态打包于此,调用方释放串行锁后交还
 // ProcessFrameFinish。不透明指针,调用方不得解引用。
@@ -112,7 +139,7 @@ public:
     // 缺省 709 limited)—— YUV↔RGB GPU 转换按此展开/压缩。
     // n is the frame index; discontinuity detection (NGX history reset) is
     // owned here, not by the glue layer. timingOut 非 NULL 时写入分段耗时
-    // (毫秒,逗号分隔:pack,submit+gpu,unpack)
+    // (毫秒,逗号分隔七段:pack,of,eval_cpu,gpu,fg,conv,unpack)
     // FG 多帧输出(fgDst* 非 NULL = 创建时 FG 激活):fgMultiplier = 本帧
     // 倍数 M(2-6,调用方从参数快照取 —— 与输出帧数契约绑定,必须由调用
     // 方定格),每源帧产出 1 真实 + M-1 插值帧。fgDst*/fgStrides 为扁平
@@ -287,6 +314,8 @@ private:
     std::atomic<bool> _fgDupLogged{false};
 
     D3D12Context *_d3d12 = nullptr;
+    // 管线色状态账本(见上方 PipeLedger;调试观测,零行为变更)。
+    PipeLedger _pipeLedger;
     // 帧率环形计数(纯 QPC 数学;原住 D3D12Context,2026-10-03 迁出 ——
     // 与设备无关的统计不该住在设备上下文里)。
     FrameRateMeter _fpsMeter;
