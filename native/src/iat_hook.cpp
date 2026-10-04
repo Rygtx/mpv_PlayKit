@@ -82,7 +82,7 @@ void **FindImportedFunctionSlot(HMODULE module, const char *functionName) noexce
         for (; nameThunk->u1.AddressOfData; ++nameThunk, ++addressThunk) {
             if (IMAGE_SNAP_BY_ORDINAL64(nameThunk->u1.Ordinal)) continue;
             const uint32_t nameRva = static_cast<uint32_t>(nameThunk->u1.AddressOfData);
-            if (nameRva >= nt->OptionalHeader.SizeOfImage) return nullptr;
+            if (nameRva >= nt->OptionalHeader.SizeOfImage) continue; // 单项越界跳过,不中止整个搜索
             const auto *import = reinterpret_cast<const IMAGE_IMPORT_BY_NAME *>(base + nameRva);
             if (std::strcmp(reinterpret_cast<const char *>(import->Name), functionName) == 0) {
                 return reinterpret_cast<void **>(&addressThunk->u1.Function);

@@ -146,7 +146,11 @@ bool FxofContext::CreateSession(D3D12Context &d3d12, int width, int height,
 
     // FFX context 创建(Magpie Create 原样):scratch → backend interface →
     // context → 共享资源描述。
-    _scratch.resize(ffxGetScratchMemorySizeDX12(FFX_OPTICALFLOW_CONTEXT_COUNT));
+    try {
+        _scratch.resize(ffxGetScratchMemorySizeDX12(FFX_OPTICALFLOW_CONTEXT_COUNT));
+    } catch (...) { // noexcept 路径:抛出即 terminate 杀宿主,转建会话失败降级
+        return fail("fxof: scratch allocation failed (oom)");
+    }
     FfxOpticalflowContextDescription ctxDesc{
         .flags = 0,
         .resolution = { _ofW, _ofH },
@@ -242,6 +246,7 @@ bool FxofContext::CreateSession(D3D12Context &d3d12, int width, int height,
                     IID_PPV_ARGS(_tsReadback.GetAddressOf()))) ||
                 FAILED(_tsReadback->Map(0, nullptr, &_tsMapped)) || !_tsMapped) {
                 _tsReadback.Reset();
+                _tsHeap.Reset(); // 半初始化防悬:heap 存活 + mapped null = 每帧 null 目标 ResolveQueryData
                 TimingStatusLine("DLSSNR STATUS: fxof ts readback failed; span fallback to submit");
             }
         }

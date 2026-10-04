@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <mutex>
 
 // ---------------------------------------------------------------------------
 // mpv IPC 自动重载:需要重建滤镜会话的变动(vsrMode/scale/HDR 开关、FG
@@ -36,6 +37,12 @@ LARGE_INTEGER g_pipeFailQpc{};
 bool g_pipeFailStamped = false;
 
 wchar_t *ResolveMpvPipeCandidates(const wchar_t **candidates) noexcept {
+    // 缓存三件套(g_pipeResolved/失败戳)被主线程(reseek)与打标线程并发
+    // 触达 —— 此前无锁,并发首解析 = 一次 _wcsdup 泄漏 + 指针中途被覆盖
+    //(2026-10-04 评审修)。锁内只动簿记;返回的候选指针进程期有效,
+    // 锁外使用安全。
+    static std::mutex resolveMutex;
+    std::lock_guard<std::mutex> lock(resolveMutex);
     // 默认兜底名收口 mpv_pipe_common(与插件 resize watcher 同一份,
     // 2026-10-05 —— 候选列表/连接/有界发送三条轴此前各写一份)。
     MpvPipeDefaultNames(candidates);
@@ -95,7 +102,7 @@ bool TriggerMpvReseek() noexcept {
     for (int i = 0; i < 4 && !ok; ++i) {
         if (!candidates[i] || !candidates[i][0]) continue;
         // 逐候选连接(单一候选指针 = 逐候选语义;写失败继续下一候选)。
-        HANDLE pipe = MpvPipeOpen(&candidates[i], /*overlapped=*/true, nullptr, 0);
+        HANDLE pipe = MpvPipeOpen(&candidates[i], 1, /*overlapped=*/true, nullptr, 0);
         if (!pipe) continue;
         ok = MpvPipeSendBounded(pipe, kSeekCmd, sizeof(kSeekCmd) - 1);
         CloseHandle(pipe);
@@ -188,7 +195,7 @@ bool HdrTagTick(HdrTagConn &c, int want) noexcept {
     if (!c.pipe) {
         const wchar_t *candidates[4];
         wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
-        c.pipe = MpvPipeOpen(candidates, /*overlapped=*/false,
+        c.pipe = MpvPipeOpen(candidates, kMpvPipeMaxCandidates, /*overlapped=*/false,
                              c.name, std::size(c.name));
         free(parsedName);
         if (!c.pipe) return false; // mpv 不在/IPC 未起:下拍重试,不闩锁

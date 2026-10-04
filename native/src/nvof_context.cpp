@@ -458,7 +458,8 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
                                                  bool inputWrittenByPostCopy,
                                                  std::unique_lock<std::mutex> &gateOut) noexcept {
     StageResult result{};
-    if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue()) {
+    if (!_ready.load(std::memory_order_acquire) || !_d3d12 || !_d3d12->Queue() ||
+        !postExecute || !postCopy) { // 回调空 = 契约破坏,播种降级(对齐 FfxContext;裸调空 std::function = bad_function_call 杀宿主)
         result.historyReset = true;
         return result;
     }
@@ -590,6 +591,10 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             // 提交 + 记账单点(OfClRotator::Submit;此前 ECL/Signal/RecordUse
             // 三步手工簿记散布五处)。
             _lastCopyFence = _rotator.Submit(queue, _copyFence.Get(), copyCl, ++_copySeq);
+            // 连败计数归位含播种帧:"连续失败"以成功提交为界(FFX 主提交
+            // 成功即重置同款;此前只有 execute 成功重置,播种帧夹层的间歇
+            // 失败会被误闩,2026-10-04 评审修)。
+            _consecutiveFailures = 0;
         } else {
             // 拷贝失败:清零 + 重置(下帧重新播种)。失败必须进 timing log。
             // 链断(InvalidateHistory)= 连败闩锁语义内,计入(2026-10-04:

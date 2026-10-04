@@ -130,15 +130,16 @@ def pack_stats(stats, seq=1):
 # residualMultiplier,residualSaturation,residualLightness,shadowStructure,
 # reflectionGlow | 11i scalingEnabled,logEnabled,motionVectorQuality,
 # ffxQuality,nvofFollowScaling,fgEnabled,fgMultiplier,fgRoute,nrEnabled,
-# debugView,ofBackend | i f(vsrMode,vsrScale)| 7i vsrStrength,hdrEnabled,
-# hdrContrast,hdrSaturation,hdrMiddleGray,hdrMaxLuminance,fgHdrInterp
-# (v25 删 uiCorrection/saveRequest。)
-_STRUCT = struct.Struct("<3I2i4f2i5f11iif7i")
-assert _STRUCT.size == 144, "PanelPayload 布局与 panel_ipc.h 不一致"
+# debugView,ofBackend | i f(vsrMode,vsrScale)| 8i vsrStrength,hdrEnabled,
+# hdrContrast,hdrSaturation,hdrMiddleGray,hdrMaxLuminance,fgHdrInterp,
+# antiFlicker
+# (v24 增 antiFlicker;v25 删 uiCorrection/saveRequest。)
+_STRUCT = struct.Struct("<3I2i4f2i5f11iif8i")
+assert _STRUCT.size == 148, "PanelPayload 布局与 panel_ipc.h 不一致"
 
 DEFAULTS = dict(
     preset=0, style=0,
-    intensity=1.0, localTone=1.0, localStructure=1.0, skinStructure=-1.0,
+    intensity=1.0, localTone=1.0, localStructure=1.0, skinStructure=1.0,
     useAutoMask=1, inputResolution=100,
     residualMultiplier=1.0, residualSaturation=1.0, residualLightness=1.0,
     shadowStructure=1.0, reflectionGlow=1.0,
@@ -149,7 +150,7 @@ DEFAULTS = dict(
     vsrMode=0, vsrScale=2.0, vsrStrength=2,
     hdrEnabled=0, hdrContrast=100, hdrSaturation=100,
     hdrMiddleGray=50, hdrMaxLuminance=1000,
-    fgHdrInterp=0,
+    fgHdrInterp=0, antiFlicker=0,
 )
 
 _FIELDS = ("magic", "seq", "generation", "preset", "style",
@@ -162,7 +163,8 @@ _FIELDS = ("magic", "seq", "generation", "preset", "style",
            "fgEnabled", "fgMultiplier", "fgRoute", "nrEnabled", "debugView",
            "ofBackend",
            "vsrMode", "vsrScale", "vsrStrength", "hdrEnabled", "hdrContrast",
-           "hdrSaturation", "hdrMiddleGray", "hdrMaxLuminance", "fgHdrInterp")
+           "hdrSaturation", "hdrMiddleGray", "hdrMaxLuminance", "fgHdrInterp",
+           "antiFlicker")
 
 PAGE_READWRITE = 0x04
 FILE_MAP_READ = 0x0004
@@ -201,7 +203,8 @@ class ParamsChannel:
             vals["nrEnabled"], vals["debugView"], vals["ofBackend"],
             vals["vsrMode"], vals["vsrScale"], vals["vsrStrength"],
             vals["hdrEnabled"], vals["hdrContrast"], vals["hdrSaturation"],
-            vals["hdrMiddleGray"], vals["hdrMaxLuminance"], vals["fgHdrInterp"])
+            vals["hdrMiddleGray"], vals["hdrMaxLuminance"], vals["fgHdrInterp"],
+            vals["antiFlicker"])
         assert len(data) == _STRUCT.size, "PanelPayload pack 布局与 panel_ipc.h 不一致"
         ctypes.memmove(ctypes.c_void_p(self._view), data, len(data))
 

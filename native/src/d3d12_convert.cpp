@@ -114,7 +114,7 @@ bool D3D12Context::CreateConvertObjects(char *err, size_t errLen) noexcept {
 
 
 // cbuffer ConvertInParams(root constants,三处同步铁律:HLSL cbuffer /
-// Num32BitValues=10 / SetComputeRoot32BitConstants):
+// Num32BitValues=16 / SetComputeRoot32BitConstants):
 // @0-1 uint2 DstExtent(inputColor 尺寸,dispatch 边界)
 // @2 containerMax @3 yLo @4 yScale(1/ySpan) @5 cMid @6 cScale(1/cSpan)
 // @7 kr @8 kb @9 pad

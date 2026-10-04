@@ -123,7 +123,7 @@ public:
     // quality = 调用方按 ofBackend 预解析的档位(NVOF→motionVectorQuality,
     // FFX→ffxQuality)。内部自取 PoolHold:调用方必须尚未持有槽位,且不得
     // 已在 PoolHold 之中。
-    bool RebuildOf(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept;
+    bool RebuildOf(int quality, int backendReq, int dstW, int dstH, char *err, size_t errLen) noexcept;
     // 光流会话同步单一裁决点(2026-09-25 收敛):follow 判定/尺寸换算/档位
     // 解析/触发条件/重建调用在此。allowRetry = 会话级边界(rebind/recreate)
     // 才置 true —— 帧路径不带 _nvofFailed 重试项,否则失败会话每帧触发

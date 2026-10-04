@@ -63,7 +63,11 @@ bool BasePath(wchar_t *path, size_t len) noexcept {
     wchar_t exe[MAX_PATH]{};
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return false;
     std::wstring dir = std::filesystem::path(exe).parent_path().wstring();
-    if (dir.size() >= len) return false;
+    // 上限预留 64 字符给消费方拼接("\dlssnr_panel.log"、
+    // "\..\portable_config\mpv.conf" 等全部落 wchar_t[MAX_PATH])—— 深安装
+    // 目录拼出 >260 时 swprintf_s 触发 invalid-parameter handler = 进程
+    // abort,且恰死在报错路上(2026-10-04 评审修:超限 = 优雅降级不记日志)。
+    if (dir.size() + 64 >= len) return false;
     wcscpy_s(path, len, dir.c_str());
     return true;
 }
@@ -476,8 +480,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     bool owned = false;
     for (int attempt = 0; attempt < 3 && !owned; ++attempt) {
         if (attempt) Sleep(500);
-        CreateMutexW(nullptr, TRUE, L"vs_dlssnr_panel_single");
-        owned = GetLastError() != ERROR_ALREADY_EXISTS;
+        // 句柄 NULL(同名恶性对象 ACCESS_DENIED 等)= 守卫状态不可知:按
+        // 未持有处理(fail-closed,走下方退出)。放行会在参数映射上双写,
+        // 违反单写者契约 —— 单写者优先于可用性(2026-10-04 评审修)。
+        owned = CreateMutexW(nullptr, TRUE, L"vs_dlssnr_panel_single") != nullptr &&
+                GetLastError() != ERROR_ALREADY_EXISTS;
         if (!owned) {
             PanelLog("panel: duplicate launch (attempt %d), retrying briefly", attempt + 1);
         }

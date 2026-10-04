@@ -92,6 +92,9 @@ public:
     }
 
 private:
+    // ponytail: 64 位环无代数,相距 64 的两帧共享一位 —— 需前者卡在
+    // MarkIncoming 与门锁之间且后者已置位才误判"在飞",后果只是 100ms
+    // 熔断多等一拍;流水深度远小于 64,实不可达。加代数计数是升级路径。
     static uint64_t Mask(int64_t i) noexcept {
         return uint64_t(1) << (uint64_t(i) & 63);
     }

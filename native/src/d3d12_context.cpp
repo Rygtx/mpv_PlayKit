@@ -310,6 +310,36 @@ bool D3D12Context::ExecuteCtlAndWait(char *err, size_t errLen, const char *where
 }
 
 bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_t errLen) noexcept {
+    // 丢失上报单点(removed/hang 两分支共用;面板 stats 通道由宿主层接线,
+    // 设备层不直连 UI 传输,见 SetHangNotify)。
+    auto reportLost = [&](const char *why, uint64_t v) {
+        const HRESULT rr = _device ? _device->GetDeviceRemovedReason() : E_FAIL;
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s reason=0x%08lX fence=%llu", why,
+                 static_cast<unsigned long>(rr),
+                 static_cast<unsigned long long>(v));
+        if (_hangNotify) {
+            char reason[16];
+            snprintf(reason, sizeof(reason), "0x%08lX",
+                     static_cast<unsigned long>(rr));
+            _hangNotify(reason);
+        }
+        // 项目惯例:GPU 级失败必须进 timing log —— 之前只上面板+DebugView,
+        // 跨进程观测时(面板没开)日志完全静默,无法定位。
+        TimingStatusLine(buf);
+        _deviceLost.store(true, std::memory_order_relaxed);
+        OutputDebugStringA("vs_dlssnr: ");
+        OutputDebugStringA(buf);
+        OutputDebugStringA("\n");
+        SetErr(err, errLen, E_FAIL, buf);
+    };
+    // 设备移除后 GetCompletedValue 恒 UINT64_MAX(D3D12 契约)—— 下方
+    // "< value" 恒假、整个等待被跳过 = 假成功:陈旧回读当新帧交付,
+    // _deviceLost/_hangNotify 永不触发(2026-10-04 评审修)。
+    if (_fence->GetCompletedValue() == UINT64_MAX) {
+        reportLost("fence wait: device removed:", value);
+        return false;
+    }
     if (_fence->GetCompletedValue() < value) {
         if (FAILED(_fence->SetEventOnCompletion(value, event))) {
             SetErr(err, errLen, E_FAIL, "SetEventOnCompletion failed");
@@ -322,27 +352,7 @@ bool D3D12Context::WaitFenceValue(uint64_t value, HANDLE event, char *err, size_
         QueryPerformanceCounter(&w1);
         QueryPerformanceFrequency(&wf);
         if (wr != WAIT_OBJECT_0) {
-            HRESULT rr = _device ? _device->GetDeviceRemovedReason() : E_FAIL;
-            char buf[160];
-            snprintf(buf, sizeof(buf),
-                     "GPU hang/removed: reason=0x%08lX fence=%llu",
-                     static_cast<unsigned long>(rr), static_cast<unsigned long long>(value));
-            // surface through the host-supplied notify(面板 stats 通道由
-            // 宿主层接线;设备层不直连 UI 传输,见 SetHangNotify)
-            if (_hangNotify) {
-                char reason[16];
-                snprintf(reason, sizeof(reason), "0x%08lX",
-                         static_cast<unsigned long>(rr));
-                _hangNotify(reason);
-            }
-            // 项目惯例:GPU 级失败必须进 timing log —— 之前只上面板+DebugView,
-            // 跨进程观测时(面板没开)日志完全静默,无法定位。
-            TimingStatusLine(buf);
-            _deviceLost.store(true, std::memory_order_relaxed);
-            OutputDebugStringA("vs_dlssnr: ");
-            OutputDebugStringA(buf);
-            OutputDebugStringA("\n");
-            SetErr(err, errLen, E_FAIL, buf);
+            reportLost("GPU hang/removed:", value);
             return false;
         }
         // 探针:恢复型 GPU 停顿(TDR 恢复/驱动内部同步/着色器首次编译)
@@ -592,7 +602,7 @@ bool D3D12Context::CreateFrameResources(const SessionDesc &desc,
     // 因此必须先于槽池循环创建。重建(hot 复用换尺寸)时整槽纹理按
     // GetAddressOf 惯例重造(与 _motion/_depth 同款)。
     if (!CreateColorTexture(_debugDiff.GetAddressOf(), width, height,
-                            DXGI_FORMAT_B8G8R8A8_UNORM, D3D12_RESOURCE_STATE_COMMON,
+                            _inColorFmt, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
     }

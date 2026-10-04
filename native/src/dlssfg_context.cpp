@@ -344,15 +344,26 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
     }
     const bool carryReset = _needsReset || reset;
     _needsReset = false;
-    ++_frameId;
+    // FrameID 按源帧一拍一个(对照 Magpie DLSSFrameGenerator.cpp:710-713:
+    // ID 在槽循环前设一次,M-1 个 eval 共用)—— 此前逐 eval 递增,MFG 批
+    //(MultiFrameCount=N, index 1..N)被拆进 N 个不同 ID,index>=2 落在
+    // "从未见过 index 1" 的新批,违背官方 "in order starting at 1" 批契约。
+    // 批内首槽恒 1(槽位门 1 ≤ _maxGen 恒过,caller 按序发 1..M-1),
+    // slotIndex==1 即新源帧锚。
+    if (slotIndex == 1) ++_frameId;
 
     // eval 参数(官方 helper NGX_D3D12_EVALUATE_DLSSG;
     // 布局对照 Magpie DLSSFrameGenerator.cpp:724-758 —— 恒等相机 + mvecScale
     // 1,1 + 像素单位 current-to-previous)。multiFrameCount/Index:M 倍时每
     // 真实帧产出 M-1 插值帧,slotIndex 1..M-1 必须按序递增(官方 MFG 契约
     // "MFG indices must be evaluated in order starting at 1")。
-    const unsigned int genCount =
-        static_cast<unsigned int>(std::clamp(multiplier - 1, 1, kFgMultMax - 1));
+    // genCount 受运行库上限约束(槽位门只挡 slotIndex,不挡这里 —— 上限=1
+    // 时槽 1 照常过门,声明 5 个插值帧必被 count gate 拒收,eval 失败即把
+    // 全会话闩死,"回落 2x 保底"落空,2026-10-04 评审修);reset 帧按
+    // Magpie 同款(DLSSFrameGenerator.cpp:705-706)只声明 1 —— 播种帧只评
+    // index 1,声明 M-1 属谎报批。
+    const unsigned int genCount = static_cast<unsigned int>(
+        carryReset ? 1 : std::clamp(multiplier - 1, 1, _maxGen));
     const unsigned int genIndex =
         static_cast<unsigned int>(std::clamp(slotIndex, 1, kFgMultMax - 1));
     _params->Set(NVSDK_NGX_DLSSG_Parameter_Backbuffer, backbuffer);
@@ -411,7 +422,10 @@ bool DlssfgContext::Evaluate(ID3D12GraphicsCommandList *cl, ID3D12Resource *back
     _params->Set(NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0u);
     _params->Set(NVSDK_NGX_DLSSG_Parameter_OrthoProjection, 0u);
     // 可选资源键显式置空(helper NGX_D3D12_EVALUATE_DLSSG 无条件写,官方
-    // ABI 惯例;同时声明进 create 的 ResourceNeverProvided_Flags)。
+    // ABI 惯例)。注:OutputDisableInterpolation **不在** create 的
+    // ResourceNeverProvided_Flags 里(该旗标只含下方 HUDLess/UI/UIAlpha/
+    // BidirectionalDistortionField/OutputReal 五项)—— 置空直发是官方
+    // helper 形态;MenuDetectionEnabled=0 下运行库不消费此键。
     _params->Set(NVSDK_NGX_DLSSG_Parameter_HUDLess, static_cast<ID3D12Resource *>(nullptr));
     _params->Set(NVSDK_NGX_DLSSG_Parameter_UI, static_cast<ID3D12Resource *>(nullptr));
     _params->Set(NVSDK_NGX_DLSSG_Parameter_UIAlpha, static_cast<ID3D12Resource *>(nullptr));

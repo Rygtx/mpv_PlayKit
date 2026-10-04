@@ -1606,15 +1606,30 @@ bool DlssnrContext::SyncOfSession(const DlssnrParams &p, int srcW, int srcH,
     const int nvH = follow ? _d3d12->InternalHeight() : srcH;
     const int backendReq = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
     const int ofq = ResolveOfQuality(p); // clamp 在 helper 内(按后端值域)
-    bool stale = ofq != _curOfQuality || backendReq != _curOfBackend ||
-                 (ofq > 0 && _ofBackend &&
-                  (_ofBackend->Width() != nvW || _ofBackend->Height() != nvH));
-    if (!stale && ofq > 0 && allowRetry && _nvofFailed) stale = true;
+    // 簿记快照在 _nvofMutex 内捕获(2026-10-04 评审修):裸读 _ofBackend 与
+    // 并发 RebuildOf 的 move 是数据竞争(裸指针 UB)。捕获后即使 move 已发生
+    // 也安全 —— 退役对象进程期存活(_retiredOf 哲学),悬空不可能;裁决
+    // 陈旧由 RebuildOf 锁内复查兜住(后来者跳过)。
+    int curQ = 0, curB = 0;
+    bool nvofFailed = true;
+    IOpticalFlowBackend *of = nullptr;
+    {
+        std::lock_guard<std::mutex> switchLock(_nvofMutex);
+        curQ = _curOfQuality;
+        curB = _curOfBackend;
+        nvofFailed = _nvofFailed;
+        of = _ofBackend.get();
+    }
+    bool stale = ofq != curQ || backendReq != curB ||
+                 (ofq > 0 && of && (of->Width() != nvW || of->Height() != nvH));
+    if (!stale && ofq > 0 && allowRetry && nvofFailed) stale = true;
     if (!stale) return true;
-    return RebuildOf(ofq, nvW, nvH, err, errLen); // 失败仅降级零 guidance(调用方语义)
+    return RebuildOf(ofq, backendReq, nvW, nvH,
+                     err, errLen); // 失败仅降级零 guidance(调用方语义)
 }
 
-bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t errLen) noexcept {
+bool DlssnrContext::RebuildOf(int quality, int backendReq, int dstW, int dstH,
+                              char *err, size_t errLen) noexcept {
     // 光流会话重建(quality / of_backend / 会话输入尺寸变化;follow 模式下
     // 会话输入 = 内部尺寸,由调用方传入 dstW/dstH)。只重建光流会话,NGX
     // feature 不动。内部自取 PoolHold(槽池封死满足会话的调用约束)——
@@ -1629,8 +1644,10 @@ bool DlssnrContext::RebuildOf(int quality, int dstW, int dstH, char *err, size_t
     // 调用方传入的档位已经 ResolveOfQuality 按后端值域 clamp;此处宽 clamp
     // 仅作双保险(FFX 的 2 也在 0-5 内,不受影响)。
     const int q = std::clamp(quality, kOfQualityMin, kOfQualityMax);
-    const int backendReq =
-        std::clamp(_shared->Snapshot().ofBackend, kOfBackendMin, kOfBackendMax);
+    // backendReq = 调用方快照(单一快照纪律:函数内自取会在 SyncOfSession
+    // 裁决与重建之间混入更新的面板推送,瞬态"旧档位配新后端",2026-10-04
+    // 评审修;2026-10-04 该纪律在 CreateOfBackend 落地时漏了本函数)。
+    backendReq = std::clamp(backendReq, kOfBackendMin, kOfBackendMax);
     if (q == _curOfQuality && backendReq == _curOfBackend && !_nvofFailed && _ofBackend &&
         _ofBackend->Width() == dstW && _ofBackend->Height() == dstH) return true;
     if (q == 0) {
@@ -1778,9 +1795,12 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     // 形态变化(RTX 参数 / FG 请求 / FG HDR 折叠态):热复用 + 会话形态
     // 重建(RecreateFeature 形态段),NR NGX feature 不额外重建 —— 冷启动
     // (设备/核心/snippet 重载)不再发生(2026-09-27 解耦收尾)。fg_hdr_interp
-    // 按折叠态比较(请求 && rtxHdrEnabled):与 _fgHdrInterp 的折叠语义一致,
-    // 纯 HDR 域内翻转由 rtx != _rtx 兜住。
-    const bool fgHdrDesired = (p.fgHdrInterp != 0) && (p.rtxHdrEnabled != 0);
+    // 折叠基准 = _hdrActive 实际态(与 Initialize/RecreateFeature 同一基准
+    // —— 此前用请求侧 rtxHdrEnabled,TrueHDR 降级会话(_hdrActive=false)
+    // 下请求恒"想建",每次 Rebind 都误判 shapeChanged,热复用分支永不可达,
+    // 每次 seek 全量排空+重建且永不收敛,2026-10-04 评审修)。纯 HDR 域内
+    // 翻转由 rtx != _rtx 兜住(hdrEnabled ∈ RtxVideoParams)。
+    const bool fgHdrDesired = (p.fgHdrInterp != 0) && _hdrActive;
     const bool shapeChanged = rtx != _rtx ||
                               (p.fgEnabled != 0) != (_fgRequested != 0) ||
                               fgHdrDesired != (_fgHdrInterp != 0);
@@ -1798,7 +1818,10 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         // 会话输入尺寸同步(follow = 开关 + scaling 状态 + FG 未激活;热路
         // 径下内部尺寸未变,除非 ini/payload 同时带了 res% 变化 —— 那会走
         // 下方重建分支)。档位按后端取对应字段。单一裁决点见 SyncOfSession。
-        SyncOfSession(p, _width, _height, /*allowRetry=*/true, err, errLen);
+        // err 用本地暂存:OF 降级失败(仅零 guidance)不得污染 rebind 错误串
+        //(2026-10-04 评审修)。
+        char ofErr[160]{};
+        SyncOfSession(p, _width, _height, /*allowRetry=*/true, ofErr, sizeof(ofErr));
         char msg[160];
         std::snprintf(msg, sizeof(msg),
                       "DLSSNR STATUS: hot rebind kept feature (preset=%d res=%d%% scaling=%d of=%d %dx%dd%d internal=%dx%d)",
@@ -1823,20 +1846,28 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     recreate.fgRequested = p.fgEnabled != 0;
     recreate.fgHdr = fgHdrDesired;
     const bool nvofOk = RecreateFeature(recreate, err, errLen);
+    if (!nvofOk) {
+        // 重建失败 = 会话死态:契约锚(本实例"会话创建 Xx")清零 —— 残留
+        // M0 会让死态面板谎报一个死会话从未兑现的倍数契约(2026-10-04 评审修)。
+        _fgCreateMult = 0;
+        return false;
+    }
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
     // 只处理尺寸,档位变化在这里补齐。会话输入尺寸同样在此对齐(follow 开
-    // 关/res% 变化)。单一裁决点见 SyncOfSession。
-    if (nvofOk) {
-        // 重载 = reseek = 新时间线:与上方热复用分支同理,光流/FG 历史必须
-        // 作废。此前只写于热复用分支 —— vsr 形态变化时 OF 会话原样保留
-        // (dimsChange=false 不触发重建,"历史已在会话(重)建时作废"的
-        // 假设对它不成立),帧序门残留旧时间线的 _nextSeq;重载后 mpv 从
-        // 帧 0 重新送帧,每帧被判迟到 → 播种式复制帧爬满旧时间线长度
-        // (2026-10-02 门打点实锤:next=200,streak 爬到 188 才自愈)。
+    // 关/res% 变化)。单一裁决点见 SyncOfSession(err 用本地暂存:失败仅
+    // 降级零 guidance,不得污染调用方的 rebind 错误串)。
+    //
+    // 重载 = reseek = 新时间线:光流/FG 历史必须作废。此前只写于热复用分支
+    // —— vsr 形态变化时 OF 会话原样保留(dimsChange=false 不触发重建,
+    // "历史已在会话(重)建时作废"的假设对它不成立),帧序门残留旧时间线的
+    // _nextSeq;重载后 mpv 从帧 0 重新送帧,每帧被判迟到 → 播种式复制帧爬
+    // 满旧时间线长度(2026-10-02 门打点实锤:next=200,streak 爬到 188 才自愈)。
+    {
+        char ofErr[160]{};
         ResetNvofHistory();
-        SyncOfSession(p, _width, _height, /*allowRetry=*/true, err, errLen);
+        SyncOfSession(p, _width, _height, /*allowRetry=*/true, ofErr, sizeof(ofErr));
     }
-    return nvofOk;
+    return true;
 }
 
 // 拆分执行续体:ProcessFrame(Submit 半段)成功后把等待/unpack/stats 所需
@@ -2049,12 +2080,35 @@ bool DlssnrContext::ProcessFrame(
         IOpticalFlowBackend *of = nullptr;
         bool drain = false;   // 拆分模式失败路径:槽释放前排空 OF 在飞拷贝
         bool handoff = false; // 拆分模式 Submit 成功:所有权移交 FrameFinish
+        // 提交后排空(2026-10-04 评审修):base/fg/post 任一提交成功后的失败
+        // early-return,槽带着在飞 CL 归池 —— 下一帧 allocator Reset 撞执行中
+        // 命令列表 = UB(gen eval 失败路径 3111 同款教训;此前只有 3114/3390
+        // 两处有本地等待,且 3390 对门关帧等的是陈旧 fgFenceValue)。守卫携
+        // "最后提交的 shared fence 值 + 用过的 RTX 队列",析构(未 handoff)
+        // 时统一排空:直队列等 fence 值;RTX 队列补 SignalNow 锚再等(成功
+        // 路径帧尾锚同机制,只是把锚从帧尾提前到失败点)。成功路径 handoff
+        // 后由 FrameFinish 既有等待链接管,守卫不重复等待。
+        uint64_t drainShared = 0;
+        RtxQueue *drainQ[2] = {};
+        int drainQN = 0;
+        void ArmDrainShared(uint64_t v) { if (v > drainShared) drainShared = v; }
+        void ArmDrainQueue(RtxQueue *q) {
+            if (!q) return;
+            for (int i = 0; i < drainQN; ++i)
+                if (drainQ[i] == q) return;
+            if (drainQN < 2) drainQ[drainQN++] = q;
+        }
         ~SlotGuard() {
             if (s && !handoff) {
                 // 拆分模式的 CopyDrainGuard 被禁用(成功路径排空在 Finish 尾);
                 // 失败 early-return 仍会在此释放槽 —— FFX 的 copy CL 可能
                 // 在飞,upload 堆 CPU 写(下一帧 PackInput)竞争由此排空。
                 if (of && drain) of->WaitCopyIdle();
+                if (drainShared)
+                    ctx->WaitFenceValuePublic(drainShared, s->fenceEvent, nullptr, 0);
+                for (int i = 0; i < drainQN; ++i)
+                    if (const uint64_t v = drainQ[i]->SignalNow())
+                        drainQ[i]->Wait(v, nullptr, 0, 10000);
                 ctx->ReleaseSlot(s);
             }
         }
@@ -2786,6 +2840,7 @@ bool DlssnrContext::ProcessFrame(
         }
         return false;
     }
+    guard.ArmDrainShared(slot->baseFenceValue); // 失败路径槽释放前排空在飞 base CL
     if (ProbeEnabled()) TimingStatusLine("PROBE: base submitted"); // 探针(VSDLSSNR_PROBE=1)
     // base 完成观测(t3a,2026-09-25 时间戳化):默认路径不再 CPU 阻塞 ——
     // base GPU 执行与后续 RTX 提交链 + fg/post 录制重叠(此前阻塞把这段
@@ -2844,6 +2899,7 @@ bool DlssnrContext::ProcessFrame(
                                 slot->ts[kTsPreVsr].alloc.Get(),
                                 slot->ts[kTsPreVsr].cl.Get(), kTsPreVsr,
                                 _d3d12->Fence(), slot->baseFenceValue);
+        guard.ArmDrainQueue(&_vsr->Queue()); // 失败路径排空含本括号
         char rtxErr[160]{};
         uint64_t fv = 0;
         if (!_vsr->Evaluate(rtxColorIn, width, height,
@@ -2876,6 +2932,7 @@ bool DlssnrContext::ProcessFrame(
                                 slot->ts[kTsPreHdr].cl.Get(), kTsPreHdr,
                                 vsrRun ? _vsr->Queue().Fence() : _d3d12->Fence(),
                                 vsrRun ? vsrDoneVal : slot->baseFenceValue);
+        guard.ArmDrainQueue(&_hdr->Queue()); // 失败路径排空含本括号
         char rtxErr[160]{};
         uint64_t fv = 0;
         if (!_hdr->Evaluate(vsrRun ? slot->vsrColor.Get()
@@ -3077,6 +3134,7 @@ bool DlssnrContext::ProcessFrame(
             }
             return false;
         }
+        guard.ArmDrainShared(slot->fgFenceValue); // 失败路径排空含在飞 fg CL
     }
     // 插值帧 TrueHDR 链(HDR 会话):逐 evaluated gen 追加到专用队列,全部
     // 等 postA 栅栏(同队列 FIFO 保序);链尾栅栏 = postB 消费锚 + 计时锚。
@@ -3094,6 +3152,7 @@ bool DlssnrContext::ProcessFrame(
                                         slot->ts[kTsPreGen].alloc.Get(),
                                         slot->ts[kTsPreGen].cl.Get(), kTsPreGen,
                                         _d3d12->Fence(), slot->fgFenceValue);
+                guard.ArmDrainQueue(&_hdr->Queue());
                 genBracketOpen = true;
             }
             char rtxErr[160]{};
@@ -3105,11 +3164,8 @@ bool DlssnrContext::ProcessFrame(
                                 _d3d12->Fence(), slot->fgFenceValue, &fv,
                                 rtxErr, sizeof(rtxErr))) {
                 if (err && errLen) std::snprintf(err, errLen, "%.180s", rtxErr);
-                // 槽释放加固:fg CL 已提交在飞,失败 return 会让槽被下一帧
-                // 复用并 Reset fg allocator —— in-flight Reset = UB。有界等
-                // fg 完成再释放(超时 = 设备故障域,WaitFenceValue 已兜)。
-                _d3d12->WaitFenceValuePublic(slot->fgFenceValue, slot->fenceEvent,
-                                             nullptr, 0);
+                // 槽释放排空归 SlotGuard(fg/RTX 队列已在上方武装,析构统一
+                // 有界等待 —— 原 2026-09-25 的本地等待已收口)。
                 return false;
             }
             hdrDoneFence = _hdr->Queue().Fence();
@@ -3387,11 +3443,12 @@ bool DlssnrContext::ProcessFrame(
             TimingStatusLine(err);
             std::snprintf(err, errLen, "Submit(post) failed");
         }
-        // 槽释放加固(同 gen eval 失败路径):post CL Close 失败时 fg CL 已
-        // 提交在飞,补有界等待再释放槽,防下一帧 in-flight Reset fg allocator。
-        _d3d12->WaitFenceValuePublic(slot->fgFenceValue, slot->fenceEvent, nullptr, 0);
+        // 槽释放排空归 SlotGuard(base/fg 已武装;post Close 失败 = post CL
+        // 未入队,无需等 post 值 —— 原本地等待对门关帧等陈旧 fgFenceValue,
+        // 已随守卫化修复)。
         return false;
     }
+    guard.ArmDrainShared(slot->fenceValue); // post 值恒最后(≥fg≥base),覆盖全部直队列提交
     // Submit 半段收尾(2026-09-25 FG 持锁窗口缩小):把等待/unpack/stats
     // 所需状态打包进续体并移交槽所有权。defer 模式在此返回(调用方释放
     // 其串行锁后调 ProcessFrameFinish);同步模式就地完成后半段。

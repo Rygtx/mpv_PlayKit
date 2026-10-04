@@ -1,95 +1,43 @@
-// stats 共享内存消费(2026-10-03 自 panel_app.cpp 拆出):进程级视图缓存、
-// seq 门快照、死亡态清零与字段直读。HDR 打标线程(本件外)经
-// ReadStatsSnapshot 共用同一份快照实现。
+// stats 共享内存消费(2026-10-03 自 panel_app.cpp 拆出):每拍开关的映射
+// 快照、seq 门校验、死亡态清零与字段直读。HDR 打标线程(本件外)经
+// ReadStatsSnapshot 共用同一份实现。
 
 #include "panel_shared.h"
 
 #include <cstring>
 #include <cstdio>
-#include <mutex>
 
-// Stats 映射句柄/视图进程级缓存(2026-09-25):两个消费方(UI 10Hz + 打标
-// 线程 ~4Hz)此前每拍 Open/Map/Unmap/Close 全套内核往返 + 页表工作;与插件
-// 侧协议(映射句柄进程级保留,panel_ipc.h 注释明示)对齐。插件重启 = 同名
-// 新 section(旧对象随创建者退出改名),靠 1Hz 新鲜度探针检出句柄失配后
-// 重开 —— CompareObjectHandles 动态加载(Win10 1607+,拿不到则视为恒匹配,
-// 退化为老语义:重启后等面板重启恢复)。
-namespace {
-HANDLE g_statsMapping = nullptr;
-void *g_statsView = nullptr;
-LARGE_INTEGER g_statsProbeQpc{};
-bool g_statsCmpHandlesOk = true;
-std::mutex g_statsCacheMutex; // 缓存初建/换新互斥(LoadStats 主线程 + 打标线程并发)
-
-bool StatsCmpSameObject(HANDLE a, HANDLE b) noexcept {
-    if (!g_statsCmpHandlesOk) return true; // 探针不可用:退化为恒匹配
-    using Fn = BOOL(WINAPI *)(HANDLE, HANDLE);
-    static Fn fn = []() -> Fn {
-        HMODULE k = GetModuleHandleW(L"kernel32.dll");
-        return k ? reinterpret_cast<Fn>(GetProcAddress(k, "CompareObjectHandles")) : nullptr;
-    }();
-    if (!fn) {
-        g_statsCmpHandlesOk = false;
-        return true;
-    }
-    return fn(a, b) != FALSE;
-}
-
-// 调用方必须持 g_statsCacheMutex(ReadStatsSnapshot 全程持锁)。
-bool EnsureStatsViewLocked() noexcept {
-    if (g_statsView) {
-        // 1Hz 探针:插件重启后同名 section 是新对象,旧视图会永久读到冻结
-        // 快照 —— 检出句柄失配即换新。
-        LARGE_INTEGER now{}, tf{};
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&tf);
-        if (now.QuadPart - g_statsProbeQpc.QuadPart < tf.QuadPart) return true;
-        g_statsProbeQpc = now;
-        HANDLE fresh = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
-        if (!fresh) return true; // 暂时打不开:沿用旧视图(老语义也如此)
-        if (StatsCmpSameObject(fresh, g_statsMapping)) {
-            CloseHandle(fresh);
-            return true;
-        }
-        UnmapViewOfFile(g_statsView);
-        g_statsView = nullptr;
-        CloseHandle(g_statsMapping);
-        g_statsMapping = fresh;
-    }
-    if (!g_statsMapping) {
-        g_statsMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
-        if (!g_statsMapping) return false;
-    }
-    if (!g_statsView) {
-        g_statsView = MapViewOfFile(g_statsMapping, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE);
-        if (!g_statsView) {
-            CloseHandle(g_statsMapping);
-            g_statsMapping = nullptr;
-            return false;
-        }
-        QueryPerformanceCounter(&g_statsProbeQpc);
-    }
-    return true;
-}
-} // namespace
+// Stats 映射消费 = 每拍 Open/Map/拷贝校验/Unmap/Close(2026-10-04 评审修,
+// 回到 panel_ipc.h 契约原文"映射对象随插件进程死亡,每拍重开"):此前
+// (2026-09-25)的进程级句柄缓存把 section 的最后一个引用钉在面板自己手里
+// —— mpv 退出后 OpenFileMappingW 仍成功、CompareObjectHandles 比对的是自己
+// 钉住的同一对象,冻结快照 + "已连接"永不消除。全套内核往返在 UI 10Hz +
+// 打标 ~4Hz 节拍下是 µs 级,可忽略;插件重启(同名新 section)由"重开即
+// 新句柄"天然覆盖,1Hz 探针与 CompareObjectHandles 动态加载一并退场。
+// 多读者安全由 seq 协议本身保证(协议只承诺"拷贝期间计数器不动"),无
+// 共享状态即无锁。
 
 // Stats 映射一拍快照(seq 门校验)。返回:2=有效(已拷入 *st);1=映射在
 // 但快照未稳(seq 翻转中/未发布),*badMagic 带回 magic 是否失配;0=映射
-// 不存在(插件未运行)。多读者安全:LoadStats(主线程,UI)与 HdrTagProc
-// (打标线程)各自调用,seq 协议只保证"拷贝期间计数器不动";ensure+拷贝+
-// 校验整体在 g_statsCacheMutex 内 —— 防止本线程拷贝期间另一线程的插件
-// 重启换新路径 unmap 同一视图。10Hz+4Hz 的节拍下锁竞争可忽略。
+// 不存在(插件未运行)。
 int ReadStatsSnapshot(StatsPayload *st, bool *badMagic) noexcept {
     *badMagic = false;
-    std::lock_guard<std::mutex> lock(g_statsCacheMutex);
-    if (!EnsureStatsViewLocked()) return 0;
-    const StatsPayload *view = static_cast<const StatsPayload *>(g_statsView);
+    HANDLE h = OpenFileMappingW(FILE_MAP_READ, FALSE, STATS_MAPPING);
+    if (!h) return 0;
+    void *view = MapViewOfFile(h, FILE_MAP_READ, 0, 0, PAYLOAD_SIZE);
+    if (!view) {
+        CloseHandle(h);
+        return 0;
+    }
     // 直拷(2026-10-04:原 VirtualQuery 钳制分支恒假 —— 映射区域页粒度
     // ≥4096,恒覆盖 sizeof(StatsPayload)≈1.1K;混部署错配由下方 magic
     // 校验拒读,防的是"读到错版本数据"而非"读到映射外")。
     memcpy(st, view, sizeof(*st));
     *badMagic = st->magic != 0 && st->magic != STATS_MAGIC;
-    const bool valid = st->magic == STATS_MAGIC && SeqStable(view, *st);
+    const bool valid = st->magic == STATS_MAGIC &&
+                       SeqStable(static_cast<const StatsPayload *>(view), *st);
+    UnmapViewOfFile(view);
+    CloseHandle(h);
     return valid ? 2 : 1;
 }
 

@@ -99,22 +99,21 @@ bool ResizeWatchSendSeek() noexcept {
     // 挂起时本线程永久滞留 —— watcher 名额上限 2,滞留 = 自动跟随静默失效)。
     const wchar_t *candidates[kMpvPipeMaxCandidates];
     MpvPipeDefaultNames(candidates);
-    static wchar_t *g_confPipe = nullptr; // 进程级缓存(nullptr = 解析过且无)
-    static bool g_confProbed = false;
-    if (!g_confProbed) {
-        g_confProbed = true;
+    // conf 解析进程级缓存(magic static:watcher 名额上限 2,两线程可能
+    // 并发首调 —— 手写 probed 旗标有初始化竞态 + 双解析泄漏一条,静态
+    // 初始化一次性的语义正是这里的合同,2026-10-04 评审修)。
+    static const wchar_t *g_confPipe = [] {
         wchar_t exe[MAX_PATH];
-        if (GetModuleFileNameW(nullptr, exe, MAX_PATH)) {
-            const std::filesystem::path confPath =
-                std::filesystem::path(exe).parent_path() / L"portable_config" / L"mpv.conf";
-            g_confPipe = MpvParseIpcServerName(confPath.c_str());
-        }
-    }
+        if (!GetModuleFileNameW(nullptr, exe, MAX_PATH)) return static_cast<const wchar_t *>(nullptr);
+        const std::filesystem::path confPath =
+            std::filesystem::path(exe).parent_path() / L"portable_config" / L"mpv.conf";
+        return static_cast<const wchar_t *>(MpvParseIpcServerName(confPath.c_str()));
+    }();
     candidates[0] = g_confPipe;
     static constexpr char kSeekCmd[] =
         "{\"command\":[\"seek\",\"0.001\",\"relative+exact\"]}\n";
     for (const wchar_t *name : candidates) {
-        HANDLE pipe = MpvPipeOpen(&name, /*overlapped=*/true, nullptr, 0);
+        HANDLE pipe = MpvPipeOpen(&name, 1, /*overlapped=*/true, nullptr, 0);
         if (!pipe) continue;
         if (!MpvPipeSendBounded(pipe, kSeekCmd, sizeof(kSeekCmd) - 1)) {
             CloseHandle(pipe);

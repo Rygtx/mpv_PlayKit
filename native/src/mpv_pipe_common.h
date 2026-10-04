@@ -20,11 +20,15 @@ inline constexpr int kMpvPipeMaxCandidates = 4; // [0]=conf 解析名,1-3 = 默�
 // 默认兜底候选名(静态字面量,无所有权;[0] 槽位留给调用方填 conf 解析值)。
 void MpvPipeDefaultNames(const wchar_t *candidates[kMpvPipeMaxCandidates]) noexcept;
 
-// 候选逐个 CreateFileW 连接,命中即返回(全败 nullptr)。overlapped = 命令
+// 候选逐个 CreateFileW 连接,命中即返回(全败 nullptr)。candidateCount =
+// 自基址起扫描的槽位数:整表传 kMpvPipeMaxCandidates,单一候选传 1 ——
+// 无隐式终结符,计数不实即越界读(2026-10-05 评审修:此前固定扫 4 槽,
+// 单候选调用方 &candidates[i] 在 i>0 时读到数组外栈垃圾,垃圾非空即被
+// CreateFileW 解引用)。overlapped = 命令
 // 形态(FILE_FLAG_OVERLAPPED,配合 MpvPipeSendBounded);nameOut 可空(命中
 // 管道名,日志用)。跳过空槽位(null/空串)。
-HANDLE MpvPipeOpen(const wchar_t *const *candidates, bool overlapped,
-                   wchar_t *nameOut, size_t nameLen) noexcept;
+HANDLE MpvPipeOpen(const wchar_t *const *candidates, int candidateCount,
+                   bool overlapped, wchar_t *nameOut, size_t nameLen) noexcept;
 
 // 已连接管道写一条命令 + 排空回执(overlapped + 500ms 有界;mpv 挂起不拖
 // 死调用线程,2026-09-25 教训)。ok = 命令全量写入;回执只排空不解析(两侧

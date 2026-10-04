@@ -801,9 +801,10 @@ private:
     ComPtr<ID3D12Resource> _debugDiff;
     // YUV↔RGB 转换(YUV 原生化):深度/矩阵/范围全走 root constants,
     // R8/R16_UNORM 的 Texture2D<float> 视图同构 —— 仅 3 个 PSO:
-    // convertIn(Y/U/V 3 SRV → inputColor 1 UAV,8 常量);
+    // convertIn(Y/U/V 3 SRV → inputColor 1 UAV,16 常量:extent 2 + 系数 8
+    // + chroma 4 + pitch 2,实际写满 16);
     // convertOut luma/chroma(outputColor 1 SRV → yuvOut 2 UAV——luma 用
-    // u0、chroma 用 u0/u1,共享根签名,10 常量:系数 4 + 范围 4 + 尺寸 2)。
+    // u0、chroma 用 u0/u1,共享根签名,14 常量:系数 8 + 尺寸 4 + step 2)。
     ComPtr<ID3D12RootSignature> _rsConvertIn;
     ComPtr<ID3D12PipelineState> _psoConvertIn;
     ComPtr<ID3D12PipelineState> _psoConvertInRgb; // VS RGBP 直读(零矩阵)

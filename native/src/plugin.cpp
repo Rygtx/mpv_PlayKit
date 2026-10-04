@@ -156,15 +156,43 @@ struct FilterData {
     // (ProcessFrameFinish),使下一源帧的 CPU 链(pack/OF/NGX 录制/提交)
     // 与上一帧的 GPU 执行重叠 —— FG 会话从"零重叠"回到 3 槽流水。内容与
     // 交付的时序由世代门保证:处理线程锁内存缓存(引用仍 pending)时
-    // ++fgCacheGen,Finish 完成后把 fgReadyGen 追平并 notify;消费线程在
-    // fgMutex 内 addFrameRef 领引用(引用计数防逐出)+ 读世代,fgReadyGen
-    // 未追平则锁外等 cv —— 等的是自己那批帧的内容,不阻塞其它帧的处理。
-    // 锁序恒 fgMutex → fgReadyMutex,无环。
+    // ++fgCacheGen 并挂 pending 就绪项,本批 Finish 落账时翻旗标并 notify;
+    // 消费线程在 fgMutex 内 addFrameRef 领引用(引用计数防逐出)+ 读世代,
+    // 就绪项未翻则锁外等 cv —— 等的是自己那批帧的内容,不阻塞其它帧的
+    // 处理。就绪状态按"代"挂账而非单调计数器:三个 Finish 出口各写自己
+    // 的代,后完成的代不得放行前代等待者(前代 unpack 可能还在写缓存帧
+    // —— 2026-10-04 评审修:旧 fgReadyGen ">=" 谓词正是这个假放行)。
+    // 锁序恒 fgMutex → fgReadyMutex,无环(Finish 出口不持 fgMutex)。
+    static constexpr int kFgReadyRing = 8;    // ≥ 在飞批数上限;被挤出 = 早于最近 8 批,必然已落账
     uint64_t fgCacheGen = 0;                  // 最近一次缓存存储的世代(fgMutex 内写)
-    uint64_t fgReadyGen = 0;                  // 内容已就绪的世代(fgReadyMutex 内写)
+    uint64_t fgReadyRingGen[kFgReadyRing] = {}; // 0 = 空槽(fgReadyMutex 内读写)
+    bool fgReadyRingOk[kFgReadyRing] = {};
+    int fgReadyRingNext = 0;
     std::mutex fgReadyMutex;
     std::condition_variable fgReadyCv;
 };
+
+// 世代门环形账(均须 fgReadyMutex;FgReadyQueryLocked 供 cv 谓词在已持锁
+// 下复用)。gen 未入环 = 早于最近 kFgReadyRing 批 —— 每批必然落账(三个
+// Finish 出口 + 同步兜底路径全覆盖),被挤出即早已就绪。
+static bool FgReadyQueryLocked(const FilterData *d, uint64_t gen) {
+    for (int i = 0; i < FilterData::kFgReadyRing; ++i)
+        if (d->fgReadyRingGen[i] == gen) return d->fgReadyRingOk[i];
+    return true;
+}
+
+static bool FgReadyQuery(FilterData *d, uint64_t gen) {
+    std::lock_guard<std::mutex> lock(d->fgReadyMutex);
+    return FgReadyQueryLocked(d, gen);
+}
+
+static void FgReadyMark(FilterData *d, uint64_t gen, bool ready) {
+    std::lock_guard<std::mutex> lock(d->fgReadyMutex);
+    d->fgReadyRingGen[d->fgReadyRingNext] = gen;
+    d->fgReadyRingOk[d->fgReadyRingNext] = ready;
+    d->fgReadyRingNext = (d->fgReadyRingNext + 1) % FilterData::kFgReadyRing;
+    d->fgReadyCv.notify_all();
+}
 
 // Process-lifetime hot context. mpv's vf_vapoursynth tears down and
 // re-creates the whole VS script on every seek; keeping the D3D12 device,
@@ -412,7 +440,7 @@ bool RunProcessFrameCommon(FilterData *d, const VSFrame *src, VSFrame *out,
 }
 } // namespace
 
-static const VSFrame *VS_CC DlssnrGetFrame(
+static const VSFrame *VS_CC DlssnrGetFrameImpl(
     int n, int activationReason, void *instanceData, void **frameData,
     VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
     auto *d = static_cast<FilterData *>(instanceData);
@@ -440,7 +468,8 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                     slot = (p == m0 - 1) ? 0 : p + 1;
                 }
             }
-            *frameData = reinterpret_cast<void *>(static_cast<intptr_t>((k << 4) | slot));
+            *frameData = reinterpret_cast<void *>(static_cast<intptr_t>(
+                (static_cast<intptr_t>(k) << 4) | slot)); // 有符号移位前先拓宽:1.3 亿帧后 (k<<4) 溢出 UB
             vsapi->requestFrameFilter(k, d->node, frameCtx);
             return nullptr;
         }
@@ -506,7 +535,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             // 缓存命中:先领引用再等内容(2026-09-25 持锁窗口缩小)。引用在
             // fgMutex 内领 —— 引用计数使后续逐出(k+1 存储覆盖)不影响本引用;
             // 内容可能仍在锁外 unpack(处理线程已提交、缓存标了 Pending)——
-            // 世代门等 fgReadyGen 追平本帧世代后交付。等待在两把锁外完成,
+            // 世代门等本帧世代就绪项翻旗后交付。等待在两把锁外完成,
             // 不阻塞其它源帧的处理线程。
             // 无缓存内容的槽位(密度下调的多余槽/播种帧/eval 降级)回落
             // 真实帧 —— 槽位照常占位,输出节奏不变。
@@ -515,21 +544,15 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                     ? vsapi->addFrameRef(d->fgCache[slot])
                     : vsapi->addFrameRef(d->fgCache[0]);
             const uint64_t myGen = d->fgCacheGen;
-            bool ready = false;
-            {
-                std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
-                ready = d->fgReadyGen >= myGen;
-            }
-            if (!ready) {
+            if (!FgReadyQuery(d, myGen)) {
                 fgLock.unlock();
                 std::unique_lock<std::mutex> readyLock(d->fgReadyMutex);
                 if (!d->fgReadyCv.wait_for(readyLock, std::chrono::seconds(15),
-                                           [&] { return d->fgReadyGen >= myGen; })) {
+                                           [&] { return FgReadyQueryLocked(d, myGen); })) {
                     char msg[128];
                     std::snprintf(msg, sizeof(msg),
-                                  "DLSSNR STATUS: fg gen-gate wait TIMEOUT frame=%d gen=%llu ready=%llu",
-                                  k, static_cast<unsigned long long>(myGen),
-                                  static_cast<unsigned long long>(d->fgReadyGen));
+                                  "DLSSNR STATUS: fg gen-gate wait TIMEOUT frame=%d gen=%llu",
+                                  k, static_cast<unsigned long long>(myGen));
                     vsdlssnr::TimingStatusLine(msg);
                 }
             }
@@ -545,6 +568,11 @@ static const VSFrame *VS_CC DlssnrGetFrame(
             // rtxActive 只在 initOk 后置位(Create 侧),此处恒 false,
             // 几何恒 = 源 → 恒同构行拷贝(缩放拷贝兜底已删,2026-09-26)。
             VSFrame *dup = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
+            if (!dup) { // OOM:帧错误上报,不空指针杀宿主(2026-10-04 评审修)
+                vsapi->freeFrame(src);
+                vsapi->setFilterError("dlssnr.Enhance: newVideoFrame (dup) failed", frameCtx);
+                return nullptr;
+            }
             CopyPlanes(src, dup, vsapi, d->width, d->height);
             if (d->hdrOut) SetHdrFrameProps(dup, vsapi);
             ScaleOutputDuration(dup, vsapi, m0);
@@ -555,21 +583,23 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                 d->fgCache[i] = nullptr;
             }
             d->fgCache[0] = dup;
-            // 纯 CPU 降级:内容同步就绪 —— 世代推进 + 就绪追平(无 pending 窗口)。
+            // 纯 CPU 降级:内容同步就绪 —— 世代推进 + 挂就绪账(无 pending 窗口)。
             ++d->fgCacheGen;
-            {
-                std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
-                d->fgReadyGen = d->fgCacheGen;
-            }
-            d->fgReadyCv.notify_all();
+            FgReadyMark(d, d->fgCacheGen, true);
             const VSFrame *ret = vsapi->addFrameRef(d->fgCache[0]);
             vsapi->freeFrame(src);
             return ret;
         }
 
         VSFrame *out = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
+        if (!out) { // OOM:帧错误上报(同上,2026-10-04 评审修)
+            vsapi->freeFrame(src);
+            vsapi->setFilterError("dlssnr.Enhance: newVideoFrame failed", frameCtx);
+            return nullptr;
+        }
         // effGens 个插值输出帧(仅 eval 成功槽进缓存;失败/降级槽直接释放,
         // 槽位在出帧时回落真实帧引用 —— 零复制优于再拷一份重复帧)。
+        // 分配失败的槽留空 = 回落真实帧,null 由下方各消费点显式判空。
         VSFrame *genFrame[kFgGenSlots] = {};
         for (int g = 0; g < effGens; ++g) {
             genFrame[g] = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
@@ -618,6 +648,8 @@ static const VSFrame *VS_CC DlssnrGetFrame(
         }
         ++d->fgCacheGen;
         const uint64_t myGen = d->fgCacheGen;
+        // pending 项先行(消费端要"查得到才等得到";本批 Finish 落账翻旗标)。
+        FgReadyMark(d, myGen, false);
         const VSFrame *ret =
             (slot >= 1 && slot < d->fgCacheM && d->fgCache[slot])
                 ? vsapi->addFrameRef(d->fgCache[slot])
@@ -702,11 +734,7 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                         std::lock_guard<std::mutex> cacheLock(d->fgMutex);
                         d->fgCacheK = -1;
                     }
-                    {
-                        std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
-                        d->fgReadyGen = myGen;
-                    }
-                    d->fgReadyCv.notify_all();
+                    FgReadyMark(d, myGen, true); // 唤醒等待者免 15s 超时拖住报错
                     char abortMsg[320];
                     std::snprintf(abortMsg, sizeof(abortMsg),
                                   "vs_dlssnr frame %d failed at finish: %s", k, finErr);
@@ -723,19 +751,13 @@ static const VSFrame *VS_CC DlssnrGetFrame(
                     }
                 }
             }
-            // 内容就绪:追平世代 + 唤醒等待中的消费方(失败也推进 —— 交付
+            // 内容就绪:落账本批 + 唤醒等待中的消费方(失败也落账 —— 交付
             // 的是兜底内容,等待不悬空)。
-            {
-                std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
-                d->fgReadyGen = myGen;
-            }
-            d->fgReadyCv.notify_all();
+            FgReadyMark(d, myGen, true);
         } else {
-            // Submit 半段失败:内容已同步兜底,无 pending 窗口 —— 就绪追平,
+            // Submit 半段失败:内容已同步兜底,无 pending 窗口 —— 落账本批,
             // 防消费者按本帧世代悬挂在 cv 上。
-            std::lock_guard<std::mutex> readyLock(d->fgReadyMutex);
-            d->fgReadyGen = myGen;
-            d->fgReadyCv.notify_all();
+            FgReadyMark(d, myGen, true);
         }
         vsapi->freeFrame(src);
         return ret;
@@ -748,6 +770,11 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     if (!d->initOk || (!nrLive && !d->rtxActive)) return src;
 
     VSFrame *out = vsapi->newVideoFrame(&d->outFi, d->outW, d->outH, src, core);
+    if (!out) { // OOM:帧错误上报,不空指针杀宿主(2026-10-04 评审修)
+        vsapi->freeFrame(src);
+        vsapi->setFilterError("dlssnr.Enhance: newVideoFrame failed", frameCtx);
+        return nullptr;
+    }
     if (!RunProcessFrameCommon(d, src, out, n, 0, nullptr, 0, nullptr, nullptr,
                                frameCtx, core, vsapi)) {
         return nullptr;
@@ -758,7 +785,23 @@ static const VSFrame *VS_CC DlssnrGetFrame(
     return out;
 }
 
-static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI *vsapi) {
+// VS C ABI 边界兜底(2026-10-04 评审修):实现链里的任何抛式操作(new/
+// make_shared/filesystem 等)若逃逸出 C 回调 = std::terminate 杀宿主 mpv。
+// 边界一处 catch 全收(含未来回归),比逐点 nothrow 化 ~40 个分配点更小
+// 且不会漏;OOM 级失败转化为帧/创建错误上报。
+static const VSFrame *VS_CC DlssnrGetFrame(
+    int n, int activationReason, void *instanceData, void **frameData,
+    VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
+    try {
+        return DlssnrGetFrameImpl(n, activationReason, instanceData, frameData,
+                                  frameCtx, core, vsapi);
+    } catch (...) {
+        vsapi->setFilterError("dlssnr.Enhance: internal error (exception)", frameCtx);
+        return nullptr;
+    }
+}
+
+static void VS_CC DlssnrFreeImpl(void *instanceData, VSCore * /*core*/, const VSAPI *vsapi) {
     auto *d = static_cast<FilterData *>(instanceData);
     if (d->node) vsapi->freeNode(d->node);
     // Stop the bridge before tearing down the contexts it observes. The D3D12
@@ -803,7 +846,14 @@ static void VS_CC DlssnrFree(void *instanceData, VSCore * /*core*/, const VSAPI 
     delete d;
 }
 
-static void VS_CC DlssnrCreate(
+static void VS_CC DlssnrFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
+    try {
+        DlssnrFreeImpl(instanceData, core, vsapi);
+    } catch (...) { // ABI 边界兜底(见 DlssnrGetFrame 注释);Free 无处上报,吞掉
+    }
+}
+
+static void VS_CC DlssnrCreateImpl(
     const VSMap *in, VSMap *out, void * /*userData*/, VSCore *core, const VSAPI *vsapi) {
     VSNode *node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     if (!node) {
@@ -1140,6 +1190,9 @@ static void VS_CC DlssnrCreate(
             VSVideoFormat p10{};
             if (!vsapi->getVideoFormatByID(&p10, pfYUV420P10, core)) {
                 vsapi->mapSetError(out, "dlssnr.Enhance: getVideoFormatByID(YUV420P10) failed");
+                // 引用放出先于实例析构(对齐 format-reject 路径;漏放 = 上游
+                // 整图随 core 生命周期滞留,2026-10-04 评审修)。
+                if (d->node) vsapi->freeNode(d->node);
                 delete d;
                 return;
             }
@@ -1185,6 +1238,15 @@ static void VS_CC DlssnrCreate(
     // 保证同源帧的两条输出只处理一次。
     vsapi->createVideoFilter(out, "Enhance", &viOut, DlssnrGetFrame, DlssnrFree,
                              fmParallel, deps, 1, d, core);
+}
+
+static void VS_CC DlssnrCreate(
+    const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
+    try {
+        DlssnrCreateImpl(in, out, userData, core, vsapi);
+    } catch (...) { // ABI 边界兜底(见 DlssnrGetFrame 注释)
+        vsapi->mapSetError(out, "dlssnr.Enhance: internal error (exception)");
+    }
 }
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin *plugin, const VSPLUGINAPI *vspapi) {

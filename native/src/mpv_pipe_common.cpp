@@ -57,9 +57,9 @@ void MpvPipeDefaultNames(const wchar_t *candidates[kMpvPipeMaxCandidates]) noexc
     candidates[3] = L"umpv";
 }
 
-HANDLE MpvPipeOpen(const wchar_t *const *candidates, bool overlapped,
-                   wchar_t *nameOut, size_t nameLen) noexcept {
-    for (int i = 0; i < kMpvPipeMaxCandidates; ++i) {
+HANDLE MpvPipeOpen(const wchar_t *const *candidates, int candidateCount,
+                   bool overlapped, wchar_t *nameOut, size_t nameLen) noexcept {
+    for (int i = 0; i < candidateCount; ++i) {
         if (!candidates[i] || !candidates[i][0]) continue;
         wchar_t pipePath[MAX_PATH];
         swprintf_s(pipePath, L"\\\\.\\pipe\\%s", candidates[i]);
