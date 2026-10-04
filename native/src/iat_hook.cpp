@@ -198,8 +198,12 @@ bool RestoreSnippetCallerHook(SnippetCallerHook &hook) noexcept {
 
     hook.installed = false;
     hook.iatSlot = nullptr;
-    g_originalGetModuleFileNameW.store(nullptr, std::memory_order_release);
-    g_snippetCallerModule.store(nullptr, std::memory_order_release);
+    // 两个全局刻意不清零:换槽后新调用方不再进 hook,只有已换槽前读走
+    // hook 地址的在途线程还会进来 —— 它们要靠这两个全局转发/应答。清零会
+    // 让在途线程读到 original==null 吃 ERROR_INVALID_FUNCTION(snippet
+    // caller 自检撞上 = NR init 莫名失败);下一次 install 会原样覆写两值,
+    // 残留无害(2026-10-05 评审修,与 install 侧"original 先落账再换槽"
+    // 的时序对称)。
     void *expectedOwner = &hook;
     g_hookOwner.compare_exchange_strong(expectedOwner, nullptr, std::memory_order_acq_rel);
     return true;

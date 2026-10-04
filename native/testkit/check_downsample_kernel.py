@@ -61,15 +61,19 @@ def capture(**kw):
     return out[-1] if out else f"(worker failed: {r.stderr[-200:]})"
 
 
-a = capture()
+# 钉 nr=1 + scaling=1(2026-10-05 实测定案):出厂默认 nr=0 全直通恒红
+# (validate_params 同款陷阱);且 res% 只是参数,内部分辨率管线的闸门是
+# scaling_enabled —— scaling=0 时 create params 显示 res=50% 但 pipe 恒
+# 1280,档位无效应。本测试的全部判据都要求残差管线真实存在。
+a = capture(nr_enabled=1, scaling_enabled=1)
 print(f"hifreq default res100: {a}")
-a2 = capture()
+a2 = capture(nr_enabled=1, scaling_enabled=1)
 print(f"hifreq res100 again:   {a2}  {'DETERMINISTIC' if a2 == a else 'NONDET!'}")
-b = capture(input_resolution=50)
-print(f"hifreq res50:          {b}  {'DIFF' if b != a else 'SAME!'}")
-c = capture(residual_multiplier=1.5)
-print(f"hifreq res100 mult1.5: {c}  {'DIFF' if c != a else 'SAME!'}")
+a50 = capture(nr_enabled=1, scaling_enabled=1, input_resolution=50)
+print(f"hifreq res50:          {a50}  {'DIFF' if a50 != a else 'SAME!'}")
+c = capture(nr_enabled=1, scaling_enabled=1, input_resolution=50, residual_multiplier=1.5)
+print(f"hifreq res50 mult1.5:  {c}  {'DIFF' if c != a50 else 'SAME!'}")
 
-ok = (a2 == a) and (b != a) and (c != a)
+ok = (a2 == a) and (a50 != a) and (c != a50)
 print("DOWNSAMPLE-KERNEL:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

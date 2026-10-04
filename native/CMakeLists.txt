@@ -55,6 +55,16 @@ if (NOT FFX_DXC_PATH)
     message(FATAL_ERROR "dxc.exe not found (Windows SDK bin\\<ver>\\x64); FidelityFX OF blobs cannot be generated")
 endif ()
 message(STATUS "FidelityFX OF dxc: ${FFX_DXC_PATH}")
+# SDK 输入入 DEPENDS(2026-10-05 评审修):脚本自带指纹 stamp 只在命令被
+# 调度时检查,CMake 的重跑判定只看 DEPENDS —— 此前仅依赖 .ps1 本身,
+# fetch-deps 换 SDK 后 generation.json 时间戳不比 vendor 旧即不重跑,陈旧
+# blob 直接入包。configure 期 GLOB(fetch-deps 先于 configure 跑,新增文件
+# 已在盘上;其后新增文件走手动 reconfigure,与 stamp 检查互补)。
+file(GLOB_RECURSE FFX_SDK_INPUTS
+     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/*.h"
+     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/*.hpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/*.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/vendor/fidelityfx/*.json")
 add_custom_command(
     OUTPUT "${FFX_GEN_DIR}/generation.json"
     BYPRODUCTS ${FFX_GEN_HEADERS}
@@ -65,6 +75,7 @@ add_custom_command(
             -OutputDirectory "${FFX_GEN_DIR}"
             -DxcPath "${FFX_DXC_PATH}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/Generate-FidelityFXOpticalFlowShaders.ps1"
+            ${FFX_SDK_INPUTS}
     VERBATIM)
 add_custom_target(ffx_of_blobs DEPENDS "${FFX_GEN_DIR}/generation.json")
 

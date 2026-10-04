@@ -412,7 +412,11 @@ void D3D12Context::RecordFlowView(FrameSlot &slot, bool useReduced, bool realMot
     cl->CopyResource(slot.outputColor.Get(), _debugDiff.Get());
     D3D12_RESOURCE_BARRIER post[2]{
         Transition(_debugDiff.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        // 出态对称回入态:NR 开帧 UAV→COPY_DEST→UAV(eval 帧末不变量);
+        // debugPipe(NR 关)帧 COMMON→COPY_DEST→COMMON —— 此前无条件归
+        // UAV,post CL 按契约从 COMMON 对接时 StateBefore 失配(UAV 显式态
+        // 跨 ECL 不衰减)(2026-10-05 评审修)。
+        Transition(slot.outputColor.Get(), D3D12_RESOURCE_STATE_COPY_DEST, outColorIn),
     };
     cl->ResourceBarrier(2, post);
 }

@@ -71,9 +71,17 @@ def get_plane(f, p):
     return a[:, :(W if p == 0 else CW)]
 
 
-env = os.environ.get("VSDLSSNR_SKIP_EVAL", "")
-print(f"SKIP_EVAL={env!r}")
-mine = core.dlssnr.Enhance(src)
+# SKIP_EVAL 自设 + 留痕断言(2026-10-05 评审修):此前环境变量只打印不设
+# 也不验 —— 忘设时(部署 ini nr=1)全量 NR 参与,逐块偏差爆表假 FAIL;
+# 出厂默认 nr=0 直通时纯转换根本没跑也 PASS(空心)。现在自设 SKIP_EVAL=1
+# (跳 NGX eval 的纯转换诊断模式),钉 nr_enabled=1 保证转换管线真实在跑,
+# 并从 timing log 的 session start flags 断言插件确实进入 skip_eval 模式。
+os.environ.setdefault("VSDLSSNR_SKIP_EVAL", "1")
+log_off = testenv.log_size()
+mine = core.dlssnr.Enhance(src, nr_enabled=1)
+_flags = [l for l in testenv.new_lines(log_off) if "session start" in l]
+assert _flags and "skip_eval" in _flags[-1], \
+    f"插件未进入 skip_eval 模式(session start flags: {_flags[-1:] or '无'})"
 zimg = src.resize.Bilinear(format=vs.RGBS, matrix_in_s="709")
 zimg = zimg.resize.Bilinear(format=src.format.id, matrix_s="709")
 

@@ -96,6 +96,9 @@ if (Test-Path $rtxLicense) {
 }
 
 # --- 安装说明 ---
+# Encoding=UTF8(2026-10-05 评审修):utf8BOM 枚举是 PowerShell 6+ 独有,
+# 5.1 的 Set-Content 参数绑定直接终止错误,炸在 staging 全做完之后。UTF8
+# 双版本可跑(5.1 带 BOM,7 无 BOM,内容同为有效 UTF-8)。
 $readme = Join-Path $stage "安装说明.txt"
 @"
 mpv_PlayKit DLSSNR 完整包 v$Version
@@ -144,7 +147,7 @@ mpv_PlayKit DLSSNR 完整包 v$Version
 
 要求: RTX 显卡
 本包不含 mpv.exe 与 VapourSynth 运行时, 请使用官方 mpv-lazy 发行包
-"@ | Set-Content $readme -Encoding utf8BOM
+"@ | Set-Content $readme -Encoding UTF8
 
 # --- 压缩并清理暂存 ---
 Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force

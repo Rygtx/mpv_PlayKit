@@ -1164,10 +1164,13 @@ void ScaledToYuvLuma(uint3 tid : SV_DispatchThreadID) {
 void ScaledToYuvChroma(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
     // luma 域 ChromaStep 覆盖区四点采样(各点双线性)平均 → 转换。
-    // step=(2,2) 时与旧硬编码 0.25/2×2 逐式恒等;444=(1,1) 四点同址 = 直写。
+    // 四点 = 覆盖区四角内缩半像素(0.5 / step−0.5;对照 PqToYuvChroma 同
+    // 形态),step=(2,2) 时即 (0.5,0.5)(1.5,0.5)(0.5,1.5)(1.5,1.5);
+    // 444=(1,1) 四点同址 = 直写。此前 h 误取 step×0.5,step−h ≡ h,四点
+    // 恒重合退化单点采样,box 预滤波不存在(2026-10-05 评审修)。
     const float2 base = tid.xy * ChromaStep;
     const float invW = 1.0 / float(ChromaStep.x * ChromaStep.y);
-    const float2 h = float2(ChromaStep) * 0.5;
+    const float2 h = float2(0.5, 0.5);
     const float3 rgb = saturate(invW * (SampleBilinear(ToSrcPosChroma(base + float2(h.x, h.y)))
                                       + SampleBilinear(ToSrcPosChroma(base + float2(ChromaStep.x - h.x, h.y)))
                                       + SampleBilinear(ToSrcPosChroma(base + float2(h.x, ChromaStep.y - h.y)))

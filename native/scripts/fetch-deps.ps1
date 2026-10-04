@@ -104,7 +104,7 @@ if (-not (Test-Path $fgProxyDll) -or (Get-FileHash -LiteralPath $fgProxyDll -Alg
     Copy-Item $iniSrc $fgProxyIni -Force
     Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
-    Write-Host "dlssg_for_sm86 ${sm86Tag}: $fgProxyDll ($sm86DllBytes bytes) + factory ini"
+    Write-Host "dlssg_for_sm86 ${sm86Tag}: $fgProxyDll ($((Get-Item -LiteralPath $fgProxyDll).Length) bytes) + factory ini"
 }
 
 # 出厂 ini 的 MaxGeneratedFrames 默认 3(4X);部署默认开到 5(6X)——

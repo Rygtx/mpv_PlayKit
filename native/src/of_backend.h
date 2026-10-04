@@ -35,7 +35,9 @@ namespace vsdlssnr {
 
 // 栅栏值到达等待(两光流后端共用):共享 auto-reset 事件的唤醒可能被同
 // 事件的其它等待者窃取(单次 Wait 返回不代表本等待的目标值已达成),循环
-// 复查完成值;栅栏值单调 ⇒ 有界退出。
+// 复查完成值;栅栏值单调 ⇒ 有界退出。超时路径同样先复查完成值再认输 ——
+// 唤醒被窃时事件不再来,但目标值可能早已达成,不复查 = 假超时假退役
+// (RtxQueue 等待同形态,2026-10-05 评审修)。
 // CL 轮转池的 allocator Reset + force-close 自愈(ResetAllocatorHealed)
 // 已上移 d3d12_context.h(全仓唯一实现,含 d3d12 侧五处原手写份)。
 inline bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
@@ -43,7 +45,8 @@ inline bool WaitFenceReached(ID3D12Fence *fence, uint64_t value,
     for (;;) {
         if (fence->GetCompletedValue() >= value) return true;
         if (FAILED(fence->SetEventOnCompletion(value, event))) return false;
-        if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0) return false;
+        if (WaitForSingleObject(event, timeoutMs) != WAIT_OBJECT_0)
+            return fence->GetCompletedValue() >= value;
     }
 }
 

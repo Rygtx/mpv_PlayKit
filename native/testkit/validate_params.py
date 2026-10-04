@@ -103,8 +103,11 @@ d = capture({"input_resolution": 50, "residual_multiplier": 2.0})
 print(f"res50 multiplier=2:        {d}  {'DIFF' if d != a50 else 'SAME!'}")
 e = capture({"input_resolution": 50, "residual_saturation": 0.0, "residual_lightness": 0.5})
 print(f"res50 sat=0 light=0.5:     {e}  {'DIFF' if e != a50 else 'SAME!'}")
-g = capture({"intensity": 1.5})
-print(f"intensity=1.5 (clamp 1.0): {g}  {'CLAMPED-OK' if g == a else 'NOT CLAMPED!'}")
+g = capture({"intensity": 0.0})
+# 强度合同用 0.0 边沿验(2026-10-05 实测定案):交付路径无二道钳(NGX 键
+# 原样 Set),但 tier-2030 模型把 Intensity ≥1.0 饱和 —— 1.5 与 1.0 输出
+# 恒同,1.5 不再构成判据;0.0 是有判别力的合同边沿。
+print(f"intensity=0 (min edge):    {g}  {'DIFF' if g != a else 'SAME!'}")
 s = capture({"input_resolution": 50, "shadow_structure": 0.0, "reflection_glow": 1.8})
 print(f"res50 shadow=0 glow=1.8:   {s}  {'DIFF' if s != a50 else 'SAME!'}")
 
@@ -126,7 +129,7 @@ if not p_ok:
     print("  ^ SENTINEL TRIPPED: 新 DLL 消费 Hint.Render.Preset 了 —— "
           "恢复面板\"预设\"下拉(对照 2026-09-14 的移除提交)")
 
-ok = (a2 == a) and (b != a) and (d != a50) and (e != a50) and (g == a) and (s != a50)
+ok = (a2 == a) and (b != a) and (d != a50) and (e != a50) and (g != a) and (s != a50)
 ok = ok and (st1 != a) and (st2 != a) and (am != a) and (nr0 != a) and p_ok
 print("VALIDATE-PARAMS:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

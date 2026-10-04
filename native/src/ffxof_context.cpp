@@ -283,8 +283,9 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         result.historyReset = true;
         return result;
     }
-    // 停摆观测④的连续迟到计数(函数级作用域:Expired 分支内外共用)。
-    static int s_expStreak = 0;
+    // 停摆观测④的连续迟到计数(成员 _expStreak:函数级 static 跨实例残留,
+    // 退役重建/换档后旧计数带进新会话;且 static 非 atomic,当前靠门 mutex
+    // 串行纯属侥幸 —— 成员化后串行即设计保证,2026-10-05 评审修)。
     LARGE_INTEGER freq{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
@@ -303,19 +304,19 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             // 门残留旧 _nextSeq 实锤:重载后 mpv 从帧 0 重送,复制帧爬满旧
             // 时间线长度才自愈)。阈值触达打一行,归零前不再刷 —— 常态零
             // 输出,perf 行 s/x/r 不覆盖"过期"形态,此行是唯一信号。
-            ++s_expStreak;
-            if (s_expStreak == 16) {
+            ++_expStreak;
+            if (_expStreak == 16) {
                 char msg[128];
                 std::snprintf(msg, sizeof(msg),
                               "DLSSNR STATUS: of gate late streak=%d frame=%d next=%d",
-                              s_expStreak, frameIndex, static_cast<int>(_gate.NextSeq()));
+                              _expStreak, frameIndex, static_cast<int>(_gate.NextSeq()));
                 TimingStatusLine(msg);
             }
             _lastStageMs = 0.0;
             _lastGpuSpanMs = 0.0; // 过期帧无光流计算,nvof 段读 0
             return result;
         }
-        s_expStreak = 0;
+        _expStreak = 0;
         // 推进门:活性不变量要求过 Arrive 的帧所有路径必达 Advance,否则
         // 缺口=1 的等待方永久悬等(of_frame_gate.h)。
         if (_d3d12->IsDeviceLost()) {
@@ -463,7 +464,9 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
             _spanPending = true;
             _spanFence = _lastDone.load(std::memory_order_relaxed);
         }
-        _consecutiveFailures = 0;
+        // 连败清零已下移 densify 成功分支:整链(main+densify)成功才算链完
+        // 好 —— 此前 main 成功即清,densify 单点持续失败每帧被抵消,连败
+        // 闩锁永不触发(2026-10-05 评审修)。
         if (_executesLogged < 5) {
             ++_executesLogged;
             char msg[128];
@@ -488,6 +491,7 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         if (densifyOk) {
             _lastCopyFence = _rotator.Submit(queue, _copyFence.Get(), densCl, ++_copySeq);
             result.waitFenceValue = _lastDone; // 非 0 = realMotion
+            _consecutiveFailures = 0;
         } else {
             // densify 失败与 copy/main 同类(链断:InvalidateHistory 已落),
             // 计入连败闩锁 —— 此前恰漏在"失败收口三连已统一"的网外,持续

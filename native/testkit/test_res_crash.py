@@ -26,6 +26,13 @@ import panel_ipc  # noqa: E402
 testenv.require_env()
 testenv.require_nvidia()
 
+# 真实面板清场(对齐 test_ipc.py):真实面板 adopt 会以自己的 generation
+# 重写映射并下发面板 ini 的档位,recreate 防线可被噪声灌满空心化
+# (2026-10-05 评审修)。
+testenv.kill_panel()
+os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")
+time.sleep(1)
+
 source = sys.argv[1] if len(sys.argv) > 1 else "av://lavfi:testsrc2"
 VPY = "~~/vs/DLSSNR_NV.vpy"
 

@@ -107,8 +107,9 @@ struct FilterData {
     int subW = 1;  // 输入色度抽取档(420=(1,1) 422=(1,0) 444=(0,0));RGB=0
     int subH = 1;
     bool isRgb = false; // VS RGBP 计划族直读(零矩阵)
-    // resize watcher 停事件句柄(匿名 auto-reset;Free 时 SetEvent+Close,
-    // watcher 线程生命周期与实例对齐)。
+    // resize watcher 停事件句柄原件(匿名 auto-reset;watcher 线程持自己的
+    // 复制份,Free 时 MpvResizeWatchStop SetEvent+Close 本件,线程生命周期
+    // 与实例对齐)。
     HANDLE resizeWatchStop = nullptr;
     // RTX Video 输出几何(init 后从 context 读回;输出帧按此建)。
     int outW = 0;
@@ -1213,6 +1214,10 @@ static void VS_CC DlssnrCreateImpl(
                 // 引用放出先于实例析构(对齐 format-reject 路径;漏放 = 上游
                 // 整图随 core 生命周期滞留,2026-10-04 评审修)。
                 if (d->node) vsapi->freeNode(d->node);
+                // 此处已过 BridgeStart:不收口就 delete = 桥线程孤儿(它持
+                // params 的自身拷贝继续跑,只能等下一实例 handoff 才被停,
+                // 此后无 create 即永活)(2026-10-05 评审修)。
+                vsdlssnr::BridgeStop(d->params);
                 delete d;
                 return;
             }
@@ -1249,7 +1254,12 @@ static void VS_CC DlssnrCreateImpl(
         vsdlssnr::TimingStatusLine(msg);
     }
 
-    VSFilterDependency deps[]{ { node, rpStrictSpatial } };
+    // 依赖声明按会话形态:FG 会话实际请求 k≠n((n-1)/m0+1 闭式映射,尾段
+    // 还重复请求末源帧),不符合 rpStrictSpatial "恒且仅请求 n" 的声明 ——
+    // 核心会按声明做预取/复用优化,声明错误 = 按错误模式工作,FG 用
+    // rpGeneral。非 FG 路径 requestFrameFilter(n) 严格空间型,维持原声明
+    // (2026-10-05 评审修)。
+    VSFilterDependency deps[]{ { node, d->fgActive ? rpGeneral : rpStrictSpatial } };
     // fmParallel: mpv keeps multiple frame requests in flight; each getFrame
     // runs on its own D3D12 slot (slot pool caps the concurrency at
     // kSlotCount), which overlaps CPU pack/unpack with the GPU work of other

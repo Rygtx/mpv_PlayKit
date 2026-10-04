@@ -24,7 +24,9 @@ from vapoursynth import core  # noqa: E402
 
 def bench(w, h, n=12):
     clip = core.std.BlankClip(width=w, height=h, format=vs.YUV420P8, color=[138, 169, 91])
-    ret = core.dlssnr.Enhance(clip)
+    # nr 钉 1(2026-10-05 评审修):缺省 nr=0 走零 GPU 直通,实测会把 memcpy
+    # 耗时当 NGX 稳态数据报(虚低一个量级)。
+    ret = core.dlssnr.Enhance(clip, nr_enabled=1)
     ret.get_frame(0)  # warmup: plugin/NGX init 只发生在首帧
     t0 = time.perf_counter()
     for i in range(1, n + 1):

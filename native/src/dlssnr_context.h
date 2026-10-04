@@ -313,7 +313,9 @@ private:
     char _fgDetail[128] = "";
     // 创建倍数 M0(plugin.cpp 侧 vi.fps/帧数契约的同一值;FG 未激活 = 0)。
     // live 倍数 > M0 的面板档位本会话无槽可填 —— 面板据此红显"需重建"。
-    int _fgCreateMult = 0;
+    // 会话创建倍数契约(M0):Rebind 写 vs FillStatsCommon(桥/统计路径)读
+    // 跨线程,atomic 收口(2026-10-05 评审修)。
+    std::atomic<int> _fgCreateMult{ 0 };
     // 自动档 hook 代理预载失败原因(非空 = 预载没进托)。官方链失败时并
     // 入 _fgDetail(面板直读真因,而非误导性的 "DLSSG unavailable");
     // 官方链成功则保持无消费( FG 能跑,预载失败无实际影响)。
@@ -336,7 +338,11 @@ private:
     NVSDK_NGX_Handle *_feature = nullptr;
     HMODULE _snippetModule = nullptr;
     SnippetCallerHook _hook{};
-    SharedParams *_shared = nullptr;
+    // 共享参数块指针:Rebind 热复用换绑新实例的块,与帧线程/统计线程的
+    // 解引用并发 —— 指针本身 atomic 收口(防撕裂/UB;跨帧换块读到新快照
+    // 是热复用的既有语义,解引用对象生命周期由实例 shared_ptr 背书)
+    // (2026-10-05 评审修)。
+    std::atomic<SharedParams *> _shared{ nullptr };
 
     using SnippetInitExtFn = NVSDK_NGX_Result(NVSDK_CONV *)(
         unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version, const NVSDK_NGX_Parameter *);

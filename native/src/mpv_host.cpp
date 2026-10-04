@@ -83,11 +83,13 @@ namespace {
 
 struct ResizeWatchCtx {
     int srcW, srcH, refH;
-    HANDLE stop; // 匿名停事件;线程创建后所有权归 watcher(退出时自关,
-                 // MpvResizeWatchStop 只 SetEvent —— 此前 Stop 的 CloseHandle
-                 // 与线程"扫描窗口不在 wait"竞态,句柄值被复用后下一轮
-                 // wait 撞无关对象 → WAIT_TIMEOUT 空转永不退,名额泄漏,
-                 // 2026-10-04 评审修)
+    HANDLE stop; // 匿名停事件;此处是线程私有的复制句柄(DuplicateHandle,
+                 // 退出时自关),调用方 FilterData 持原件并由
+                 // MpvResizeWatchStop SetEvent+Close。两份句柄指向同一事件
+                 // 对象,所有权互不重叠 —— 此前"线程自退自关 + 调用方迟后
+                 // SetEvent"共享同一句柄值,自退到 Free 之间句柄值被复用即
+                 // 伪信号误杀下一个 watcher(2026-10-05 评审修);更早
+                 // Stop 侧 CloseHandle 与 wait 的竞态见 Start 内注释。
 };
 
 std::atomic<int> g_resizeWatchers{ 0 };
@@ -163,7 +165,7 @@ DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
         break; // 重建带来新探测值与新 watcher
     }
     g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
-    CloseHandle(ctx->stop); // 停事件所有权归线程(见 ResizeWatchCtx 注),退出自关
+    CloseHandle(ctx->stop); // 只关线程自己的复制句柄(见 ResizeWatchCtx 注)
     return 0;
 }
 
@@ -174,10 +176,21 @@ HANDLE MpvResizeWatchStart(int srcW, int srcH, int refH, bool vsrAutoMode) noexc
     HANDLE stop = CreateEventW(nullptr, FALSE, FALSE, nullptr); // auto-reset 停旗
     if (!stop) return nullptr;
     g_resizeWatchers.fetch_add(1, std::memory_order_relaxed);
+    // 线程私有的复制句柄:线程自退自关只动自己的份,调用方原件到 Stop
+    // (SetEvent+Close)始终有效 —— 两条退出路径共享同一句柄值的悬空
+    // SetEvent 竞态就此消失(2026-10-05 评审修)。
+    HANDLE threadStop = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), stop, GetCurrentProcess(),
+                         &threadStop, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        CloseHandle(stop);
+        g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
+        return nullptr;
+    }
     // nothrow new:本函数 noexcept,抛式 new 的分配失败会变 std::terminate
     // 杀掉整个 mpv 进程 —— 按本函数既有契约优雅降级(nullptr = 跟随关闭)。
-    auto *ctx = new (std::nothrow) ResizeWatchCtx{ srcW, srcH, refH, stop };
+    auto *ctx = new (std::nothrow) ResizeWatchCtx{ srcW, srcH, refH, threadStop };
     if (!ctx) {
+        CloseHandle(threadStop);
         CloseHandle(stop);
         g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
         return nullptr;
@@ -185,9 +198,10 @@ HANDLE MpvResizeWatchStart(int srcW, int srcH, int refH, bool vsrAutoMode) noexc
     HANDLE th = CreateThread(nullptr, 0, ResizeWatchProc, ctx, 0, nullptr);
     if (th) {
         CloseHandle(th);
-        return stop; // 句柄归调用方转交语义(Stop 只 SetEvent;Close 归线程)
+        return stop; // 原件归调用方(Stop 里 SetEvent+Close);线程只认自己的复制份
     }
     delete ctx;
+    CloseHandle(threadStop);
     CloseHandle(stop);
     g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
     return nullptr;
@@ -195,11 +209,12 @@ HANDLE MpvResizeWatchStart(int srcW, int srcH, int refH, bool vsrAutoMode) noexc
 
 void MpvResizeWatchStop(HANDLE stop) noexcept {
     if (!stop) return;
-    // 只置旗不关句柄(2026-10-04 评审修):CloseHandle 后句柄值可被其它
-    // 线程复用,watcher 正处扫描窗口(不在 wait)时下一轮 wait 撞复用句柄
-    // —— 可等待且不触发的对象 = 恒 WAIT_TIMEOUT,线程空转永不退,两次即
-    // 耗尽名额,自动跟随整个会话静默失效。句柄所有权归线程,退出自关。
+    // SetEvent + CloseHandle(原件归调用方):SetEvent 对已自退的 watcher 是
+    // 无害空拍(事件对象仍在本句柄下存活,不撞复用值);CloseHandle 与线程
+    // wait 无竞态 —— 线程等待/自关的都是它自己的复制句柄,原件生命周期
+    // 只有本函数触碰(2026-10-05 评审修,原"只 SetEvent"形态见 ResizeWatchCtx 注)。
     SetEvent(stop);
+    CloseHandle(stop);
 }
 
 } // namespace vsdlssnr

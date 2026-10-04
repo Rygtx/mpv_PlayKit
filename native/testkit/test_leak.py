@@ -43,7 +43,8 @@ def ws_mb():
 
 W, H, N = 1280, 720, 150
 clip = core.std.BlankClip(width=W, height=H, format=vs.YUV420P8, color=[138, 169, 91])
-ret = core.dlssnr.Enhance(clip)
+# nr 钉 1(2026-10-05 评审修):缺省 nr=0 直通路径测不出 NGX 管线泄漏。
+ret = core.dlssnr.Enhance(clip, nr_enabled=1)
 ret.get_frame(0)  # warmup: init
 
 samples = []

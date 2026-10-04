@@ -18,6 +18,13 @@ import panel_ipc  # noqa: E402
 testenv.require_env()
 testenv.require_nvidia()
 
+# 真实面板清场(对齐 test_ipc.py:真实面板会与本测试的 ParamsChannel 互写
+# 同一映射的 generation,recreate 计数断言被面板噪声打成假 FAIL,
+# 2026-10-05 评审修)。
+testenv.kill_panel()
+os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")
+time.sleep(1)
+
 ch = panel_ipc.ParamsChannel()
 
 W, H = 640, 480

@@ -5,6 +5,7 @@
 
 #include <shellapi.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -43,6 +44,12 @@ BridgeState *g_bridge = nullptr; // one live bridge at a time (last filter wins)
 // lifecycle → bridge 单向)。
 std::mutex g_bridgeMutex;
 
+// 楔死旗:某次 BridgeStop 5s 超时后,旧线程仍活着且会继续触碰进程级全局
+// (g_paramsMapping/g_paramsView 的重开/覆盖)。置位后本进程不再新开桥线程
+// —— 双线程并发竞争全局(互相覆盖 mapping 句柄、双次 ApplyPanelPayload)
+// 比桥停摆更糟,宁可显式降级留痕(2026-10-05 评审修)。
+std::atomic<bool> g_bridgeWedged{ false };
+
 // 锁内实现(BridgeStart 的 handoff 与 BridgeStop 共用;调用方持锁)。
 void BridgeStopLocked(BridgeState *state) noexcept {
     state->running = false;
@@ -57,7 +64,8 @@ void BridgeStopLocked(BridgeState *state) noexcept {
             // of risking a use-after-free; the thread exits on its own once
             // the block clears. The alive event / mapping handles are
             // process-lifetime either way.
-            TimingStatusLine("DLSSNR STATUS: bridge stop TIMED OUT (5s); state leaked, thread wedged");
+            TimingStatusLine("DLSSNR STATUS: bridge stop TIMED OUT (5s); state leaked, thread wedged; bridge disabled for process lifetime");
+            g_bridgeWedged.store(true, std::memory_order_release);
             if (g_bridge == state) g_bridge = nullptr;
             return;
         }
@@ -347,6 +355,12 @@ void LaunchPanelSilently() noexcept {
 
 bool BridgeStart(const std::shared_ptr<SharedParams> &params) noexcept {
     std::lock_guard<std::mutex> lock(g_bridgeMutex);
+    // 楔死后拒绝再开:旧楔线程未死,新线程会与它并发竞争进程级全局
+    // (bridge disabled 日志见 BridgeStopLocked 超时路径,2026-10-05 评审修)。
+    if (g_bridgeWedged.load(std::memory_order_acquire)) {
+        TimingStatusLine("DLSSNR STATUS: bridge start REFUSED (wedged thread still alive)");
+        return false;
+    }
     if (g_bridge) {
         if (g_bridge->params == params) return true;
         // A newer filter instance is going live while the previous one is

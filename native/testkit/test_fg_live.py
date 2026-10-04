@@ -33,7 +33,7 @@ assert len(ret) == 12 * M, f"帧数应 ×M({len(ret)} != {12 * M})"
 f0 = ret.get_frame(0)
 dn = f0.props.get("_DurationNum")
 dd = f0.props.get("_DurationDen")
-assert dn and dd and dd % (24 * M) == 0 or (dn, dd) == (1, 24 * M), \
+assert dn is not None and dd is not None and (dn, dd) == (1, 24 * M), \
     f"时长应为 1/{24 * M},实测 {dn}/{dd}"
 for n in (0, 1, 2, 3, 11, 12 * M - 1):
     f = ret.get_frame(n)

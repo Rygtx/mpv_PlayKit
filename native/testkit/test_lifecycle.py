@@ -29,7 +29,8 @@ mpv = subprocess.Popen(
      f"--vf=vapoursynth={VPY}", "--vo=null", "--no-terminal", "--really-quiet"],
     cwd=testenv.ROOT)
 time.sleep(8)
-print("after filter load, panel running:", panel_pid() == 1)
+panel_up = panel_pid() == 1
+print("after filter load, panel running:", panel_up)
 
 # mpv.com 是启动壳:必须按名杀真正的 mpv.exe,否则 alive 事件仍在,
 # 面板正确地继续运行(这不是 bug)。
@@ -42,5 +43,10 @@ while time.time() < deadline:
         gone = True
         break
 print("after mpv kill, panel exited:", gone)
-print("LIFECYCLE", "OK" if gone else "FAIL")
-sys.exit(0 if gone else 1)
+# 两段契约都要验:面板被拉起(panel_up)+ 杀 mpv 后 watchdog 退出(gone)。
+# 此前最终判定只看 gone —— 面板从未启动(dlssnr_panel.exe 缺失/拉起失败)
+# 时 panel_pid() 恒 0,循环第一拍即 gone=True 照样 PASS,空心通过
+# (2026-10-05 评审修)。
+ok = gone and panel_up
+print("LIFECYCLE", "OK" if ok else "FAIL")
+sys.exit(0 if ok else 1)

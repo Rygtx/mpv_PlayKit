@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 namespace vsdlssnr {
 
@@ -29,7 +30,10 @@ constexpr unsigned int DLSSG_NEVER_PROVIDED_FLAGS =
 // ---- 进程级模块缓存:同路径只 LoadLibrary 一次,永不卸载 ----
 // quality/dims 变化只重建 feature 不卸模块(nvofapi64.dll 同哲学:驱动内
 // 部线程存活期不明,FreeLibrary 死锁风险;进程退出由 OS 回收)。
+// mu:预载入口有两个(dlssnr_context Initialize FG 段与 Rebind 预检)可并发,
+// 裸写曾构成数据竞争(2026-10-05 评审修)。
 struct FgModuleCache {
+    std::mutex mu;
     HMODULE module = nullptr;
     wchar_t path[MAX_PATH]{};
 };
@@ -58,6 +62,7 @@ bool DlssfgContext::PreloadProxyModule(const wchar_t *dllPath,
     };
     if (!dllPath || !dllPath[0]) return fail("proxy dll path empty");
     FgModuleCache &cache = FgModule();
+    std::lock_guard<std::mutex> lock(cache.mu);
     if (cache.module && wcscmp(cache.path, dllPath) == 0) return true;
     HMODULE mod = LoadLibraryExW(dllPath, nullptr,
                                  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
@@ -78,12 +83,19 @@ bool DlssfgContext::CachedProxyIsHookStyle() noexcept {
     // 导出(version 桩转发系统 version.dll);NGX 调用靠钩子接管,不经
     // GetProcAddress 直接驱动 —— fg_route_eff 据此定名 official-hook/
     // official(钩子进程级不可拆,与本次是否预载解耦)。
-    HMODULE mod = FgModule().module;
+    HMODULE mod = nullptr;
+    {
+        FgModuleCache &cache = FgModule();
+        std::lock_guard<std::mutex> lock(cache.mu);
+        mod = cache.module;
+    }
     return mod && GetProcAddress(mod, "DlssgProxy_Role") != nullptr;
 }
 
 bool DlssfgContext::ProxyLoaded() noexcept {
-    return FgModule().module != nullptr;
+    FgModuleCache &cache = FgModule();
+    std::lock_guard<std::mutex> lock(cache.mu);
+    return cache.module != nullptr;
 }
 
 DlssfgContext::~DlssfgContext() {
@@ -149,11 +161,14 @@ bool DlssfgContext::Initialize(D3D12Context &d3d12, const wchar_t *dllPath,
                                 &available) == NVSDK_NGX_Result_Success;
         }, "Get(FrameGeneration.Available)", sehErr, sizeof(sehErr));
         if (!haveCap || !available) {
-            // FeatureInitResult 读回(官方键,失败精确归因)。
+            // FeatureInitResult 读回(官方键,失败精确归因)。同套 SehCall:
+            // 上一个 Get 若正撞 SEH,core 可能已打穿,归因读回裸调 = 二次
+            // 崩溃逃逸降级边界(2026-10-05 评审修)。
             unsigned int initResult = 0;
-            const bool haveResult =
-                _params->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult,
-                             &initResult) == NVSDK_NGX_Result_Success;
+            const bool haveResult = SehCall([&] {
+                return _params->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult,
+                                    &initResult) == NVSDK_NGX_Result_Success;
+            }, "Get(FeatureInitResult)", nullptr, 0);
             char tag[48]{};
             if (haveResult) {
                 std::snprintf(tag, sizeof(tag), " (FeatureInitResult 0x%X)", initResult);
@@ -255,16 +270,21 @@ bool DlssfgContext::CreateFeatureOnCtl(int width, int height, DXGI_FORMAT backbu
                NVSDK_NGX_Result_Success;
     }, "CreateFeature", sehErr, sizeof(sehErr));
     if (ok && !_feature) ok = false;
+    // ExecuteCtlAndWait 恒收口(SEH 后亦然):CL 内可能已有 create 录入的
+    // 部分 D3D12 工作,不执行 = CL 悬空,后续 BeginCtlRecording 必败。本调用
+    // 纯 D3D12 侧无 NGX 代码,SEH 后执行安全(2026-10-05 评审修)。
     if (!_d3d12->ExecuteCtlAndWait(err, errLen, "fg create")) return false;
     if (!ok) {
         if (err && errLen) {
             // 官方 DLSS 同款:CreateFeature 失败后从同一参数块读核心记下的
             // 精确初始化结果码(官方 FrameGeneration.FeatureInitResult 键;
-            // 读不到 = 核心没记,原样)。
+            // 读不到 = 核心没记,原样)。归因读回同套 SehCall(与 Initialize
+            // 能力预检同因,2026-10-05 评审修)。
             unsigned int initResult = 0;
-            const bool haveResult =
-                _params->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult,
-                             &initResult) == NVSDK_NGX_Result_Success;
+            const bool haveResult = SehCall([&] {
+                return _params->Get(NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult,
+                                    &initResult) == NVSDK_NGX_Result_Success;
+            }, "Get(FeatureInitResult)", nullptr, 0);
             char resultTag[40]{};
             if (haveResult) {
                 std::snprintf(resultTag, sizeof(resultTag), " (FeatureInitResult 0x%X)", initResult);
@@ -309,6 +329,10 @@ bool DlssfgContext::Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,
         _ready.store(false, std::memory_order_release);
         return false;
     }
+    // 恢复 _ready:此前只在 Initialize 置位 —— evaluate 首败闩停后(_feature
+    // 仍非空)任何 Rebuild 都真实重建并返回 true,Enabled() 却恒 false,
+    // 返回值与状态机自相矛盾(2026-10-05 评审修)。
+    _ready.store(true, std::memory_order_release);
     _needsReset = true;
     return true;
 }

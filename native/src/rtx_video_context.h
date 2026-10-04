@@ -55,6 +55,10 @@ public:
     RtxQueue() = default;
     RtxQueue(const RtxQueue &) = delete;
     RtxQueue &operator=(const RtxQueue &) = delete;
+    // 只关事件句柄(COM 成员随 ComPtr 自释放;queue/fence 的进程级回收哲学
+    // 不变):此前 _event 无人关,VSR/HDR 每次 off→on 循环漏一个句柄
+    // (2026-10-05 评审修)。
+    ~RtxQueue() { if (_event) CloseHandle(_event); }
 
     bool Initialize(ID3D12Device *device, const char *label, char *err, size_t errLen) noexcept;
     // 生产者等待(waitFence)排队 → CL 重置 → fn(CLI) 录制 → Close →

@@ -466,7 +466,6 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
     LARGE_INTEGER freq{}, t0{}, t1{};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&t0);
-    _stageStartQpc = t0.QuadPart; // 全跨度锚(门入口 → 冲刷完成,LastStageTotalMs)
 
     {
         // 取锁前声明在途:门据此区分"前驱堵在 mutex 外(等它插队)"与
@@ -476,6 +475,10 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         const uint64_t gateEpoch = _gate.Epoch();
         _gate.MarkIncoming(frameIndex);
         std::unique_lock<std::mutex> lock(_gate.Mutex);
+        // 全跨度锚(门入口 → 冲刷完成,LastStageTotalMs)锁内写:此前锁前
+        // 写,前驱帧正持锁在 FlushPendingDensify CPU 等(最长 10s)时本帧
+        // 先覆写锚点,前驱醒后按本帧锚算跨度 —— 用时账错帧(2026-10-05 评审修)。
+        _stageStartQpc = t0.QuadPart;
         // 入门即清:上一帧失败路径(ProcessFrame 提前返回且守卫冲刷未跑,
         // 理论上守卫恒跑,此为双保险)残留的待冲刷作废 —— 其帧已失败,
         // densify 不再有意义。残留非零 = "恰一次冲刷"契约被破坏(调用方
@@ -494,6 +497,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             // 迟到帧(乱序/回退,其序号已被越过):清零发布,不推进门。
             // 零等待门下无需簿记,链不受影响。
             _lastStageMs = 0.0;
+            _lastOfWallMs = 0.0; // 全跨度同帧清零,防陈旧值被逐帧 stats 消费(对齐 FFX,2026-10-05 评审修)
             ++_gateExpired;
             _lastGateWaitMs = _lastCpyWaitMs = _lastExeWaitMs = 0.0;
             return result;

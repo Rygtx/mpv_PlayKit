@@ -644,12 +644,12 @@ bool DlssnrContext::Initialize(
     _subW = subW;
     _subH = subH;
     _isRgb = rgb;
-    _shared = shared;
+    _shared.store(shared, std::memory_order_release);
     _rtx = rtx;
     // 全程单一快照(与帧路径 frameParams 同纪律):初始化是数百毫秒的
     // 多步决策链,散点 Snapshot 会在面板中途推送时建出"半新半旧"的缝合
     // 形态,且组合随时机漂移不可复现。入口取一次,全文只读这一份。
-    const DlssnrParams pInit = _shared->Snapshot();
+    const DlssnrParams pInit = shared->Snapshot();
 
     // RTX Video 几何换算(单一裁决 helper;capability 预检在资源创建之前 ——
     // 不过/建不起 = 由 DegradeRtxFeature 收口,资源按降级形态建,直通尺寸
@@ -914,7 +914,7 @@ bool DlssnrContext::Initialize(
     // M0 不在此暂记:会话边界(SetupFgSession)单点落账,真实值在 4a 段
     // 就位 —— 此前此处按请求预写,初始化若在会话建立前失败,死态 body
     // 会谎报 FG 契约倍数。
-    _fgCreateMult = 0;
+    _fgCreateMult.store(0, std::memory_order_relaxed);
     std::snprintf(_fgRouteEff, sizeof(_fgRouteEff), "%s", _fgRequested ? "copy" : "off");
     _fgDetail[0] = '\0';
     // 预载失败归因并入(appendProxyNote)与 FG 会话建立一起迁入
@@ -1098,7 +1098,7 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
     // 入参为准(调用方定格传入),本快照服务形态段其余字段 —— 其 create
     // 键与入参恒等(current 侧在消费与传参之间只被 ConsumeRebuild 改写,
     // 而那正是入参的来源)。
-    const DlssnrParams p = _shared->Snapshot();
+    const DlssnrParams p = _shared.load(std::memory_order_acquire)->Snapshot();
     // 重建耗时分解打点(2026-10-02):VSR 切档"复制帧好几秒"的定位数据 ——
     // 各段耗时随 STATUS 行落 timing log,一次复现即可定位大头(排空/RTX
     // 模型加载/槽纹理/NR 特征)。
@@ -1607,9 +1607,10 @@ bool DlssnrContext::SetupFgSession(const DlssnrParams &p) noexcept {
     // 后面板 M0 恒 0,"需重建"红显判定被自己的簿记骗了。Rebind 的写点
     // 保留(新实例契约锚:hot-reuse 路径不进本函数,倍数非 create 键也
     // 随 seek 换实例刷新)。
-    _fgCreateMult = (fgUp && _fgRequested)
-                        ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
-                        : 0;
+    _fgCreateMult.store((fgUp && _fgRequested)
+                            ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
+                            : 0,
+                        std::memory_order_relaxed);
     return fgUp;
 }
 
@@ -1807,8 +1808,8 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         if (err && errLen) std::snprintf(err, errLen, "Rebind: context not ready");
         return false;
     }
-    _shared = shared;
-    const DlssnrParams p = _shared->Snapshot();
+    _shared.store(shared, std::memory_order_release);
+    const DlssnrParams p = shared->Snapshot();
     // FG 会话创建倍数随每次 bind 重新落定 = 新滤镜实例的输出契约 M0
     // (面板 payload 已先于此被新实例采纳,见下)。此前只写于 Initialize:
     // 档位不属 CreateParamsChanged 三元组、换档恒走热复用,stats 里
@@ -1819,9 +1820,10 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         std::lock_guard<std::mutex> fgLock(_fgMutex); // 无池读侧收口(2026-10-04 评审修)
         fgLiveForM0 = _fg && _fg->Enabled();
     }
-    _fgCreateMult = (p.fgEnabled != 0 && fgLiveForM0)
-                        ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
-                        : 0;
+    _fgCreateMult.store((p.fgEnabled != 0 && fgLiveForM0)
+                            ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
+                            : 0,
+                        std::memory_order_relaxed);
     // Snapshot already carries the ini overrides and the panel-payload adopt
     // the new filter instance loaded (BridgeLoadIni + BridgeAdoptPanelPayload
     // run in DlssnrCreate before this). Only a real create-time change needs
@@ -1854,7 +1856,13 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
         // 触发播种式重置,显式复位让首帧就走 weight=0 播种,不留歧义)。
         // 模式变化的资源重建不在此做:ProcessFrame 的逐帧同步持 PoolHold
         // 兜住,热复用分支不持池,直接重建会在在飞帧脚下换纹理。
-        _tValid = false;
+        {
+            // 热复用分支不持池,旧实例在飞帧可在 eval 域(_evaluateMutex 内
+            // 读写 _t* 时域线)与本写并发 —— 同锁互斥收口;锁序
+            // lifecycle → evaluate 单向,无环(2026-10-05 评审修)。
+            std::lock_guard<std::mutex> evalLock(_evaluateMutex);
+            _tValid = false;
+        }
         // 会话输入尺寸同步(follow = 开关 + scaling 状态 + FG 未激活;热路
         // 径下内部尺寸未变,除非 ini/payload 同时带了 res% 变化 —— 那会走
         // 下方重建分支)。档位按后端取对应字段。单一裁决点见 SyncOfSession。
@@ -1889,7 +1897,7 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     if (!nvofOk) {
         // 重建失败 = 会话死态:契约锚(本实例"会话创建 Xx")清零 —— 残留
         // M0 会让死态面板谎报一个死会话从未兑现的倍数契约(2026-10-04 评审修)。
-        _fgCreateMult = 0;
+        _fgCreateMult.store(0, std::memory_order_relaxed);
         return false;
     }
     // 新实例的参数快照可能换了光流档位(面板 seek 前调过):RecreateFeature
@@ -2008,7 +2016,8 @@ bool DlssnrContext::ProcessFrame(
     // 门状态,与门自身的消化路径重复且有 churn 副作用,已删。
     // Panel preset / internal-resolution / scaling-toggle changes require a
     // feature rebuild; consume before packing.
-    if (int newPreset = -1, newRes = -1, newScaling = -1; _shared->ConsumeRebuild(newPreset, newRes, newScaling)) {
+    if (int newPreset = -1, newRes = -1, newScaling = -1;
+        _shared.load(std::memory_order_acquire)->ConsumeRebuild(newPreset, newRes, newScaling)) {
         if (!RecreateFeature({newPreset, newRes, newScaling != 0}, err, errLen)) {
             // 面板可见:重建失败 = 本会话整体直通,具体原因进 stats。后续帧
             // 顶部 !ready 早退的发布被边缘去重,不会覆盖这条更具体的原因。
@@ -2016,7 +2025,7 @@ bool DlssnrContext::ProcessFrame(
             return false;
         }
     }
-    const DlssnrParams frameParams = _shared->Snapshot();
+    const DlssnrParams frameParams = _shared.load(std::memory_order_acquire)->Snapshot();
     // 光流档位/后端/会话输入尺寸同步(只重建光流会话,不动 NGX feature)。
     // 在 AcquireSlot 之前消费:RebuildOf 要封池排空。失败只降级零 guidance,
     // 帧继续。会话输入尺寸 = follow(开关 + scaling 启用 + FG 未激活)?
@@ -3090,7 +3099,7 @@ bool DlssnrContext::ProcessFrame(
         char fgErr[160]{};
         for (int g = 0; g < fgM - 1; ++g) {
             if (fgResetEval && g > 0) break; // 播种帧只建历史,不产插值
-            if (fgDstPlanes && !fgDstPlanes[g * 3]) continue; // 分配失败槽:无落点,eval/屏障全跳过,fgGenOk 保持 false(2026-10-04 评审修)
+            if (fgDstPlanes && !fgDstPlanes[g * 3]) break; // 分配失败槽:整批作废 —— continue 会把后续槽以 g+1 提交成 1,3,4 洞批,违背 MFG "in order starting at 1" 批契约;洞在槽 1 时 _frameId 还不推进,下个源帧复用同 ID(2026-10-05 评审修)
             D3D12_RESOURCE_BARRIER toUav[1]{
                 Transition(slot->fgInterp[g].Get(),
                            D3D12_RESOURCE_STATE_COMMON,
@@ -3465,6 +3474,20 @@ bool DlssnrContext::ProcessFrame(
                                  D3D12_RESOURCE_STATE_COMMON),
             };
             postCl->ResourceBarrier(1, inBack);
+        }
+        // hdr-only 拆分形态 NR 开:DLSSG backbuffer = outputColor,base 尾
+        // NSR 化(TrueHDR 消费)。其归位此前只挂 fgOnFgCl 分支(上方 fgBack)
+        // —— 而本形态门关帧连 fg CL 都不开(2788 postBeginReq 明确排除
+        // hdrPostSplit),outputColor NSR 态跨帧滞留,下帧 base 尾 UAV→NSR
+        // 屏障 StateBefore 失配(2026-10-05 评审修;与上方 nrOff 门关
+        // inputColor 滞留 2026-10-04 修同族,含 fg CL begin 失败降级帧)。
+        if (!fgOnFgCl && hdrPostSplit && rtxIn && !nrOff) {
+            D3D12_RESOURCE_BARRIER outBack[1]{
+                TransitionFromTo(_d3d12->OutputColor(*slot),
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 D3D12_RESOURCE_STATE_COMMON),
+            };
+            postCl->ResourceBarrier(1, outBack);
         }
     }
     // post 提交(跨队列生产者双等待,排队在 Execute 前):
@@ -3870,9 +3893,9 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             // Snapshot/FrameRateWindow 锁外取(各自持独立互斥,勿叠锁)。
             // res 本就是会话配置回显;NR 关(live 门)时缩放整级绕过(nrOff
             // 直连 inputColor),行内就地标注,防误读"正在按内部尺寸处理"。
-            const int perfResPct = std::clamp(_shared->Snapshot().inputResolutionPercent,
+            const int perfResPct = std::clamp(_shared.load(std::memory_order_acquire)->Snapshot().inputResolutionPercent,
                                               kResPctMin, kResPctMax);
-            const bool perfNrOff = !_shared->Snapshot().nrEnabled;
+            const bool perfNrOff = !_shared.load(std::memory_order_acquire)->Snapshot().nrEnabled;
             const double perfFps = _fpsMeter.Rate();
             snprintf(line, sizeof(line),
                      "DLSSNR perf: gpu=%.1f ema=%.1f p99=%.1f | pack=%.1f of=%.1f/%.1f g%.1f c%.1f e%.1f x%u r%u | eval_cpu=%.1f fg=%.1f rtx=%.1f/%.1f conv=%.1f unpack=%.1f sub=%.1f | slot=%.1f/%.1f lock=%.1f/%.1f q=%.1f | res=%d%%%s ofq=%d %dx%d f=%d fps=%.0f",
@@ -3985,7 +4008,7 @@ void DlssnrContext::FillStatsCommon(StatsPayload &st) noexcept {
     CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
     CopyStatStr(st.ofMode, OfModeString());
     CopyStatStr(st.fgRouteEff, _fgRouteEff);
-    st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult);
+    st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult.load(std::memory_order_relaxed));
     CopyStatStr(st.fgDetail, _fgDetail);
     // fgMultMax = 运行库插值帧上限(gate 解锁结果定格值):40 系解锁失败
     // 回落 2x 时创建/面板仍报 6,没有它面板无从知道实际密度只有 (max+1)x。

@@ -149,6 +149,9 @@ private:
     OfFrameGate _gate;
     uint32_t _consecutiveFailures = 0;
     int _executesLogged = 0; // 前 5 次 dispatch 的诊断日志计数
+    // 停摆观测④连续迟到计数(Expired 分支内外共用;StageFrame 由门 mutex
+    // 串行,成员化防跨实例残留 —— 原函数级 static,2026-10-05 评审修)。
+    int _expStreak = 0;
     std::atomic<bool> _ready{ false };
     double _lastStageMs = 0.0;
     // OF GPU 跨度括号(v25 后端对等):main CL(dispatch,FFX 光流计算的

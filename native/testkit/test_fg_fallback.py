@@ -19,6 +19,7 @@ src = core.std.BlankClip(width=320, height=240, format=vs.YUV420P8, length=10, f
 if os.path.exists(os.path.join(os.path.dirname(testenv.NGX_DLL), "version.dll")):
     print("FG FALLBACK SKIP: 部署树带 hook 代理,FG 正常激活;降级路径需无 proxy 环境")
     sys.exit(0)
+log_off = testenv.log_size()  # 水位:只看本测试窗口的留痕
 ret = core.dlssnr.Enhance(src, fg_enabled=1, motion_vector_quality=0)
 
 info = ret.get_frame(0)
@@ -28,4 +29,7 @@ assert len(ret) == 10, f"FG 降级应 1:1(帧数 {len(ret)} != 10)"
 for n in (0, 3, 9):
     f = ret.get_frame(n)
     assert f.width == 320, "帧内容应正常产出"
+# timing log 留痕(文档声称的第三项验证,此前从未断言,2026-10-05 评审修)
+init_fail = [l for l in testenv.new_lines(log_off) if "dlssfg init failed" in l]
+assert init_fail, "timing log 应留痕 'dlssfg init failed'(降级原因无迹可查)"
 print("FG FALLBACK OK: frames =", len(ret))
