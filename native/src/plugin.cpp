@@ -188,6 +188,16 @@ static bool FgReadyQuery(FilterData *d, uint64_t gen) {
 
 static void FgReadyMark(FilterData *d, uint64_t gen, bool ready) {
     std::lock_guard<std::mutex> lock(d->fgReadyMutex);
+    // 已有账(本批存储时的 pending 项)→ 原位翻旗 —— 追加第二条会让查询的
+    // "首个同代项"永远命中 pending false(2026-10-04 实测:每次面板改参数
+    // 后 4 个在飞消费端各冻结 15s 才超时放行,真旗标被 pending 项遮蔽)。
+    for (int i = 0; i < FilterData::kFgReadyRing; ++i) {
+        if (d->fgReadyRingGen[i] == gen) {
+            d->fgReadyRingOk[i] = ready;
+            d->fgReadyCv.notify_all();
+            return;
+        }
+    }
     d->fgReadyRingGen[d->fgReadyRingNext] = gen;
     d->fgReadyRingOk[d->fgReadyRingNext] = ready;
     d->fgReadyRingNext = (d->fgReadyRingNext + 1) % FilterData::kFgReadyRing;
