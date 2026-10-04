@@ -37,14 +37,16 @@ while time.time() - t0 < 12:
         n[0] += 1
     time.sleep(0.2)
 
-# stats channel (plugin -> panel)
+# stats channel (plugin -> panel)(2026-10-05 评审修:映射缺失/JSON 解析失败
+# 并入最终判定 —— 此前只打印不置 FAIL,PASS 仅由 params 通道单边决定)
 st = panel_ipc.read_stats()
-if st:
-    body = panel_ipc.read_stats_json()
-    print("STATS:", {k: body[k] for k in ("filter_state", "of_mode", "gpu_name", "fps")}
-          if body else "(unparsed)", flush=True)
+body = panel_ipc.read_stats_json() if st else None
+if body:
+    print("STATS:", {k: body[k] for k in ("filter_state", "of_mode", "gpu_name", "fps")},
+          flush=True)
 else:
-    print("STATS: MAPPING MISSING", flush=True)
+    print("STATS:", "MAPPING MISSING" if not st else "JSON UNPARSED", flush=True)
+st_ok = bool(body)
 
 # params channel (panel -> plugin)
 h, v = panel_ipc.open_params_mapping_readonly()
@@ -54,7 +56,7 @@ if v:
     magic, seq, gen = buf[0], buf[1], buf[2]
     print(f"PARAMS: magic=0x{magic:08X} (expect 0x{panel_ipc.PAYLOAD_MAGIC:08X}) "
           f"seq={seq} gen={gen}", flush=True)
-    ok = magic == panel_ipc.PAYLOAD_MAGIC and seq >= 1 and gen != 0
+    ok = st_ok and magic == panel_ipc.PAYLOAD_MAGIC and seq >= 1 and gen != 0
     print("PARAMS-OK:", ok, flush=True)
 else:
     print("PARAMS: MAPPING MISSING (panel not running?)", flush=True)

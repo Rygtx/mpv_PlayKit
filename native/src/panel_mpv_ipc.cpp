@@ -259,6 +259,15 @@ DWORD WINAPI HdrTagProc(LPVOID) noexcept {
         // = SDR 实态,发 remove 摘标 —— 与旧"rtx 字段为空"判据同语义。
         HdrTagTick(conn, st.rtxHdrActive ? 1 : 0);
     }
+    // 退出清理(2026-10-05 评审修):摘标 + 还原 target-colorspace-hint。
+    // 此前退出只关管道 —— @dlssnr-hdr-tag 恒在 mpv vf 链且跨文件持久,
+    // 面板退出时若标在挂,同实例之后播 SDR 也被强标 BT.2020 PQ + hint=yes,
+    // 错色直到 mpv 重启。lastTagState==1 = 确定在挂;-1(连上未同步,含
+    // 前一面板实例遗留的标)也发一次摘除,remove 对无标链报错无害(ack
+    // 不解析)。崩溃场景无法清理,维持已知残留。
+    if (conn.pipe && conn.lastTagState != 0) {
+        HdrTagTick(conn, 0);
+    }
     if (conn.pipe) CloseHandle(conn.pipe);
     return 0;
 }

@@ -21,6 +21,12 @@ testenv.ini_restore_on_exit()  # 部署 ini 现场保护(2026-09-25 收敛)
 import panel_ipc  # noqa: E402
 
 testenv.require_env()
+# 真实面板清场(2026-10-05 评审修,同 test_ipc.py 模式):前序测试经
+# BridgeStart 拉起过真实面板时,它会与本测试 ParamsChannel 互写同一映射
+# (seq 基线被外力推进),adopt/recreate 计数断言随机失败。通道语义必须独占。
+testenv.kill_panel()
+os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")
+time.sleep(1)
 
 import vapoursynth as vs  # noqa: E402
 from vapoursynth import core  # noqa: E402

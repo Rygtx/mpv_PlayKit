@@ -1141,6 +1141,10 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
                           "RecreateFeature: frame finish tickets not drained (pipeline wedged)");
         }
         TimingStatusLine("DLSSNR STATUS: recreate ABORTED (finish tickets not drained)");
+        // 发布死态:重建请求已被 ConsumeRebuild 消费,此路径若只 return
+        // false,会话表面存活(面板无感知)而票据已 wedged —— 与
+        // RebuildScaling 失败同款收口(2026-10-05 评审修)。
+        _ready.store(false, std::memory_order_release);
         return false;
     }
     const int drainMs = segMs();
@@ -1172,6 +1176,16 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
         // 新源×4);否则 pipe/out 跟随新源(TrueHDR 不缩放;plain-NR 同样
         // 跟随 —— plain-NR 会话换尺寸后 UnpackOutput 按旧 _outW/_outH
         // 回读,潜伏写穿/裁切)。
+        if (_vsrRequested) {
+            const double ratio = static_cast<double>(_outH) / static_cast<double>(newHeight);
+            if (ratio <= 1.001) {
+                // 请求门复查(2026-10-05 评审修):此前沿用创建期 _vsrRequested,
+                // 新源高超过绝对目标(auto-height 会话 seek 到更高源)时
+                // ratio<1 → pipe<src,VSR 按降采样评估(官方只支持放大,
+                // RtxVsrContext 内部无钳制)。与 571 行请求门同判据落旁路。
+                _vsrRequested = false;
+            }
+        }
         if (_vsrRequested) {
             const double ratio = static_cast<double>(_outH) / static_cast<double>(newHeight);
             const double cap = static_cast<double>(kVsrMaxScale);
@@ -1311,6 +1325,11 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
                               fgErr);
                 DbgLine(msg);
                 TimingStatusLine(msg);
+                // 簿记收口(2026-10-05 评审修):与 SetupFgSession 失败路径
+                // 对称 —— 此前 _fgCreateMult/_fgDetail 不动,面板仍显示
+                // "会话创建 Mx"且无归因,实际 FG 已死降级复制帧。
+                SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
+                _fgCreateMult.store(0, std::memory_order_relaxed);
             }
         } else {
             // off→on / 旧会话闩停:重建会话(SetupFgSession 与冷初始化同
@@ -1668,10 +1687,13 @@ bool DlssnrContext::RebuildOf(int quality, int backendReq, int dstW, int dstH,
     // (实测并发重建互相踩踏挂死);锁内复查 _curOfQuality/_curOfBackend 与
     // 尺寸,后来者直接跳过。
     std::lock_guard<std::mutex> switchLock(_nvofMutex);
-    // 会话账(_ofBackend/_retiredOf)swap 收口(2026-10-04 评审修):与
-    // RecreateFeature 尺寸段(PoolHold → _ofSwapMutex)并发;本函数已有
-    // _nvofMutex → PoolHold,嵌套次序与偏序一致。
-    std::lock_guard<std::mutex> swapLock(_ofSwapMutex);
+    // 会话账(_ofBackend/_retiredOf)swap 锁在 PoolHold 之内取(下方)。
+    // 2026-10-05 评审修:此前 _ofSwapMutex 先于 PoolHold 获取,与
+    // RecreateFeature 尺寸段(PoolHold → _ofSwapMutex)构成 ABBA —— A 线程
+    // 持 swap 等池、B 线程持池等 swap,fmParallel 下挂死。全局偏序恒为
+    // _nvofMutex → PoolHold → _ofSwapMutex;本函数此前快路径/quality=0 段
+    // 的 _ofBackend 读改为主持 swap 保护,现与 SyncOfSession 快照同款裸读
+    // (原子指针读 + 退役对象永生,最坏过期决策,池内重建分支在锁内复核)。
     // 调用方传入的档位已经 ResolveOfQuality 按后端值域 clamp;此处宽 clamp
     // 仅作双保险(FFX 的 2 也在 0-5 内,不受影响)。
     const int q = std::clamp(quality, kOfQualityMin, kOfQualityMax);
@@ -1680,6 +1702,7 @@ bool DlssnrContext::RebuildOf(int quality, int backendReq, int dstW, int dstH,
     // 评审修;2026-10-04 该纪律在 CreateOfBackend 落地时漏了本函数)。
     backendReq = std::clamp(backendReq, kOfBackendMin, kOfBackendMax);
     if (q == _curOfQuality && backendReq == _curOfBackend && !_nvofFailed && _ofBackend &&
+        _ofBackend->Enabled() &&
         _ofBackend->Width() == dstW && _ofBackend->Height() == dstH) return true;
     if (q == 0) {
         // 保留会话仅停用:后端销毁不可靠(NVOF 引擎 destroy 实测崩溃,
@@ -1709,10 +1732,20 @@ bool DlssnrContext::RebuildOf(int quality, int backendReq, int dstW, int dstH,
                 std::snprintf(err, errLen,
                               "RebuildOf: frame finish tickets not drained (pipeline wedged)");
             }
+            // 请求落账(承认已处理)+ 亮 _nvofFailed:否则 _curOfQuality
+            // 未更新 → SyncOfSession stale 恒真 → 逐帧封池 + 各等 30s 活锁
+            // (2026-10-05 评审修)。面板经 nvof_zero 可见,重试经 Rebind。
+            _nvofFailed = true;
+            _curOfQuality = q;
+            _curOfBackend = backendReq;
             TimingStatusLine("DLSSNR STATUS: of rebuild ABORTED (finish tickets not drained)");
             return false;
         }
-        if (!_ofBackend || _nvofFailed ||
+        // 会话账锁:PoolHold 之内取(偏序末端,见本函数头部 2026-10-05 修
+        // 注)。覆盖重建裁决 + swap 全段 —— 此前裁决在锁外,与并发 swap 的
+        // 竞争窗口在锁内复核闭合。
+        std::lock_guard<std::mutex> swapLock(_ofSwapMutex);
+        if (!_ofBackend || _nvofFailed || !_ofBackend->Enabled() ||
             _ofBackend->Quality() != q || _ofBackend->Width() != dstW ||
             _ofBackend->Height() != dstH || _ofBackend->Kind() != backendReq) {
             // 退役名单全等复用:Kind/档位/尺寸一致 = 会话即所需(反复拖
@@ -1793,7 +1826,13 @@ void DlssnrContext::ResetNvofHistory() noexcept {
     // seek = 新时间线:流历史作废,下一帧重新播种(清零发布 + NGX PARAM_RESET;
     // FG 下一帧 eval 带 DLSSG.Reset,该帧插值输出降级复制)。会话本身保留
     // (热上下文跨 seek 存活)。
-    if (_ofBackend) _ofBackend->ResetHistory();
+    {
+        // 指针解引用收口(2026-10-05 评审修):此前裸读 _ofBackend,与帧线程
+        // RebuildOf/Rebind 内联段的 swap(PoolHold → _ofSwapMutex)并发 =
+        // 数据竞争。只取偏序末端锁(本函数调用点不持 _nvofMutex/池)。
+        std::lock_guard<std::mutex> swapLock(_ofSwapMutex);
+        if (_ofBackend) _ofBackend->ResetHistory();
+    }
     {
         // Rebind 热复用分支不持池(1816 注),与帧线程写侧(PoolHold 内
         // SetupFgSession)并发 —— 指针解引用锁内(2026-10-04 评审修)。
@@ -1936,6 +1975,7 @@ struct FrameFinish {
     bool hdrRun = false;
     bool dumpEnabled = false;
     bool realMotion = false;
+    bool rbOk = false; // 真实帧回读成功(UnpackOutput);dump latch 门(防废帧烧一次性 dump)
     bool evalZeroed = false;
     bool rtxIn = false;
     bool ofNeeded = false;
@@ -3057,14 +3097,24 @@ bool DlssnrContext::ProcessFrame(
         // pass,非 NGX 衰减路径),legacy+vsr 时 pipe.res 指向 fgBack 而
         // 真正 NGX 衰减的 vsrColor 由 TrueHDR 输入侧 NSR 化、post 尾归位。
         const bool pipeNeedsBar = !hdrLegacyInterp && (vsrRun || !rtxIn);
+        // NR 关直连帧的管线色 = inputColor,已在 OF copy CL 转换落 NSR
+        // (2947 注 "C1 已落 NSR";C2 侧 3312-3335 同判据)。已 NSR 则免
+        // 屏障只对账 —— 此前恒声明 COMMON→NSR,转换帧 StateBefore 失配
+        // (debug 层报错,release 静默 no-op)。
+        const bool pipeAlreadyNsr = nrOff && !debugPipe && convertedOnNvof;
         if (pipeNeedsBar) {
-            _pipeLedger.Expect(pipe.res, D3D12_RESOURCE_STATE_COMMON, "fgBar");
-            D3D12_RESOURCE_BARRIER fgBar[1]{
-                TransitionFromTo(pipe.res,
-                                 D3D12_RESOURCE_STATE_COMMON,
-                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
-            };
-            fgCl->ResourceBarrier(1, fgBar);
+            _pipeLedger.Expect(pipe.res,
+                               pipeAlreadyNsr ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                              : D3D12_RESOURCE_STATE_COMMON,
+                               "fgBar");
+            if (!pipeAlreadyNsr) {
+                D3D12_RESOURCE_BARRIER fgBar[1]{
+                    TransitionFromTo(pipe.res,
+                                     D3D12_RESOURCE_STATE_COMMON,
+                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                };
+                fgCl->ResourceBarrier(1, fgBar);
+            }
             _pipeLedger.Set(pipe.res, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
         if (hdrLegacyInterp) {
@@ -3443,6 +3493,19 @@ bool DlssnrContext::ProcessFrame(
                                      D3D12_RESOURCE_STATE_COMMON),
                 };
                 postCl->ResourceBarrier(1, vsrBack);
+                // hdrPostSplit+vsr:VSR 输入(base 尾 NSR 化,抗闪烁帧 =
+                // 稳定帧)在 inBack(3038)被排除、门关帧才走 3484 补归位
+                // —— 门开帧此前无人归位,NSR 跨帧滞留,下帧 base 尾
+                // UAV→NSR StateBefore 失配(与 3484 已修门关帧同族)。
+                if (hdrPostSplit) {
+                    D3D12_RESOURCE_BARRIER vsrInBack[1]{
+                        TransitionFromTo(temporalRan ? _d3d12->TemporalOut(*slot)
+                                                     : _d3d12->OutputColor(*slot),
+                                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                         D3D12_RESOURCE_STATE_COMMON),
+                    };
+                    postCl->ResourceBarrier(1, vsrInBack);
+                }
             } else if (hdrPostSplit) {
                 D3D12_RESOURCE_BARRIER fgBack[1]{
                     TransitionFromTo(pipe.res,
@@ -3481,13 +3544,29 @@ bool DlssnrContext::ProcessFrame(
         // hdrPostSplit),outputColor NSR 态跨帧滞留,下帧 base 尾 UAV→NSR
         // 屏障 StateBefore 失配(2026-10-05 评审修;与上方 nrOff 门关
         // inputColor 滞留 2026-10-04 修同族,含 fg CL begin 失败降级帧)。
+        // 资源与 base 尾 NSR 化同款选择(抗闪烁帧 = TemporalOut;
+        // outputColor 在抗闪烁帧停 COMMON,对它录 NSR→COMMON 反而失配)。
         if (!fgOnFgCl && hdrPostSplit && rtxIn && !nrOff) {
             D3D12_RESOURCE_BARRIER outBack[1]{
-                TransitionFromTo(_d3d12->OutputColor(*slot),
+                TransitionFromTo(temporalRan ? _d3d12->TemporalOut(*slot)
+                                             : _d3d12->OutputColor(*slot),
                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  D3D12_RESOURCE_STATE_COMMON),
             };
             postCl->ResourceBarrier(1, outBack);
+        }
+        // legacy 形态 fg CL begin 失败帧:inBack 归位录进了永不提交的
+        // fg CL(2796 注契约"RTX 帧无 inBack 落点 = 整帧失败"未实现,
+        // begin 失败只降级门关)—— 此处补归位,与 3484/上方门开支路
+        // 同账。门开成功帧 inBack 已在 fg CL 落账,勿双归位。
+        if (!fgBeginOk && postBeginReq && rtxIn && !nrOff && !hdrPostSplit) {
+            D3D12_RESOURCE_BARRIER inBackLate[1]{
+                TransitionFromTo(temporalRan ? _d3d12->TemporalOut(*slot)
+                                             : _d3d12->OutputColor(*slot),
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                 D3D12_RESOURCE_STATE_COMMON),
+            };
+            postCl->ResourceBarrier(1, inBackLate);
         }
     }
     // post 提交(跨队列生产者双等待,排队在 Execute 前):
@@ -3730,6 +3809,7 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
         TimingStatusLine(pbuf);
     }
     const bool rb = _d3d12->UnpackOutput(*ff->slot, dstPlanes, dstStrides, _outW, _outH, err, errLen);
+    ff->rbOk = rb;
     // unpack 段 = 真实帧回读(t3b→t3c);插值帧回读(t3c→t4)是 FG 的
     // 输出搬运成本,归 fg 段 —— FG 4x 时 4 帧 P10 @OUT 几何可达 100MB+,
     // 混在 unpack 里会让"解包"凭空翻倍而"补帧"恒 0(2026-09-24 用户
@@ -3746,9 +3826,11 @@ bool DlssnrContext::ProcessFrameFinish(FrameFinish *ff,
             }
         }
     }
-    DumpFrameDiagnostics(*ff);
     {
         QueryPerformanceCounter(&t4);
+        // 诊断 IO(纹理回读 + 磁盘写)不计入 t3c→t4 段(2026-10-05 修:
+        // 此前 dump 帧的面板 fg 耗时虚高;dump 是"帧已收敛后的旁路")。
+        DumpFrameDiagnostics(*ff);
         const auto ms = [](LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER f) {
             return (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
         };
@@ -4006,7 +4088,13 @@ void DlssnrContext::FillStatsCommon(StatsPayload &st) noexcept {
     CopyStatStr(st.rtx, _rtxStateStr);
     CopyStatStr(st.rtxDetail, _rtxDetail);
     CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
-    CopyStatStr(st.ofMode, OfModeString());
+    {
+        // 会话指针收口(2026-10-05 评审修):OfModeString 三连裸读
+        // _ofBackend 与并发 swap 竞争 —— 整段挪 _ofSwapMutex 内(偏序末端;
+        // 调用方不持会与末端成环的锁)。退役对象进程期存活,悬垂不可能。
+        std::lock_guard<std::mutex> swapLock(_ofSwapMutex);
+        CopyStatStr(st.ofMode, OfModeString());
+    }
     CopyStatStr(st.fgRouteEff, _fgRouteEff);
     st.fgMultCreate = static_cast<uint32_t>(_fgCreateMult.load(std::memory_order_relaxed));
     CopyStatStr(st.fgDetail, _fgDetail);
@@ -4042,7 +4130,7 @@ void DlssnrContext::DumpFrameDiagnostics(FrameFinish &ff) noexcept {
         GetEnvironmentVariableA("VSDLSSNR_DUMP_SKIP", b, sizeof(b) - 1);
         return b[0] ? std::atoi(b) : 0;
     }();
-    if (ff.dumpEnabled && ff.realMotion && myIdx >= dumpSkip &&
+    if (ff.dumpEnabled && ff.realMotion && ff.rbOk && myIdx >= dumpSkip &&
         !dumpedMotion.load(std::memory_order_relaxed)) {
         static std::mutex dumpMotionMutex;
         std::lock_guard<std::mutex> dumpLock(dumpMotionMutex);
@@ -4082,7 +4170,7 @@ void DlssnrContext::DumpFrameDiagnostics(FrameFinish &ff) noexcept {
             }
         }
     }
-    if (ff.dumpEnabled && !dumped.load(std::memory_order_relaxed)) {
+    if (ff.dumpEnabled && ff.rbOk && !dumped.load(std::memory_order_relaxed)) {
         static std::mutex dumpMutex;
         std::lock_guard<std::mutex> dumpLock(dumpMutex);
         if (!dumped.exchange(true)) {

@@ -333,6 +333,8 @@ ID3D11DeviceContext *g_context = nullptr;
 IDXGISwapChain *g_swap = nullptr;
 ID3D11RenderTargetView *g_rtv = nullptr;
 NOTIFYICONDATAW g_nid{};
+UINT g_msgTaskbarCreated = 0; // explorer 重启广播(TaskbarCreated),托盘重挂用
+bool g_trayUp = false;        // NIM_ADD 成功后置位;托盘重挂的门
 
 void CreateRenderTarget() noexcept {
     ID3D11Texture2D *back = nullptr;
@@ -349,6 +351,13 @@ void DropRenderTarget() noexcept {
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noexcept {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam)) return 1;
+    if (g_msgTaskbarCreated && msg == g_msgTaskbarCreated) {
+        // explorer 重启:托盘图标随 shell 重建而销毁,必须重挂(2026-10-05
+        // 评审修 —— 此前只启动 NIM_ADD 一次,explorer 崩溃后面板进程永久
+        // 不可达;托盘是隐藏窗口唯一入口)。
+        if (g_trayUp) Shell_NotifyIconW(NIM_ADD, &g_nid);
+        return 0;
+    }
     switch (msg) {
     case WM_SIZE:
         if (g_device && wParam != SIZE_MINIMIZED) {
@@ -410,6 +419,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) noex
             SetForegroundWindow(hwnd);
             const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
             DestroyMenu(menu);
+            // KB135788:TrackPopupMenu 前的 SetForegroundWindow 要求菜单关闭
+            // 后补一条无害消息归还前台,否则下一次弹出被立即吞掉(需点两次)。
+            PostMessageW(hwnd, WM_NULL, 0, 0);
             if (cmd == 1) { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); }
             if (cmd == 2) { PostThreadMessageW(g_mainThreadId, WM_QUIT, 0, 0); }
         }
@@ -572,6 +584,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     RebuildFontDpi(g_app.dpi);
 
     // Tray icon
+    g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     // 托盘图标用 16px 变体(系统 DPI 缩放时由 Shell 按需缩放资源内其他尺寸);
     // 程序生命周期内常驻,句柄不销毁(LR_SHARED 归属进程,无需显式清理)。
     ZeroMemory(&g_nid, sizeof(g_nid));
@@ -597,6 +610,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                     L"DLSSNR 控制面板", MB_OK | MB_ICONWARNING);
         return 1;
     }
+    g_trayUp = true;
 
     LoadIni();
     const bool mappingOk = CreateParamsMapping(); // adopts previous session's live params if present
@@ -722,6 +736,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                 g_context->ClearRenderTargetView(g_rtv, clear);
                 ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
                 g_swap->Present(1, 0);
+            } else {
+                // 设备移除(RTV 重建失败)后窗口冻结:静默黑窗改一次性弹窗
+                // 说明(2026-10-05 评审修;设备/交换链创建内联在 wWinMain,
+                // 就地重建需连 ImGui_ImplDX11 一起重初始化 —— 自动恢复为
+                // 升级路径,需要时抽 CreateDeviceAndSwapChain 再接)。
+                static bool deviceLostReported = false;
+                if (!deviceLostReported) {
+                    deviceLostReported = true;
+                    PanelLog("panel: render device lost; window frozen until panel restart");
+                    MessageBoxW(g_hwnd,
+                                L"面板渲染设备丢失(驱动重置或远程会话切换)。\n面板停止刷新;请重新启动面板恢复(设置已保存)。",
+                                L"DLSSNR 控制面板", MB_OK | MB_ICONWARNING);
+                }
             }
         } else {
             // sleep until input arrives or the next 100ms stats tick comes due

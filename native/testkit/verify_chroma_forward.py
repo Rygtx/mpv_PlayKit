@@ -85,4 +85,15 @@ print("V<500 占比: meas=%.1f%% exp=%.1f%%" % (
     (v_m < 500).mean() * 100, (v_exp < 500).mean() * 100))
 print("pq.r vs y(编码域): mean(pq.r - y) = %.4f" % (pq_avg[:, :, 0] - y_exp).mean())
 print("pq.b vs y: mean(pq.b - y) = %.4f" % (pq_avg[:, :, 2] - y_exp).mean())
-sys.exit(0)
+
+# 判定(2026-10-05 评审修:此前只打印测量值恒 exit 0)。判定只锁 U/V 均值
+# 偏差 —— 参考是"4 tap 平均后再转换",shader 是逐 tap 转换后平均,PQ 非线性
+# 下 dark/bright 硬边界处存在合法逐像素偏差(参照 verify_pq_roundtrip 判例
+# 不锁 max),均值判定只抓系统性错位(cMid/cSpan/矩阵错)。容差取宁松量级。
+CHROMA_MEAN_TOL = 8.0  # 0-1023 code 域
+du_mean = abs(u_m.mean() - u_exp.mean())
+dv_mean = abs(v_m.mean() - v_exp.mean())
+ok = du_mean <= CHROMA_MEAN_TOL and dv_mean <= CHROMA_MEAN_TOL
+print("RESULT:", "PASS" if ok else "FAIL",
+      "|dU|mean=%.1f |dV|mean=%.1f (tol=%.1f)" % (du_mean, dv_mean, CHROMA_MEAN_TOL))
+sys.exit(0 if ok else 1)

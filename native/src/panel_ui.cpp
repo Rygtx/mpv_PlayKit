@@ -1181,7 +1181,11 @@ void DrawUi() noexcept {
                                 // 也不重建链)。多写一次 payload 幂等无害。
         // RTX Video 开关(mode/HDR)是创建时参数:重置真关掉了它们才触发
         // 链重建(与开关控件同款 reseek 语义;本来就没开时不付一次 seek)。
-        if (beforeReset.rtxVsrMode != 0 || beforeReset.rtxHdrEnabled != 0) {
+        // fg_hdr_interp 同为创建期参数(复选框 566 行:槽资源/FG create 格式
+        // 随创建定格),此前重置漏查 —— 开着 HDR 域插帧点重置,画面按旧
+        // 格式跑到下次 seek(2026-10-05 评审修)。
+        if (beforeReset.rtxVsrMode != 0 || beforeReset.rtxHdrEnabled != 0 ||
+            beforeReset.fgHdrInterp != 0) {
             g_app.reseekDirty = true;
         }
         // Optimized 档位不在 payload 里(插件不消费):随重置归 1 并写回

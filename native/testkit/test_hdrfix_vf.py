@@ -91,5 +91,5 @@ errf.close()
 if os.path.exists(shot):
     print("SHOT OK:", shot)
 else:
-    print("SHOT MISSING")
-sys.exit(0)
+    print("SHOT MISSING")  # 截图缺失 = 链路未走通,判 FAIL(2026-10-05 评审修,此前无条件 exit 0)
+sys.exit(0 if os.path.exists(shot) else 1)

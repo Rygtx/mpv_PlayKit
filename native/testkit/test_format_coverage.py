@@ -35,7 +35,8 @@ def main():
 
     # 备份将被触碰的 ini 键,结束恢复(部署 ini 是用户的真实配置)
     touched = [("dlssnr", "nr_enabled"), ("dlssnr", "fg_enabled"),
-               ("rtxvideo", "vsr_mode"), ("rtxvideo", "hdr_enabled")]
+               ("rtxvideo", "vsr_mode"), ("rtxvideo", "hdr_enabled"),
+               ("dlssnr", "saved")]  # 下面显式写 saved=1,不进清单则 finally 恢复漏掉残留用户 ini(2026-10-05 评审修)
     backup = {}
     for sec, key in touched:
         buf = ctypes.create_unicode_buffer(64)

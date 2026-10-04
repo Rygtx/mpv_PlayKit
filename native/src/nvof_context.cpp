@@ -785,12 +785,21 @@ void NvofContext::FlushPendingDensify(const OfPostExecuteFn &postExecute) noexce
     ID3D12CommandAllocator *densAlloc = nullptr;
     ID3D12GraphicsCommandList *densCl = nullptr;
     if (!AcquireCl(&densAlloc, &densCl, freq)) {
-        TimingStatusLine("DLSSNR STATUS: nvof densify acquire failed at flush");
+        // 会话退役(2026-10-05 评审修,与上方 fence 超时同款收口):此前
+        // 仅留痕继续跑,本帧 densify 屏障没录而归位照录 NSR→COMMON,实际
+        // 态 COMMON —— StateBefore 反向失配,且会话在"半失账"状态下持续。
+        // 注释只接受了"运动场陈旧一帧"的内容后果,漏了状态机后果。罕见
+        // 故障,作废代价低(下帧 RebuildOf 重建,Enabled() 门已开)。
+        TimingStatusLine("DLSSNR STATUS: nvof densify acquire failed at flush; session retired");
+        _gate.InvalidateHistory();
+        _ready.store(false, std::memory_order_release);
         return;
     }
     postExecute(densCl, cur);
     if (FAILED(densCl->Close())) {
-        TimingStatusLine("DLSSNR STATUS: nvof densify close failed at flush");
+        TimingStatusLine("DLSSNR STATUS: nvof densify close failed at flush; session retired");
+        _gate.InvalidateHistory();
+        _ready.store(false, std::memory_order_release);
         return;
     }
     // 提交 + 记账单点(OfClRotator::Submit)。

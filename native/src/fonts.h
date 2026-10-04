@@ -137,8 +137,12 @@ inline bool BuildFonts(float dpiScale, ImFont **outUI, ImFont **outMono) noexcep
         const long size = ftell(f);
         fseek(f, 0, SEEK_SET);
         uiData.resize(size);
-        fread(uiData.data(), 1, size, f);
+        // 读全量校验(2026-10-05 评审修):字体被安全软件锁住截断时,残缺
+        // 数据进 AddFontFromMemoryTTF 失败 → atlas 无可用字体,下个
+        // NewFrame 断言。回退静态字体再试,再败即快速失败于建库早期。
+        const size_t got = fread(uiData.data(), 1, size, f);
         fclose(f);
+        if (got != static_cast<size_t>(size) || size <= 0) return false;
     }
 
     ImFontAtlas &fontAtlas = *ImGui::GetIO().Fonts;

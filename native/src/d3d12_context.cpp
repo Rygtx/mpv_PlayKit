@@ -579,12 +579,12 @@ bool D3D12Context::CreateFrameResources(const SessionDesc &desc,
     // RTV clear 要求 ALLOW_RENDER_TARGET 标志。clear 后常驻
     // NON_PIXEL_SHADER_RESOURCE(evaluate 只读,无每帧状态转换,
     // 并发帧的命令列表可以同时引用)。
-    if (!CreateColorTexture(_motion.GetAddressOf(), width, height,
+    if (!CreateColorTexture(_motion.ReleaseAndGetAddressOf(), width, height,
                             DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, err, errLen)) {
         return false;
     }
-    if (!CreateColorTexture(_depth.GetAddressOf(), width, height,
+    if (!CreateColorTexture(_depth.ReleaseAndGetAddressOf(), width, height,
                             DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, err, errLen)) {
         return false;
@@ -593,15 +593,18 @@ bool D3D12Context::CreateFrameResources(const SessionDesc &desc,
     // 尺寸;内容与 _depth 同为全零)。
     const bool needDepthPipe = desc.fg && _vsrSlots && (_pipeW != width || _pipeH != height);
     if (needDepthPipe &&
-        !CreateColorTexture(_depthPipe.GetAddressOf(), _pipeW, _pipeH,
+        !CreateColorTexture(_depthPipe.ReleaseAndGetAddressOf(), _pipeW, _pipeH,
                             DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, err, errLen)) {
         return false;
     }
+    if (!needDepthPipe) _depthPipe.Reset(); // 几何反转后旧 PIPE 深度不滞留
     // 差异调试纹理(共享单实例):每槽描述符堆的槽 34 视图都指向它,
     // 因此必须先于槽池循环创建。重建(hot 复用换尺寸)时整槽纹理按
-    // GetAddressOf 惯例重造(与 _motion/_depth 同款)。
-    if (!CreateColorTexture(_debugDiff.GetAddressOf(), width, height,
+    // ReleaseAndGetAddressOf 重造(先释放旧引用再接新 —— 此前用
+    // GetAddressOf,WRL 语义不释放旧指针,热重建每轮泄漏
+    // _motion/_depth/_depthPipe/_debugDiff/_rtvHeap 五件,2026-10-05 修)。
+    if (!CreateColorTexture(_debugDiff.ReleaseAndGetAddressOf(), width, height,
                             _inColorFmt, D3D12_RESOURCE_STATE_COMMON,
                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, err, errLen)) {
         return false;
@@ -612,7 +615,7 @@ bool D3D12Context::CreateFrameResources(const SessionDesc &desc,
         D3D12_DESCRIPTOR_HEAP_DESC rtvDesc{};
         rtvDesc.NumDescriptors = 3;
         rtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        HRESULT hr = _device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(_rtvHeap.GetAddressOf()));
+        HRESULT hr = _device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(_rtvHeap.ReleaseAndGetAddressOf()));
         if (FAILED(hr)) {
             SetErr(err, errLen, hr, "CreateDescriptorHeap(RTV) failed");
             return false;

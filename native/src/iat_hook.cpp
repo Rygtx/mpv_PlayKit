@@ -141,6 +141,22 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook,
     void *original = *reinterpret_cast<void *volatile *>(hook.iatSlot);
     GetModuleFileNameWFn originalFunction = nullptr;
     std::memcpy(&originalFunction, &original, sizeof(original));
+    if (!originalFunction) {
+        // Null import:槽未换、页仍可写,就地清账退出(2026-10-05 评审修:
+        // 此前在 VirtualProtect 恢复只读保护之后又写回槽 = 写只读页 AV;
+        // 被外层 SEH 吞掉时 owner 释放/清账全跳过,g_hookOwner 悬垂指向
+        // 调用方栈对象且槽永久留在 hook 函数上,后续安装全被拒)。
+        // Initialize 调用方失败后不会调 RestoreSnippetCallerHook,此处
+        // 必须把 owner 完整放回。
+        OutputDebugStringA("vs_dlssnr: IAT hook null import (GetModuleFileNameW slot is null); hook disarmed\n");
+        if (err && errLen) {
+            std::snprintf(err, errLen, "null import (GetModuleFileNameW slot is null)");
+        }
+        hook.iatSlot = nullptr;
+        void *owner = &hook;
+        g_hookOwner.compare_exchange_strong(owner, nullptr, std::memory_order_acq_rel);
+        return false;
+    }
     g_originalGetModuleFileNameW.store(originalFunction, std::memory_order_release);
     g_snippetCallerModule.store(callerModule, std::memory_order_release);
     InterlockedExchangePointer(
@@ -150,27 +166,6 @@ bool InstallSnippetCallerHook(HMODULE snippetModule, SnippetCallerHook &hook,
     DWORD ignoredProtection = 0;
     VirtualProtect(hook.iatSlot, sizeof(void *), oldProtection, &ignoredProtection);
     FlushInstructionCache(GetCurrentProcess(), hook.iatSlot, sizeof(void *));
-
-    if (!originalFunction) {
-        // Null import: the hook cannot work — restore the slot and release
-        // the owner right here. The Initialize caller fails without calling
-        // RestoreSnippetCallerHook, so leaving the hook armed would serve
-        // ERROR_INVALID_FUNCTION from this IAT slot for the whole session
-        // and block every future context from installing.
-        OutputDebugStringA("vs_dlssnr: IAT hook null import (GetModuleFileNameW slot is null); hook disarmed\n");
-        if (err && errLen) {
-            std::snprintf(err, errLen, "null import (GetModuleFileNameW slot is null)");
-        }
-        InterlockedExchangePointer(
-            reinterpret_cast<void *volatile *>(hook.iatSlot), original);
-        g_originalGetModuleFileNameW.store(nullptr, std::memory_order_release);
-        g_snippetCallerModule.store(nullptr, std::memory_order_release);
-        hook.installed = false;
-        hook.iatSlot = nullptr;
-        void *owner = &hook;
-        g_hookOwner.compare_exchange_strong(owner, nullptr, std::memory_order_acq_rel);
-        return false;
-    }
     return true;
 }
 

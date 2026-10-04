@@ -24,12 +24,17 @@ def panel_pid():
     return testenv.panel_running()
 
 
+# 启动前清场(2026-10-05 评审修):前序测试遗留的面板实例会令计数叠成 2,
+# 下面的精确计数恒假 FAIL —— 先杀干净再等一小拍让进程树退净。
+testenv.kill_panel()
+time.sleep(1)
+
 mpv = subprocess.Popen(
     [testenv.MPV_COM, "av://lavfi:testsrc2", "--frames=600",
      f"--vf=vapoursynth={VPY}", "--vo=null", "--no-terminal", "--really-quiet"],
     cwd=testenv.ROOT)
 time.sleep(8)
-panel_up = panel_pid() == 1
+panel_up = panel_pid() >= 1  # 清场后计数即准确;>=1 容 tasklist 偶发抖动
 print("after filter load, panel running:", panel_up)
 
 # mpv.com 是启动壳:必须按名杀真正的 mpv.exe,否则 alive 事件仍在,

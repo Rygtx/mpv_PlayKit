@@ -27,11 +27,17 @@ W, H = (int(x) for x in (sys.argv[2], sys.argv[3])) if len(sys.argv) > 3 else (1
 CW, CH = (W + 1) // 2, (H + 1) // 2
 
 
-def read_plane(path, w, h, bpp=1):
+def read_plane(path, w, h):
+    # bpp 自动探测(2026-10-05 评审修):头注声明 dump 可为 R8/R16_UNORM,
+    # 此前固定按 1 字节/采样读,16-bit dump 整体错读。按文件实际大小判:
+    # w*h*2 → 16bit(uint16 视图直读,右对齐采样字);w*h → 8bit。
+    # DumpTextureToFile 逐行紧凑 fwrite,文件内无 pitch 间隙(同旧注)。
     raw = open(path, "rb").read()
-    stride = w * bpp  # DumpTextureToFile 逐行紧凑 fwrite,文件内无 pitch 间隙
-    arr = np.frombuffer(raw[: stride * h], dtype=np.uint8).reshape(h, stride)
-    return arr[:, :w].astype(np.float32)
+    if len(raw) == w * h * 2:
+        return np.frombuffer(raw, dtype=np.uint16).reshape(h, w).astype(np.float32)
+    if len(raw) == w * h:
+        return np.frombuffer(raw, dtype=np.uint8).reshape(h, w).astype(np.float32)
+    raise SystemExit(f"{path}: 大小 {len(raw)} 与 {w}x{h} 的 8/16bit 紧凑形态均不符")
 
 
 def read_bgra(path, w, h):

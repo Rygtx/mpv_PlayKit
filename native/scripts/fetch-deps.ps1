@@ -49,12 +49,18 @@ $ngxCommit = "a291cc7d2cc6"
 # 闭包:src 直接消费 nvsdk_ngx.h / nvsdk_ngx_defs_dlssg.h,vendor\rtxvideo
 # 4 头 → {defs,helpers};ngx.h→defs+params,helpers.h→ngx+defs,其余
 # (VK/dlssd 族 + helpers_dlssg/params_dlssg)零 include 不拉。
-$ngxHeaders = @(
-    "nvsdk_ngx.h", "nvsdk_ngx_defs.h", "nvsdk_ngx_defs_dlssg.h",
-    "nvsdk_ngx_helpers.h", "nvsdk_ngx_params.h"
-)
-foreach ($h in $ngxHeaders) {
-    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/include/$h" (Join-Path $ngxInc $h)
+# 头文件哈希钉值(2026-10-05 评审补齐):与 .lib/.dll 同策略 —— 此前
+# "存在即短路",缓存被本机污染/截断时静默进构建(URL commit 钉只护首次)。
+# 钉值取自对应 commit 首拉内容;升级 commit 时同步重算。
+$ngxHeaders = [ordered]@{
+    "nvsdk_ngx.h"            = 'F6014A256F9D75CCEC1278AC6E23D596B398A76CC3960048CA1A274B378B1989'
+    "nvsdk_ngx_defs.h"       = 'EA23F33497CD274860D1C25A97644FCE807DCB0037C594547203343103FAD03E'
+    "nvsdk_ngx_defs_dlssg.h" = '5E76E5CF0397F0B093887D0392B427A6B3E3F722CEC5F5A4795357EDEB6DE4BA'
+    "nvsdk_ngx_helpers.h"    = '2D5661F8B5AB55E1223E485F24146274D48077E09051873826B653D4384FE7D8'
+    "nvsdk_ngx_params.h"     = '943BC8CC5CDAE03B6303016FBAD3183636F2335AE27A2D18776798C3B4EFABBC'
+}
+foreach ($h in $ngxHeaders.Keys) {
+    Fetch "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/include/$h" (Join-Path $ngxInc $h) $ngxHeaders[$h]
 }
 
 # --- NGX static core lib (layout mirrors Magpie BuildOptions.props DLSSSdkDir) ---
@@ -84,7 +90,12 @@ $fgProxyDll = Join-Path $root "vendor\ngx\version.dll"
 $fgProxyIni = Join-Path $root "vendor\ngx\dlssg_sm86.ini"
 $sm86Tag = "0.3.5"
 $sm86DllSha256 = 'C3934A09399F022504227C72DF0BF8C0DE55F9A08880DDDDE898C5262CEFA838'
-if (-not (Test-Path $fgProxyDll) -or (Get-FileHash -LiteralPath $fgProxyDll -Algorithm SHA256).Hash -ne $sm86DllSha256) {
+# ini 随 dll 同批复制;中断落在两次 Copy 之间时,dll 哈希命中会把本分支
+# 整段跳过,ini 永不补齐(重跑 fetch-deps 无法自愈,2026-10-05 评审修)——
+# ini 缺失同样进本分支重取,两件一起重拷(幂等)。
+if ((-not (Test-Path $fgProxyDll)) -or
+    (Get-FileHash -LiteralPath $fgProxyDll -Algorithm SHA256).Hash -ne $sm86DllSha256 -or
+    (-not (Test-Path $fgProxyIni))) {
     New-Item -ItemType Directory -Force (Split-Path -Parent $fgProxyDll) | Out-Null
     $zip = Join-Path $env:TEMP "dlssg_for_sm86-$sm86Tag.zip"
     Fetch "https://codeload.github.com/sdli1995/dlssg_for_sm86/zip/refs/tags/$sm86Tag" $zip
@@ -214,8 +225,13 @@ if (-not (Test-Path $rtxZipMarker)) {
 }
 
 # --- VapourSynth R73 headers (runtime is R73 / API4, see mpv-lazy Lib\site-packages\vapoursynth-73.dist-info) ---
-foreach ($h in @("VapourSynth4.h", "VSHelper4.h", "VSScript4.h")) {
-    Fetch "https://raw.githubusercontent.com/VapourSynth/VapourSynth/R73/include/$h" (Join-Path $vsInc $h)
+$vsHeaders = [ordered]@{
+    "VapourSynth4.h" = 'A73A23AA9EA8395F475644344CF7B60FBC9DE29A571B9AF131361265C09C8530'
+    "VSHelper4.h"    = 'A648BC2123E17365548BE83070A6F1363994CCEF54433D3848AA84F15C419892'
+    "VSScript4.h"    = '2C9497111C23784F9A2C3CF94007A1EE9ABBFBA47A1BB33A3E26EAF38C689B36'
+}
+foreach ($h in $vsHeaders.Keys) {
+    Fetch "https://raw.githubusercontent.com/VapourSynth/VapourSynth/R73/include/$h" (Join-Path $vsInc $h) $vsHeaders[$h]
 }
 
 # --- NVOF headers(清单 #6 光流;官方 OpticalFlowSDK 仓库已从 GitHub 撤下,
@@ -227,8 +243,12 @@ $nvofDir = Join-Path $root "vendor\nvof"
 New-Item -ItemType Directory -Force $nvofDir | Out-Null
 # D3D12-only:Common 被 D3D12 头直接包含必留;D3D11/Cuda 是平级喂入接口
 # (D3D11 纹理/CUDA 缓冲),不在本工程路径上。
-foreach ($h in @("nvOpticalFlowCommon.h", "nvOpticalFlowD3D12.h")) {
-    Fetch "https://raw.githubusercontent.com/mbucchia/Optical-Flow-SDK/$nvofCommit/NvOFInterface/$h" (Join-Path $nvofDir $h)
+$nvofHeaders = [ordered]@{
+    "nvOpticalFlowCommon.h" = 'CDBDBF0797FC02D2DE1051520D4164BB1E36B7722009F46CB16216675319436A'
+    "nvOpticalFlowD3D12.h"  = 'F12BBC6C54278CB5D3AE81723CA0363644F672FC3E72B635A709470FFDD6886F'
+}
+foreach ($h in $nvofHeaders.Keys) {
+    Fetch "https://raw.githubusercontent.com/mbucchia/Optical-Flow-SDK/$nvofCommit/NvOFInterface/$h" (Join-Path $nvofDir $h) $nvofHeaders[$h]
 }
 
 # --- FidelityFX SDK v2.3.0(AMD 光流后端 FxofContext;裁剪子集,vendor 不入库

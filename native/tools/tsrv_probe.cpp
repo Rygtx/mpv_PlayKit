@@ -155,66 +155,85 @@ int main(int argc, char **argv) {
                     bd.MipLevels = 1; bd.SampleDesc.Count = 1;
                     bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
                     ID3D12Resource *upload = nullptr, *result = nullptr, *back = nullptr;
-                    dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
+                    // 资源创建 HRESULT 全查(2026-10-05 评审修):失败轮打印并
+                    // 跳过该轮 —— null 描述符 dispatch 会以假 CONFIRMED 污染判定。
+                    bool created =
+                        SUCCEEDED(dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd,
                                                  D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                 nullptr, IID_PPV_ARGS(&upload));
+                                                 nullptr, IID_PPV_ARGS(&upload)));
                     bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-                    dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd,
+                    created = created &&
+                        SUCCEEDED(dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &bd,
                                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                                 nullptr, IID_PPV_ARGS(&result));
+                                                 nullptr, IID_PPV_ARGS(&result)));
                     bd.Flags = D3D12_RESOURCE_FLAG_NONE;
-                    dev->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd,
+                    created = created &&
+                        SUCCEEDED(dev->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd,
                                                  D3D12_RESOURCE_STATE_COPY_DEST,
-                                                 nullptr, IID_PPV_ARGS(&back));
+                                                 nullptr, IID_PPV_ARGS(&back)));
                     D3D12_DESCRIPTOR_HEAP_DESC dh{};
                     dh.NumDescriptors = 4;
                     dh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
                     dh.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
                     ID3D12DescriptorHeap *heap = nullptr;
-                    dev->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&heap));
-                    const D3D12_CPU_DESCRIPTOR_HANDLE h0 =
-                        heap->GetCPUDescriptorHandleForHeapStart();
-                    const D3D12_CPU_DESCRIPTOR_HANDLE h1{
-                        h0.ptr + (SIZE_T)dev->GetDescriptorHandleIncrementSize(
-                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)};
-                    // SRV 落在 UPLOAD buffer 上(涉事形态);UAV 在 DEFAULT。
-                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-                    srv.Format = DXGI_FORMAT_R32_UINT;
-                    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                    srv.Shader4ComponentMapping =
-                        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                    srv.Buffer.NumElements = 1024;
-                    dev->CreateShaderResourceView(upload, &srv, h0);
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-                    uav.Format = DXGI_FORMAT_R32_UINT;
-                    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                    uav.Buffer.NumElements = 1024;
-                    dev->CreateUnorderedAccessView(result, nullptr, &uav, h1);
-                    const D3D12_GPU_DESCRIPTOR_HANDLE g0 =
-                        heap->GetGPUDescriptorHandleForHeapStart();
-                    const D3D12_GPU_DESCRIPTOR_HANDLE g1{
-                        g0.ptr + (UINT64)dev->GetDescriptorHandleIncrementSize(
-                                     D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)};
-
+                    created = created &&
+                        SUCCEEDED(dev->CreateDescriptorHeap(&dh, IID_PPV_ARGS(&heap)));
                     ID3D12CommandAllocator *alloc = nullptr;
                     ID3D12GraphicsCommandList *cl = nullptr;
-                    dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                IID_PPV_ARGS(&alloc));
-                    dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
-                                           nullptr, IID_PPV_ARGS(&cl));
-                    ID3D12DescriptorHeap *heaps[]{heap};
-                    cl->SetDescriptorHeaps(1, heaps);
-                    cl->SetComputeRootSignature(root);
-                    cl->SetComputeRootDescriptorTable(0, g0);
-                    cl->SetComputeRootDescriptorTable(1, g1);
-                    cl->Dispatch(1, 1, 1);
-                    cl->Close();
-                    ID3D12CommandList *lists[]{cl};
-                    queue->ExecuteCommandLists(1, lists);
-                    queue->Signal(fence, (UINT64)i + 1);
-                    fence->SetEventOnCompletion((UINT64)i + 1, fenceEvent);
-                    WaitForSingleObject(fenceEvent, 5000);
-                    const bool hit = Removed(dev);
+                    created = created &&
+                        SUCCEEDED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                              IID_PPV_ARGS(&alloc)));
+                    created = created &&
+                        SUCCEEDED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc,
+                                                         nullptr, IID_PPV_ARGS(&cl)));
+                    bool hit = false;
+                    if (created) {
+                        const D3D12_CPU_DESCRIPTOR_HANDLE h0 =
+                            heap->GetCPUDescriptorHandleForHeapStart();
+                        const D3D12_CPU_DESCRIPTOR_HANDLE h1{
+                            h0.ptr + (SIZE_T)dev->GetDescriptorHandleIncrementSize(
+                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)};
+                        // SRV 落在 UPLOAD buffer 上(涉事形态);UAV 在 DEFAULT。
+                        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                        srv.Format = DXGI_FORMAT_R32_UINT;
+                        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                        srv.Shader4ComponentMapping =
+                            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        srv.Buffer.NumElements = 1024;
+                        dev->CreateShaderResourceView(upload, &srv, h0);
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                        uav.Format = DXGI_FORMAT_R32_UINT;
+                        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                        uav.Buffer.NumElements = 1024;
+                        dev->CreateUnorderedAccessView(result, nullptr, &uav, h1);
+                        const D3D12_GPU_DESCRIPTOR_HANDLE g0 =
+                            heap->GetGPUDescriptorHandleForHeapStart();
+                        const D3D12_GPU_DESCRIPTOR_HANDLE g1{
+                            g0.ptr + (UINT64)dev->GetDescriptorHandleIncrementSize(
+                                         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)};
+
+                        ID3D12DescriptorHeap *heaps[]{heap};
+                        cl->SetDescriptorHeaps(1, heaps);
+                        cl->SetComputeRootSignature(root);
+                        cl->SetComputeRootDescriptorTable(0, g0);
+                        cl->SetComputeRootDescriptorTable(1, g1);
+                        cl->Dispatch(1, 1, 1);
+                        cl->Close();
+                        ID3D12CommandList *lists[]{cl};
+                        queue->ExecuteCommandLists(1, lists);
+                        queue->Signal(fence, (UINT64)i + 1);
+                        fence->SetEventOnCompletion((UINT64)i + 1, fenceEvent);
+                        // 等票返回值检查(2026-10-05 评审修):非 WAIT_OBJECT_0 =
+                        // 该轮未完成,打印并跳过、不计入判定(总体 CONFIRMED /
+                        // NOT REPRODUCED 语义不变;removed 查询只对完成轮做)。
+                        if (WaitForSingleObject(fenceEvent, 5000) != WAIT_OBJECT_0) {
+                            printf("TS-RV: s2[%d] fence wait TIMEOUT, round skipped\n", i);
+                        } else {
+                            hit = Removed(dev);
+                        }
+                    } else {
+                        printf("TS-RV: s2[%d] resource create FAILED, round skipped\n", i);
+                    }
                     Rel(&cl); Rel(&alloc); Rel(&heap);
                     Rel(&back); Rel(&result); Rel(&upload);
                     if (hit) {

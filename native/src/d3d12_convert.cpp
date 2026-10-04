@@ -19,7 +19,7 @@ struct YuvCoeffs {
     float containerMax;
     float sampleMax;
     float yLo, ySpan;   // limited: 16/219(8bit) 64/876(10bit);full: 0/sampleMax
-    float cMid, cSpan;  // limited: 128/224 512/896;full: sampleMax/2
+    float cMid, cSpan;  // limited: 128/224 512/896;full: sampleMax/2 与 sampleMax
     float kr, kb;       // 709: 0.2126/0.0722;601: 0.299/0.114
 };
 
@@ -42,7 +42,13 @@ YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept
         c.yLo = 0.0f;
         c.ySpan = c.sampleMax;
         c.cMid = c.sampleMax * 0.5f;
-        c.cSpan = c.sampleMax * 0.5f;
+        // 全范围色度零点在 sampleMax/2,最大偏移到两端(0/sampleMax)。
+        // 归一域与 limited 档同为 [-0.5,0.5](shader 公式 r=nY+nV*2(1-Kr)
+        // 恒定),跨度 = sampleMax —— 此前 sampleMax*0.5 使 nC 落 [-1,1]:
+        // 解码色度 ×2(强色被 saturate 钳断不可逆)、编码压进半码域
+        // (2026-10-05 评审修;check_yuv_convert 此前只验 limited 档,
+        // 该分支零数值验收)。
+        c.cSpan = c.sampleMax;
     }
     c.kr = matrix == ColorMatrix::BT709 ? 0.2126f : 0.299f;
     c.kb = matrix == ColorMatrix::BT709 ? 0.0722f : 0.114f;

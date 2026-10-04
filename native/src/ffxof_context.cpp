@@ -481,39 +481,41 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
         // 契约);densify SRV 读走隐式提升 —— debug layer 校验点。读序 =
         // 同队列 FIFO(densify 后于 dispatch 入队,自然后完成;原 queue
         // Wait 同为 NVOF 同构仪式,2026-10-04 撤)。
-        ID3D12CommandAllocator *densAlloc = nullptr;
-        ID3D12GraphicsCommandList *densCl = nullptr;
-        bool densifyOk = AcquireCl(&densAlloc, &densCl);
-        if (densifyOk) {
-            postExecute(densCl, 0); // motion/conf 屏障 + RecordFfxDensify
-            densifyOk = SUCCEEDED(densCl->Close());
-        }
-        if (densifyOk) {
-            _lastCopyFence = _rotator.Submit(queue, _copyFence.Get(), densCl, ++_copySeq);
-            result.waitFenceValue = _lastDone; // 非 0 = realMotion
-            _consecutiveFailures = 0;
-        } else {
-            // densify 失败与 copy/main 同类(链断:InvalidateHistory 已落),
-            // 计入连败闩锁 —— 此前恰漏在"失败收口三连已统一"的网外,持续
-            // 失败风暴时本后端永不自停(2026-10-04 补齐)。
-            TimingStatusLine("DLSSNR STATUS: fxof densify submit failed");
-            result.historyReset = true;
-            result.waitFenceValue = 0;
-            _gate.InvalidateHistory();
-            LatchFailure(_consecutiveFailures, _ready, "fxof");
-        }
-
-        // 播种帧对齐 NVOF 播种语义(of_backend.h 契约):发布零运动 + 携带
-        // NGX 重置。此前播种成功路径返回 realMotion 且不带重置 —— PARAM_RESET
-        // 只由播种帧携带,FFX 后端(默认)下每次 seek NR 都缺重置,时域历史
-        // 跨时间线泄漏(2026-09-25 修复)。本帧 densify 已照录,输出仅下帧
-        // 起被消费,不影响。
+        //
+        // 播种帧跳过 densify(2026-10-05 评审修,对齐 NVOF 播种语义):
+        // 此前播种帧照录 densify 把 motion/reduced 推到 NSR,而播种发布
+        // realMotion=0 → 消费侧 recordGuidancePark 跳过归位 → NSR 跨帧
+        // 滞留,下帧 COMMON→UAV StateBefore 失配(FFX 为默认后端,每次
+        // seek/会话首帧后的第一个真运动帧必触发)。播种帧的 densify 产物
+        // 本就无人消费(下帧整体重算),跳过纯省一次 dispatch。
         if (seed) {
             result.historyReset = true;
             result.waitFenceValue = 0;
+            _gate.MarkSeeded();
+        } else {
+            ID3D12CommandAllocator *densAlloc = nullptr;
+            ID3D12GraphicsCommandList *densCl = nullptr;
+            bool densifyOk = AcquireCl(&densAlloc, &densCl);
+            if (densifyOk) {
+                postExecute(densCl, 0); // motion/conf 屏障 + RecordFfxDensify
+                densifyOk = SUCCEEDED(densCl->Close());
+            }
+            if (densifyOk) {
+                _lastCopyFence = _rotator.Submit(queue, _copyFence.Get(), densCl, ++_copySeq);
+                result.waitFenceValue = _lastDone; // 非 0 = realMotion
+                _consecutiveFailures = 0;
+            } else {
+                // densify 失败与 copy/main 同类(链断:InvalidateHistory 已落),
+                // 计入连败闩锁 —— 此前恰漏在"失败收口三连已统一"的网外,持续
+                // 失败风暴时本后端永不自停(2026-10-04 补齐)。
+                TimingStatusLine("DLSSNR STATUS: fxof densify submit failed");
+                result.historyReset = true;
+                result.waitFenceValue = 0;
+                _gate.InvalidateHistory();
+                LatchFailure(_consecutiveFailures, _ready, "fxof");
+            }
         }
 
-        if (seed && densifyOk) _gate.MarkSeeded();
         _gate.Advance(frameIndex);
     }
 

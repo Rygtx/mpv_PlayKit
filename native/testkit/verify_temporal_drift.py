@@ -48,4 +48,4 @@ for n in SAMPLES:
     if uniq <= 4 and n > 0:
         bad = True
 print("RESULT:", "RAIL(复现实机病灶)" if bad else "稳定(时域无退化)")
-sys.exit(0)
+sys.exit(1 if bad else 0)  # (2026-10-05 评审修:此前算出 RAILED 仍 exit 0)

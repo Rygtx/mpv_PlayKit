@@ -306,7 +306,14 @@ bool DlssfgContext::Rebuild(int width, int height, DXGI_FORMAT backbufferFormat,
         return false;
     }
     if (_width == width && _height == height && _format == backbufferFormat) {
-        return true; // 同尺寸同格式热复用,历史由调用方显式 ResetHistory
+        // 热复用同样落复位旗(2026-10-05 评审修):走到这里的调用必先重建
+        // 了槽资源(CreateFrameResources),DLSSG 内部历史还是旧槽纹理时代
+        // 的 —— 函数注释曾说"历史由调用方显式 ResetHistory",但唯一调用方
+        // (dlssnr_context Rebind)成功路径从不调它,shape-only rebind 的
+        // 首帧直接拿旧历史插帧 = 瞬态鬼影。就地置旗(_mutex 已持,不可调
+        // ResetHistory 重入),与 off→on 路径的 _needsReset 持久化同源。
+        _needsReset = true;
+        return true;
     }
     {
         const bool released = SehCall([&] {

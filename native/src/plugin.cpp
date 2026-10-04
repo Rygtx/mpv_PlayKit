@@ -164,7 +164,7 @@ struct FilterData {
     // 的代,后完成的代不得放行前代等待者(前代 unpack 可能还在写缓存帧
     // —— 2026-10-04 评审修:旧 fgReadyGen ">=" 谓词正是这个假放行)。
     // 锁序恒 fgMutex → fgReadyMutex,无环(Finish 出口不持 fgMutex)。
-    static constexpr int kFgReadyRing = 8;    // ≥ 在飞批数上限;被挤出 = 早于最近 8 批,必然已落账
+    static constexpr int kFgReadyRing = 8;    // 环深 ≠ 在飞上限(在飞无强制上界,见 FgReadyQueryLocked 缺省语义)
     uint64_t fgCacheGen = 0;                  // 最近一次缓存存储的世代(fgMutex 内写)
     uint64_t fgReadyRingGen[kFgReadyRing] = {}; // 0 = 空槽(fgReadyMutex 内读写)
     bool fgReadyRingOk[kFgReadyRing] = {};
@@ -174,12 +174,18 @@ struct FilterData {
 };
 
 // 世代门环形账(均须 fgReadyMutex;FgReadyQueryLocked 供 cv 谓词在已持锁
-// 下复用)。gen 未入环 = 早于最近 kFgReadyRing 批 —— 每批必然落账(三个
-// Finish 出口 + 同步兜底路径全覆盖),被挤出即早已就绪。
+// 下复用)。gen 未入环 = 不可证明已落账,按未就绪处理(2026-10-05 修;
+// 此前缺省就绪依赖"在飞 ≤8"不变量,无任何强制)。
 static bool FgReadyQueryLocked(const FilterData *d, uint64_t gen) {
     for (int i = 0; i < FilterData::kFgReadyRing; ++i)
         if (d->fgReadyRingGen[i] == gen) return d->fgReadyRingOk[i];
-    return true;
+    // 未入环 = 不可证明已落账,按未就绪处理(2026-10-05 评审修):此前
+    // 缺省 true 依赖"在飞批 ≤8"不变量,但 fgMutex 只串行存储,Finish 在
+    // 锁外 —— ≥9 批同时在飞时第 9 个 pending 项挤出最老批,消费端假放行
+    // 领走 unpack 仍在写的缓存帧(数据竞争)。缺省 false 后该场景消费端
+    // 走 15s 超时降级(宁迟交不假放行);正常路径最新批必有 pending/落账
+    // 项,不受影响。
+    return false;
 }
 
 static bool FgReadyQuery(FilterData *d, uint64_t gen) {
@@ -904,7 +910,16 @@ static void VS_CC DlssnrCreateImpl(
         return;
     }
 
-    auto *d = new FilterData();
+    // new 与 createVideoFilter 之间是抛逸泄漏窗(node 引用无人释放;
+    // DlssnrCreate 的 catch-all 只 mapSetError)。两处分配各自收口。
+    FilterData *d = nullptr;
+    try {
+        d = new FilterData();
+    } catch (...) {
+        vsapi->freeNode(node);
+        vsapi->mapSetError(out, "dlssnr.Enhance: out of memory");
+        return;
+    }
     d->node = node;
     d->width = vi->width;
     d->height = vi->height;
@@ -997,7 +1012,14 @@ static void VS_CC DlssnrCreateImpl(
                       initial.antiFlicker);
         vsdlssnr::TimingStatusLine(msg);
     }
-    d->params = std::make_shared<vsdlssnr::SharedParams>(initial);
+    try {
+        d->params = std::make_shared<vsdlssnr::SharedParams>(initial);
+    } catch (...) {
+        delete d; // 滤镜实例未入册(createVideoFilter 未调),就地释放
+        vsapi->freeNode(node);
+        vsapi->mapSetError(out, "dlssnr.Enhance: out of memory");
+        return;
+    }
 
     int dllErr = 0;
     const char *dllArg = vsapi->mapGetData(in, "ngx_dll", 0, &dllErr);
