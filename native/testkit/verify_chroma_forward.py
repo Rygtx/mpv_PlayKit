@@ -36,6 +36,16 @@ from pq2020 import KR, KB, to_pq2020  # noqa: E402  # 前向数学单一权威(�
 dark = core.std.BlankClip(width=640, height=480, format=vs.YUV420P8, color=[40,128,128])
 bright = core.std.BlankClip(width=640, height=480, format=vs.YUV420P8, color=[200,128,128])
 src = core.std.StackHorizontal([dark, bright])
+
+# 陈旧 dump 先删(2026-10-04,与 verify_pq_roundtrip 同族同步):必须在
+# Enhance/get_frame 之前 —— 色度 dump 在首帧 Finish 内同步执行完(进程内
+# 一次锁存),get_frame 之后删的就是刚写好的文件,锁存已置位永不重写;
+# 不删则上一会话的残留 dump 直接过大小门 → 前向对照跑在陈旧帧上,
+# PASS/FAIL 均不可信。
+dump = os.path.join(testenv.HOST_DIR, "dump_hdrcolor.bin")
+if os.path.exists(dump):
+    os.remove(dump)
+
 ret = core.dlssnr.Enhance(src, vsr_mode=2, vsr_scale=2.0, hdr_enabled=1)
 N = 5
 f = ret.get_frame(N)
@@ -43,7 +53,6 @@ y_meas = np.asarray(f[0]).astype(np.float64) / 1023.0
 u_meas = np.asarray(f[1]).astype(np.float64) / 1023.0
 v_meas = np.asarray(f[2]).astype(np.float64) / 1023.0
 
-dump = os.path.join(testenv.HOST_DIR, "dump_hdrcolor.bin")
 for _ in range(80):
     if os.path.exists(dump) and os.path.getsize(dump) > 1000000:
         break

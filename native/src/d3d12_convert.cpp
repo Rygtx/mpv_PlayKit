@@ -244,7 +244,10 @@ void D3D12Context::RecordColorOutput(ID3D12GraphicsCommandList &clRef, FrameSlot
     cl->SetComputeRootSignature(_rsConvertOut.Get());
     HeapBinder gpu{ _device.Get(), *cl, slot };
 
-    const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _outPlaneBytes > 1 ? 10 : 8);
+    // 深度 = 源位深(SDR 输出 = 源同格式,见 _outPlaneBytes 定义处):
+    // 此前 >8bit 一律按 10bit 量化,12/16bit 源的输出码域错位(整帧暗
+    // 4×/256×,2026-10-04 评审修)。HDR 分支(PQ)不消费阶梯常量,无影响。
+    const YuvCoeffs cf = YuvCoeffsFor(matrix, range, _bitDepth);
     const bool fp16 = kind != ColorOutKind::Sdr; // P10 输出契约 + ChromaStep (2,2)
     ID3D12PipelineState *lumaPso = nullptr;
     ID3D12PipelineState *chromaPso = nullptr;

@@ -651,6 +651,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         // 日志开关会把待发 reseek 连坐丢失(创建参数已随 payload 发出但 mpv
         // 不重载,静默降级为"等手动 seek")。reseek 有自己的节流戳。
         if (g_app.reseekDirty && nowSec - g_app.lastReseekWrite > 0.1) {
+            // reseek 前强制 flush 未落地的 live 变更(2026-10-04 评审修):
+            // live 分支的 100ms 节流若恰好挡住本拍写入,reseek 会先触发 ——
+            // 重建的新实例采纳旧 payload,随后落地的 live 值无人再消费,
+            // 变更静默丢失且面板勾选态与实际不符。此处无视节流先写。
+            if (g_app.liveDirty) {
+                WritePayload();
+                g_app.liveDirty = false;
+                g_app.lastLiveWrite = nowSec;
+            }
             g_app.reseekDirty = false;
             g_app.lastReseekWrite = nowSec;
             // 任意面板主动 reseek 都入闭环去抖戳:重建窗口内旧全关实例

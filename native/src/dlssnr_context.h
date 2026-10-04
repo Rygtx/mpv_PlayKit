@@ -211,8 +211,10 @@ private:
     NVSDK_NGX_Result SnippetEvaluateSafely(ID3D12GraphicsCommandList *cl, NVSDK_NGX_Parameter *params, DWORD *sehCode) noexcept;
     NVSDK_NGX_Result SnippetReleaseSafely(DWORD *sehCode) noexcept;
     NVSDK_NGX_Result SnippetShutdownSafely(DWORD *sehCode) noexcept;
-    void SetCreateParametersUnsafe() noexcept;
-    bool SetCreateParametersSafely(DWORD *sehCode) noexcept;
+    // create 键快照由调用方显式传入(2026-10-04 评审修):此前函数内自取
+    // Snapshot,与调用方按入参建好的 scaling 纹理可隔一次面板推送而错配。
+    void SetCreateParametersUnsafe(const DlssnrParams &createParams) noexcept;
+    bool SetCreateParametersSafely(const DlssnrParams &createParams, DWORD *sehCode) noexcept;
     // NGX tuning 键缓存(脏检查;仅 _evaluateMutex 内消费,无并发)。feature
     // 重建置 _lastEvalTuningValid = false 强制首帧重写。
     struct EvalTuning {
@@ -389,6 +391,12 @@ private:
     // 存活到进程退出(热上下文哲学;每会话约 2×W×H×4B 显存,FFX 另含内部
     // 金字塔资源)。
     std::vector<std::unique_ptr<IOpticalFlowBackend>> _retiredOf;
+    // _ofBackend 指针本体/_retiredOf 收口锁(2026-10-04 评审修):RecreateFeature
+    // 尺寸重建段(PoolHold 内,无 _nvofMutex)与帧线程 SyncOfSession 快照并发。
+    // 不复用 _nvofMutex:RebuildOf 是 _nvofMutex → PoolHold,尺寸段是
+    // PoolHold → ? —— 嵌套 _nvofMutex 会成 ABBA 死锁;本锁落在偏序最末端
+    // (_nvofMutex > PoolHold > _ofSwapMutex),单向无环。
+    mutable std::mutex _ofSwapMutex;
     // 跨帧线程读写的会话事实(fmParallel):写侧恒在 PoolHold/_nvofMutex
     // 封池窗口,读侧(SyncOfSession 每帧 stale 检查、ProcessFrame、stats
     // 发布)在窗口外无锁 —— atomic 化对齐 _tPubState 惯例(2026-10-04,
@@ -402,6 +410,13 @@ private:
     // _fg 空,滤镜优雅回退 1:1 输出。面板 fgEnabled 为 live 语义(会话内
     // 关 = 复制真实帧;未激活会话内开 = 下次播放生效)。
     std::unique_ptr<DlssfgContext> _fg;
+    // _fg 指针本体收口锁(2026-10-04 评审修):写侧(SetupFgSession 建活/
+    // reset,PoolHold 内)与无池读侧(Rebind 热复用簿记/ResetNvofHistory、
+    // 帧线程 AcquireSlot 前的 fgGateLive/OfFollowDesired)并发 —— PoolHold
+    // 只挡持槽线程,挡不住入口段帧。解引用一律锁内完成(持槽后的读点被
+    // 封池互斥,无需此锁)。锁序:PoolHold → _fgMutex / fgMutex → _fgMutex,
+    // 单向无环。
+    mutable std::mutex _fgMutex;
     NVSDK_NGX_Parameter *_fgParams = nullptr; // FG 专用核心参数块(core 拥有)
     bool _fgRequested = false;
     // sticky 语义仅限会话内 live 变化(面板开关只动逐帧 eval 门);seek 边界

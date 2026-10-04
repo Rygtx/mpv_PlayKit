@@ -16,11 +16,12 @@ MpvDisplayPick MpvDetectTargetSize(int srcW, int srcH) noexcept;
 
 // 启动窗口 resize 跟随 watcher(mode=1):400ms 探测节拍 + 高度迟滞
 // (max(8px, 2%)),连续两拍稳定偏离后经 mpv IPC seek 触发链重建,随即
-// 自退。返回 stop 句柄(调用方持有,Free 时 MpvResizeWatchStop);
+// 自退。返回 stop 句柄(调用方持有,Free 时 MpvResizeWatchStop;句柄的
+// Close 归 watcher 线程退出时自办,Stop 只 SetEvent);
 // vsrAutoMode=false / 名额满(≥2)/线程创建失败 = nullptr(自动跟随关闭,
 // 优雅降级为需手动 seek)。
 HANDLE MpvResizeWatchStart(int srcW, int srcH, int refH, bool vsrAutoMode) noexcept;
-// 停止并回收 watcher(nullptr 恒安全)。
+// 停止 watcher(nullptr 恒安全);线程退出与句柄回收异步自办。
 void MpvResizeWatchStop(HANDLE stop) noexcept;
 
 } // namespace vsdlssnr

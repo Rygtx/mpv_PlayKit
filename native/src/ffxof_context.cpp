@@ -291,10 +291,12 @@ OfStageResult FxofContext::StageFrame(int frameIndex, ID3D12Resource *srcTex,
 
     {
         // 取锁前声明在途:门据此区分"前驱堵在 mutex 外(等它插队)"与
-        // "真丢帧(零等待立即播种)"(of_frame_gate.h)。
+        // "真丢帧(零等待立即播种)"(of_frame_gate.h)。代际快照同窗口
+        // 采样:ResetTimeline 插队时 Arrive 代际失配判幽灵帧(2026-10-04)。
+        const uint64_t gateEpoch = _gate.Epoch();
         _gate.MarkIncoming(frameIndex);
         std::unique_lock<std::mutex> lock(_gate.Mutex);
-        const OfGateDecision decision = _gate.Arrive(frameIndex, lock);
+        const OfGateDecision decision = _gate.Arrive(frameIndex, gateEpoch, lock);
         if (decision == OfGateDecision::Expired) {
             // 连续迟到帧观测(正式保留):偶发 1-2 帧 = 线程乱序,正常;
             // streak 累到 16+ = 门期望与帧号时间线错位(2026-10-02 vsr 切档

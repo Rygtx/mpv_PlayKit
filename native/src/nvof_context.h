@@ -170,7 +170,7 @@ public:
     // StageFrame 内三段 CPU 等待细分 + 门异常事件累计。
     double LastGateWaitMs() const noexcept { return _lastGateWaitMs; } // 门互斥+cv 等待
     double LastCpyWaitMs() const noexcept { return _lastCpyWaitMs; }   // 前帧拷贝完成 CPU 等待
-    double LastExeWaitMs() const noexcept { return _lastExeWaitMs; }   // execute 输出栅栏 CPU 等待
+    double LastExeWaitMs() const noexcept override { return _lastExeWaitMs; } // execute 输出栅栏 CPU 等待(override 补 2026-10-04:此前名字隐藏,经后端接口恒读基类 0)
     uint32_t GateExpired() const noexcept { return _gateExpired; }     // 过期帧累计
     uint32_t ResetCount() const noexcept { return _resetCount; }       // ResetHistory 累计
     // (GateSkips 已删 2026-10-04:恒 0 死指标,读数会让人误判"从未跳帧"而非

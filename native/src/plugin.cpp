@@ -387,6 +387,7 @@ bool RunProcessFrameCommon(FilterData *d, const VSFrame *src, VSFrame *out,
     uint8_t *genPlanes[kFgGenSlots * 3]{};
     int64_t genStrides[kFgGenSlots * 3]{};
     for (int g = 0; g < effGens; ++g) {
+        if (!genFrame[g]) continue; // 分配失败槽:留空回落真实帧(2026-10-04 评审修)
         for (int p = 0; p < 3; ++p) {
             genPlanes[g * 3 + p] = vsapi->getWritePtr(genFrame[g], p);
             genStrides[g * 3 + p] = vsapi->getStride(genFrame[g], p);
@@ -829,6 +830,15 @@ static void VS_CC DlssnrFreeImpl(void *instanceData, VSCore * /*core*/, const VS
         d->resizeWatchStop = nullptr;
     }
     vsdlssnr::BridgeStop(d->params);
+    // 卸载落账(2026-10-04 评审修):stats mapping 进程级存活,实例死后面
+    // 板读到的恒是冻结末帧 + "已连接"。发布一次 unloaded 死亡体(seq 推进,
+    // gpuName 空 → 面板会话区回落"未加载滤镜"兜底文案,统计清零):seek
+    // 间隙闪现一拍即被新实例逐帧体覆盖,真正移除滤镜则持续显示实态。
+    {
+        vsdlssnr::StatsPayload st{};
+        vsdlssnr::CopyStatStr(st.filterState, "unloaded");
+        vsdlssnr::PublishStats(st);
+    }
     // FG 缓存帧:最后一个引用(缓存自留),先于 filter 释放。
     for (int i = 0; i < kFgMultMax; ++i) {
         if (d->fgCache[i]) vsapi->freeFrame(d->fgCache[i]);

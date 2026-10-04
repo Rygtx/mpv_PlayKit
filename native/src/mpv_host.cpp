@@ -83,7 +83,11 @@ namespace {
 
 struct ResizeWatchCtx {
     int srcW, srcH, refH;
-    HANDLE stop; // 匿名停事件(FilterData 持句柄,Free 时 SetEvent+Close)
+    HANDLE stop; // 匿名停事件;线程创建后所有权归 watcher(退出时自关,
+                 // MpvResizeWatchStop 只 SetEvent —— 此前 Stop 的 CloseHandle
+                 // 与线程"扫描窗口不在 wait"竞态,句柄值被复用后下一轮
+                 // wait 撞无关对象 → WAIT_TIMEOUT 空转永不退,名额泄漏,
+                 // 2026-10-04 评审修)
 };
 
 std::atomic<int> g_resizeWatchers{ 0 };
@@ -139,8 +143,8 @@ DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
     // 时 SetEvent —— 实例与线程生命周期对齐。
     for (;;) {
         const DWORD w = WaitForSingleObject(ctx->stop, 400);
-        // 非 WAIT_TIMEOUT 一律停:SetEvent 是正常停旗;WAIT_FAILED = Free 的
-        // CloseHandle 撞上扫描窗口(不在 wait 中),句柄已关,继续循环会
+        // 非 WAIT_TIMEOUT 一律停:SetEvent 是正常停旗;WAIT_FAILED = 句柄
+        // 已失效(所有权已归线程自关,此分支现为纯防御),继续循环会
         // 全速空转(每圈全量 EnumWindows)。
         if (w != WAIT_TIMEOUT) break; // 滤镜已释放(重建/热停泊/关停)
         const MpvDisplayPick d = MpvDetectTargetSize(ctx->srcW, ctx->srcH);
@@ -159,6 +163,7 @@ DWORD WINAPI ResizeWatchProc(LPVOID param) noexcept {
         break; // 重建带来新探测值与新 watcher
     }
     g_resizeWatchers.fetch_sub(1, std::memory_order_relaxed);
+    CloseHandle(ctx->stop); // 停事件所有权归线程(见 ResizeWatchCtx 注),退出自关
     return 0;
 }
 
@@ -180,7 +185,7 @@ HANDLE MpvResizeWatchStart(int srcW, int srcH, int refH, bool vsrAutoMode) noexc
     HANDLE th = CreateThread(nullptr, 0, ResizeWatchProc, ctx, 0, nullptr);
     if (th) {
         CloseHandle(th);
-        return stop; // 句柄归调用方,Free 时 MpvResizeWatchStop
+        return stop; // 句柄归调用方转交语义(Stop 只 SetEvent;Close 归线程)
     }
     delete ctx;
     CloseHandle(stop);
@@ -190,8 +195,11 @@ HANDLE MpvResizeWatchStart(int srcW, int srcH, int refH, bool vsrAutoMode) noexc
 
 void MpvResizeWatchStop(HANDLE stop) noexcept {
     if (!stop) return;
+    // 只置旗不关句柄(2026-10-04 评审修):CloseHandle 后句柄值可被其它
+    // 线程复用,watcher 正处扫描窗口(不在 wait)时下一轮 wait 撞复用句柄
+    // —— 可等待且不触发的对象 = 恒 WAIT_TIMEOUT,线程空转永不退,两次即
+    // 耗尽名额,自动跟随整个会话静默失效。句柄所有权归线程,退出自关。
     SetEvent(stop);
-    CloseHandle(stop);
 }
 
 } // namespace vsdlssnr

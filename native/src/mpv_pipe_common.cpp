@@ -15,6 +15,11 @@ wchar_t *MpvParseIpcServerName(const wchar_t *confPath) noexcept {
     const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     // 逐行找未注释的 input-ipc-server = <名>(值可带引号,行尾 # 截断)。
+    // 同名键取**最后**一个命中(2026-10-04 评审修):mpv 语义是同名 option
+    // 后值覆盖前值,此前取首个 —— 重复键(追加修改残留)时两侧同源地连到
+    // 已废弃的旧管道名,reseek/打标静默退化。
+    wchar_t last[64]{};
+    bool have = false;
     size_t pos = 0;
     while (pos < n) {
         const size_t eol = pos + strcspn(buf + pos, "\r\n");
@@ -39,15 +44,15 @@ wchar_t *MpvParseIpcServerName(const wchar_t *confPath) noexcept {
                         parsed, 63);
                     if (cw > 0) {
                         parsed[cw] = L'\0';
-                        return _wcsdup(parsed);
+                        wcscpy_s(last, parsed); // 覆盖语义:后值胜
+                        have = true;
                     }
                 }
-                break; // 键命中但值非法:不再扫后续行
             }
         }
         pos = eol + 1;
     }
-    return nullptr;
+    return have ? _wcsdup(last) : nullptr;
 }
 
 void MpvPipeDefaultNames(const wchar_t *candidates[kMpvPipeMaxCandidates]) noexcept {

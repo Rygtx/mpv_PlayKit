@@ -14,6 +14,9 @@
 //     缺口,自持卡顿,nvof 实测 2026-09 教训);
 //   - 设备丢失/失败帧:历史作废,下一帧重新播种(播种帧成功则历史重建);
 //   - ResetTimeline(seek):_nextSeq 归 -1(下一帧自定起点)+ 历史作废。
+//     持门锁 + 代际递增:与在途帧(放锁等待/未入门)并发时,旧时间线
+//     帧经 Arrive 代际比对判幽灵帧(Expired,不推进不污染),_nextSeq
+//     不会被旧帧号复活(2026-10-04 评审修)。
 //
 // 活性不变量:凡被等待方等待的帧(缺口=1 时前驱),其 StageFrame 的所有
 // 路径必达 Advance(Expired 例外 —— 等待期间前驱不可能 Expired,见下)。
@@ -51,10 +54,19 @@ public:
         _incoming.fetch_or(Mask(frameIndex), std::memory_order_acq_rel);
     }
 
+    // 时间线代际(MarkIncoming 之前采样,随 Arrive 回传):ResetTimeline
+    // 与在途帧并发时(在 cv wait 放锁窗口 / MarkIncoming 已置未入门),
+    // 旧时间线帧会走 Seed 并 Advance(旧帧号)把刚归 -1 的 _nextSeq 复活
+    // (2026-10-02 "next=200 爬 188" 的真根因)。Arrive 入口比对代际,
+    // 失配 = 旧时间线幽灵帧 → Expired(播种、不推进、不污染 _nextSeq)。
+    uint64_t Epoch() const noexcept { return _epoch; }
+
     // 到达帧决策(须已持 unique_lock(Mutex);cv 等待期间放锁让前驱插队)。
-    OfGateDecision Arrive(int64_t frameIndex,
+    // epoch = MarkIncoming 前 Epoch() 快照。
+    OfGateDecision Arrive(int64_t frameIndex, uint64_t epoch,
                           std::unique_lock<std::mutex> &lock) noexcept {
         _incoming.fetch_and(~Mask(frameIndex), std::memory_order_acq_rel);
+        if (epoch != _epoch) return OfGateDecision::Expired; // 旧时间线幽灵帧
         if (_nextSeq < 0) _nextSeq = frameIndex; // 首帧自定起点
         if (frameIndex < _nextSeq) return OfGateDecision::Expired;
         if (frameIndex > _nextSeq) {
@@ -62,8 +74,9 @@ public:
                 (_incoming.load(std::memory_order_acquire) & Mask(frameIndex - 1))) {
                 // 前驱已入门径(堵在 mutex 外):它必会推进,纯事件等待。
                 _cv.wait_for(lock, std::chrono::milliseconds(100),
-                             [&] { return _nextSeq >= frameIndex; });
+                             [&] { return _epoch != epoch || _nextSeq >= frameIndex; });
             }
+            if (_epoch != epoch) return OfGateDecision::Expired; // 等待期间重置
             if (_nextSeq > frameIndex) return OfGateDecision::Expired;
             if (_nextSeq < frameIndex) return OfGateDecision::Seed;
         }
@@ -84,10 +97,15 @@ public:
     // 失败帧:历史作废但门继续推进(下一帧重新播种)。
     void InvalidateHistory() noexcept { _historyValid = false; }
     // seek = 新时间线:_nextSeq 归 -1(与 NvofContext::ResetHistory 同款),
-    // 旧时间线帧号不再误判迟到。
+    // 旧时间线帧号不再误判迟到。代际递增(2026-10-04 评审修):在途帧经
+    // Arrive 的代际比对判幽灵帧,_nextSeq 不再被旧帧号 Seed+Advance 复活。
+    // **调用方必须持门锁**(既有约定,全部 6 个调用点满足):cv 等待方
+    // 放锁窗口内本函数与其串行,递增对帧线程可见且 notify 立刻唤醒
+    // (谓词含代际比对,不空耗 100ms 熔断)。
     void ResetTimeline() noexcept {
         _historyValid = false;
         _nextSeq = -1;
+        ++_epoch;
         _cv.notify_all();
     }
 
@@ -101,6 +119,7 @@ private:
     std::condition_variable _cv;
     std::atomic<uint64_t> _incoming{0};
     int64_t _nextSeq = -1;
+    uint64_t _epoch = 0; // 时间线代际(ResetTimeline 递增,Arrive 比对)
     bool _historyValid = false;
 };
 

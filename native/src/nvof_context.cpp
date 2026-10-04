@@ -470,7 +470,10 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
 
     {
         // 取锁前声明在途:门据此区分"前驱堵在 mutex 外(等它插队)"与
-        // "真丢帧(零等待立即播种)"(of_frame_gate.h)。
+        // "真丢帧(零等待立即播种)"(of_frame_gate.h)。代际快照同窗口
+        // 采样:ResetTimeline 插在 MarkIncoming 与 Arrive 之间时,Arrive
+        // 代际失配判幽灵帧,旧帧号不再复活 _nextSeq(2026-10-04 评审修)。
+        const uint64_t gateEpoch = _gate.Epoch();
         _gate.MarkIncoming(frameIndex);
         std::unique_lock<std::mutex> lock(_gate.Mutex);
         // 入门即清:上一帧失败路径(ProcessFrame 提前返回且守卫冲刷未跑,
@@ -486,7 +489,7 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
 
         // ---- 帧序门:迟到/缺口一律播种,连续才 execute(OfFrameGate::Arrive;
         // 在途判据与事件驱动等待语义见 of_frame_gate.h)----
-        const OfGateDecision gate = _gate.Arrive(frameIndex, lock);
+        const OfGateDecision gate = _gate.Arrive(frameIndex, gateEpoch, lock);
         if (gate == OfGateDecision::Expired) {
             // 迟到帧(乱序/回退,其序号已被越过):清零发布,不推进门。
             // 零等待门下无需簿记,链不受影响。

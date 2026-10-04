@@ -379,9 +379,8 @@ NVSDK_NGX_Result DlssnrContext::SnippetShutdownSafely(DWORD *sehCode) noexcept {
 
 // ---- Parameter assembly (Magpie DLSSNRFilter.cpp:1104-1130 / 1197-1230) ----
 
-void DlssnrContext::SetCreateParametersUnsafe() noexcept {
+void DlssnrContext::SetCreateParametersUnsafe(const DlssnrParams &createParams) noexcept {
     NVSDK_NGX_Parameter *p = _parameters;
-    const DlssnrParams createParams = _shared->Snapshot();
     // Internal processing size: source * inputResolutionPercent (25-100) when
     // scaling is enabled; at 100% or with scaling disabled all NGX size keys
     // refer to the full source size.
@@ -422,9 +421,9 @@ void DlssnrContext::SetCreateParametersUnsafe() noexcept {
     _lastEvalTuningValid = false;
 }
 
-bool DlssnrContext::SetCreateParametersSafely(DWORD *sehCode) noexcept {
+bool DlssnrContext::SetCreateParametersSafely(const DlssnrParams &createParams, DWORD *sehCode) noexcept {
     return NgxRuntimeGuard::Invoke([&] {
-        SetCreateParametersUnsafe();
+        SetCreateParametersUnsafe(createParams);
         return true;
     }, false, sehCode);
 }
@@ -1044,7 +1043,7 @@ bool DlssnrContext::Initialize(
         if (!_d3d12->BeginCtlRecording()) return fail("BeginCtlRecording(create) failed");
         {
             DWORD sehCode = 0;
-            if (!SetCreateParametersSafely(&sehCode)) return fail("Create parameter setup raised SEH");
+            if (!SetCreateParametersSafely(pInit, &sehCode)) return fail("Create parameter setup raised SEH");
         }
         {
             DWORD sehCode = 0;
@@ -1355,18 +1354,27 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
         auto next = CreateOfBackend(_curOfQuality,
                                     std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax),
                                     iw, ih, ofErr, sizeof(ofErr));
-        if (next) {
-            _retiredOf.push_back(std::move(_ofBackend));
-            _ofBackend = std::move(next);
-            _curOfBackend = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
-        } else {
-            _nvofFailed = true;
-            // 尺寸重建失败:旧会话尺寸必然已失配(触发本次重建的原因),
-            // 退役它 —— 否则旧会话尺寸项在 ProcessFrame 触发条件里每帧
-            // 为真 → RebuildOf 每帧封池风暴(2026-09-25)。降级零 guidance,
-            // 重试通道由 _nvofFailed 保留。
-            _retiredOf.push_back(std::move(_ofBackend));
-            _ofBackend = nullptr;
+        {
+            // 指针 swap/退役账收口(2026-10-04 评审修):与帧线程 SyncOfSession
+            // 的 _nvofMutex 内快照并发 —— 本段持 PoolHold,RebuildOf 是
+            // _nvofMutex → PoolHold,嵌 _nvofMutex 会 ABBA 死锁,走专用
+            // _ofSwapMutex(偏序末端)。
+            std::lock_guard<std::mutex> swapLock(_ofSwapMutex);
+            if (next) {
+                _retiredOf.push_back(std::move(_ofBackend));
+                _ofBackend = std::move(next);
+                _curOfBackend = std::clamp(p.ofBackend, kOfBackendMin, kOfBackendMax);
+            } else {
+                _nvofFailed = true;
+                // 尺寸重建失败:旧会话尺寸必然已失配(触发本次重建的原因),
+                // 退役它 —— 否则旧会话尺寸项在 ProcessFrame 触发条件里每帧
+                // 为真 → RebuildOf 每帧封池风暴(2026-09-25)。降级零 guidance,
+                // 重试通道由 _nvofFailed 保留。
+                _retiredOf.push_back(std::move(_ofBackend));
+                _ofBackend = nullptr;
+            }
+        }
+        if (!next) {
             char msg[288];
             std::snprintf(msg, sizeof(msg),
                           "DLSSNR STATUS: of resize failed (%s); zero guidance", ofErr);
@@ -1418,7 +1426,10 @@ bool DlssnrContext::RecreateFeature(const RecreateRequest &req, char *err, size_
     }
     {
         DWORD sehCode = 0;
-        if (!SetCreateParametersSafely(&sehCode)) {
+        if (!SetCreateParametersSafely(p, &sehCode)) {
+            // create 键 = 入口单一快照 p(2026-10-04 评审修):此前函数内自取
+            // Snapshot,重建窗口内面板再推 scaling 会让 NGX 键的内部尺寸与
+            // 已按入参建好的纹理错配一帧。
             if (err && errLen) std::snprintf(err, errLen, "RecreateFeature: parameter setup raised SEH");
             _ready.store(false, std::memory_order_release);
             return false;
@@ -1525,7 +1536,11 @@ bool DlssnrContext::SetupFgSession(const DlssnrParams &p) noexcept {
             std::snprintf(_fgDetail, sizeof(_fgDetail), "official capability block failed");
             appendProxyNote();
         } else {
-            _fg = std::make_unique<DlssfgContext>();
+            // 会话重建全程不持 _fgMutex(Initialize 毫秒级,锁内会挡帧线程
+            // 入口读点);指针进/出成员的两个赋值点各自锁内(2026-10-04 评审
+            // 修)—— 尝试期间旧实例(如有)保持存活,锁内读点看到的一律是
+            // 完整对象。
+            auto fgNext = std::make_unique<DlssfgContext>();
             char fgErr[256]{};
             // FG backbuffer = 管线色:**默认恒 BGRA8 SDR 域**(TrueHDR
             // 后置:DLSSG 的 HDR 路径对 >1.0 线性值不保真,2026-09-23
@@ -1534,11 +1549,15 @@ bool DlssnrContext::SetupFgSession(const DlssnrParams &p) noexcept {
             // 产物经 HdrToPq 编码,ColorBuffersHDR=0;DLSSG 在感知域插帧
             // —— 直吃 scRGB 线性 >1.0 会被钳 ~0.875,值域定案 2026-09-24),
             // 尺寸 = PIPE。
-            if (_fg->Initialize(*_d3d12, officialDll, _fgParams,
-                                _pipeW, _pipeH,
-                                _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                             : DXGI_FORMAT_B8G8R8A8_UNORM,
-                                fgErr, sizeof(fgErr))) {
+            if (fgNext->Initialize(*_d3d12, officialDll, _fgParams,
+                                   _pipeW, _pipeH,
+                                   _fgHdrInterp ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                : DXGI_FORMAT_B8G8R8A8_UNORM,
+                                   fgErr, sizeof(fgErr))) {
+                {
+                    std::lock_guard<std::mutex> fgLock(_fgMutex);
+                    _fg = std::move(fgNext); // 旧实例(热复用失败残留)在此销毁
+                }
                 fgUp = true;
                 // 钩子进程级、装上不可拆:只要缓存模块是 hook 型就标
                 // official-hook(与本次是否预载解耦 —— 上会话自动档
@@ -1561,7 +1580,10 @@ bool DlssnrContext::SetupFgSession(const DlssnrParams &p) noexcept {
                 TimingStatusLine(msg);
                 SanitizeJsonDetail(fgErr, _fgDetail, sizeof(_fgDetail));
                 appendProxyNote();
-                _fg.reset();
+                {
+                    std::lock_guard<std::mutex> fgLock(_fgMutex);
+                    _fg.reset(); // 旧实例(如有)销毁;fgNext 局部出作用域自毁
+                }
                 // 参数块:FG 死了块也作废(core 参数块无成本,留着会话内
                 // 复用反而要考虑并发;直接随进程回收,Shutdown 不再触碰)。
                 _fgParams = nullptr;
@@ -1592,6 +1614,7 @@ bool DlssnrContext::SetupFgSession(const DlssnrParams &p) noexcept {
 }
 
 bool DlssnrContext::OfFollowDesired(const DlssnrParams &p, bool scalingActive) const noexcept {
+    std::lock_guard<std::mutex> fgLock(_fgMutex);
     const bool fgLive = _fg && _fg->Enabled() && p.fgEnabled != 0;
     return p.nvofFollowScaling != 0 && scalingActive && !fgLive;
 }
@@ -1618,6 +1641,9 @@ bool DlssnrContext::SyncOfSession(const DlssnrParams &p, int srcW, int srcH,
         curQ = _curOfQuality;
         curB = _curOfBackend;
         nvofFailed = _nvofFailed;
+        // 指针本体读取收口(2026-10-04 评审修):与 RecreateFeature 尺寸段
+        // (PoolHold → _ofSwapMutex)并发,嵌套 _ofSwapMutex(偏序末端)。
+        std::lock_guard<std::mutex> swapLock(_ofSwapMutex);
         of = _ofBackend.get();
     }
     bool stale = ofq != curQ || backendReq != curB ||
@@ -1641,6 +1667,10 @@ bool DlssnrContext::RebuildOf(int quality, int backendReq, int dstW, int dstH,
     // (实测并发重建互相踩踏挂死);锁内复查 _curOfQuality/_curOfBackend 与
     // 尺寸,后来者直接跳过。
     std::lock_guard<std::mutex> switchLock(_nvofMutex);
+    // 会话账(_ofBackend/_retiredOf)swap 收口(2026-10-04 评审修):与
+    // RecreateFeature 尺寸段(PoolHold → _ofSwapMutex)并发;本函数已有
+    // _nvofMutex → PoolHold,嵌套次序与偏序一致。
+    std::lock_guard<std::mutex> swapLock(_ofSwapMutex);
     // 调用方传入的档位已经 ResolveOfQuality 按后端值域 clamp;此处宽 clamp
     // 仅作双保险(FFX 的 2 也在 0-5 内,不受影响)。
     const int q = std::clamp(quality, kOfQualityMin, kOfQualityMax);
@@ -1763,7 +1793,12 @@ void DlssnrContext::ResetNvofHistory() noexcept {
     // FG 下一帧 eval 带 DLSSG.Reset,该帧插值输出降级复制)。会话本身保留
     // (热上下文跨 seek 存活)。
     if (_ofBackend) _ofBackend->ResetHistory();
-    if (_fg) _fg->ResetHistory();
+    {
+        // Rebind 热复用分支不持池(1816 注),与帧线程写侧(PoolHold 内
+        // SetupFgSession)并发 —— 指针解引用锁内(2026-10-04 评审修)。
+        std::lock_guard<std::mutex> fgLock(_fgMutex);
+        if (_fg) _fg->ResetHistory();
+    }
 }
 
 bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int depth,
@@ -1779,7 +1814,12 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     // 档位不属 CreateParamsChanged 三元组、换档恒走热复用,stats 里
     // fg_mult_create 永远停在进程启动值 —— 面板"会话创建 Xx"红显永
     // 不清除(2026-09-25 用户实测定案)。
-    _fgCreateMult = (p.fgEnabled != 0 && _fg && _fg->Enabled())
+    bool fgLiveForM0 = false;
+    {
+        std::lock_guard<std::mutex> fgLock(_fgMutex); // 无池读侧收口(2026-10-04 评审修)
+        fgLiveForM0 = _fg && _fg->Enabled();
+    }
+    _fgCreateMult = (p.fgEnabled != 0 && fgLiveForM0)
                         ? std::clamp(p.fgMultiplier, kFgMultMin, kFgMultMax)
                         : 0;
     // Snapshot already carries the ini overrides and the panel-payload adopt
@@ -1983,7 +2023,11 @@ bool DlssnrContext::ProcessFrame(
     // 内部尺寸 : 源尺寸 —— FG 的 MVecs 契约要求与 backbuffer 同尺寸稠密
     // 运动场,FG 激活时 follow 被强制忽略。ConsumeRebuild 已在上文跑过,
     // 内部尺寸此处是新鲜的。
-    const bool fgGateLive = _fg && _fg->Enabled() && frameParams.fgEnabled;
+    bool fgGateLive = false;
+    {
+        std::lock_guard<std::mutex> fgLock(_fgMutex);
+        fgGateLive = _fg && _fg->Enabled() && frameParams.fgEnabled;
+    }
     // 本帧倍数(调用方从参数快照定格 —— 与输出帧数契约绑定;live 变化在
     // 源帧边界生效,由调用方逐帧传入)。0 = FG 未激活。
     const int fgM = fgGateLive && fgDstPlanes && _d3d12->FgSlots()
@@ -2113,6 +2157,12 @@ bool DlssnrContext::ProcessFrame(
             }
         }
     } guard{ _d3d12, slot, _ofBackend.get(), false };
+    // evaluate 域句柄(defer_lock):录制(RecordTemporal)到提交
+    // (SubmitBaseFrame)必须同锁 —— 非 FG 帧无 fgMutex 串行,槽翻转在
+    // evalLock 序而 GPU 执行按提交序,两序脱钩 = 抗闪烁历史前后帧颠倒
+    // (2026-10-04 评审修)。所有 early-return 由 unique_lock 析构放锁;
+    // 成功路径 Submit 后显式 unlock 缩窗。
+    std::unique_lock<std::mutex> evalLock(_evaluateMutex, std::defer_lock);
     // drain 标志在 ofNeeded 声明后补齐(声明序在后)。
     // The pool seal only serializes; it does not refresh readiness. A
     // concurrent RecreateFeature may have failed (leaving _parameters null)
@@ -2473,7 +2523,7 @@ bool DlssnrContext::ProcessFrame(
         // 探针:evaluate 互斥等待。eval_cpu 段包含它(无法从分段里拆出),
         // 这里单独测量:"NGX CPU 变慢"与"被别的槽的 evaluate 排队"由此分家。
         QueryPerformanceCounter(&tLock0);
-        std::lock_guard<std::mutex> evalLock(_evaluateMutex);
+        evalLock.lock(); // defer_lock 句柄,见上方声明(录制→提交同锁,2026-10-04 评审修)
         QueryPerformanceCounter(&tLock1);
         if (ProbeEnabled()) TimingStatusLine("PROBE: eval-locked"); // 探针(VSDLSSNR_PROBE=1)
         DWORD sehCode = 0;
@@ -2841,6 +2891,8 @@ bool DlssnrContext::ProcessFrame(
         return false;
     }
     guard.ArmDrainShared(slot->baseFenceValue); // 失败路径槽释放前排空在飞 base CL
+    if (evalLock.owns_lock())
+        evalLock.unlock(); // 录制→提交同锁收口完成,后续 RTX eval 自取(2026-10-04 评审修;skipEval/nrOff 帧未加锁,不得误 unlock)
     if (ProbeEnabled()) TimingStatusLine("PROBE: base submitted"); // 探针(VSDLSSNR_PROBE=1)
     // base 完成观测(t3a,2026-09-25 时间戳化):默认路径不再 CPU 阻塞 ——
     // base GPU 执行与后续 RTX 提交链 + fg/post 录制重叠(此前阻塞把这段
@@ -3038,6 +3090,7 @@ bool DlssnrContext::ProcessFrame(
         char fgErr[160]{};
         for (int g = 0; g < fgM - 1; ++g) {
             if (fgResetEval && g > 0) break; // 播种帧只建历史,不产插值
+            if (fgDstPlanes && !fgDstPlanes[g * 3]) continue; // 分配失败槽:无落点,eval/屏障全跳过,fgGenOk 保持 false(2026-10-04 评审修)
             D3D12_RESOURCE_BARRIER toUav[1]{
                 Transition(slot->fgInterp[g].Get(),
                            D3D12_RESOURCE_STATE_COMMON,
@@ -3401,7 +3454,11 @@ bool DlssnrContext::ProcessFrame(
             }
         }
         recordGuidancePark(*postCl);
-        if (nrOff && rtxIn && !(hdrPostSplit && !vsrRun)) {
+        // hdr-only 拆分形态且 FG 门开时 pipe.res == inputColor 已在上方
+        // fgBack 分支归位,此处跳过防双归位;门关帧(3376 块整体跳过)仍需
+        // 在此归位 —— 旧条件不分门态,门关帧 NSR 态跨帧滞留,下帧 C1
+        // COMMON→UAV 屏障 StateBefore 失配(2026-10-04 评审修)。
+        if (nrOff && rtxIn && !(fgOnFgCl && hdrPostSplit && !vsrRun)) {
             D3D12_RESOURCE_BARRIER inBack[1]{
                 TransitionFromTo(slot->inputColor.Get(),
                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
