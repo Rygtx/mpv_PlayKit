@@ -20,7 +20,7 @@ struct YuvCoeffs {
     float sampleMax;
     float yLo, ySpan;   // limited: 16/219(8bit) 64/876(10bit);full: 0/sampleMax
     float cMid, cSpan;  // limited: 128/224 512/896;full: sampleMax/2 与 sampleMax
-    float kr, kb;       // 709: 0.2126/0.0722;601: 0.299/0.114
+    float kr, kb;       // 709: 0.2126/0.0722;601: 0.299/0.114;2020: 0.2627/0.0593
 };
 
 YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept {
@@ -50,8 +50,12 @@ YuvCoeffs YuvCoeffsFor(ColorMatrix matrix, ColorRange range, int depth) noexcept
         // 该分支零数值验收)。
         c.cSpan = c.sampleMax;
     }
-    c.kr = matrix == ColorMatrix::BT709 ? 0.2126f : 0.299f;
-    c.kb = matrix == ColorMatrix::BT709 ? 0.0722f : 0.114f;
+    switch (matrix) {
+    case ColorMatrix::BT601:  c.kr = 0.299f;  c.kb = 0.114f; break;
+    case ColorMatrix::BT2020: c.kr = 0.2627f; c.kb = 0.0593f; break;
+    case ColorMatrix::BT709:
+    default:                  c.kr = 0.2126f; c.kb = 0.0722f; break;
+    }
     return c;
 }
 

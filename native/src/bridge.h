@@ -23,6 +23,8 @@ bool BridgeLoadIni(DlssnrParams &p) noexcept;
 // included) onto `p`. Call at filter-create time, after BridgeLoadIni:
 // panel state wins over the ini, mirroring the panel's own startup adopt.
 // Returns false when no panel payload exists (mapping absent / empty / torn).
-bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept;
+// srcHdrOut 非 NULL 时带回 payload 的源传输函数探针位(v30;探针是环境
+// 事实非用户参数,不进 DlssnrParams;采纳失败保持调用方初值)。
+bool BridgeAdoptPanelPayload(DlssnrParams &p, int32_t *srcHdrOut) noexcept;
 
 } // namespace vsdlssnr

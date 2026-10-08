@@ -475,7 +475,7 @@ void DrawRtxPage(UiCtx &ui) noexcept {
         if (!vsrOn) ImGui::EndDisabled();
     }
     ui.pairLabel(1, "RTX Video HDR", "SDR → HDR10,输出切 10bit BT.2020;显示切换面板自动完成。\n"
-              "需 ngx\\ 下有 nvngx_truehdr.dll。");
+              "需 ngx\\ 下有 nvngx_truehdr.dll。HDR(PQ/HLG)片源自动旁路,见诊断页。");
     ImGui::SetCursorScreenPos(ImVec2(wpos.x + marginX + (halfW + colGap) + pairLabelW, wpos.y + y));
     {
         bool hdr = g_app.params.rtxHdrEnabled != 0;
@@ -830,9 +830,12 @@ void DrawDiagPage(UiCtx &ui) noexcept {
 
                 // RTX 请求 vs 实际:请求开(vsrMode>0 / hdrEnabled)而实态
                 // off = 降级(capability/部署问题),原因串 rtx_detail 红显。
+                // 例外:HDR 源已旁路(src_hdr=1,面板请求仍 HDR)= 预期 off
+                // —— gamma 探针 + 插件 create 压制,非故障,不红显。
                 {
                     const bool vsrReq = g_app.params.rtxVsrMode != 0;
                     const bool hdrReq = g_app.params.rtxHdrEnabled != 0;
+                    const bool hdrBypassed = hdrReq && g_app.snap.srcHdr != 0;
                     char rtxReq[64];
                     if (!vsrReq && !hdrReq) {
                         std::snprintf(rtxReq, sizeof(rtxReq), "关");
@@ -842,7 +845,8 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                         std::snprintf(rtxReq, sizeof(rtxReq), "%s", vsrReq ? "VSR" : "HDR");
                     }
                     const bool rtxDown = (vsrReq || hdrReq) &&
-                                         std::strcmp(g_app.snap.rtx, "off") == 0;
+                                         std::strcmp(g_app.snap.rtx, "off") == 0 &&
+                                         !hdrBypassed;
                     if (rtxDown) ImGui::TextColored(kErrRed, "RTX Video");
                     else ImGui::TextUnformatted("RTX Video");
                     ImGui::SameLine();
@@ -850,9 +854,22 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                     ImGui::TextUnformatted(rtxReq);
                     ImGui::SameLine();
                     ImGui::SetCursorPosX(actX);
-                    TextColoredWrapped(rtxDown ? kErrRed : kDimTxt, "%s%s%s",
-                                       g_app.snap.rtx[0] ? g_app.snap.rtx : "(未加载)",
-                                       g_app.snap.rtxDetail[0] ? " —— " : "", g_app.snap.rtxDetail);
+                    char rtxAct[224];
+                    if (hdrBypassed) {
+                        // HDR 源直通:HDR 开关对 PQ/HLG 片源无效果(TrueHDR
+                        // 只吃 SDR 输入);VSR 与片源同活,实态串照常带上。
+                        const bool vsrLive = g_app.snap.rtx[0] &&
+                                             std::strcmp(g_app.snap.rtx, "off") != 0;
+                        std::snprintf(rtxAct, sizeof(rtxAct), "%s%sHDR 源已旁路"
+                                      "(PQ/HLG 片源,TrueHDR 仅接受 SDR 输入)",
+                                      vsrLive ? g_app.snap.rtx : "",
+                                      vsrLive ? " | " : "");
+                    } else {
+                        std::snprintf(rtxAct, sizeof(rtxAct), "%s%s%s",
+                                      g_app.snap.rtx[0] ? g_app.snap.rtx : "(未加载)",
+                                      g_app.snap.rtxDetail[0] ? " —— " : "", g_app.snap.rtxDetail);
+                    }
+                    TextColoredWrapped(rtxDown ? kErrRed : kDimTxt, "%s", rtxAct);
                 }
             }
 

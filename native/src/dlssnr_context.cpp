@@ -570,6 +570,7 @@ void DlssnrContext::DecideRtxGeometry(const RtxVideoParams &rtx, int srcW, int s
     const double ratio = static_cast<double>(dstH) / static_cast<double>(srcH);
     _vsrRequested = rtx.vsrMode > 0 && ratio > 1.001;
     _hdrActive = rtx.hdrEnabled != 0;
+    _srcHdr = rtx.srcHdr != 0;
     if (_vsrRequested) {
         const double cap = static_cast<double>(kVsrMaxScale);
         _pipeH = static_cast<int>(std::lround(static_cast<double>(srcH) *
@@ -1849,6 +1850,9 @@ bool DlssnrContext::Rebind(SharedParams *shared, int width, int height, int dept
     }
     _shared.store(shared, std::memory_order_release);
     const DlssnrParams p = shared->Snapshot();
+    // 源 HDR 探针随新实例刷新(热复用早退分支不经 DecideRtxGeometry,
+    // 不在此落账会把上一部片子的探测值带进新源的面板显示)。
+    _srcHdr = rtx.srcHdr != 0;
     // FG 会话创建倍数随每次 bind 重新落定 = 新滤镜实例的输出契约 M0
     // (面板 payload 已先于此被新实例采纳,见下)。此前只写于 Initialize:
     // 档位不属 CreateParamsChanged 三元组、换档恒走热复用,stats 里
@@ -4098,6 +4102,7 @@ void DlssnrContext::FillStatsCommon(StatsPayload &st) noexcept {
     CopyStatStr(st.modelDll, _modelDllUtf8);
     CopyStatStr(st.rtx, _rtxStateStr);
     CopyStatStr(st.rtxDetail, _rtxDetail);
+    st.srcHdr = _srcHdr ? 1u : 0u;
     CopyStatStr(st.filterState, (_nvofFailed && _curOfQuality > 0) ? "nvof_zero" : "ok");
     {
         // 会话指针收口(2026-10-05 评审修):OfModeString 三连裸读

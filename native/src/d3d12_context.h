@@ -129,10 +129,11 @@ struct ResidualControls {
     float reflectionGlow = 1.0f;
 };
 
-// YUV↔RGB 转换的色彩参数(props _Matrix/_ColorRange → root constants 的语义
-// 输入;具体系数/范围常量在记录函数里按 _depth 推导)。矩阵只支持 709/601,
-// HDR 传输函数不在本滤镜范围(SDR 链)。
-enum class ColorMatrix : int { BT709 = 0, BT601 = 1 };
+// YUV↔RGB 转换的色彩参数(props _Matrix(或 mpv 桥的 _ColorSpace)/
+// _ColorRange → root constants 的语义输入;具体系数/范围常量在记录函数里
+// 按 _depth 推导)。矩阵 709/601/2020 三档(2020 = HDR 片源解析路径;mpv
+// 桥不写 _Transfer,HDR 判定在面板 gamma 探针,此处只管矩阵系数)。
+enum class ColorMatrix : int { BT709 = 0, BT601 = 1, BT2020 = 2 };
 enum class ColorRange : int { Full = 0, Limited = 1 };
 // RecordColorOutput 的源颜色形态(选 PSO 对;输出契约 Sdr=随源位深,
 // Hdr* = P10 420):Sdr = BGRA8 码域;HdrScRgb = FP16 scRGB 线性(逐像素

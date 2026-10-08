@@ -449,6 +449,9 @@ private:
     bool _vsrRequested = false; // VSR 在管线(模式开 + 倍率 > 1 + capability 过)
     bool _hdrActive = false;    // TrueHDR 在管线(创建时定格;输出 P10)
     bool _rtxActive = false;    // _vsrRequested || _hdrActive(输出几何判据)
+    // 源帧 HDR 探针(rtx.srcHdr,创建/Rebind 随新实例刷新;_srcHdr 键数据
+    // 源)。纯显示事实,门本体在 DlssnrCreate 的参数压制,此处不参与门控。
+    bool _srcHdr = false;
     // RTX 最近一次初始化失败原因(消毒串;成功路径清空;_rtxDetail 键的
     // 数据源,与 _fgDetail/_ofDetail 同语义)。请求开但实态 off = 降级,
     // 面板诊断页红显的原因串。

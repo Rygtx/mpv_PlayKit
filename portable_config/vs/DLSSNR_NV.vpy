@@ -128,6 +128,7 @@ H_Max = 0
 ##          HDR 上屏(打标 + 色彩空间 hint)由面板自动同步, 无需改 mpv.conf
 ##          (SDR 屏自动色调映射)
 ##          依赖 vs-plugins\ngx\nvngx_truehdr.dll; HDR 源内容照常走全链
+##          HDR 片源 (PQ/HLG) 自动旁路 TrueHDR (面板代测 gamma, 见下方说明), 本开关对其无效果
 ## <0-200> 整数, HDR 对比度 (默认 100)
 ## <0-200> 整数, HDR 饱和度 (默认 100)
 ## <10-100> 整数, HDR 中间灰 (默认 50)
@@ -138,6 +139,13 @@ H_Max = 0
 ############
 
 clip = video_in
+
+# HDR 片源旁路(2026-10-08):mpv 的 vf_vapoursynth 桥不往帧 props 写
+# _Transfer,vpy 侧探不到传输函数 —— HDR 探测由面板打标 worker 代读
+# video-params/gamma,经 payload 传入插件;插件在参数合并(vpy→ini→
+# 面板 payload)终局强制旁路 RTX HDR(TrueHDR 官方只吃 SDR 输入)。
+# seek/reload 重跑脚本逐片重判,面板改 HDR 开关触发 reseek 同样重新过门;
+# 面板"RTX Video"行显示"HDR 源已旁路"。
 
 # 原生直吃(2026-09-24,vpy 预转换退役):插件已原生收编 YUV 计划族
 # {420,422,444} × 8/10/12/14/16bit,直传 Enhance,不做任何预转换。

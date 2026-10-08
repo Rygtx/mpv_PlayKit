@@ -19,6 +19,10 @@ struct ImFont;
 
 // 进程退出旗标:主循环(WM_QUIT)、看门狗与 HDR 打标线程轮询同一位。
 extern std::atomic<bool> g_quit;
+// 源传输函数探针(HdrTagProc worker 读 mpv video-params/gamma;-1 = 尚未
+// 读到,0/1 = 非 HDR/HDR)。主循环发现变化时折叠进 payload 并触发 reseek
+// —— v30 payload srcHdr 的数据源。写侧仅 worker,读侧主线程。
+extern std::atomic<int> g_srcGammaProbe;
 struct AppState {
     DlssnrParams params{};
     // stats 通道整快照(2026-10-04 快照化:此前 25+ 字段逐个镜像 StatsPayload
@@ -49,6 +53,8 @@ struct AppState {
     double lastReseekWrite = 0.0; // reseek 独立节流戳(不挂 liveDirty)
     double lastStatsRead = 0.0;
     double lastSeekInitReseek = 0.0; // kStateNrSeekInit 兜底 reseek 去抖
+    int lastSrcProbe = -1;           // 已折叠进 payload 的探针值(-1 未定;
+                                     // worker 读数与主循环消费的比对基准)
     char status[160]{};
     char statsBig[64]{};
     char statsRes[96]{};

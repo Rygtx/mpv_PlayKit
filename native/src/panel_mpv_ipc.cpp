@@ -11,6 +11,12 @@
 #include <cstdio>
 #include <mutex>
 
+// 源传输函数探针(worker 独写,主循环消费):0 = 非 HDR,1 = PQ/HLG,
+// -1 = 尚未读到。mpv 桥不往帧 props 写 _Transfer(见 panel_ipc.h v30 注),
+// 传输函数只能在此经 input-ipc-server 代读 —— 探针唯一数据源。
+// 文件作用域(panel_shared.h 声明,panel_app.cpp 主循环消费)。
+std::atomic<int> g_srcGammaProbe{ -1 };
+
 // ---------------------------------------------------------------------------
 // mpv IPC 自动重载:需要重建滤镜会话的变动(vsrMode/scale/HDR 开关、FG
 // 开关等 create-time 参数)由面板经 mpv JSON IPC 直接触发一次原地 seek
@@ -157,17 +163,24 @@ bool HdrTagSendOnPipe(HANDLE pipe, const char *cmd) noexcept {
            ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr) != FALSE;
 }
 
+// 发 get_property 并读回原始 ack 文本。false = 管道已断(mpv 死亡/重启),
+// 调用方关连接下拍重连;ack 内容由各读取函数自行 parse。
+bool HdrTagGetPropAck(HANDLE pipe, const char *prop, char *ack, size_t cap) noexcept {
+    char cmd[96];
+    std::snprintf(cmd, sizeof(cmd),
+                  "{\"command\":[\"get_property\",\"%s\"]}\n", prop);
+    DWORD written = 0, got = 0;
+    return WriteFile(pipe, cmd, static_cast<DWORD>(strlen(cmd)), &written, nullptr) &&
+           written == strlen(cmd) &&
+           ReadFile(pipe, ack, static_cast<DWORD>(cap - 1), &got, nullptr) != FALSE;
+}
+
 // 读回 target-colorspace-hint 实值("auto"/"yes"/"no")到 out。入口先写
 // "auto" 兜底,故返回时 out 恒非空(调用方无需判空)。
 void HdrTagReadHint(HANDLE pipe, char *out, size_t cap) noexcept {
-    static const char kCmd[] =
-        "{\"command\":[\"get_property\",\"target-colorspace-hint\"]}\n";
     strcpy_s(out, cap, "auto"); // mpv 0.41+ 默认档
     char ack[256]{};
-    DWORD written = 0, got = 0;
-    if (!WriteFile(pipe, kCmd, static_cast<DWORD>(sizeof(kCmd) - 1), &written, nullptr) ||
-        written != sizeof(kCmd) - 1 ||
-        ReadFile(pipe, ack, sizeof(ack) - 1, &got, nullptr) == FALSE)
+    if (!HdrTagGetPropAck(pipe, "target-colorspace-hint", ack, sizeof(ack)))
         return;
     const char *d = strstr(ack, "\"data\":");
     if (!d) return;
@@ -183,6 +196,25 @@ void HdrTagReadHint(HANDLE pipe, char *out, size_t cap) noexcept {
     }
 }
 
+// 读回 video-params/gamma 实值(源传输函数,面板侧 HDR 探针数据源)。
+// 入口清空 out;error ack(无视频/属性不可用,换片间隙常态)时保持空,
+// 调用方按"读到才更新"处理 —— 不在此维持上一值,状态归 worker 比对。
+void HdrTagReadGamma(HANDLE pipe, char *out, size_t cap) noexcept {
+    out[0] = '\0';
+    char ack[256]{};
+    if (!HdrTagGetPropAck(pipe, "video-params/gamma", ack, sizeof(ack)))
+        return;
+    const char *d = strstr(ack, "\"data\":\"");
+    if (!d) return;
+    d += 8;
+    const char *e = strchr(d, '"');
+    if (e && static_cast<size_t>(e - d) < cap) {
+        memcpy(out, d, static_cast<size_t>(e - d));
+        out[e - d] = '\0';
+    }
+}
+
+// 打标持久连接态(worker 本地;gamma 探针读取共用同一连接)。
 struct HdrTagConn {
     HANDLE pipe = nullptr; // 持久连接:句柄存活 = 同一 mpv 会话
     wchar_t name[64]{};    // 当前管道名(conf 解析命中值,仅日志)
@@ -253,11 +285,26 @@ DWORD WINAPI HdrTagProc(LPVOID) noexcept {
         if (g_quit) break;
         StatsPayload st{};
         bool badMagic = false;
-        if (ReadStatsSnapshot(&st, &badMagic) != 2) continue; // 插件未跑/快照未稳
-        // HDR 打标直读实效位(DSLA;原 strstr 人读串 parse 在插件改显示
-        // 格式时会静默错)。rtxHdrActive 缺省 0(passthrough 简体 body 不带)
-        // = SDR 实态,发 remove 摘标 —— 与旧"rtx 字段为空"判据同语义。
-        HdrTagTick(conn, st.rtxHdrActive ? 1 : 0);
+        if (ReadStatsSnapshot(&st, &badMagic) == 2) {
+            // HDR 打标直读实效位(DSLA;原 strstr 人读串 parse 在插件改显示
+            // 格式时会静默错)。rtxHdrActive 缺省 0(passthrough 简体 body 不带)
+            // = SDR 实态,发 remove 摘标 —— 与旧"rtx 字段为空"判据同语义。
+            HdrTagTick(conn, st.rtxHdrActive ? 1 : 0);
+        }
+        // 源传输函数探针(连接存活才读;不 gate 在 stats 上 —— 探针必须在
+        // 滤镜 create 之前就绪,而那时 stats 可能还没第一帧)。error ack
+        // (换片间隙)保持上一值,防逐拍抖动。mpv gamma 值域 = "pq"/"hlg"
+        // 为 HDR(2026-10-08 实测 hdr10 片返回 "pq";不是编码侧的
+        // "smpte2084"/"arib-b67" 拼写)。
+        if (conn.pipe) {
+            char gamma[24]{};
+            HdrTagReadGamma(conn.pipe, gamma, sizeof(gamma));
+            if (gamma[0]) {
+                const int hdr = (std::strcmp(gamma, "pq") == 0 ||
+                                 std::strcmp(gamma, "hlg") == 0) ? 1 : 0;
+                g_srcGammaProbe.store(hdr, std::memory_order_relaxed);
+            }
+        }
     }
     // 退出清理(2026-10-05 评审修):摘标 + 还原 target-colorspace-hint。
     // 此前退出只关管道 —— @dlssnr-hdr-tag 恒在 mpv vf 链且跨文件持久,

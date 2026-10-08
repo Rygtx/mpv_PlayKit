@@ -70,8 +70,15 @@ constexpr uint32_t PAYLOAD_SIZE = 2048;
 // —— v14 首引入、v18 随"维护成本 > 感知收益"裁定移除;NR 参数调强后
 // 闪烁复现,机制原样回植(d3d12 侧 TEMPORAL_* HLSL + dlssnr 侧时间线),
 // 结构体尾部追加,新旧混跑按 magic 拒 —— 成对部署。
-constexpr uint32_t PAYLOAD_MAGIC = 0x504C5344u; // "DSLP" (v25:saveRequest/uiCorrection
-                                                //  死字段删除 —— 版本位走 hex)
+constexpr uint32_t PAYLOAD_MAGIC = 0x514C5344u; // "DSLQ" (v25:saveRequest/uiCorrection
+                                                //  死字段删除;v29:v22-24 键全量;
+                                                //  v30:srcHdr,见下)
+// v30:srcHdr(0/1,源传输函数探针)。mpv 的 vf_vapoursynth 桥只往 VS 帧
+// props 写 _ColorSpace/_ColorRange/_ChromaLocation(实测 v0.41-615),无
+// _Transfer/_Primaries —— vpy 侧探不到传输函数。由面板打标 worker 经
+// input-ipc-server 读 video-params/gamma 代测,写进 payload;插件 create
+// 时采纳并压制 rtxHdrEnabled。结构体尾部追加,新旧混跑按 magic 拒 ——
+// 成对部署。
 // v23(stats "DSL4",hex 实际末字节 '4'):stats JSON 新增 rtxvsr_last/
 // rtxhdr_last(RTX Video VSR/TrueHDR 专用队列 eval 分段拆账 —— 此前 RTX
 // 时间无账目:CPU 录制混进 gpu 段窗口,GPU 执行经 post CL 的队列 Wait 全落
@@ -92,9 +99,14 @@ constexpr uint32_t PAYLOAD_MAGIC = 0x504C5344u; // "DSLP" (v25:saveRequest/uiCor
 // DSL9(v28,0x394C5344):每帧实效位三元(evalActive/ofActive/scalingActive)
 // —— 面板"增强中/光流行/分辨率链"改为直读,不再镜像插件门控公式
 // (插件改门控面板静默错标的整类失配消灭)。
-constexpr uint32_t STATS_MAGIC = 0x414C5344u;   // "DSLA" (v29:gateSkips 死指标删除;
-                                                //  rtx 实效位/数值输出尺寸加入 ——
-                                                //  hdr 打标与分辨率链不再 parse 人读串)
+constexpr uint32_t STATS_MAGIC = 0x424C5344u;   // "DSLB" (v29:gateSkips 死指标删除
+                                                //  + rtx 实效位/数值输出尺寸;
+                                                //  v30:srcHdr 位,见下)
+// v30(DSLB):srcHdr 位(源帧 transfer ∈ {PQ,HLG},面板 gamma 探针经
+// payload 定格)。面板"RTX Video"行凭它区分"HDR 源已旁路"(预期,探针 +
+// create 压制)与"降级 off"(capability/部署问题,红显)—— 没有它 bypass
+// 会话 rtx="off" 恒红显误报。键为纯增量,bump 理由同 v21:成对部署约束,
+// 两端都有明确信号。
 
 #pragma pack(push, 8)
 struct PanelPayload {
@@ -139,6 +151,9 @@ struct PanelPayload {
     int32_t hdrMaxLuminance;     // 400-2000 nits(live)
     int32_t fgHdrInterp;         // 0/1 实验性补帧 HDR 域插值(v23,创建时)
     int32_t antiFlicker;         // 0-4 抗闪烁时域稳定器(v24,live)
+    int32_t srcHdr;              // 0/1 源传输函数探针(v30;面板读 mpv
+                                 // video-params/gamma ∈ {smpte2084,arib-b67};
+                                 // 创建时,消费 = 插件 HDR 源压制,非用户参数)
 };
 #pragma pack(pop)
 
@@ -255,7 +270,7 @@ struct StatsPayload {
     uint32_t magic; // STATS_MAGIC
     uint32_t seq;   // publisher increments per write; 0 = write in progress
 
-    // ---- numbers: 14 float + 13 uint32 (pack(8), no padding gaps) ----
+    // ---- numbers: 14 float + 20 uint32 (pack(8), no padding gaps) ----
     // Render timings are per-frame last values (EMA is the 120-frame rolling
     // mean, consumed by the perf log line only — steady-state EMA reads
     // frozen on the panel). gpuLast sentinel: partial bodies (dead state /
@@ -300,6 +315,9 @@ struct StatsPayload {
     uint32_t rtxHdrActive;  // 本帧 TrueHDR 真参与(HDR 打标直读位)
     uint32_t rtxOutW;       // RTX 输出尺寸(vsr 关 = 源尺寸;分辨率链直读)
     uint32_t rtxOutH;
+    uint32_t srcHdr;        // 源帧为 HDR(transfer ∈ {PQ,HLG},面板 gamma
+                            // 探针定格;未读到 = 0)。RTX HDR 自动旁路的
+                            // 判定位(旁路会话 rtx="off" 非故障)。
 
     // ---- strings: fixed width; overlong copies truncate at the field edge,
     // the struct itself can never be corrupted (CopyStatStr below). Detail

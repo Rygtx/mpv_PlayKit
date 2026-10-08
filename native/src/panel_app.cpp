@@ -215,6 +215,9 @@ bool CreateParamsMapping() noexcept {
     if (g_payload->magic == PAYLOAD_MAGIC && g_payload->seq > 0) {
         LoadLiveParams(g_app.params, *g_payload);
         LoadCreateParams(g_app.params, *g_payload);
+        // 探针比对基准取上一实例的已发布值:重启后 worker 读到同值不触发
+        // 多余 reseek,读到不同值(文件已换)才走主循环探针分支。
+        g_app.lastSrcProbe = g_payload->srcHdr;
     }
     return true;
 }
@@ -226,6 +229,9 @@ void WritePayload() noexcept {
     PanelPayload pl = PayloadFromParams(g_app.params); // shared field mapping; seq stays 0
     pl.generation = g_generation;
     pl.logEnabled = g_app.timingLog ? 1 : 0;
+    // 源传输函数探针(v30):worker 代读 mpv gamma,非用户参数,逐次写入
+    // (-1 未读到 = 0 保守)。
+    pl.srcHdr = g_srcGammaProbe.load(std::memory_order_relaxed) > 0 ? 1 : 0;
     // Publish protocol shared with the plugin's stats channel (panel_ipc.h):
     // body lands with seq 0, the counter moves alone after it is stable.
     PublishWithSeq(&g_payload->seq, newSeq, [&] {
@@ -697,6 +703,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (nowSec - g_app.lastStatsRead > 0.1) {
             g_app.lastStatsRead = nowSec;
             LoadStats();
+        }
+        // 源传输函数探针变化(worker 代读 gamma):折叠进 payload + 触发一次
+        // reseek —— srcHdr 是创建时事实,必须经新脚本 create 采纳。换片后
+        // 新 create 先吃到上一片探针值(首段 ≤0.5s 误向),本次 reseek 收敛;
+        // 之后值稳定,不再触发。
+        {
+            const int probe = g_srcGammaProbe.load(std::memory_order_relaxed);
+            if (probe >= 0 && probe != g_app.lastSrcProbe) {
+                g_app.lastSrcProbe = probe;
+                // reseek 分支会无视节流强制 flush live 变更,无需另设 liveDirty。
+                g_app.reseekDirty = true;
+            }
         }
         // 闭环兜底:DLL 报 kStateNrSeekInit = NR 已开但会话未初始化(在
         // 全关直通实例上开的 NR)。开关瞬间 stats 尚未到位等一切漏判路径

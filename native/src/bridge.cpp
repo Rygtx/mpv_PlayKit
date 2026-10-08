@@ -145,7 +145,9 @@ bool BridgeLoadIni(DlssnrParams &p) noexcept {
 // after every seek until the user touched the panel again. This mirrors the
 // panel's own startup adopt (panel_ipc.h CreateParamsMapping): last live
 // state wins over the ini. Tear-safe read, same protocol as the poll thread.
-bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept {
+// srcHdrOut 非 NULL 时带回 payload 的源传输函数探针位(v30;采纳失败保持
+// 调用方初值)—— 探针是环境事实非用户参数,不进 DlssnrParams。
+bool BridgeAdoptPanelPayload(DlssnrParams &p, int32_t *srcHdrOut) noexcept {
     HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, PARAMS_MAPPING);
     if (!mapping) return false; // no panel this session: keep ini/vpy values
     const PanelPayload *view = static_cast<const PanelPayload *>(
@@ -160,6 +162,7 @@ bool BridgeAdoptPanelPayload(DlssnrParams &p) noexcept {
         {
             LoadLiveParams(p, snap); // shared field mapping, clamps included
             LoadCreateParams(p, snap);
+            if (srcHdrOut) *srcHdrOut = snap.srcHdr;
             adopted = true;
             // 探针:采纳了面板哪一版 payload(#37"seek 后参数回退"的
             // 决定性证据 —— 采纳失败时这行缺失,配合 create params 行

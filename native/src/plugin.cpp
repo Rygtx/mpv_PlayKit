@@ -335,21 +335,32 @@ static void SetHdrFrameProps(VSFrame *frame, const VSAPI *vsapi) noexcept {
 
 // 从源帧 props 解析色彩矩阵/范围(缺失/未知回落 709 limited);值变化时
 // 留痕一行(atomic 边沿去重)。VS _Matrix:1=BT.709,5(BT470BG)/6(SMPTE170M)
-// =601 族,4(XYZ)=601 近似(D65 录制内容的可用降级);9(BT.2020)/0(GBR)
-// 等超范围按 709 处理(vpy 层已有 HDR 直通守卫,到这里的多半是属性缺失
-// 的裸流)。
+// =601 族,4(XYZ)=601 近似(D65 录制内容的可用降级),9(BT.2020)=2020。
+// mpv 的 vf_vapoursynth 桥不写 VS 标准名 _Matrix,矩阵落在 `_ColorSpace`
+// (值域同 H.273 编号,2026-10-08 实测 dump);_Transfer/_Primaries 两名
+// 均无(HDR 判定走面板 gamma 探针,见 panel_ipc.h v30)。故 _Matrix 缺失
+// 时 fallback 读 _ColorSpace。
 static void ParseColorProps(const VSMap *props, const VSAPI *vsapi,
                             vsdlssnr::ColorMatrix &matrix,
                             vsdlssnr::ColorRange &range) noexcept {
     int perr = 0;
-    const int matrixProp = vsapi->mapGetInt(props, "_Matrix", 0, &perr);
-    const bool matrixKnown = perr == 0;
+    int matrixProp = vsapi->mapGetInt(props, "_Matrix", 0, &perr);
+    bool matrixKnown = perr == 0;
+    const char *matrixSrc = "_Matrix";
+    if (!matrixKnown) {
+        perr = 0;
+        matrixProp = vsapi->mapGetInt(props, "_ColorSpace", 0, &perr);
+        matrixKnown = perr == 0;
+        matrixSrc = "_ColorSpace";
+    }
     perr = 0;
     const int rangeProp = vsapi->mapGetInt(props, "_ColorRange", 0, &perr);
     const bool rangeKnown = perr == 0;
     matrix = vsdlssnr::ColorMatrix::BT709;
     if (matrixKnown && (matrixProp == 4 || matrixProp == 5 || matrixProp == 6)) {
         matrix = vsdlssnr::ColorMatrix::BT601;
+    } else if (matrixKnown && matrixProp == 9) {
+        matrix = vsdlssnr::ColorMatrix::BT2020;
     }
     range = vsdlssnr::ColorRange::Limited;
     if (rangeKnown && rangeProp == 0) range = vsdlssnr::ColorRange::Full;
@@ -358,10 +369,11 @@ static void ParseColorProps(const VSMap *props, const VSAPI *vsapi,
     if (lastSig.exchange(sig, std::memory_order_relaxed) != sig) {
         char msg[160];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: frame props matrix=%s(%d) range=%s(%d) -> %s/%s",
-                      matrixKnown ? "yes" : "missing", matrixProp,
+                      "DLSSNR STATUS: frame props matrix=%s(%d via %s) range=%s(%d) -> %s/%s",
+                      matrixKnown ? "yes" : "missing", matrixProp, matrixSrc,
                       rangeKnown ? "yes" : "missing", rangeProp,
-                      matrix == vsdlssnr::ColorMatrix::BT709 ? "709" : "601",
+                      matrix == vsdlssnr::ColorMatrix::BT709 ? "709"
+                      : matrix == vsdlssnr::ColorMatrix::BT2020 ? "2020" : "601",
                       range == vsdlssnr::ColorRange::Limited ? "limited" : "full");
         vsdlssnr::TimingStatusLine(msg);
     }
@@ -987,7 +999,19 @@ static void VS_CC DlssnrCreateImpl(
     ApplyIntArg(in, vsapi, "hdr_middle_gray", initial.rtxHdrMiddleGray, kHdrMiddleGrayMin, kHdrMiddleGrayMax);
     ApplyIntArg(in, vsapi, "hdr_peak_nits", initial.rtxHdrMaxLuminance, kHdrMaxLumMin, kHdrMaxLumMax);
     const bool iniLoaded = vsdlssnr::BridgeLoadIni(initial);
-    const bool payloadAdopted = vsdlssnr::BridgeAdoptPanelPayload(initial);
+    int32_t payloadSrcHdr = 0;
+    const bool payloadAdopted = vsdlssnr::BridgeAdoptPanelPayload(initial, &payloadSrcHdr);
+    // HDR 源自动旁路 RTX HDR(2026-10-08):TrueHDR 官方只吃 SDR 输入
+    // (dlssnr_params.h kVsrModeMin 注),PQ/HLG 源照喂 = 码值双重映射失真。
+    // 压制点必须在三层合并(vpy→ini→payload)之后:面板几乎常驻,payload
+    // 恒覆盖 vpy 值,门放合并前会被打穿;放合并后 = 探针事实最终裁决,
+    // 面板改 HDR 开关经 reseek 重跑脚本同样重新过门。
+    // 探针源唯一 = 面板 payload(打标 worker 代读 mpv video-params/gamma
+    // 写入;mpv 的 vf_vapoursynth 桥不写 _Transfer 进帧 props,实测 v0.41
+    // 只有 _ColorSpace/_ColorRange/_ChromaLocation,vpy 侧探不到传输函数)。
+    // srcHdr 随 _hdrActive 落 false → 输出沿用源格式,newVideoFrame 继承
+    // 源 props(PQ/HLG 标记原样保留);fg_hdr_interp 折叠基准同锁。
+    if (payloadSrcHdr) initial.rtxHdrEnabled = 0;
     // mode=1 的 mpv 窗口客户区探测(三层裁决的唯一 probe 写入点)。
     ResolveRtxParams(initial, d->width, d->height);
     // 探针:三层参数源(vpy 默认 → ini → 面板 payload)的最终裁决值。
@@ -1001,8 +1025,9 @@ static void VS_CC DlssnrCreateImpl(
                                       : d->subW == 1 && d->subH == 1 ? "420" : "?";
         char msg[288];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: create params %dx%dd%d %s ini=%d payload=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d fg_hdr=%d af=%d",
+                      "DLSSNR STATUS: create params %dx%dd%d %s ini=%d payload=%d hsrc=%d -> nr=%d preset=%d res=%d%% scaling=%d of=%d ffx=%d follow=%d fg=%d mult=%d route=%d fg_hdr=%d af=%d",
                       d->width, d->height, d->depth, layout, iniLoaded ? 1 : 0, payloadAdopted ? 1 : 0,
+                      payloadSrcHdr,
                       initial.nrEnabled ? 1 : 0, initial.preset, initial.inputResolutionPercent,
                       initial.scalingEnabled ? 1 : 0, initial.motionVectorQuality,
                       initial.ffxQuality,
@@ -1097,8 +1122,9 @@ static void VS_CC DlssnrCreateImpl(
     // NR+FG+RTX 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开
     // 秒回);仅 NR 关而 FG/RTX 开仍需热复用(设备与上下文都在用)。
     // ctx 载荷从合并后的 DlssnrParams 折出(probe 已在 ResolveRtxParams
-    // 填入)。
-    const RtxVideoParams rtx = RtxFromParams(initial);
+    // 填入);srcHdr 探针(压制的同一事实)随载荷进 ctx 作 stats 发布源。
+    RtxVideoParams rtx = RtxFromParams(initial);
+    rtx.srcHdr = payloadSrcHdr;
     // 生命周期锁:覆盖热匹配判定 → 冷初始化结束(见 g_lifecycleMutex 定义
     // 处注释)。冷初始化 ~1s 在锁内 —— 并发的 Free 最多等一个冷启动周期。
     std::lock_guard<std::mutex> lifecycleLock(g_lifecycleMutex);
@@ -1193,6 +1219,7 @@ static void VS_CC DlssnrCreateImpl(
             vsdlssnr::StatsPayload st{};
             vsdlssnr::CopyStatStr(st.filterState, "passthrough");
             vsdlssnr::CopyStatStr(st.stateDetail, safe);
+            st.srcHdr = payloadSrcHdr; // 直通体也带探针位(面板旁路显示同判)
             vsdlssnr::PublishStats(st);
         }
     }
@@ -1206,6 +1233,7 @@ static void VS_CC DlssnrCreateImpl(
         vsdlssnr::StatsPayload st{};
         vsdlssnr::CopyStatStr(st.filterState, "passthrough");
         vsdlssnr::CopyStatStr(st.stateDetail, "NR+FG+RTX disabled (panel/vpy)");
+        st.srcHdr = payloadSrcHdr; // 同上:直通体带探针位
         vsdlssnr::PublishStats(st);
         if (!vsdlssnr::BridgeStart(d->params)) WarnBridgeFailed(core, vsapi);
         vsdlssnr::TimingStatusLine("DLSSNR STATUS: NR+FG+RTX disabled; passthrough (zero GPU)");

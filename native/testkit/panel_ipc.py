@@ -16,8 +16,10 @@ import re
 import struct
 
 PAYLOAD_SIZE = 2048
-PAYLOAD_MAGIC = 0x504C5344  # "DSLP" (v25: saveRequest/uiCorrection 死字段删除)
-STATS_MAGIC = 0x414C5344  # "DSLA" (v29: gateSkips 删除 + rtx 实效位/数值尺寸)
+PAYLOAD_MAGIC = 0x514C5344  # "DSLQ" (v25: saveRequest/uiCorrection 删除;v29: v22-24 键全量;
+                            #  v30: src_hdr —— 源传输函数探针,插件 HDR 源压制消费)
+STATS_MAGIC = 0x424C5344  # "DSLB" (v29: gateSkips 删除 + rtx 实效位/数值尺寸;
+                          #  v30: src_hdr 位 —— HDR 源旁路判定)
 
 PARAMS_MAPPING = "vs_dlssnr_panel_params"
 STATS_MAPPING = "vs_dlssnr_stats"
@@ -69,6 +71,7 @@ SK = {
     "rtx_hdr_active": "rtx_hdr_active",
     "rtx_out_w": "rtx_out_w",
     "rtx_out_h": "rtx_out_h",
+    "src_hdr": "src_hdr",
     "temporal": "temporal",
     "temporal_route": "temporal_route",
     "temporal_w": "temporal_w",
@@ -77,12 +80,12 @@ assert len(set(SK.values())) == len(SK), "SK 键名表内有重复值"
 
 # mirror of StatsPayload (panel_ipc.h #pragma pack push,8;v27 起定长 struct,
 # 旧 JSON 键名保留为 dict 键)。布局:2I magic,seq | 14f 计时/权重 |
-# 19I 尺寸/倍数/门累计/实效位(DSL9 三位 + DSLA rtx 四项;gate_skips 已删)|
-# 13 段定长字符串(v28 起含 model_dll)。错位 = 读出乱码,断言即炸 ——
-# 尺寸断言是同步防线(与 _STRUCT 同一教训)。1096 = C++ sizeof(pack(8),
-# 尾部对齐到 4)。
-_STATS_STRUCT = struct.Struct("<II14f19I160s64s200s16s40s16s16s128s96s96s96s10s16s")
-assert _STATS_STRUCT.size == 1094, "StatsPayload 布局与 panel_ipc.h 不一致(C++ sizeof=1096)"
+# 20I 尺寸/倍数/门累计/实效位(DSL9 三位 + DSLA rtx 四项 + DSLB src_hdr;
+# gate_skips 已删)| 13 段定长字符串(v28 起含 model_dll)。错位 = 读出
+# 乱码,断言即炸 —— 尺寸断言是同步防线(与 _STRUCT 同一教训)。
+# 1098 = python pack 尺寸;C++ sizeof(pack(8),尾部对齐到 4)= 1100。
+_STATS_STRUCT = struct.Struct("<II14f20I160s64s200s16s40s16s16s128s96s96s96s10s16s")
+assert _STATS_STRUCT.size == 1098, "StatsPayload 布局与 panel_ipc.h 不一致(C++ sizeof=1100)"
 _STATS_FIELDS = (
     "magic", "seq",
     "gpu_last", "pack_last", "eval_cpu_last", "unpack_last",
@@ -92,16 +95,16 @@ _STATS_FIELDS = (
     "fg_mult", "fg_mult_create", "fg_mult_max",
     "gate_expired", "gate_resets", "gpu_hang", "temporal_route",
     "eval_active", "of_active", "scaling_active",
-    "rtx_vsr_active", "rtx_hdr_active", "rtx_out_w", "rtx_out_h",
+    "rtx_vsr_active", "rtx_hdr_active", "rtx_out_w", "rtx_out_h", "src_hdr",
     "gpu_name", "model_dll", "state_detail", "filter_state", "of_mode", "fg",
     "fg_route_eff", "fg_detail", "of_detail", "rtx", "rtx_detail", "temporal",
     "removed_reason",
 )
-assert len(_STATS_FIELDS) == 2 + 14 + 19 + 13 == len(set(_STATS_FIELDS))
-_STATS_STR_START = 2 + 14 + 19  # 首个字符串字段在字段元组中的下标
+assert len(_STATS_FIELDS) == 2 + 14 + 20 + 13 == len(set(_STATS_FIELDS))
+_STATS_STR_START = 2 + 14 + 20  # 首个字符串字段在字段元组中的下标
 _STATS_STR_WIDTHS = [int(w) for w in re.findall(r"(\d+)s", _STATS_STRUCT.format)]
 assert len(_STATS_STR_WIDTHS) == 13
-assert sum(_STATS_STR_WIDTHS) == _STATS_STRUCT.size - 8 - 14 * 4 - 19 * 4
+assert sum(_STATS_STR_WIDTHS) == _STATS_STRUCT.size - 8 - 14 * 4 - 20 * 4
 
 
 def pack_stats(stats, seq=1):
@@ -132,10 +135,10 @@ def pack_stats(stats, seq=1):
 # ffxQuality,nvofFollowScaling,fgEnabled,fgMultiplier,fgRoute,nrEnabled,
 # debugView,ofBackend | i f(vsrMode,vsrScale)| 8i vsrStrength,hdrEnabled,
 # hdrContrast,hdrSaturation,hdrMiddleGray,hdrMaxLuminance,fgHdrInterp,
-# antiFlicker
-# (v24 增 antiFlicker;v25 删 uiCorrection/saveRequest。)
-_STRUCT = struct.Struct("<3I2i4f2i5f11iif8i")
-assert _STRUCT.size == 148, "PanelPayload 布局与 panel_ipc.h 不一致"
+# antiFlicker | 1i srcHdr(v30)
+# (v24 增 antiFlicker;v25 删 uiCorrection/saveRequest;v30 增 src_hdr。)
+_STRUCT = struct.Struct("<3I2i4f2i5f11iif9i")
+assert _STRUCT.size == 152, "PanelPayload 布局与 panel_ipc.h 不一致"
 
 DEFAULTS = dict(
     preset=0, style=0,
@@ -151,6 +154,7 @@ DEFAULTS = dict(
     hdrEnabled=0, hdrContrast=100, hdrSaturation=100,
     hdrMiddleGray=50, hdrMaxLuminance=1000,
     fgHdrInterp=0, antiFlicker=0,
+    src_hdr=0,
 )
 
 _FIELDS = ("magic", "seq", "generation", "preset", "style",
@@ -164,7 +168,7 @@ _FIELDS = ("magic", "seq", "generation", "preset", "style",
            "ofBackend",
            "vsrMode", "vsrScale", "vsrStrength", "hdrEnabled", "hdrContrast",
            "hdrSaturation", "hdrMiddleGray", "hdrMaxLuminance", "fgHdrInterp",
-           "antiFlicker")
+           "antiFlicker", "src_hdr")
 
 PAGE_READWRITE = 0x04
 FILE_MAP_READ = 0x0004
@@ -204,7 +208,7 @@ class ParamsChannel:
             vals["vsrMode"], vals["vsrScale"], vals["vsrStrength"],
             vals["hdrEnabled"], vals["hdrContrast"], vals["hdrSaturation"],
             vals["hdrMiddleGray"], vals["hdrMaxLuminance"], vals["fgHdrInterp"],
-            vals["antiFlicker"])
+            vals["antiFlicker"], vals["src_hdr"])
         assert len(data) == _STRUCT.size, "PanelPayload pack 布局与 panel_ipc.h 不一致"
         ctypes.memmove(ctypes.c_void_p(self._view), data, len(data))
 
