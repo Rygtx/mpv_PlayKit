@@ -2277,6 +2277,14 @@ bool DlssnrContext::ProcessFrame(
         densifyInternal =
             nvW != static_cast<uint32_t>(width) || nvH != static_cast<uint32_t>(height);
         const int ofKind = _ofBackend->Kind();
+        // 整帧 CopyTextureRegion 要求源格式 == 注册输入格式(BGRA8):
+        // 管线色 RGBA16F(>8bit 无 RTX)/ R10G10B10A2(VSR-only 10bit)时
+        // 格式不匹配,nvof CL Close 恒败 → 连败闩锁 NVOF 自禁用
+        //(2026-10-08 用户 10-bit 实测定案)。非 follow + 非 BGRA8 改走
+        // 同款降采样 shader 1:1 直写(SRV 读格式无关);BGRA8 保留零拷贝。
+        const bool nvofInputViaShader =
+            ofKind == kOfBackendNvof && !densifyInternal &&
+            _d3d12->ColorFormat() != DXGI_FORMAT_B8G8R8A8_UNORM;
         if (ofKind == kOfBackendNvof) {
             // ---- NVOF:网格流(1/32 像素定点)densify(原 PORTING #6 路径)----
             NvofContext *nv = static_cast<NvofContext *>(_ofBackend.get());
@@ -2317,12 +2325,14 @@ bool DlssnrContext::ProcessFrame(
             // YUV 原生:postCopy 恒设 —— 回调在 nvof CL 第一次提交上记录
             // YUV→RGB 转换,follow 时追加 RecordNvofDownsample 直写注册输入
             // 纹理;非 follow 由 StageFrame 随后做整帧纹理拷贝。
-            postCopy = [this, &slot, nvW, nvH, densifyInternal, matrix, range](ID3D12GraphicsCommandList *cl, int inputIndex) {
+            postCopy = [this, &slot, nvW, nvH, densifyInternal, nvofInputViaShader,
+                        width, height, matrix, range](ID3D12GraphicsCommandList *cl, int inputIndex) {
                 _d3d12->RecordConvertInput(*cl, *slot, matrix, range,
                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (densifyInternal) {
+                if (densifyInternal || nvofInputViaShader) {
                     _d3d12->RecordNvofDownsample(*cl, *slot,
-                                                 static_cast<int>(nvW), static_cast<int>(nvH),
+                                                 static_cast<int>(densifyInternal ? nvW : width),
+                                                 static_cast<int>(densifyInternal ? nvH : height),
                                                  inputIndex);
                 }
             };
@@ -2378,7 +2388,8 @@ bool DlssnrContext::ProcessFrame(
         // 记与旧"门内全程"形态等价。FFX:门锁不动、densify 门内已提交,
         // 冲刷恒 no-op。
         const OfStageResult st =
-            _ofBackend->StageFrame(n, _d3d12->InputColor(*slot), post, postCopy, densifyInternal, ofGate);
+            _ofBackend->StageFrame(n, _d3d12->InputColor(*slot), post, postCopy,
+                                   densifyInternal || nvofInputViaShader, ofGate);
         nvofHistoryReset = st.historyReset;
         nvofMs = _ofBackend->LastStageMs();
         realMotion = st.waitFenceValue != 0;

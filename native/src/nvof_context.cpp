@@ -565,9 +565,11 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             };
             copyCl->ResourceBarrier(1, toCommon);
             if (!inputWrittenByPostCopy) {
-                // 非 follow:回调只做了转换(srcTex=inputColor,NSR),把整帧
-                // 纹理拷进 _input[cur](目标 COMMON 靠隐式提升,与旧 buffer
-                // 拷贝同款;源 NSR→COPY_SOURCE→copy→回 NSR)。
+                // 非 follow 且管线色为 BGRA8:回调只做了转换(srcTex=inputColor,
+                // NSR),把整帧纹理拷进 _input[cur](目标 COMMON 靠隐式提升,与
+                // 旧 buffer 拷贝同款;源 NSR→COPY_SOURCE→copy→回 NSR)。
+                // 管线色非 BGRA8(RGBA16F/R10G10B10A2)时裸拷贝格式非法,
+                // 输入由回调内 shader 直写(inputWrittenByPostCopy=true)不走此支。
                 D3D12_RESOURCE_BARRIER toSrc[1]{
                     Transition(srcTex,
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
