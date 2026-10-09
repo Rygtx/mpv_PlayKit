@@ -96,13 +96,13 @@ struct RtxVideoParams {
     // 内 GetClientRect 零桥接,clamp 到所在显示器)填入;链创建粒度,非
     // 持久化字段,ini 不读写。窗口换屏/改尺寸后的生效点 = 下一次链重建。
     int vsrAutoHeight = 2160;
-    // 源帧 HDR 探针(面板打标 worker 代读 mpv video-params/gamma ∈
-    // {pq,hlg},经 payload srcHdr 采纳;vsrAutoHeight 同款链创建粒度字段,
-    // 非持久化,不进 ==)。消费点唯一:DlssnrCreate 三层合并(vpy→ini→
-    // payload)之后强制压制 rtxHdrEnabled(TrueHDR 官方只吃 SDR 输入,
-    // HDR 源旁路),再经 Initialize/Rebind 落 ctx _srcHdr 供 stats 发布。
-    // 面板"HDR 源已旁路"显示由此位与请求态组合判定。
-    int srcHdr = 0;
+    // 源帧 HDR 探针位(面板打标 worker 代读 mpv video-params/gamma ∈
+    // {pq,hlg},经 payload srcHdr 采纳)不经本结构:DlssnrCreate 三层合并
+    //(vpy→ini→payload)之后强制压制 rtxHdrEnabled(TrueHDR 官方只吃 SDR
+    // 输入,HDR 源旁路),同一采纳点直接落 stats 探针单存储(panel_ipc.h
+    // StatsSrcHdrStore;PublishStats 单点盖章,2026-10-09 评审修:曾借道
+    // 本字段进 context 再进全局,三点两账)。面板"HDR 源已旁路"显示由此
+    // 位与请求态组合判定。
     // TrueHDR(0/1):输出域切换为 HDR10 —— 滤镜输出 YUV420P10(BT.2020
     // PQ limited),上屏由面板自动同步(vf 打标 + target-colorspace-hint)。
     // 创建时。vsrStrength 与 HDR 四参(对比度/饱和度/中间灰/峰值)是

@@ -17,6 +17,10 @@ import testenv  # noqa: E402
 
 testenv.require_env()
 testenv.require_nvidia()
+# 前提钉死(2026-10-09):用户 ini nr_enabled=0 会覆盖下方 nr_enabled=1
+# vpy 参数(插件顺序 vpy→ini→payload),基准静默退化为 memcpy 计时。
+testenv.solo_panel()
+testenv.ini_isolated()  # 清空 + 退出恢复(统一配方,防用户 ini 现场)
 
 import vapoursynth as vs  # noqa: E402
 from vapoursynth import core  # noqa: E402

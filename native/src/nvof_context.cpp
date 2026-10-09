@@ -338,8 +338,9 @@ bool NvofContext::CreateSession(D3D12Context &d3d12, int width, int height,
     const uint32_t flowH =
         (static_cast<uint32_t>(height) + _gridSize - 1) / _gridSize;
     ID3D12Resource *tex[6]{};
+    _inputFmt = ToDxgi(NV_OF_BUFFER_FORMAT_ABGR8); // 裸拷贝格式防御比对值(见 StageFrame)
     for (int i = 0; i < 2; ++i) {
-        if (!CreateRegisteredTexture(device, ToDxgi(NV_OF_BUFFER_FORMAT_ABGR8),
+        if (!CreateRegisteredTexture(device, _inputFmt,
                                      static_cast<uint32_t>(width),
                                      static_cast<uint32_t>(height),
                                      _input[i].GetAddressOf())) {
@@ -545,7 +546,30 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
         // 等待兜底。
         ID3D12CommandAllocator *copyAlloc = nullptr;
         ID3D12GraphicsCommandList *copyCl = nullptr;
-        bool copyOk = AcquireCl(&copyAlloc, &copyCl, freq);
+        // 本地格式防御(2026-10-08 评审修):裸拷贝要求源格式 == 注册输入
+        // 格式,唯一防线原是调用方 flag(inputWrittenByPostCopy)—— flag
+        // 算错即落进非法拷贝(nvof CL Close 恒败连败自禁用,正是 10-bit
+        // 实测的原始故障形态)。此处独立复检真实格式,失配按拷贝失败记账
+        //(下方失败路径:播种降级 + 连败闩锁),flag 降级为快路径提示。
+        // 格式会话内恒不变:双方各锁存一次免逐帧 GetDesc 全量 desc 拷贝
+        //(2026-10-09 评审修)。失配判定在 AcquireCl 之前:此前失配帧仍录
+        // 满一整条 CL 再丢弃,且落进通用失败分支误报 "copy submit failed"
+        //(test_nvof_yuv10 的计数对象),真因被日志带偏 —— 同日修。
+        if (_srcFmtLatched == DXGI_FORMAT_UNKNOWN) {
+            _srcFmtLatched = srcTex->GetDesc().Format;
+        }
+        const bool copyFormatMismatch =
+            !inputWrittenByPostCopy && _srcFmtLatched != _inputFmt;
+        bool copyOk = false;
+        if (copyFormatMismatch) {
+            char msg[128];
+            std::snprintf(msg, sizeof(msg),
+                          "DLSSNR STATUS: nvof input format mismatch frame=%d (copy skipped)",
+                          frameIndex);
+            TimingStatusLine(msg);
+        } else {
+            copyOk = AcquireCl(&copyAlloc, &copyCl, freq);
+        }
         if (copyOk) {
             // YUV 原生:postCopy 恒设 —— 回调在本 nvof CL 上记录 YUV→RGB
             // 转换(yuvUpload→yuvIn 拷贝 + dispatch → inputColor);follow 时
@@ -565,11 +589,12 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             };
             copyCl->ResourceBarrier(1, toCommon);
             if (!inputWrittenByPostCopy) {
-                // 非 follow 且管线色为 BGRA8:回调只做了转换(srcTex=inputColor,
-                // NSR),把整帧纹理拷进 _input[cur](目标 COMMON 靠隐式提升,与
-                // 旧 buffer 拷贝同款;源 NSR→COPY_SOURCE→copy→回 NSR)。
-                // 管线色非 BGRA8(RGBA16F/R10G10B10A2)时裸拷贝格式非法,
-                // 输入由回调内 shader 直写(inputWrittenByPostCopy=true)不走此支。
+                // 非 follow 且管线色为 BGRA8(失配已在上游拦截):回调只做了
+                // 转换(srcTex=inputColor,NSR),把整帧纹理拷进 _input[cur]
+                //(目标 COMMON 靠隐式提升,与旧 buffer 拷贝同款;源
+                // NSR→COPY_SOURCE→copy→回 NSR)。管线色非 BGRA8(RGBA16F/
+                // R10G10B10A2)时裸拷贝格式非法,输入由回调内 shader 直写
+                //(inputWrittenByPostCopy=true)不走此支。
                 D3D12_RESOURCE_BARRIER toSrc[1]{
                     Transition(srcTex,
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -605,14 +630,17 @@ NvofContext::StageResult NvofContext::StageFrame(int frameIndex,
             // 失败会被误闩,2026-10-04 评审修)。
             _consecutiveFailures = 0;
         } else {
-            // 拷贝失败:清零 + 重置(下帧重新播种)。失败必须进 timing log。
-            // 链断(InvalidateHistory)= 连败闩锁语义内,计入(2026-10-04:
-            // 此前只有 execute 失败计数,拷贝风暴永不自停)。
-            char msg[128];
-            std::snprintf(msg, sizeof(msg),
-                          "DLSSNR STATUS: nvof copy submit failed frame=%d", frameIndex);
-            OutputDebugStringA("vs_dlssnr: nvof copy submit failed\n");
-            TimingStatusLine(msg);
+            // 拷贝失败/格式失配:清零 + 重置(下帧重新播种)。真实提交失败
+            // 必须进 timing log(失配已带各自原因行,不再叠误报);链断
+            //(InvalidateHistory)= 连败闩锁语义内,计入(2026-10-04:此前
+            // 只有 execute 失败计数,拷贝风暴永不自停)。
+            if (!copyFormatMismatch) {
+                char msg[128];
+                std::snprintf(msg, sizeof(msg),
+                              "DLSSNR STATUS: nvof copy submit failed frame=%d", frameIndex);
+                OutputDebugStringA("vs_dlssnr: nvof copy submit failed\n");
+                TimingStatusLine(msg);
+            }
             result.historyReset = true;
             _gate.InvalidateHistory(); // 参考帧未更新,历史链断
             LatchFailure(_consecutiveFailures, _ready, "nvof");

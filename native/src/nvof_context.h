@@ -204,6 +204,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> _flow[2];
     Microsoft::WRL::ComPtr<ID3D12Resource> _cost[2];
     NvOFGPUBufferHandle _registered[6]{};
+    // 裸拷贝格式防御的比对值(2026-10-09 评审修):会话内恒不变,注册时/
+    // 首帧各锁存一次,免逐帧 GetDesc 全量 desc 拷贝(_inputFmt = ABGR8
+    // 注册常量;_srcFmtLatched = 首帧 srcTex 实际格式)。
+    DXGI_FORMAT _inputFmt = DXGI_FORMAT_UNKNOWN;
+    DXGI_FORMAT _srcFmtLatched = DXGI_FORMAT_UNKNOWN;
 
     // 拷贝命令路径:4 深轮转池(2026-09-25;2026-10-03 实体收拢到
     // of_backend.h OfClRotator,NVOF/FFX 共用)。copy 与 densify 各占一个

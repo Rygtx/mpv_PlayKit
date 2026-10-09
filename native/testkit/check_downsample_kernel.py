@@ -14,20 +14,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402
-testenv.ini_restore_on_exit()  # 部署 ini 现场保护(2026-09-25 收敛)
 
 testenv.require_env()
 testenv.require_nvidia()
 
-if os.path.exists(testenv.INI):
-    os.remove(testenv.INI)
-# 面板残留清场:面板 payload 会覆盖 vpy kwargs(#37 优先级),配置差异被抹平
-testenv.kill_panel()
-import time  # noqa: E402
-time.sleep(1)
+# ini 隔离 + 面板残留清场(2026-10-09 评审修,与 validate_params 同批收口)
+testenv.ini_isolated()
+testenv.solo_panel()
 # 同进程多实例共享 NGX 时域历史(见 validate_params.py 注释):哈希断言
 # 只在"每配置一个进程"下可靠。本脚本用 driver+worker 模式跑。
-os.environ["VSDLSSNR_NO_PANEL"] = "1"
 
 WORKER = r'''
 import ctypes, hashlib, json, sys

@@ -29,9 +29,14 @@ testenv.require_nvidia()
 # 真实面板清场(对齐 test_ipc.py):真实面板 adopt 会以自己的 generation
 # 重写映射并下发面板 ini 的档位,recreate 防线可被噪声灌满空心化
 # (2026-10-05 评审修)。
-testenv.kill_panel()
-os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")
-time.sleep(1)
+testenv.solo_panel()
+# 前提钉死(2026-10-09):res 档重建需要存活的 NGX feature;用户 ini
+# nr_enabled=0 时 mpv 侧是全关直通实例,recreate 防线恒 0 空转。清空 +
+# 退出恢复(统一配方,用户其余档位如 FG 不再泄入 mpv 会话)后双钉
+# nr+scaling(参数语义见 README:res 档闸门 = scaling_enabled)。
+testenv.ini_isolated()
+testenv.set_ini("dlssnr", "nr_enabled", 1)
+testenv.set_ini("dlssnr", "scaling_enabled", 1)
 
 source = sys.argv[1] if len(sys.argv) > 1 else "av://lavfi:testsrc2"
 VPY = "~~/vs/DLSSNR_NV.vpy"

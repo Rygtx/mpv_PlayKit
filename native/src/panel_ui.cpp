@@ -831,11 +831,21 @@ void DrawDiagPage(UiCtx &ui) noexcept {
                 // RTX 请求 vs 实际:请求开(vsrMode>0 / hdrEnabled)而实态
                 // off = 降级(capability/部署问题),原因串 rtx_detail 红显。
                 // 例外:HDR 源已旁路(src_hdr=1,面板请求仍 HDR)= 预期 off
-                // —— gamma 探针 + 插件 create 压制,非故障,不红显。
+                // —— gamma 探针 + 插件 create 压制,非故障,不红显。旁路只
+                // 解释"无原因串的 off":真实 VSR 故障与旁路并存时(detail
+                // 非空)照常红显,旁路文案吃掉故障原因 = 降级不可见
+                //(2026-10-08 评审修)。
                 {
                     const bool vsrReq = g_app.params.rtxVsrMode != 0;
                     const bool hdrReq = g_app.params.rtxHdrEnabled != 0;
-                    const bool hdrBypassed = hdrReq && g_app.snap.srcHdr != 0;
+                    // rtx 非空门:死体(ngx_faulted/初始化失败)与 GPU 挂起体
+                    // 的 rtx/rtxDetail 均为空,srcHdr 却带着 —— 不加此门会把
+                    // 真故障渲染成良性旁路,与上方滤镜状态行的红显自相矛盾
+                    //(2026-10-09 评审修)。活体会话 rtx 恒有值("off" 或
+                    // "vsr …"),不受影响。
+                    const bool hdrBypassed = hdrReq && g_app.snap.srcHdr != 0 &&
+                                             g_app.snap.rtxDetail[0] == '\0' &&
+                                             g_app.snap.rtx[0] != '\0';
                     char rtxReq[64];
                     if (!vsrReq && !hdrReq) {
                         std::snprintf(rtxReq, sizeof(rtxReq), "关");

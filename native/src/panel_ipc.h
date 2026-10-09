@@ -8,6 +8,7 @@
 
 #include "dlssnr_params.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -152,8 +153,10 @@ struct PanelPayload {
     int32_t fgHdrInterp;         // 0/1 实验性补帧 HDR 域插值(v23,创建时)
     int32_t antiFlicker;         // 0-4 抗闪烁时域稳定器(v24,live)
     int32_t srcHdr;              // 0/1 源传输函数探针(v30;面板读 mpv
-                                 // video-params/gamma ∈ {smpte2084,arib-b67};
-                                 // 创建时,消费 = 插件 HDR 源压制,非用户参数)
+                                 // video-params/gamma ∈ {pq,hlg} —— mpv
+                                 // 实测返回串拼写,非编码侧 smpte2084/
+                                 // arib-b67,勿"勘误"匹配串;创建时,消费
+                                 // = 插件 HDR 源压制,非用户参数)
 };
 #pragma pack(pop)
 
@@ -411,6 +414,22 @@ inline bool ReadWithSeq(const T *view, T *snap, MagicT magic) noexcept {
 // 与"插件没加载"无法区分。
 inline void (*g_statsChannelFailLog)(const char *) = nullptr;
 
+// 源帧 HDR 探针位(StatsPayload.srcHdr 的单点数据源,v30;2026-10-09 评审
+// 修收口):写点唯一 = DlssnrCreate 采纳 payload 时(plugin.cpp),读点唯一
+// = 下方 PublishStats 的单点盖章。此前 8 个发布点里 5 个手写盖章,每个新
+// body 都得记得带 —— 无会话边沿体漏带就是面板把 HDR 源误读成 SDR(同周
+// 两起)。头文件层函数局部 static:写者(plugin.cpp)与发布器
+// (dlssnr_context.cpp)分属不同 TU,inline = 单实例。
+inline std::atomic<int> &StatsSrcHdrSlot() noexcept {
+    static std::atomic<int> slot{ 0 };
+    return slot;
+}
+
+// 唯一写点(DlssnrCreate 采纳):归一 0/1 后落存储。
+inline void StatsSrcHdrStore(int v) noexcept {
+    StatsSrcHdrSlot().store(v != 0 ? 1 : 0, std::memory_order_relaxed);
+}
+
 inline bool PublishStats(const StatsPayload &st) noexcept {
     // Every publisher (the per-frame stats publish in ProcessFrame, the
     // GPU-hang path in WaitFenceValue, Initialize) serializes
@@ -457,6 +476,9 @@ inline bool PublishStats(const StatsPayload &st) noexcept {
     }
     PublishWithSeq(&view->seq, ++seq, [&] {
         *view = st; // plain field copy; no format step, nothing to truncate
+        // srcHdr 单点盖章(见 StatsSrcHdrSlot):覆盖 st 自带值,发布者无需
+        //(也不得)自带 —— 探针位恒反映当前采纳事实。
+        view->srcHdr = StatsSrcHdrSlot().load(std::memory_order_relaxed) ? 1u : 0u;
         view->magic = STATS_MAGIC;
     });
     return true;

@@ -215,8 +215,12 @@ bool CreateParamsMapping() noexcept {
     if (g_payload->magic == PAYLOAD_MAGIC && g_payload->seq > 0) {
         LoadLiveParams(g_app.params, *g_payload);
         LoadCreateParams(g_app.params, *g_payload);
-        // 探针比对基准取上一实例的已发布值:重启后 worker 读到同值不触发
-        // 多余 reseek,读到不同值(文件已换)才走主循环探针分支。
+        // 探针基准从遗留 payload 播种(2026-10-09 评审修,反转 2026-10-08
+        // 的"不播种"裁定):活滤镜实例是死窗口里按遗留 srcHdr create 的,
+        // 播种值 = 该实例真实持有的 create 事实 —— 当前文件与遗留值一致时
+        // 不触发多余 reseek(重启免一次可见卡顿),不一致时探针边沿必触发
+        // (死窗口换片/换 mpv 后 SDR 文件顶着陈旧 srcHdr=1 的场景,不播种
+        // 恰好失明)。该值同时是 WritePayload 的发布源(单值双职能)。
         g_app.lastSrcProbe = g_payload->srcHdr;
     }
     return true;
@@ -229,9 +233,14 @@ void WritePayload() noexcept {
     PanelPayload pl = PayloadFromParams(g_app.params); // shared field mapping; seq stays 0
     pl.generation = g_generation;
     pl.logEnabled = g_app.timingLog ? 1 : 0;
-    // 源传输函数探针(v30):worker 代读 mpv gamma,非用户参数,逐次写入
-    // (-1 未读到 = 0 保守)。
-    pl.srcHdr = g_srcGammaProbe.load(std::memory_order_relaxed) > 0 ? 1 : 0;
+    // 源传输函数探针(v30):worker 代读 mpv gamma,非用户参数。单值取
+    // lastSrcProbe —— 主循环探针边沿的已消费基准,写点唯一 = 边沿分支,
+    // 发布与基线天然同源(2026-10-09 评审修:参数穿针只盖住边沿一个调用
+    // 点,其余发布点发主循环从未消费过的裸读)。未读(边沿未触发过)时
+    // 持基准值:断连窗口发 0 会经 create 让 HDR 片采纳 srcHdr=0(TrueHDR
+    // 照跑 = 双重传输映射失真);反向(持 1 落到 SDR 片)只是 TrueHDR 被
+    // 压制的质量损失,无失真,且重连后边沿照常收敛。首次落 0。
+    pl.srcHdr = g_app.lastSrcProbe > 0 ? 1 : 0;
     // Publish protocol shared with the plugin's stats channel (panel_ipc.h):
     // body lands with seq 0, the counter moves alone after it is stable.
     PublishWithSeq(&g_payload->seq, newSeq, [&] {
@@ -710,8 +719,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         // 之后值稳定,不再触发。
         {
             const int probe = g_srcGammaProbe.load(std::memory_order_relaxed);
+            // 值变化边沿 → 基线落账 + 补发布 + reseek(srcHdr 是 create-time
+            // 事实,会话必须重建)。写点唯一:基线在此落账,WritePayload 随
+            // 后读同一值 —— 发布与基线天然同源,两拍间 worker 翻转不会造成
+            // 边沿已记账而 payload 发了旧值的脱钩(2026-10-09 评审修)。
             if (probe >= 0 && probe != g_app.lastSrcProbe) {
                 g_app.lastSrcProbe = probe;
+                WritePayload();
                 // reseek 分支会无视节流强制 flush live 变更,无需另设 liveDirty。
                 g_app.reseekDirty = true;
             }

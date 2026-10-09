@@ -175,6 +175,19 @@ bool HdrTagGetPropAck(HANDLE pipe, const char *prop, char *ack, size_t cap) noex
            ReadFile(pipe, ack, static_cast<DWORD>(cap - 1), &got, nullptr) != FALSE;
 }
 
+// 从 ack 提取 "..." 引号字符串到 out(HdrTagReadHint 的字符串分支
+// 与 HdrTagReadGamma 共用;此前 ReadGamma 又手抄了一份提取,转义引号/非串
+// data 值两类演进都得双处同步)。d 必须指向【值】的开引号(不是 key 的
+// —— ReadHint 由 d+=7 落位,ReadGamma 由 strstr("\"data\":\"") 匹配起点
+// +7 落位;拿 key 的开引号进来会提到字面量 "data",2026-10-09 评审修)。
+void HdrTagQuotedValue(const char *d, char *out, size_t cap) noexcept {
+    const char *e = strchr(d + 1, '"');
+    if (e && static_cast<size_t>(e - d - 1) < cap) {
+        memcpy(out, d + 1, static_cast<size_t>(e - d - 1));
+        out[e - d - 1] = '\0';
+    }
+}
+
 // 读回 target-colorspace-hint 实值("auto"/"yes"/"no")到 out。入口先写
 // "auto" 兜底,故返回时 out 恒非空(调用方无需判空)。
 void HdrTagReadHint(HANDLE pipe, char *out, size_t cap) noexcept {
@@ -187,31 +200,26 @@ void HdrTagReadHint(HANDLE pipe, char *out, size_t cap) noexcept {
     d += 7;
     if (strncmp(d, "true", 4) == 0) strcpy_s(out, cap, "yes");
     else if (strncmp(d, "false", 5) == 0) strcpy_s(out, cap, "no");
-    else if (*d == '"') {
-        const char *e = strchr(d + 1, '"');
-        if (e && static_cast<size_t>(e - d - 1) < cap) {
-            memcpy(out, d + 1, static_cast<size_t>(e - d - 1));
-            out[e - d - 1] = '\0';
-        }
-    }
+    else if (*d == '"') HdrTagQuotedValue(d, out, cap);
 }
 
 // 读回 video-params/gamma 实值(源传输函数,面板侧 HDR 探针数据源)。
-// 入口清空 out;error ack(无视频/属性不可用,换片间隙常态)时保持空,
-// 调用方按"读到才更新"处理 —— 不在此维持上一值,状态归 worker 比对。
-void HdrTagReadGamma(HANDLE pipe, char *out, size_t cap) noexcept {
+// 返回 false = 管道已断(契约同 HdrTagGetPropAck;此前返回值被丢弃,死句
+// 柄恒挂 conn.pipe、探针冻结在上一文件的值,换片后 create 采纳陈旧 srcHdr
+// —— 2026-10-08 评审修)。error ack(无视频/属性不可用,换片间隙常态)时
+// out 保持空,调用方按"读到才更新"处理,状态归 worker 比对。
+bool HdrTagReadGamma(HANDLE pipe, char *out, size_t cap) noexcept {
     out[0] = '\0';
     char ack[256]{};
     if (!HdrTagGetPropAck(pipe, "video-params/gamma", ack, sizeof(ack)))
-        return;
+        return false;
     const char *d = strstr(ack, "\"data\":\"");
-    if (!d) return;
-    d += 8;
-    const char *e = strchr(d, '"');
-    if (e && static_cast<size_t>(e - d) < cap) {
-        memcpy(out, d, static_cast<size_t>(e - d));
-        out[e - d] = '\0';
-    }
+    // 匹配起点 = key "data" 的开引号,+7 落到【值】的开引号
+    // ("data":"  = 8 字节;d+7 才是值引号,直接传会把字面量 "data"
+    // 当 gamma 值,strcmp("data","pq") 恒败 → 探针恒 0,整条 HDR 旁路
+    // 静默失效(2026-10-09 评审修,旧代码 d+=8 的等价落位)。
+    if (d) HdrTagQuotedValue(d + 7, out, cap);
+    return true;
 }
 
 // 打标持久连接态(worker 本地;gamma 探针读取共用同一连接)。
@@ -220,22 +228,57 @@ struct HdrTagConn {
     wchar_t name[64]{};    // 当前管道名(conf 解析命中值,仅日志)
     int lastTagState = -1; // -1 未知(连接建立前/断开后)→ 重连必发
     char initialHint[8]{}; // 连接时读回的 target-colorspace-hint 实值,摘标还原用
+    int skipTicks = 0;     // 重连退避(拍数)。随连接走而非进程静态:退出
+                           // 路径的摘标重连不被残留退避挡住(2026-10-09 评审修)
 };
 
-// 连接(若无)并把打标状态推到 want。返回 true = 连接存活且状态已对齐。
-bool HdrTagTick(HdrTagConn &c, int want) noexcept {
-    if (!c.pipe) {
-        const wchar_t *candidates[4];
-        wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
-        c.pipe = MpvPipeOpen(candidates, kMpvPipeMaxCandidates, /*overlapped=*/false,
-                             c.name, std::size(c.name));
-        free(parsedName);
-        if (!c.pipe) return false; // mpv 不在/IPC 未起:下拍重试,不闩锁
-        c.lastTagState = -1;       // 新会话一律视为未知 → 必发
-        HdrTagReadHint(c.pipe, c.initialHint, sizeof(c.initialHint));
-        PanelLog("panel: hdr tag worker connected to pipe %ls (colorspace-hint=%hs)",
-                 c.name, c.initialHint);
+// 断管收口:关连接 + 打标态打回未知 + 探针打回未读 + 退避清零。所有管道
+// 死亡路径走这里(2026-10-08 评审修:此前探针从不在断连时重置,mpv 换新
+// 实例而重连未成时探针冻结在上一文件的值,新文件首 create 采纳陈旧
+// srcHdr)。-1 的消费端语义见 WritePayload:未读 ≠ 0,保持上次发布值
+//(2026-10-09 评审修:此前 -1→0 会在断连窗口把 HDR 位的 payload 洗成 0)。
+void HdrTagDropConn(HdrTagConn &c) noexcept {
+    if (c.pipe) CloseHandle(c.pipe);
+    c.pipe = nullptr;
+    c.lastTagState = -1;
+    c.skipTicks = 0;
+    g_srcGammaProbe.store(-1, std::memory_order_relaxed);
+}
+
+// 连接(若无)。返回 true = 连接存活。不 gate 在 stats 上:探针必须在滤镜
+// create 之前就绪,而首个 create 先于插件第一条稳定 stats(2026-10-08 评
+// 审修:此前连接只发生在 stats-gated 的打标同步内,探针结构性迟到)。
+bool HdrTagEnsureConn(HdrTagConn &c) noexcept {
+    if (c.pipe) return true;
+    // mpv 缺席时逐拍全量重试 = 每秒 4 次 conf 重读解析 + 4 路 CreateFileW,
+    // 托盘常驻空转(2026-10-09 评审修;旧路径 stats-gated 时此态零成本)。
+    // 失败后跳 4 拍(HdrTagProc Sleep(250) 定拍 ≈ 1s);首拍不退避,保住
+    // "探针先于 create" 的冷启动路径。仅打标线程触达。
+    if (c.skipTicks > 0) {
+        --c.skipTicks;
+        return false;
     }
+    const wchar_t *candidates[4];
+    wchar_t *parsedName = ResolveMpvPipeCandidates(candidates);
+    c.pipe = MpvPipeOpen(candidates, kMpvPipeMaxCandidates, /*overlapped=*/false,
+                         c.name, std::size(c.name));
+    free(parsedName);
+    if (!c.pipe) {
+        c.skipTicks = 4; // 打开失败也进 ~1s 退避(下 4 拍零尝试)
+        return false;  // mpv 不在/IPC 未起:退避后重试,不闩锁
+    }
+    c.lastTagState = -1;       // 新会话一律视为未知 → 必发
+    HdrTagReadHint(c.pipe, c.initialHint, sizeof(c.initialHint));
+    PanelLog("panel: hdr tag worker connected to pipe %ls (colorspace-hint=%hs)",
+             c.name, c.initialHint);
+    return true;
+}
+
+// 打标状态推到 want(连接由调用方保证;此前 Tick 内再调一次 EnsureConn,
+// 与 HdrTagProc 循环顶的连接先行构成每拍双调,退避每拍被减两次 —— ~1s
+// 实为 ~0.5s,2026-10-09 评审修)。返回 true = 连接存活且状态已对齐。
+bool HdrTagTick(HdrTagConn &c, int want) noexcept {
+    if (!c.pipe) return false;
     if (c.lastTagState == want) return true;
     char cmd[256];
     if (want) {
@@ -258,9 +301,7 @@ bool HdrTagTick(HdrTagConn &c, int want) noexcept {
                  want ? "yes" : (c.initialHint[0] ? c.initialHint : "auto"));
         if (!HdrTagSendOnPipe(c.pipe, hintCmd)) {
             PanelLog("panel: hdr tag pipe broken (hint sync) -> reconnect next tick");
-            CloseHandle(c.pipe);
-            c.pipe = nullptr;
-            c.lastTagState = -1;
+            HdrTagDropConn(c);
             return false;
         }
         PanelLog("panel: hdr vf tag %ls + colorspace-hint via %ls",
@@ -268,9 +309,7 @@ bool HdrTagTick(HdrTagConn &c, int want) noexcept {
         return true;
     }
     PanelLog("panel: hdr tag pipe broken -> reconnect next tick");
-    CloseHandle(c.pipe);
-    c.pipe = nullptr;
-    c.lastTagState = -1;
+    HdrTagDropConn(c);
     return false;
 }
 } // namespace
@@ -283,23 +322,34 @@ DWORD WINAPI HdrTagProc(LPVOID) noexcept {
     for (;;) {
         Sleep(250);
         if (g_quit) break;
+        // 连接先行,不 gate 在 stats 上(2026-10-08 评审修):探针必须在滤镜
+        // create 之前就绪,而首个 create 先于插件第一条稳定 stats —— 此前
+        // 连接只发生在下方 stats-gated 打标同步内,探针结构性迟到,冷启动
+        // 首个 HDR 文件恒先按 SDR 建 TrueHDR。
+        HdrTagEnsureConn(conn);
         StatsPayload st{};
         bool badMagic = false;
-        if (ReadStatsSnapshot(&st, &badMagic) == 2) {
+        const bool statsValid = ReadStatsSnapshot(&st, &badMagic) == 2;
+        if (statsValid) {
             // HDR 打标直读实效位(DSLA;原 strstr 人读串 parse 在插件改显示
             // 格式时会静默错)。rtxHdrActive 缺省 0(passthrough 简体 body 不带)
             // = SDR 实态,发 remove 摘标 —— 与旧"rtx 字段为空"判据同语义。
             HdrTagTick(conn, st.rtxHdrActive ? 1 : 0);
         }
-        // 源传输函数探针(连接存活才读;不 gate 在 stats 上 —— 探针必须在
-        // 滤镜 create 之前就绪,而那时 stats 可能还没第一帧)。error ack
-        // (换片间隙)保持上一值,防逐拍抖动。mpv gamma 值域 = "pq"/"hlg"
-        // 为 HDR(2026-10-08 实测 hdr10 片返回 "pq";不是编码侧的
-        // "smpte2084"/"arib-b67" 拼写)。
-        if (conn.pipe) {
+        // 源传输函数探针:插件在跑(stats 有效)或尚未读到过(冷启动窗口,
+        // 首 create 先于第一条 stats)才读 —— mpv 开着但插件空闲的常态不再
+        // 每秒 4 次空转管道往返,阻塞读无超时的悬挂面随之收窄(2026-10-09
+        // 评审修)。error ack(换片间隙)保持上一值,防逐拍抖动;管道断 =
+        // 探针打回未读(HdrTagDropConn),冻结的旧值会让换片后 create 采纳
+        // 陈旧 srcHdr。mpv gamma 值域 = "pq"/"hlg" 为 HDR(2026-10-08 实测
+        // hdr10 片返回 "pq";不是编码侧的 "smpte2084"/"arib-b67" 拼写,契约
+        // 头 panel_ipc.h 同步该值域)。
+        if (conn.pipe &&
+            (statsValid || g_srcGammaProbe.load(std::memory_order_relaxed) < 0)) {
             char gamma[24]{};
-            HdrTagReadGamma(conn.pipe, gamma, sizeof(gamma));
-            if (gamma[0]) {
+            if (!HdrTagReadGamma(conn.pipe, gamma, sizeof(gamma))) {
+                HdrTagDropConn(conn);
+            } else if (gamma[0]) {
                 const int hdr = (std::strcmp(gamma, "pq") == 0 ||
                                  std::strcmp(gamma, "hlg") == 0) ? 1 : 0;
                 g_srcGammaProbe.store(hdr, std::memory_order_relaxed);
@@ -311,10 +361,15 @@ DWORD WINAPI HdrTagProc(LPVOID) noexcept {
     // 面板退出时若标在挂,同实例之后播 SDR 也被强标 BT.2020 PQ + hint=yes,
     // 错色直到 mpv 重启。lastTagState==1 = 确定在挂;-1(连上未同步,含
     // 前一面板实例遗留的标)也发一次摘除,remove 对无标链报错无害(ack
-    // 不解析)。崩溃场景无法清理,维持已知残留。
+    // 不解析)。连接可能已在读失败路径被摘而 mpv 还活着(2026-10-09 评审
+    // 修:此前以 conn.pipe 为前提,该态退出 = 标恒挂)—— 无条件补一次
+    // 连接再摘;DropConn 已把退避清零,这里必是真实尝试。连不上(mpv 已
+    // 关)自然无害:管道与 vf 链随 mpv 一起消失。崩溃场景无法清理,维持
+    // 已知残留。
+    HdrTagEnsureConn(conn);
     if (conn.pipe && conn.lastTagState != 0) {
         HdrTagTick(conn, 0);
     }
-    if (conn.pipe) CloseHandle(conn.pipe);
+    HdrTagDropConn(conn); // 收口 CloseHandle + 探针复位(进程即退,幂等)
     return 0;
 }

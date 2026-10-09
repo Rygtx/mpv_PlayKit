@@ -53,8 +53,17 @@ struct AppState {
     double lastReseekWrite = 0.0; // reseek 独立节流戳(不挂 liveDirty)
     double lastStatsRead = 0.0;
     double lastSeekInitReseek = 0.0; // kStateNrSeekInit 兜底 reseek 去抖
-    int lastSrcProbe = -1;           // 已折叠进 payload 的探针值(-1 未定;
-                                     // worker 读数与主循环消费的比对基准)
+    int lastSrcProbe = 0;            // 已消费的源传输函数探针值(单值,双职能):
+                                     // 1) 主循环值变化边沿的基准(采纳遗留
+                                     // payload 时播种 = 该实例 create 真实持
+                                     // 有的 srcHdr,免多余 reseek;不一致则
+                                     // 边沿必触发收敛);2) WritePayload 的
+                                     // 发布源 —— 写点唯一 = 主循环边沿分支,
+                                     // 发布与基线天然同源,不变量按构造成立
+                                     //(2026-10-09 评审修:参数穿针只盖住
+                                     // 1/7 调用点,其余发布主循环从未消费
+                                     // 过的裸读)。worker 未读到(-1)时
+                                     // 持本值不降级,首次(0)落 SDR。
     char status[160]{};
     char statsBig[64]{};
     char statsRes[96]{};

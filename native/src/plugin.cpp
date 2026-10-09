@@ -335,7 +335,11 @@ static void SetHdrFrameProps(VSFrame *frame, const VSAPI *vsapi) noexcept {
 
 // 从源帧 props 解析色彩矩阵/范围(缺失/未知回落 709 limited);值变化时
 // 留痕一行(atomic 边沿去重)。VS _Matrix:1=BT.709,5(BT470BG)/6(SMPTE170M)
-// =601 族,4(XYZ)=601 近似(D65 录制内容的可用降级),9(BT.2020)=2020。
+// =601 精确,7(SMPTE240M)/4(XYZ)=601 近似(240M 系数微差 / D65 录制内容
+// 的可用降级),9=BT.2020 NCL 精确,10(BT.2020 CL 按 NCL 系数近似)=2020。
+// 其余编号(0=GBR/8=YCgCo/11-14)不映射:落 709 兜底但状态行标
+// unsupported,不再与精确 709 同貌(2026-10-09 评审修:此前除上列外全部
+// 静默落 709,打地鼠式按上报 id 补映射)。
 // mpv 的 vf_vapoursynth 桥不写 VS 标准名 _Matrix,矩阵落在 `_ColorSpace`
 // (值域同 H.273 编号,2026-10-08 实测 dump);_Transfer/_Primaries 两名
 // 均无(HDR 判定走面板 gamma 探针,见 panel_ipc.h v30)。故 _Matrix 缺失
@@ -357,10 +361,24 @@ static void ParseColorProps(const VSMap *props, const VSAPI *vsapi,
     const int rangeProp = vsapi->mapGetInt(props, "_ColorRange", 0, &perr);
     const bool rangeKnown = perr == 0;
     matrix = vsdlssnr::ColorMatrix::BT709;
-    if (matrixKnown && (matrixProp == 4 || matrixProp == 5 || matrixProp == 6)) {
-        matrix = vsdlssnr::ColorMatrix::BT601;
-    } else if (matrixKnown && matrixProp == 9) {
-        matrix = vsdlssnr::ColorMatrix::BT2020;
+    // 映射 + 保真度分类(见函数头注):unsupported 编号照旧落 709 兜底,
+    // 但分类进状态行 —— 色度偏移类静默降级从此可辨(2026-10-09 评审修)。
+    const char *matrixClass = matrixKnown ? "unsupported" : "default";
+    if (matrixKnown) {
+        switch (matrixProp) {
+        case 1:  matrixClass = "exact"; break;                       // BT.709
+        case 5:
+        case 6:  matrix = vsdlssnr::ColorMatrix::BT601;
+                 matrixClass = "exact"; break;                       // 601 族
+        case 7:
+        case 4:  matrix = vsdlssnr::ColorMatrix::BT601;
+                 matrixClass = "approx"; break;                      // 240M/XYZ→601
+        case 9:  matrix = vsdlssnr::ColorMatrix::BT2020;
+                 matrixClass = "exact"; break;                       // 2020 NCL
+        case 10: matrix = vsdlssnr::ColorMatrix::BT2020;
+                 matrixClass = "approx"; break;                      // 2020 CL→NCL
+        default: break;                                              // 落 709 兜底
+        }
     }
     range = vsdlssnr::ColorRange::Limited;
     if (rangeKnown && rangeProp == 0) range = vsdlssnr::ColorRange::Full;
@@ -369,11 +387,12 @@ static void ParseColorProps(const VSMap *props, const VSAPI *vsapi,
     if (lastSig.exchange(sig, std::memory_order_relaxed) != sig) {
         char msg[160];
         std::snprintf(msg, sizeof(msg),
-                      "DLSSNR STATUS: frame props matrix=%s(%d via %s) range=%s(%d) -> %s/%s",
+                      "DLSSNR STATUS: frame props matrix=%s(%d via %s) range=%s(%d) -> %s(%s)/%s",
                       matrixKnown ? "yes" : "missing", matrixProp, matrixSrc,
                       rangeKnown ? "yes" : "missing", rangeProp,
                       matrix == vsdlssnr::ColorMatrix::BT709 ? "709"
                       : matrix == vsdlssnr::ColorMatrix::BT2020 ? "2020" : "601",
+                      matrixClass,
                       range == vsdlssnr::ColorRange::Limited ? "limited" : "full");
         vsdlssnr::TimingStatusLine(msg);
     }
@@ -534,7 +553,7 @@ static const VSFrame *VS_CC DlssnrGetFrameImpl(
             vsdlssnr::StatsPayload st{};
             vsdlssnr::CopyStatStr(st.filterState, "passthrough");
             vsdlssnr::CopyStatStr(st.stateDetail, vsdlssnr::kStateNrSeekInit);
-            vsdlssnr::PublishStats(st);
+            vsdlssnr::PublishStats(st); // srcHdr 由 PublishStats 单点盖章
         }
     }
 
@@ -856,7 +875,7 @@ static void VS_CC DlssnrFreeImpl(void *instanceData, VSCore * /*core*/, const VS
     {
         vsdlssnr::StatsPayload st{};
         vsdlssnr::CopyStatStr(st.filterState, "unloaded");
-        vsdlssnr::PublishStats(st);
+        vsdlssnr::PublishStats(st); // srcHdr 由 PublishStats 单点盖章
     }
     // FG 缓存帧:最后一个引用(缓存自留),先于 filter 释放。
     for (int i = 0; i < kFgMultMax; ++i) {
@@ -1122,9 +1141,13 @@ static void VS_CC DlssnrCreateImpl(
     // NR+FG+RTX 皆关 = 跳过热复用(实例纯直通,停泊上下文原样保留,重开
     // 秒回);仅 NR 关而 FG/RTX 开仍需热复用(设备与上下文都在用)。
     // ctx 载荷从合并后的 DlssnrParams 折出(probe 已在 ResolveRtxParams
-    // 填入);srcHdr 探针(压制的同一事实)随载荷进 ctx 作 stats 发布源。
+    // 填入);srcHdr 探针(压制的同一事实)在此直接落 stats 探针单存储
+    //(panel_ipc.h StatsSrcHdrSlot,唯一写点 —— 热复用/冷启/全关直通三路
+    // 都先经此行,此后所有发布体由 PublishStats 单点盖章取值,2026-10-09
+    // 评审修:曾借道 rtx.srcHdr 散落 Initialize/Rebind/各发布体多点手写,
+    // 漏带即面板误读)。
     RtxVideoParams rtx = RtxFromParams(initial);
-    rtx.srcHdr = payloadSrcHdr;
+    vsdlssnr::StatsSrcHdrStore(payloadSrcHdr);
     // 生命周期锁:覆盖热匹配判定 → 冷初始化结束(见 g_lifecycleMutex 定义
     // 处注释)。冷初始化 ~1s 在锁内 —— 并发的 Free 最多等一个冷启动周期。
     std::lock_guard<std::mutex> lifecycleLock(g_lifecycleMutex);
@@ -1219,8 +1242,7 @@ static void VS_CC DlssnrCreateImpl(
             vsdlssnr::StatsPayload st{};
             vsdlssnr::CopyStatStr(st.filterState, "passthrough");
             vsdlssnr::CopyStatStr(st.stateDetail, safe);
-            st.srcHdr = payloadSrcHdr; // 直通体也带探针位(面板旁路显示同判)
-            vsdlssnr::PublishStats(st);
+            vsdlssnr::PublishStats(st); // srcHdr 由 PublishStats 单点盖章
         }
     }
     if (!initial.nrEnabled && !initial.fgEnabled && !rtxRequested) {
@@ -1233,8 +1255,7 @@ static void VS_CC DlssnrCreateImpl(
         vsdlssnr::StatsPayload st{};
         vsdlssnr::CopyStatStr(st.filterState, "passthrough");
         vsdlssnr::CopyStatStr(st.stateDetail, "NR+FG+RTX disabled (panel/vpy)");
-        st.srcHdr = payloadSrcHdr; // 同上:直通体带探针位
-        vsdlssnr::PublishStats(st);
+        vsdlssnr::PublishStats(st); // srcHdr 由 PublishStats 单点盖章
         if (!vsdlssnr::BridgeStart(d->params)) WarnBridgeFailed(core, vsapi);
         vsdlssnr::TimingStatusLine("DLSSNR STATUS: NR+FG+RTX disabled; passthrough (zero GPU)");
     }

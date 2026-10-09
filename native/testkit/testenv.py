@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = os.environ.get("VSDLSSNR_TEST_ROOT") or os.path.dirname(sys.executable)
 HOST_DIR = os.path.dirname(sys.executable)
@@ -141,8 +142,42 @@ def ini_snapshot(clear=False):
             os.remove(INI)
 
 
+def ini_isolated(clear=True):
+    """模块级流程脚本的 ini 隔离一线式(2026-10-09 评审修收敛)。
+
+    ini_snapshot(clear=True) 语义的模块级等价物:atexit 恢复现场(经
+    ini_restore_on_exit)+ 进入即清空。此前 test_perf/verify_stats_keys 各自
+    手搓 restore+truncate 两行配方,与 ini_snapshot 三种配方并存 —— 漏
+    restore 行的那份会毁用户真实 ini,漏 clear 行的那份飘忽测到用户
+    nr_enabled=0。动 ini 的模块级脚本一律:
+
+        import testenv
+        testenv.ini_isolated()
+    """
+    ini_restore_on_exit()
+    if clear:
+        open(INI, "w").close()
+
+
 def kill_panel():
     subprocess.run(["taskkill", "/F", "/IM", PANEL_PROCESS], capture_output=True)
+
+
+def solo_panel():
+    """模块级测试的面板清场一线式(与 ini_isolated 同款收敛):
+    kill + 硬置 NO_PANEL + 等退 + 存活断言。
+
+    幸存面板的主循环会重推自己的 payload 盖掉测试钉的参数(nr=0 等),
+    断言测到面板配置而非脚本显式参数;setdefault 会尊重预设 "0" 故必须
+    硬置。动 payload 的模块级脚本一律:
+
+        import testenv
+        testenv.solo_panel()
+    """
+    kill_panel()
+    os.environ["VSDLSSNR_NO_PANEL"] = "1"
+    time.sleep(1)
+    require(not panel_running(), "面板进程无法终止,会与本测试争抢 payload")
 
 
 def kill_mpv():

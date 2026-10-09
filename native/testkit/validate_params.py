@@ -31,23 +31,17 @@ import json
 import os
 import subprocess
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import testenv  # noqa: E402
-testenv.ini_restore_on_exit()  # 部署 ini 现场保护(2026-09-25 收敛)
 
 testenv.require_env()
 testenv.require_nvidia()
 
-if os.path.exists(testenv.INI):
-    os.remove(testenv.INI)
-# 面板残留清场:面板 payload 经 BridgeAdoptPanelPayload 覆盖 worker 的
-# vpy kwargs(#37 优先级设计),配置差异全部被抹平。
-testenv.kill_panel()
-time.sleep(1)
-# worker 全程无面板
-os.environ["VSDLSSNR_NO_PANEL"] = "1"
+# ini 隔离 + 面板残留清场(2026-10-09 评审修:restore+os.remove 两行配方
+# 收口 testenv.ini_isolated;solo_panel 见其 docstring)。
+testenv.ini_isolated()
+testenv.solo_panel()  # worker 全程无面板
 
 WORKER = r'''
 import ctypes, hashlib, json, sys

@@ -317,8 +317,16 @@ cbuffer Params : register(b0) {
     float2 MotionScale;   // 流向量单位换算(会话输入像素 → 源像素);未降采样 = (1,1)
 };
 
+// 边界钳制一律走本助手(2026-10-09 评审修):int/uint 混型内联 clamp 会把
+// 负 int 提升为 uint(0xFFFFFFFF)钳到 max = 读对侧边缘 texel,历史事故
+// ×3 全是这一类。extent 收 uint2,collection 到 int2 的转换封在助手内,
+// 错误形态写不出来。
+int2 ClampIdx(int2 v, uint2 extent) {
+    return clamp(v, int2(0, 0), int2(extent) - 1);
+}
+
 float2 LoadFlow(Texture2D<int2> field, int2 p) {
-    p = clamp(p, int2(0, 0), int2(FlowExtent) - 1);
+    p = ClampIdx(p, FlowExtent);
     return float2(field.Load(int3(p, 0))) / 32.0;
 }
 
@@ -337,7 +345,7 @@ float2 SampleFlow(Texture2D<int2> field, float2 sourcePixel) {
 }
 
 float LoadCost(Texture2D<uint> field, int2 p) {
-    p = clamp(p, int2(0, 0), int2(FlowExtent) - 1);
+    p = ClampIdx(p, FlowExtent);
     return float(field.Load(int3(p, 0))) / 255.0;
 }
 
@@ -696,9 +704,15 @@ bool PreviousPosition(int2 p, out float2 previous) {
 
 // G: signed half-resolution observations, upsampled with original-color guidance.
 // Return support explicitly: a failed reconstruction must not publish history.
+// 边界钳制走 ClampIdx 助手(同 DENSIFY_HLSL 注;int/uint 混型 clamp 历史
+// 事故 ×3 的统一防线)。
+int2 ClampIdx(int2 v, uint2 extent) {
+    return clamp(v, int2(0, 0), int2(extent) - 1);
+}
+
 bool Reconstruct(int2 p, float3 color, out float3 residual) {
-    int2 a = clamp(int2(floor(float2(p) * .5 - .25)), 0, int2(LowSize) - 1);
-    int2 b = clamp(int2(floor(float2(p) * .5 - .25)) + 1, 0, int2(LowSize) - 1);
+    int2 a = ClampIdx(int2(floor(float2(p) * .5 - .25)), LowSize);
+    int2 b = ClampIdx(int2(floor(float2(p) * .5 - .25)) + 1, LowSize);
     float2 ca = min(float2(a) * 2 + .5, float2(Size) - 1);
     float2 cb = min(float2(b) * 2 + .5, float2(Size) - 1);
     float2 f = saturate((float2(p) - ca) / max(cb - ca, 1));
@@ -913,6 +927,12 @@ cbuffer ConvertInParams : register(b0) {
     uint PlaneCPitch;     // @15 U/V 平面行宽(采样字)
 };
 
+// 边界钳制走 ClampIdx 助手(同 DENSIFY_HLSL 注;int/uint 混型 clamp 历史
+// 事故 ×3 的统一防线)。
+int2 ClampIdx(int2 v, uint2 extent) {
+    return clamp(v, int2(0, 0), int2(extent) - 1);
+}
+
 [numthreads(8, 8, 1)]
 void ConvertYuvToBgra(uint3 tid : SV_DispatchThreadID) {
     if (any(tid.xy >= DstExtent)) return;
@@ -927,8 +947,12 @@ void ConvertYuvToBgra(uint3 tid : SV_DispatchThreadID) {
     const float2 fc = (tid.xy + 0.5) * ChromaScale - 0.5;
     const int2 c0 = int2(floor(fc));
     const float2 wf = fc - c0;
-    const int2 s0 = clamp(c0, int2(0, 0), ChromaExtent - 1);
-    const int2 s1 = clamp(c0 + 1, int2(0, 0), ChromaExtent - 1);
+    // 边界钳制走 ClampIdx 助手(同 DENSIFY_HLSL 注):ChromaExtent 是 uint2,
+    // 内联 uint2 混型 clamp 会把负 c0(int)提升为 uint(0xFFFFFFFF)→
+    // 钳到 max = 平面最后一格 —— 边界行/列的色度读对侧边缘 texel 而非
+    // clamp 到首格(2026-10-09 实测定位:边界 cu = 0.75*U[0]+0.25*U[159]。
+    const int2 s0 = ClampIdx(c0, ChromaExtent);
+    const int2 s1 = ClampIdx(c0 + 1, ChromaExtent);
     const float w00 = (1.0 - wf.x) * (1.0 - wf.y), w10 = wf.x * (1.0 - wf.y);
     const float w01 = (1.0 - wf.x) * wf.y, w11 = wf.x * wf.y;
     const uint ci0 = s0.x + s0.y * PlaneCPitch;

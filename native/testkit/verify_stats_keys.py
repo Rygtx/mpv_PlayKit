@@ -14,13 +14,20 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-os.environ.setdefault("VSDLSSNR_NO_PANEL", "1")  # 纯 stats 键位验证,勿拉真实面板污染后序测试
 import testenv  # noqa: E402
 import panel_ipc  # noqa: E402
 
 SK = panel_ipc.SK  # stats 键名单一镜像(勿手抄字面量 —— 改名时 python 侧同步防线)
 
 testenv.require_env()
+# 面板清场(2026-10-09 评审修,对齐 test_nvof_yuv10):幸存面板的主循环会
+# 重推自己的 payload,插件 create 采纳后 of_mode/fg_route_eff 断言测的是
+# 面板配置而非本脚本的显式 case 参数 —— 键位覆盖检查整体空心。
+testenv.solo_panel()
+# 现场保护(2026-10-09):用户 ini 的 nr_enabled=0 会覆盖 vpy 显式参数
+# (插件顺序 vpy→ini→payload),case1 直接全关 passthrough —— 与下方
+# "显式传参脱离 ini"意图相悖。清空 + 退出恢复(统一配方)。
+testenv.ini_isolated()
 
 import vapoursynth as vs  # noqa: E402
 from vapoursynth import core  # noqa: E402
